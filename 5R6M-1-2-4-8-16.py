@@ -12885,7 +12885,7 @@ def _registrar_estado_embudo(data: dict | None = None) -> dict:
     return EMBUDO_DECISION_STATE
 
 
-def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real: str, meta_live: dict | None, ctt_soft_block: bool = False, ctt_reason: str = "") -> dict:
+def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real: str, meta_live: dict | None) -> dict:
     """Embudo unificado: selección -> calidad blanda -> modulación -> estado final."""
     out = _registrar_estado_embudo({
         "decision_final": EMBUDO_FINAL_WAIT_SOFT,
@@ -12996,9 +12996,7 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
         except Exception:
             pass
 
-        # CTT (fase previa): solo telemetría, sin efecto operativo.
-        if bool(ctt_soft_block) and (degrade_from == "none"):
-            degrade_from = "ctt_telemetry"
+        # CTT (fase previa): completamente neutralizado en decisión operativa.
 
         if bool(_estado_guardrail_ia_fuerte(force=False).get("hard_block", False)) and (not reliable) and (auc < 0.50) and (n_samples < int(TRAIN_WARMUP_MIN_ROWS)):
             decision = EMBUDO_FINAL_BLOCK_HARD
@@ -14131,18 +14129,14 @@ async def main():
                         # CTT como autoridad contextual superior: si hay veto duro,
                         # no se evalúan señales individuales/techo en este tick.
                         ctt_pre_eval = None
-                        ctt_soft_block = False
-                        ctt_soft_reason = ""
                         try:
                             _dummy, ctt_pre_eval = evaluar_ctt_fase([])
                         except Exception:
                             ctt_pre_eval = None
 
                         if str((ctt_pre_eval or {}).get("gate", "NEUTRAL")) == "BLOCK":
-                            ctt_soft_block = True
                             ctt_status_pre = str((ctt_pre_eval or {}).get("status", "RED_STRONG"))
                             ctt_reason_pre = str((ctt_pre_eval or {}).get("reason", "ctt_block"))
-                            ctt_soft_reason = f"{ctt_status_pre}:{ctt_reason_pre}"
                             agregar_evento(
                                 f"🟫 CTT modo prudente ({ctt_status_pre}): embudo pasa a evaluación blanda ({ctt_reason_pre})."
                             )
@@ -14324,31 +14318,18 @@ async def main():
 
                             candidatos.sort(key=lambda x: x[0], reverse=True)
 
-                            candidatos_prev = len(candidatos)
-                            candidatos, ctt_eval = evaluar_ctt_fase(candidatos)
-                            if candidatos_prev > 0:
+                            ctt_eval = evaluar_ctt_fase([])[1]
+                            if candidatos:
                                 ctt_status = str(ctt_eval.get("status", "NEUTRAL"))
                                 ctt_gate = str(ctt_eval.get("gate", "NEUTRAL"))
                                 ctt_reason = str(ctt_eval.get("reason", "na"))
                                 if ctt_gate == "BLOCK":
                                     agregar_evento(
-                                        f"🟥 CTT veto ({ctt_status}): ola {ctt_eval.get('asset','NA') or 'NA'} "
-                                        f"wr={float(ctt_eval.get('wave_ratio',0.0))*100:.1f}% "
-                                        f"m={int(ctt_eval.get('confirmadores',0))}/{_ctt_min_confirmadores()} · techo=NO-EVAL."
+                                        f"🟥 CTT telemetría ({ctt_status}): {ctt_reason} | sin efecto operativo en esta fase."
                                     )
-                                elif ctt_gate == "ALLOW_REZAGADOS" and len(candidatos) < candidatos_prev:
+                                elif ctt_status in ("GREEN_DIAGNOSTIC", "RED_WEAK"):
                                     agregar_evento(
-                                        f"🟩 CTT verde operable: {len(candidatos)}/{candidatos_prev} rezagados válidos "
-                                        f"(lag {int(CTT_LAG_MIN_S)}-{int(CTT_LAG_MAX_S)}s, dens={float(ctt_eval.get('density_cpm',0.0)):.2f}/min)."
-                                    )
-                                elif ctt_status == "GREEN_DIAGNOSTIC":
-                                    agregar_evento(
-                                        f"🟨 CTT verde diagnóstica: sin habilitación ({ctt_reason}) "
-                                        f"dens={float(ctt_eval.get('density_cpm',0.0)):.2f}/min redun={'sí' if bool(ctt_eval.get('redundancy_high', False)) else 'no'}."
-                                    )
-                                elif ctt_status == "RED_WEAK":
-                                    agregar_evento(
-                                        f"🟧 CTT rojo débil: endurece evaluación individual (delta={float(ctt_eval.get('roof_delta',0.0))*100:+.1f} pts)."
+                                        f"🟨 CTT telemetría ({ctt_status}): {ctt_reason}."
                                     )
 
                             # Selección automática: tomar la mejor señal elegible >= umbral REAL vigente.
@@ -14382,7 +14363,7 @@ async def main():
                             candidatos.sort(key=lambda x: float(x[2]), reverse=True)
                             candidatos = candidatos[:max(1, int(REAL_MICRO_TOP_K))]
 
-                        embudo = _resolver_embudo_final(candidatos, dyn_gate, estado_real, resolver_canary_estado(leer_model_meta() or {}), ctt_soft_block=bool(ctt_soft_block), ctt_reason=str(ctt_soft_reason or ""))
+                        embudo = _resolver_embudo_final(candidatos, dyn_gate, estado_real, resolver_canary_estado(leer_model_meta() or {}))
                         decision_final = str(embudo.get("decision_final", EMBUDO_FINAL_WAIT_SOFT))
                         if decision_final == EMBUDO_FINAL_BLOCK_HARD:
                             agregar_evento(f"🛑 EMBUDO {decision_final}: {embudo.get('hard_block_reason') or embudo.get('decision_reason')}")
