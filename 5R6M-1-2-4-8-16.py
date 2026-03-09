@@ -2229,7 +2229,7 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
     # ✅ Auditoría Real vs Ficticia: abrir señal SOLO si esta orden está respaldada por IA (prob >= umbral)
     try:
         st = estado_bots.get(str(bot), {}) if isinstance(estado_bots, dict) else {}
-        prob_sig = st.get("prob_ia")
+        prob_sig = st.get("prob_ia_oper", st.get("prob_ia"))
         modo_sig = str(st.get("modo_ia") or "").upper()
         thr_sig = float(get_umbral_operativo())
         if isinstance(prob_sig, (int, float)) and modo_sig not in ("", "OFF", "0") and float(prob_sig) >= thr_sig:
@@ -10551,7 +10551,7 @@ def mostrar_panel():
         bots_obs = 0
         mejor = None
         for b in BOT_NAMES:
-            pb = estado_bots.get(b, {}).get("prob_ia")
+            pb = _prob_ia_operativa_bot(b, default=None)
             if isinstance(pb, (int, float)):
                 bots_con_prob += 1
                 if float(pb) >= float(umbral_real_vigente):
@@ -11681,11 +11681,16 @@ PENDIENTE_FORZAR_EXPIRA = 0.0
 FORZAR_LOCK = threading.Lock()
 
 def condiciones_seguras_para(bot: str) -> bool:
-    # Usa el mismo umbral operativo que el HUD/audio
-    thr = get_umbral_operativo()
-    prob = estado_bots.get(bot, {}).get("prob_ia") or 0.0
-    n    = estado_bots.get(bot, {}).get("tamano_muestra", 0)
-    return (n >= ORACULO_N_MIN) and (prob >= thr)
+    # Fuente operativa única: prob_ia_oper + estado final del embudo
+    thr = float(get_umbral_operativo())
+    prob = float(_prob_ia_operativa_bot(bot, default=0.0) or 0.0)
+    n = int(estado_bots.get(bot, {}).get("tamano_muestra", 0) or 0)
+    emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
+    dec = str(emb.get("decision_final", EMBUDO_FINAL_WAIT_SOFT))
+    top1 = str(emb.get("top1_bot") or "")
+    if top1 and bot != top1:
+        return False
+    return (n >= ORACULO_N_MIN) and (prob >= thr) and (dec in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO))
 
 # forzar_real_manual
 def forzar_real_manual(bot: str, ciclo: int):
@@ -11716,8 +11721,8 @@ def forzar_real_manual(bot: str, ciclo: int):
                 MODAL_ACTIVO = False
 
         # Nueva lógica: Marcar como señal IA si prob >= thr_ia
-        prob = estado_bots.get(bot, {}).get("prob_ia") or 0.0
-        thr_ia = get_umbral_operativo()
+        prob = float(_prob_ia_operativa_bot(bot, default=0.0) or 0.0)
+        thr_ia = float(get_umbral_operativo())
 
         if prob >= thr_ia and not estado_bots[bot]["ia_senal_pendiente"]:
             estado_bots[bot]["ia_senal_pendiente"] = True
@@ -11769,64 +11774,43 @@ def forzar_real_manual(bot: str, ciclo: int):
         FORZAR_LOCK.release()
 
 def evaluar_semaforo():
-    thr = get_umbral_operativo()
-
-    mejor = (None, None, 0)
-    for b in BOT_NAMES:
-        d = estado_bots.get(b, {})
-        prob = d.get("prob_ia")
-        n    = d.get("tamano_muestra", 0)
-        if prob is not None and (mejor[0] is None or prob > mejor[0]):
-            mejor = (prob, b, n)
-    prob, bbest, n = mejor
+    thr = float(get_umbral_operativo())
+    emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
+    dec = str(emb.get("decision_final", EMBUDO_FINAL_WAIT_SOFT))
+    reason = str(emb.get("decision_reason", "--"))
+    top1 = str(emb.get("top1_bot") or "")
+    prob = float(emb.get("top1_prob", 0.0) or 0.0)
+    n = int(estado_bots.get(top1, {}).get("tamano_muestra", 0) or 0) if top1 else 0
 
     owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
-    try: saldo_val = float(obtener_valor_saldo() or 0.0)
-    except: saldo_val = 0.0
+    try:
+        saldo_val = float(obtener_valor_saldo() or 0.0)
+    except Exception:
+        saldo_val = 0.0
     costo = float(sum(MARTI_ESCALADO[:max(1, int(MAX_CICLOS))]))
     costo_c1 = float(MARTI_ESCALADO[0]) if MARTI_ESCALADO else 0.0
 
-    detalle = ""
     if owner and owner not in (None, "none"):
-        detalle = f"Token en uso por {owner}. Puedes forzar 5–0 → 1..5."
-        return "🟡", "AVISO", detalle
+        return "🟡", "AVISO", f"Token en uso por {owner}."
     if saldo_val < costo_c1:
         falta = costo_c1 - saldo_val
-        detalle = f"Saldo < C1 ({costo_c1:.2f}). Faltan {falta:.2f} USD para abrir nueva orden."
-        return "🟡", "AVISO", detalle
-
-    # Alineación HUD vs compuerta REAL: no marcar SEÑAL LISTA si gate está en espera.
-    confirm_st = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
-    confirm_need = int(DYN_ROOF_STATE.get("last_confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
-    trigger_ok = bool(DYN_ROOF_STATE.get("last_trigger_ok", False))
-    if confirm_st < confirm_need:
-        detalle = f"Compuerta en espera: confirm={confirm_st}/{confirm_need}."
-        return "🟡", "AVISO", detalle
-    if not trigger_ok:
-        detalle = "Compuerta en espera: trigger_ok=no."
-        return "🟡", "AVISO", detalle
-
+        return "🟡", "AVISO", f"Saldo < C1 ({costo_c1:.2f}). Faltan {falta:.2f} USD."
     if saldo_val < costo:
-        detalle = f"Saldo parcial: cubre C1 pero no todo C1..C{int(MAX_CICLOS)} ({costo:.2f})."
-        return "🟡", "AVISO", detalle
+        return "🟡", "AVISO", f"Saldo parcial: cubre C1 pero no C1..C{int(MAX_CICLOS)} ({costo:.2f})."
 
-    n_inc = contar_filas_incremental()
-    if n_inc < MIN_FIT_ROWS_LOW:
-        detalle = f"IA en modo WARMUP: n={n_inc}. Faltan {MIN_FIT_ROWS_LOW - n_inc} filas para entrenamiento estable."
-        return "🟡", "EN ESPERA", detalle
+    if dec == EMBUDO_FINAL_BLOCK_HARD:
+        return "🔴", "BLOQUEO", f"{emb.get('hard_block_reason') or reason}"
+    if dec == EMBUDO_FINAL_WAIT_SOFT:
+        return "🟡", "EN ESPERA", f"{emb.get('soft_wait_reason') or reason}"
+    if dec == EMBUDO_FINAL_SHADOW_OK:
+        return "🔵", "SHADOW", f"{reason} (no ejecuta REAL)"
+    if dec in (EMBUDO_FINAL_REAL_MICRO, EMBUDO_FINAL_REAL_NORMAL):
+        if (not top1) or (prob < thr):
+            return "🟡", "EN ESPERA", f"Top1 no operativo ({top1 or '--'} p={prob:.0%}<{int(thr*100)}%)."
+        modo = "MICRO" if dec == EMBUDO_FINAL_REAL_MICRO else "NORMAL"
+        return "🟢", "SEÑAL LISTA", f"{top1} • ProbOper={prob:.0%} • n={n} • modo={modo}"
 
-    if prob is None or n < 10:
-        return "🟡", "EN ESPERA", "Pocos datos útiles aún."
-    if n < ORACULO_N_MIN and (prob or 0) < thr:
-        return "🟡", "EN ESPERA", f"n={n}<{ORACULO_N_MIN} y prob={prob:.0%}<{int(thr*100)}%"
-    if n < ORACULO_N_MIN:
-        return "🟡", "EN ESPERA", f"n={n}<{ORACULO_N_MIN}"
-    if (prob or 0) < thr:
-        return "🟡", "EN ESPERA", f"prob={prob:.0%}<{int(thr*100)}%"
-
-    tecla = (bbest or "?")[-2:]
-    detalle = f"{bbest} • Prob={prob:.0%} • n={n} → pulsa [{tecla}] y el ciclo."
-    return "🟢", "SEÑAL LISTA", detalle
+    return "🟡", "EN ESPERA", f"Sin decisión embudo ({reason})."
 
 # NUEVAS FUNCIONES PARA RESET
 RESET_ON_START = False  # Cambiado a False para mantener historial entre sesiones
@@ -12987,6 +12971,14 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
                 degrade_from = "unreliable"
                 reason = "unreliable->shadow"
 
+        # Consistencia explícita: no permitir doble ganador entre dyn_gate y embudo.
+        best_dyn = str(dgate.get("best_bot", "") or "").strip()
+        if best_dyn and (best_dyn != top1_bot):
+            decision = EMBUDO_FINAL_WAIT_SOFT
+            risk_mode = "WAIT_SOFT"
+            soft_wait_reason = "best_bot_mismatch"
+            reason = f"best_bot_mismatch:{best_dyn}!={top1_bot}"
+
         # Modulador Pattern V1: aporta contexto/calidad, no veto principal.
         try:
             ctx_top = _ultimo_contexto_operativo_bot(top1_bot)
@@ -12997,22 +12989,16 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
                 degrade_from = "pattern_v1"
                 reason = f"pattern->{why_pat}"
             elif (not ok_pat) and decision == EMBUDO_FINAL_REAL_MICRO:
-                decision = EMBUDO_FINAL_WAIT_SOFT
-                risk_mode = "WAIT_SOFT"
-                soft_wait_reason = f"pattern:{why_pat}"
+                decision = EMBUDO_FINAL_SHADOW_OK
+                risk_mode = "SHADOW_OK"
                 degrade_from = "pattern_v1"
-                reason = f"pattern_wait:{why_pat}"
+                reason = f"pattern_shadow:{why_pat}"
         except Exception:
             pass
 
-        # CTT en esta fase: NO actúa como veto duro; solo modula a espera prudente.
-        if bool(ctt_soft_block) and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
-            decision = EMBUDO_FINAL_WAIT_SOFT
-            risk_mode = "WAIT_SOFT"
-            soft_wait_reason = str(ctt_reason or "ctt_soft")
-            if degrade_from == "none":
-                degrade_from = "ctt"
-            reason = f"ctt_soft:{soft_wait_reason}"
+        # CTT (fase previa): solo telemetría, sin efecto operativo.
+        if bool(ctt_soft_block) and (degrade_from == "none"):
+            degrade_from = "ctt_telemetry"
 
         if bool(_estado_guardrail_ia_fuerte(force=False).get("hard_block", False)) and (not reliable) and (auc < 0.50) and (n_samples < int(TRAIN_WARMUP_MIN_ROWS)):
             decision = EMBUDO_FINAL_BLOCK_HARD
@@ -14428,25 +14414,12 @@ async def main():
                                 ciclo_auto = ciclo_martingala_siguiente()
                                 if reset_martingala_por_saldo(ciclo_auto, saldo_val):
                                     ciclo_auto = 1
-                                repeat_min_prob_live = float(_marti_repeat_min_prob_live())
-                                mejor = elegir_candidato_rotacion_marti(
-                                    candidatos,
-                                    ciclo_auto,
-                                    allow_repeat_fallback=bool(MARTI_CYCLE_ALLOW_REPEAT_FALLBACK and int(ciclo_auto) > 1),
-                                    repeat_min_prob=repeat_min_prob_live,
-                                )
-                                if mejor is None and int(ciclo_auto) > 1:
-                                    agregar_evento(f"🧯 Rotación C{ciclo_auto}: sin bot elegible (nuevo o fallback p>={repeat_min_prob_live*100:.0f}%).")
+                                emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
+                                mejor_bot = str(emb.get("top1_bot") or "").strip()
+                                mejor = next((c for c in candidatos if str(c[1]) == mejor_bot), None)
                                 if mejor is not None:
                                     score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
-                                    if int(ciclo_auto) > 1 and bool(MARTI_CYCLE_ALLOW_REPEAT_FALLBACK):
-                                        _repeat_pick = (mejor_bot == ultimo_bot_real) or (mejor_bot in bots_usados_en_esta_marti)
-                                        if _repeat_pick:
-                                            agregar_evento(
-                                                f"♻️ Rotación C{ciclo_auto}: fallback controlado en {mejor_bot} "
-                                                f"(p_real={p_post*100:.1f}% >= {repeat_min_prob_live*100:.0f}%)."
-                                            )
-                                    agregar_evento(f"🧠 Embudo IA: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
+                                    agregar_evento(f"🧠 Embudo IA (manual): ganador único={mejor_bot} | p_oper={prob*100:.1f}% | risk={emb.get('risk_mode','--')}")
                                     PENDIENTE_FORZAR_BOT = mejor_bot
                                     PENDIENTE_FORZAR_INICIO = ahora
                                     PENDIENTE_FORZAR_EXPIRA = ahora + VENTANA_DECISION_IA_S
@@ -14478,25 +14451,12 @@ async def main():
                             ciclo_auto = ciclo_martingala_siguiente()
                             if reset_martingala_por_saldo(ciclo_auto, saldo_val):
                                 ciclo_auto = 1
-                            repeat_min_prob_live = float(_marti_repeat_min_prob_live(meta_live if isinstance(meta_live, dict) else None))
-                            mejor = elegir_candidato_rotacion_marti(
-                                    candidatos,
-                                    ciclo_auto,
-                                    allow_repeat_fallback=bool(MARTI_CYCLE_ALLOW_REPEAT_FALLBACK and int(ciclo_auto) > 1),
-                                    repeat_min_prob=repeat_min_prob_live,
-                                )
-                            if mejor is None and int(ciclo_auto) > 1:
-                                agregar_evento(f"🧯 IA AUTO C{ciclo_auto}: sin bot elegible (nuevo o fallback p>={repeat_min_prob_live*100:.0f}%).")
+                            emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
+                            mejor_bot = str(emb.get("top1_bot") or "").strip()
+                            mejor = next((c for c in candidatos if str(c[1]) == mejor_bot), None)
                             if mejor is not None:
                                 score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
-                                if int(ciclo_auto) > 1 and bool(MARTI_CYCLE_ALLOW_REPEAT_FALLBACK):
-                                    _repeat_pick = (mejor_bot == ultimo_bot_real) or (mejor_bot in bots_usados_en_esta_marti)
-                                    if _repeat_pick:
-                                        agregar_evento(
-                                            f"♻️ IA AUTO C{ciclo_auto}: fallback controlado en {mejor_bot} "
-                                            f"(p_real={p_post*100:.1f}% >= {repeat_min_prob_live*100:.0f}%)."
-                                        )
-                                agregar_evento(f"⚙️ IA AUTO: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
+                                agregar_evento(f"⚙️ IA AUTO (embudo único): {mejor_bot} p_oper={prob*100:.1f}% risk={emb.get('risk_mode','--')} gate={emb.get('gate_quality','--')}")
                                 monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_auto - 1))]
                                 val = obtener_valor_saldo()
                                 if val is None or val < monto:
