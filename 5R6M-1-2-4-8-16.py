@@ -182,6 +182,24 @@ CTT_NEUTRAL_POLICY = "normal"      # normal | block
 CTT_CIERRE_LOOKBACK_MAX = 600       # higiene memoria eventos
 CTT_ENABLE_GREEN_IN_MARTI_ADVANCED = False  # C2..C6: CTT actúa como freno más que como habilitador
 
+# === CTT maestro de franja viva (microventanas) ===
+CTT_MICRO_WINDOW_S = 15
+CTT_ARM_MIN_GREEN = 0.60
+CTT_ARM_MIN_DELTA = 0.10
+CTT_ARM_MIN_CONFIRMADORES = 3
+CTT_VIVO_MIN_G0 = 0.70
+CTT_VIVO_MIN_G1 = 0.55
+CTT_VIVO_MIN_CONFIRMADORES = 4
+CTT_VIVO_MAX_FRONT_AGE_S = 35
+CTT_TARDIO_MAX_FRONT_AGE_S = 45
+CTT_TARDIO_RESUELTOS_MAX_RATIO = 0.70
+CTT_TARDIO_DROP_DELTA = 0.08
+CTT_LAG_MIN_S = 10
+CTT_LAG_MAX_S = 40
+CTT_RED_STRONG_MAX_G0 = 0.25
+CTT_RED_STRONG_MAX_G1 = 0.35
+CTT_STATE_LOG_COOLDOWN_S = 8.0
+
 def _ctt_min_confirmadores() -> int:
     n = int(len(BOT_NAMES))
     if n >= 10:
@@ -452,6 +470,11 @@ _REAL_SHADOW_MICRO_OPEN_TS = deque(maxlen=64)
 _REAL_SHADOW_MICRO_LAST_LOG_TS = 0.0
 REAL_MICRO_STRONG_GATE_FALLBACK_ENABLE = True
 REAL_MICRO_STRONG_GATE_MIN_PROB = 0.64
+EMBUDO_FINAL_BLOCK_HARD = "BLOCK_HARD"
+EMBUDO_FINAL_WAIT_SOFT = "WAIT_SOFT"
+EMBUDO_FINAL_REAL_MICRO = "REAL_MICRO"
+EMBUDO_FINAL_REAL_NORMAL = "REAL_NORMAL"
+EMBUDO_FINAL_SHADOW_OK = "SHADOW_OK"
 IA_PROB_POLARIZE_ENABLE = True
 IA_PROB_POLARIZE_FACTOR_RELIABLE = 1.25
 IA_PROB_POLARIZE_FACTOR_UNRELIABLE = 2.05
@@ -1068,31 +1091,68 @@ LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # evita procesar el mism
 CTT_CLOSE_EVENTS = deque(maxlen=6000)
 CTT_CLOSE_SEEN = set()
 CTT_STATE = {
-    "status": "NEUTRAL",
+    "state": "CTT_NEUTRO",
+    "status": "CTT_NEUTRO",
     "regime": "NEUTRAL",
     "gate": "NEUTRAL",
+    "reason": "init",
+    "g0": 0.0,
+    "g1": 0.0,
+    "g2": 0.0,
+    "pendiente_verde": 0.0,
+    "front_ts": 0.0,
+    "front_age_s": None,
+    "front_green_ts": 0.0,
+    "front_green_age_s": None,
+    "front_event_color": "NONE",
+    "participantes_ola": 0,
+    "confirmadores": 0,
+    "confirmadores_verdes": 0,
+    "resueltos_ola": 0,
+    "resueltos_ratio": 0.0,
+    "green_confirm_ratio": 0.0,
+    "rezagados_validos": [],
     "asset": None,
+    "no_participantes": [],
+    "sample": 0,
+    "wave_alive": False,
+    "red_counter": 0,
+    "deterioro_rojo": 0.0,
+    "debug_summary": "init",
+    # Compat legacy HUD
     "t_front": 0.0,
     "wave_start": 0.0,
     "wave_age_s": None,
     "wave_ttl_ok": False,
     "wave_ratio": 0.0,
     "wave_total": 0,
-    "confirmadores": 0,
     "density_cpm": 0.0,
     "diversity_ratio": 0.0,
     "redundancy_high": False,
     "green_mode": "none",
-    "rezagados_validos": [],
-    "no_participantes": [],
-    "sample": 0,
     "roof_policy": "normal",
     "roof_delta": 0.0,
-    "reason": "init",
 }
+CTT_LAST_STATE = "CTT_NEUTRO"
+CTT_LAST_LOG_TS = 0.0
 REAL_OWNER_LOCK = None  # owner REAL en memoria (evita carreras de lectura de archivo)
 REAL_LOCK_MISMATCH_SINCE = 0.0
 REAL_LOCK_RECONCILE_S = 6.0
+
+EMBUDO_DECISION_STATE = {
+    "decision_final": EMBUDO_FINAL_WAIT_SOFT,
+    "decision_reason": "init",
+    "gate_quality": "weak",
+    "risk_mode": "WAIT_SOFT",
+    "hard_block_reason": "",
+    "soft_wait_reason": "init",
+    "top1_bot": None,
+    "top2_bot": None,
+    "gap_value": 0.0,
+    "top1_prob": 0.0,
+    "top2_prob": 0.0,
+    "degrade_from": "none",
+}
 
 try:
     last_sig_por_bot
@@ -2209,7 +2269,7 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
     # ✅ Auditoría Real vs Ficticia: abrir señal SOLO si esta orden está respaldada por IA (prob >= umbral)
     try:
         st = estado_bots.get(str(bot), {}) if isinstance(estado_bots, dict) else {}
-        prob_sig = st.get("prob_ia")
+        prob_sig = st.get("prob_ia_oper", st.get("prob_ia"))
         modo_sig = str(st.get("modo_ia") or "").upper()
         thr_sig = float(get_umbral_operativo())
         if isinstance(prob_sig, (int, float)) and modo_sig not in ("", "OFF", "0") and float(prob_sig) >= thr_sig:
@@ -10531,7 +10591,7 @@ def mostrar_panel():
         bots_obs = 0
         mejor = None
         for b in BOT_NAMES:
-            pb = estado_bots.get(b, {}).get("prob_ia")
+            pb = _prob_ia_operativa_bot(b, default=None)
             if isinstance(pb, (int, float)):
                 bots_con_prob += 1
                 if float(pb) >= float(umbral_real_vigente):
@@ -10603,13 +10663,10 @@ def mostrar_panel():
             if not trigger_ok_h:
                 why_reasons.append("trigger_no")
             try:
-                ctt_status_h = str(CTT_STATE.get("status", "NEUTRAL") or "NEUTRAL")
-                ctt_gate_h = str(CTT_STATE.get("gate", "NEUTRAL") or "NEUTRAL")
+                ctt_state_h = str(CTT_STATE.get("state", "CTT_NEUTRO") or "CTT_NEUTRO")
                 ctt_reason_h = str(CTT_STATE.get("reason", "na") or "na")
-                if ctt_gate_h == "BLOCK":
-                    why_reasons.append(f"ctt_block({ctt_status_h.lower()}:{ctt_reason_h})")
-                elif ctt_status_h in {"RED_WEAK", "GREEN_DIAGNOSTIC"}:
-                    why_reasons.append(f"ctt_{ctt_status_h.lower()}({ctt_reason_h})")
+                if ctt_state_h != "CTT_VIVO":
+                    why_reasons.append(f"{ctt_state_h.lower()}({ctt_reason_h})")
             except Exception:
                 pass
             why_txt = "none" if not why_reasons else ",".join(why_reasons)
@@ -10848,6 +10905,23 @@ def mostrar_panel():
                         print(padding + Fore.CYAN + f"🔬 Gates(top3): {' | '.join(dbg_chunks)}")
             except Exception:
                 pass
+
+            emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
+            print(
+                padding + Fore.CYAN +
+                f"🧪 Embudo: final={emb.get('decision_final','--')} risk={emb.get('risk_mode','--')} gate={emb.get('gate_quality','--')} "
+                f"top1={emb.get('top1_bot') or '--'}({float(emb.get('top1_prob',0.0) or 0.0)*100:.1f}%) "
+                f"top2={emb.get('top2_bot') or '--'} gap={float(emb.get('gap_value',0.0) or 0.0)*100:.1f}pp "
+                f"why={emb.get('decision_reason','--')} wait={emb.get('soft_wait_reason','') or '--'} "
+                f"hard={emb.get('hard_block_reason','') or '--'} deg={emb.get('degrade_from','--')}"
+            )
+            print(
+                padding + Fore.CYAN +
+                f"🧬 CTT: {CTT_STATE.get('state','CTT_NEUTRO')} | g={float(CTT_STATE.get('g2',0.0) or 0.0):.2f}->{float(CTT_STATE.get('g1',0.0) or 0.0):.2f}->{float(CTT_STATE.get('g0',0.0) or 0.0):.2f} "
+                f"frontG={float(CTT_STATE.get('front_green_age_s',0.0) or 0.0):.1f}s confV={int(CTT_STATE.get('confirmadores_verdes',0) or 0)} "
+                f"res={float(CTT_STATE.get('resueltos_ratio',0.0) or 0.0)*100:.0f}% rez={len(CTT_STATE.get('rezagados_validos',[]) or [])} "
+                f"why={CTT_STATE.get('reason','--')}"
+            )
 
             ref_racha = ultimo_bot_real if ultimo_bot_real in BOT_NAMES else "--"
             elegido_tick = mejor[0] if isinstance(mejor, tuple) and len(mejor) >= 1 else "--"
@@ -11651,11 +11725,16 @@ PENDIENTE_FORZAR_EXPIRA = 0.0
 FORZAR_LOCK = threading.Lock()
 
 def condiciones_seguras_para(bot: str) -> bool:
-    # Usa el mismo umbral operativo que el HUD/audio
-    thr = get_umbral_operativo()
-    prob = estado_bots.get(bot, {}).get("prob_ia") or 0.0
-    n    = estado_bots.get(bot, {}).get("tamano_muestra", 0)
-    return (n >= ORACULO_N_MIN) and (prob >= thr)
+    # Fuente operativa única: prob_ia_oper + estado final del embudo
+    thr = float(get_umbral_operativo())
+    prob = float(_prob_ia_operativa_bot(bot, default=0.0) or 0.0)
+    n = int(estado_bots.get(bot, {}).get("tamano_muestra", 0) or 0)
+    emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
+    dec = str(emb.get("decision_final", EMBUDO_FINAL_WAIT_SOFT))
+    top1 = str(emb.get("top1_bot") or "")
+    if top1 and bot != top1:
+        return False
+    return (n >= ORACULO_N_MIN) and (prob >= thr) and (dec in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO))
 
 # forzar_real_manual
 def forzar_real_manual(bot: str, ciclo: int):
@@ -11686,8 +11765,8 @@ def forzar_real_manual(bot: str, ciclo: int):
                 MODAL_ACTIVO = False
 
         # Nueva lógica: Marcar como señal IA si prob >= thr_ia
-        prob = estado_bots.get(bot, {}).get("prob_ia") or 0.0
-        thr_ia = get_umbral_operativo()
+        prob = float(_prob_ia_operativa_bot(bot, default=0.0) or 0.0)
+        thr_ia = float(get_umbral_operativo())
 
         if prob >= thr_ia and not estado_bots[bot]["ia_senal_pendiente"]:
             estado_bots[bot]["ia_senal_pendiente"] = True
@@ -11739,64 +11818,43 @@ def forzar_real_manual(bot: str, ciclo: int):
         FORZAR_LOCK.release()
 
 def evaluar_semaforo():
-    thr = get_umbral_operativo()
-
-    mejor = (None, None, 0)
-    for b in BOT_NAMES:
-        d = estado_bots.get(b, {})
-        prob = d.get("prob_ia")
-        n    = d.get("tamano_muestra", 0)
-        if prob is not None and (mejor[0] is None or prob > mejor[0]):
-            mejor = (prob, b, n)
-    prob, bbest, n = mejor
+    thr = float(get_umbral_operativo())
+    emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
+    dec = str(emb.get("decision_final", EMBUDO_FINAL_WAIT_SOFT))
+    reason = str(emb.get("decision_reason", "--"))
+    top1 = str(emb.get("top1_bot") or "")
+    prob = float(emb.get("top1_prob", 0.0) or 0.0)
+    n = int(estado_bots.get(top1, {}).get("tamano_muestra", 0) or 0) if top1 else 0
 
     owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
-    try: saldo_val = float(obtener_valor_saldo() or 0.0)
-    except: saldo_val = 0.0
+    try:
+        saldo_val = float(obtener_valor_saldo() or 0.0)
+    except Exception:
+        saldo_val = 0.0
     costo = float(sum(MARTI_ESCALADO[:max(1, int(MAX_CICLOS))]))
     costo_c1 = float(MARTI_ESCALADO[0]) if MARTI_ESCALADO else 0.0
 
-    detalle = ""
     if owner and owner not in (None, "none"):
-        detalle = f"Token en uso por {owner}. Puedes forzar 5–0 → 1..5."
-        return "🟡", "AVISO", detalle
+        return "🟡", "AVISO", f"Token en uso por {owner}."
     if saldo_val < costo_c1:
         falta = costo_c1 - saldo_val
-        detalle = f"Saldo < C1 ({costo_c1:.2f}). Faltan {falta:.2f} USD para abrir nueva orden."
-        return "🟡", "AVISO", detalle
-
-    # Alineación HUD vs compuerta REAL: no marcar SEÑAL LISTA si gate está en espera.
-    confirm_st = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
-    confirm_need = int(DYN_ROOF_STATE.get("last_confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
-    trigger_ok = bool(DYN_ROOF_STATE.get("last_trigger_ok", False))
-    if confirm_st < confirm_need:
-        detalle = f"Compuerta en espera: confirm={confirm_st}/{confirm_need}."
-        return "🟡", "AVISO", detalle
-    if not trigger_ok:
-        detalle = "Compuerta en espera: trigger_ok=no."
-        return "🟡", "AVISO", detalle
-
+        return "🟡", "AVISO", f"Saldo < C1 ({costo_c1:.2f}). Faltan {falta:.2f} USD."
     if saldo_val < costo:
-        detalle = f"Saldo parcial: cubre C1 pero no todo C1..C{int(MAX_CICLOS)} ({costo:.2f})."
-        return "🟡", "AVISO", detalle
+        return "🟡", "AVISO", f"Saldo parcial: cubre C1 pero no C1..C{int(MAX_CICLOS)} ({costo:.2f})."
 
-    n_inc = contar_filas_incremental()
-    if n_inc < MIN_FIT_ROWS_LOW:
-        detalle = f"IA en modo WARMUP: n={n_inc}. Faltan {MIN_FIT_ROWS_LOW - n_inc} filas para entrenamiento estable."
-        return "🟡", "EN ESPERA", detalle
+    if dec == EMBUDO_FINAL_BLOCK_HARD:
+        return "🔴", "BLOQUEO", f"{emb.get('hard_block_reason') or reason}"
+    if dec == EMBUDO_FINAL_WAIT_SOFT:
+        return "🟡", "EN ESPERA", f"{emb.get('soft_wait_reason') or reason}"
+    if dec == EMBUDO_FINAL_SHADOW_OK:
+        return "🔵", "SHADOW", f"{reason} (no ejecuta REAL)"
+    if dec in (EMBUDO_FINAL_REAL_MICRO, EMBUDO_FINAL_REAL_NORMAL):
+        if (not top1) or (prob < thr):
+            return "🟡", "EN ESPERA", f"Top1 no operativo ({top1 or '--'} p={prob:.0%}<{int(thr*100)}%)."
+        modo = "MICRO" if dec == EMBUDO_FINAL_REAL_MICRO else "NORMAL"
+        return "🟢", "SEÑAL LISTA", f"{top1} • ProbOper={prob:.0%} • n={n} • modo={modo}"
 
-    if prob is None or n < 10:
-        return "🟡", "EN ESPERA", "Pocos datos útiles aún."
-    if n < ORACULO_N_MIN and (prob or 0) < thr:
-        return "🟡", "EN ESPERA", f"n={n}<{ORACULO_N_MIN} y prob={prob:.0%}<{int(thr*100)}%"
-    if n < ORACULO_N_MIN:
-        return "🟡", "EN ESPERA", f"n={n}<{ORACULO_N_MIN}"
-    if (prob or 0) < thr:
-        return "🟡", "EN ESPERA", f"prob={prob:.0%}<{int(thr*100)}%"
-
-    tecla = (bbest or "?")[-2:]
-    detalle = f"{bbest} • Prob={prob:.0%} • n={n} → pulsa [{tecla}] y el ciclo."
-    return "🟢", "SEÑAL LISTA", detalle
+    return "🟡", "EN ESPERA", f"Sin decisión embudo ({reason})."
 
 # NUEVAS FUNCIONES PARA RESET
 RESET_ON_START = False  # Cambiado a False para mantener historial entre sesiones
@@ -12843,6 +12901,223 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         return out
 
 
+def _registrar_estado_embudo(data: dict | None = None) -> dict:
+    """Persistencia del estado unificado del embudo para HUD/eventos."""
+    global EMBUDO_DECISION_STATE
+    base = {
+        "decision_final": EMBUDO_FINAL_WAIT_SOFT,
+        "decision_reason": "init",
+        "gate_quality": "weak",
+        "risk_mode": "WAIT_SOFT",
+        "hard_block_reason": "",
+        "soft_wait_reason": "",
+        "top1_bot": None,
+        "top2_bot": None,
+        "gap_value": 0.0,
+        "top1_prob": 0.0,
+        "top2_prob": 0.0,
+        "degrade_from": "none",
+    }
+    try:
+        if isinstance(EMBUDO_DECISION_STATE, dict):
+            base.update(EMBUDO_DECISION_STATE)
+    except Exception:
+        pass
+    if isinstance(data, dict):
+        base.update(data)
+    EMBUDO_DECISION_STATE = base
+    return EMBUDO_DECISION_STATE
+
+
+def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real: str, meta_live: dict | None, ctt_eval: dict | None = None) -> dict:
+    """Embudo unificado: selección -> calidad blanda -> modulación -> estado final."""
+    out = _registrar_estado_embudo({
+        "decision_final": EMBUDO_FINAL_WAIT_SOFT,
+        "decision_reason": "sin_candidatos",
+        "gate_quality": "weak",
+        "risk_mode": "WAIT_SOFT",
+        "soft_wait_reason": "sin_candidatos",
+        "hard_block_reason": "",
+        "top1_bot": None,
+        "top2_bot": None,
+        "gap_value": 0.0,
+        "top1_prob": 0.0,
+        "top2_prob": 0.0,
+        "degrade_from": "none",
+    })
+    ctt = ctt_eval if isinstance(ctt_eval, dict) else {}
+    ctt_state = str(ctt.get("state", CTT_STATE.get("state", "CTT_NEUTRO")) or "CTT_NEUTRO")
+    ctt_reason = str(ctt.get("reason", "ctt_neutro") or "ctt_neutro")
+    if ctt_state != "CTT_VIVO":
+        if ctt_state == "CTT_RED_STRONG":
+            return _registrar_estado_embudo({
+                "decision_final": EMBUDO_FINAL_BLOCK_HARD,
+                "decision_reason": "ctt_red_strong",
+                "gate_quality": "wait",
+                "risk_mode": "BLOCK_HARD",
+                "hard_block_reason": "ctt_red_strong",
+                "soft_wait_reason": "",
+                "degrade_from": "ctt_master",
+            })
+        why = "ctt_armado" if ctt_state == "CTT_ARMADO" else "ctt_tardio" if ctt_state == "CTT_TARDIO" else "ctt_neutro"
+        return _registrar_estado_embudo({
+            "decision_final": EMBUDO_FINAL_WAIT_SOFT,
+            "decision_reason": why,
+            "gate_quality": "wait",
+            "risk_mode": "WAIT_SOFT",
+            "soft_wait_reason": why,
+            "hard_block_reason": "",
+            "degrade_from": "ctt_master",
+        })
+
+    if not candidatos:
+        return _registrar_estado_embudo({
+            "decision_final": EMBUDO_FINAL_WAIT_SOFT,
+            "decision_reason": "ctt_vivo_sin_rezagados",
+            "gate_quality": "wait",
+            "risk_mode": "WAIT_SOFT",
+            "soft_wait_reason": "ctt_vivo_sin_rezagados",
+            "degrade_from": "ctt_master",
+        })
+    try:
+        ordered = sorted(candidatos, key=lambda x: float(x[2] if len(x) > 2 else 0.0), reverse=True)
+        top1 = ordered[0]
+        top2 = ordered[1] if len(ordered) > 1 else None
+        top1_bot = str(top1[1])
+        top1_prob = float(top1[2] or 0.0)
+        top2_bot = str(top2[1]) if top2 else None
+        top2_prob = float(top2[2] or 0.0) if top2 else 0.0
+        gap_value = float(top1_prob - top2_prob)
+
+        dgate = dyn_gate if isinstance(dyn_gate, dict) else {}
+        allow_real = bool(dgate.get("allow_real", False))
+        trigger_ok = bool(dgate.get("trigger_ok", False))
+        confirm_need = int(dgate.get("confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
+        confirm_streak = int(dgate.get("confirm_streak", 0) or 0)
+        confirm_need_eff = max(1, int(confirm_need) - 1)
+        confirm_ok = bool(confirm_streak >= confirm_need_eff)
+
+        quality = "weak"
+        if allow_real and trigger_ok and confirm_ok:
+            quality = "strong"
+        elif (allow_real and trigger_ok) or (allow_real and confirm_ok):
+            quality = "medium"
+        elif allow_real or trigger_ok or confirm_streak > 0:
+            quality = "weak"
+        else:
+            quality = "wait"
+
+        decision = EMBUDO_FINAL_WAIT_SOFT
+        reason = f"gate:{quality}"
+        risk_mode = "WAIT_SOFT"
+        soft_wait_reason = ""
+
+        if quality == "strong":
+            decision = EMBUDO_FINAL_REAL_NORMAL
+            risk_mode = "REAL_NORMAL"
+        elif quality == "medium":
+            decision = EMBUDO_FINAL_REAL_MICRO
+            risk_mode = "REAL_MICRO"
+        elif quality == "weak":
+            decision = EMBUDO_FINAL_SHADOW_OK
+            risk_mode = "SHADOW_OK"
+        else:
+            soft_wait_reason = "gate_wait"
+
+        meta = meta_live if isinstance(meta_live, dict) else {}
+        n_samples = int(meta.get("n_samples", meta.get("n", 0)) or 0)
+        reliable = bool(meta.get("reliable", False))
+        canary = bool(meta.get("canary_mode", False))
+        auc = float(meta.get("auc", 0.0) or 0.0)
+        degrade_from = "none"
+
+        if canary and decision == EMBUDO_FINAL_REAL_NORMAL:
+            decision = EMBUDO_FINAL_REAL_MICRO
+            risk_mode = "REAL_MICRO"
+            degrade_from = "canary"
+            reason = "canary->micro"
+        if not reliable:
+            if decision == EMBUDO_FINAL_REAL_NORMAL:
+                decision = EMBUDO_FINAL_REAL_MICRO
+                risk_mode = "REAL_MICRO"
+                degrade_from = "unreliable"
+                reason = "unreliable->micro"
+            elif decision == EMBUDO_FINAL_REAL_MICRO:
+                decision = EMBUDO_FINAL_SHADOW_OK
+                risk_mode = "SHADOW_OK"
+                degrade_from = "unreliable"
+                reason = "unreliable->shadow"
+
+        # Consistencia explícita: no permitir doble ganador entre dyn_gate y embudo.
+        best_dyn = str(dgate.get("best_bot", "") or "").strip()
+        if best_dyn and (best_dyn != top1_bot):
+            decision = EMBUDO_FINAL_WAIT_SOFT
+            risk_mode = "WAIT_SOFT"
+            soft_wait_reason = "best_bot_mismatch"
+            reason = f"best_bot_mismatch:{best_dyn}!={top1_bot}"
+
+        # Modulador Pattern V1: aporta contexto/calidad, no veto principal.
+        try:
+            ctx_top = _ultimo_contexto_operativo_bot(top1_bot)
+            ok_pat, why_pat = _micro_pattern_gate_ok(top1_bot, ctx_top)
+            if not ok_pat and decision == EMBUDO_FINAL_REAL_NORMAL:
+                decision = EMBUDO_FINAL_REAL_MICRO
+                risk_mode = "REAL_MICRO"
+                degrade_from = "pattern_v1"
+                reason = f"pattern->{why_pat}"
+            elif (not ok_pat) and decision == EMBUDO_FINAL_REAL_MICRO:
+                decision = EMBUDO_FINAL_SHADOW_OK
+                risk_mode = "SHADOW_OK"
+                degrade_from = "pattern_v1"
+                reason = f"pattern_shadow:{why_pat}"
+        except Exception:
+            pass
+
+        # CTT (fase previa): completamente neutralizado en decisión operativa.
+
+        if bool(_estado_guardrail_ia_fuerte(force=False).get("hard_block", False)) and (not reliable) and (auc < 0.50) and (n_samples < int(TRAIN_WARMUP_MIN_ROWS)):
+            decision = EMBUDO_FINAL_BLOCK_HARD
+            risk_mode = "BLOCK_HARD"
+            reason = "guardrail_hard"
+            out_hard = "guardrail_hard"
+        else:
+            out_hard = ""
+
+        if time.time() < float(REAL_COOLDOWN_UNTIL_TS) and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
+            decision = EMBUDO_FINAL_WAIT_SOFT
+            risk_mode = "WAIT_SOFT"
+            soft_wait_reason = "cooldown"
+            reason = "cooldown"
+
+        if estado_real == "SHADOW" and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
+            decision = EMBUDO_FINAL_REAL_MICRO if decision == EMBUDO_FINAL_REAL_NORMAL else decision
+            risk_mode = "REAL_MICRO"
+            if degrade_from == "none":
+                degrade_from = "shadow_mode"
+        if estado_real == "MICRO" and decision == EMBUDO_FINAL_REAL_NORMAL:
+            decision = EMBUDO_FINAL_REAL_MICRO
+            risk_mode = "REAL_MICRO"
+            if degrade_from == "none":
+                degrade_from = "micro_mode"
+
+        return _registrar_estado_embudo({
+            "decision_final": decision,
+            "decision_reason": reason,
+            "gate_quality": quality,
+            "risk_mode": risk_mode,
+            "hard_block_reason": out_hard,
+            "soft_wait_reason": soft_wait_reason,
+            "top1_bot": top1_bot,
+            "top2_bot": top2_bot,
+            "gap_value": gap_value,
+            "top1_prob": top1_prob,
+            "top2_prob": top2_prob,
+            "degrade_from": degrade_from,
+        })
+    except Exception:
+        return _registrar_estado_embudo({"decision_final": EMBUDO_FINAL_WAIT_SOFT, "decision_reason": "embudo_err", "soft_wait_reason": "embudo_err"})
+
+
 def _umbral_senal_actual_hud() -> float:
     """
     Umbral visual para "IA SEÑALES ACTUALES".
@@ -12927,12 +13202,11 @@ def _registrar_cierre_ctt(bot: str, fila_dict: dict, resultado: str):
 
 
 def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
+    """CTT maestro por franja viva: frente verde real + rezago útil."""
+    global CTT_LAST_STATE, CTT_LAST_LOG_TS
     now = float(time.time())
-    W = float(CTT_WAVE_WINDOW_S)
-    ttl_wave = float(max(1.0, min(CTT_WAVE_TTL_S, CTT_WAVE_WINDOW_S)))
-    lag_min = float(max(0.0, CTT_LAG_MIN_S))
-    lag_max = float(max(lag_min, CTT_LAG_MAX_S))
-    cutoff = now - max(W, float(CTT_CIERRE_LOOKBACK_MAX))
+    w = float(max(5.0, CTT_MICRO_WINDOW_S))
+    cutoff = now - max(float(CTT_CIERRE_LOOKBACK_MAX), 4.0 * w + 5.0)
 
     eventos = []
     for ev in list(CTT_CLOSE_EVENTS):
@@ -12943,193 +13217,253 @@ def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
         except Exception:
             continue
 
+    def _is_green(ev: dict) -> bool:
+        try:
+            return int(ev.get("result", 0) or 0) == 1
+        except Exception:
+            return False
+
+    def _ratio_green(seg):
+        if not seg:
+            return 0.0
+        g = sum(1 for x in seg if _is_green(x))
+        return float(g / max(1, len(seg)))
+
+    def _emit_state_log(st: dict):
+        nonlocal now
+        try:
+            state_now = str(st.get("state", "CTT_NEUTRO"))
+            changed = state_now != str(CTT_LAST_STATE)
+            cooldown = (now - float(CTT_LAST_LOG_TS or 0.0)) >= float(CTT_STATE_LOG_COOLDOWN_S)
+            if changed or cooldown:
+                CTT_LAST_STATE = state_now
+                CTT_LAST_LOG_TS = float(now)
+                agregar_evento(
+                    f"🧭 CTT {state_now}: g2→g1→g0={st.get('g2',0.0):.2f}/{st.get('g1',0.0):.2f}/{st.get('g0',0.0):.2f} "
+                    f"frontG={float(st.get('front_green_age_s') or 0.0):.1f}s confV={int(st.get('confirmadores_verdes',0))} "
+                    f"res={float(st.get('resueltos_ratio',0.0))*100:.0f}% rez={len(st.get('rezagados_validos',[]) or [])} "
+                    f"why={st.get('reason','na')}"
+                )
+        except Exception:
+            pass
+
+    st_base = {
+        "state": "CTT_NEUTRO",
+        "status": "CTT_NEUTRO",
+        "regime": "NEUTRAL",
+        "gate": "BLOCK",
+        "reason": "sin_eventos",
+        "g0": 0.0,
+        "g1": 0.0,
+        "g2": 0.0,
+        "pendiente_verde": 0.0,
+        "front_ts": 0.0,
+        "front_age_s": None,
+        "front_green_ts": 0.0,
+        "front_green_age_s": None,
+        "front_event_color": "NONE",
+        "participantes_ola": 0,
+        "confirmadores": 0,
+        "confirmadores_verdes": 0,
+        "resueltos_ola": 0,
+        "resueltos_ratio": 0.0,
+        "green_confirm_ratio": 0.0,
+        "rezagados_validos": [],
+        "asset": str(CTT_ACTIVO_UNICO or "") or None,
+        "no_participantes": list(BOT_NAMES),
+        "sample": 0,
+        "wave_alive": False,
+        "red_counter": 0,
+        "deterioro_rojo": 0.0,
+        "debug_summary": "sin_eventos",
+        # compat legacy
+        "t_front": 0.0,
+        "wave_start": 0.0,
+        "wave_age_s": None,
+        "wave_ttl_ok": False,
+        "wave_ratio": 0.0,
+        "wave_total": 0,
+        "density_cpm": 0.0,
+        "diversity_ratio": 0.0,
+        "redundancy_high": False,
+        "green_mode": "none",
+        "roof_policy": "normal",
+        "roof_delta": 0.0,
+    }
+
     if not eventos:
-        st = {
-            "status": "NEUTRAL",
-            "regime": "NEUTRAL",
-            "gate": "NEUTRAL",
-            "reason": "sin_eventos",
-            "sample": 0,
-            "rezagados_validos": [],
-            "no_participantes": list(BOT_NAMES),
-            "green_mode": "none",
-            "density_cpm": 0.0,
-            "diversity_ratio": 0.0,
-            "redundancy_high": False,
-            "wave_ttl_ok": False,
-            "roof_policy": "not_evaluated",
-            "roof_delta": 0.0,
-        }
-        CTT_STATE.update(st)
-        return list(candidatos), st
+        CTT_STATE.update(st_base)
+        _emit_state_log(st_base)
+        return [], st_base
 
-    eventos.sort(key=lambda x: float(x.get("ts", 0.0)), reverse=True)
-    base = eventos[0]
+    eventos.sort(key=lambda x: float(x.get("ts", 0.0) or 0.0), reverse=True)
     asset_target = str(CTT_ACTIVO_UNICO or "").strip().upper()
-    asset = asset_target if asset_target else str(base.get("asset", "") or "").upper()
-    t_front = float(base.get("ts", 0.0) or 0.0)
+    asset_ref = asset_target if asset_target else str(eventos[0].get("asset", "") or "").strip().upper()
 
-    # Ola activa anclada al frente temporal del grupo.
-    ola = []
+    ev_asset = []
     for ev in eventos:
-        ts = float(ev.get("ts", 0.0) or 0.0)
-        if (t_front - ts) > W:
+        try:
+            a = str(ev.get("asset", "") or "").strip().upper()
+            if bool(CTT_REQUIRE_SAME_ASSET) and asset_ref and (a != asset_ref):
+                continue
+            ev_asset.append(ev)
+        except Exception:
             continue
-        ev_asset = str(ev.get("asset", "") or "").upper()
-        if asset and ev_asset != asset:
-            continue
-        ola.append(ev)
 
-    bots_wave = {str(ev.get("bot")) for ev in ola}
-    confirmadores = len(bots_wave)
-    sample = len(ola)
-    wins = sum(int(ev.get("result", 0) or 0) for ev in ola)
-    ratio = (wins / sample) if sample > 0 else 0.0
-    wave_age_s = max(0.0, now - t_front) if t_front > 0 else None
-    ts_min = min((float(ev.get("ts", 0.0) or 0.0) for ev in ola), default=t_front)
-    span_s = max(1.0, float(t_front - ts_min)) if sample > 1 else 1.0
-    density_cpm = float(sample * 60.0 / span_s)
-    wave_ttl_ok = bool((wave_age_s is None) or (wave_age_s <= ttl_wave))
+    if not ev_asset:
+        CTT_STATE.update(st_base)
+        _emit_state_log(st_base)
+        return [], st_base
 
-    # Diversidad aproximada: confirmadores únicos sobre tamaño de muestra.
-    diversity_ratio = float(confirmadores / max(1, sample))
-    redundancy_high = bool(sample >= max(4, int(_ctt_min_confirmadores())) and diversity_ratio < 0.45)
+    # microventanas por frescura
+    w0_cut = now - w
+    w1_cut = now - 2.0 * w
+    w2_cut = now - 3.0 * w
+    wave_cut = now - 3.0 * w
 
-    regime = "NEUTRAL"
-    gate = "NEUTRAL"
-    status = "NEUTRAL"
-    green_mode = "none"
-    roof_policy = "normal"
-    roof_delta = 0.0
-    reason = "muestra_insuficiente"
+    w0 = [e for e in ev_asset if float(e.get("ts", 0.0) or 0.0) >= w0_cut]
+    w1 = [e for e in ev_asset if w1_cut <= float(e.get("ts", 0.0) or 0.0) < w0_cut]
+    w2 = [e for e in ev_asset if w2_cut <= float(e.get("ts", 0.0) or 0.0) < w1_cut]
 
-    enough_evidence = bool(sample > 0 and confirmadores >= int(_ctt_min_confirmadores()) and wave_ttl_ok)
-    if enough_evidence:
-        if ratio <= float(CTT_THR_RED):
-            regime = "RED"
-            status = "RED_STRONG"
-            gate = "BLOCK"
-            roof_policy = "not_evaluated"
-            roof_delta = 0.0
-            reason = "regime_red_strong"
-        elif ratio <= float(CTT_THR_RED_WEAK):
-            regime = "RED"
-            status = "RED_WEAK"
-            gate = "NEUTRAL"
-            roof_policy = "harden"
-            roof_delta = -abs(float(CTT_RED_WEAK_SCORE_PENALTY))
-            reason = "regime_red_weak"
-        elif ratio >= float(CTT_THR_GREEN):
-            regime = "GREEN"
-            advanced_marti = bool(int(ciclo_martingala_siguiente()) > 1)
-            green_operable = (
-                ratio >= float(CTT_THR_GREEN_OPERABLE)
-                and density_cpm >= float(CTT_DENSITY_MIN_CPM)
-                and (not redundancy_high)
-            )
-            if (not CTT_ENABLE_GREEN_IN_MARTI_ADVANCED) and advanced_marti:
-                status = "GREEN_DIAGNOSTIC"
-                green_mode = "diagnostic"
-                gate = "NEUTRAL"
-                roof_policy = "normal"
-                reason = "green_marti_brake"
-            elif green_operable:
-                status = "GREEN_OPERABLE"
-                green_mode = "operable"
-                gate = "ALLOW_REZAGADOS"
-                roof_policy = "soften"
-                roof_delta = abs(float(CTT_GREEN_OPERABLE_SCORE_BONUS))
-                reason = "green_operable"
-            else:
-                status = "GREEN_DIAGNOSTIC"
-                green_mode = "diagnostic"
-                gate = "NEUTRAL"
-                roof_policy = "normal"
-                reason = "green_diagnostic"
-        elif ratio >= float(CTT_THR_GREEN_WEAK):
-            regime = "GREEN"
-            status = "GREEN_DIAGNOSTIC"
-            green_mode = "diagnostic"
-            gate = "NEUTRAL"
-            roof_policy = "normal"
-            reason = "green_weak"
-        else:
-            status = "NEUTRAL"
-            reason = "zona_neutral"
-    else:
-        if not wave_ttl_ok:
-            reason = "wave_ttl_expirada"
-        elif sample < 1 or confirmadores < int(_ctt_min_confirmadores()):
-            reason = "muestra_insuficiente"
+    g0 = _ratio_green(w0)
+    g1 = _ratio_green(w1)
+    g2 = _ratio_green(w2)
+    pendiente_verde = float(g0 - g1)
 
-    status = regime
+    ola = [e for e in ev_asset if float(e.get("ts", 0.0) or 0.0) >= wave_cut]
+    sample = int(len(ola))
 
+    # frente verde real: último verde útil de la ola (no último cierre cualquiera)
+    verdes_ola = [e for e in ola if _is_green(e)]
+    front_green_event = verdes_ola[0] if verdes_ola else None
+    front_green_ts = float(front_green_event.get("ts", 0.0) or 0.0) if front_green_event else 0.0
+    front_green_age_s = max(0.0, now - front_green_ts) if front_green_ts > 0 else None
+    front_event_color = "GREEN" if front_green_event else "NONE"
+
+    # participación vs confirmación verde
+    bots_participantes = {str(e.get("bot")) for e in ola}
+    bots_confirmadores_verdes = {str(e.get("bot")) for e in verdes_ola}
+    participantes_ola = int(len(bots_participantes))
+    confirmadores_verdes = int(len(bots_confirmadores_verdes))
+    confirmadores = int(confirmadores_verdes)  # compat: confirmación verde real
+
+    resueltos_ola = int(participantes_ola)
+    resueltos_ratio = float(resueltos_ola / max(1, len(BOT_NAMES)))
+    green_confirm_ratio = float(confirmadores_verdes / max(1, participantes_ola))
+
+    # deterioro rojo reciente
+    rojos_w0 = sum(1 for e in w0 if (not _is_green(e)))
+    deterioro_rojo = float(rojos_w0 / max(1, len(w0))) if w0 else 0.0
+    red_counter = int((g0 <= float(CTT_RED_STRONG_MAX_G0)) + (g1 <= float(CTT_RED_STRONG_MAX_G1)) + (deterioro_rojo >= 0.70))
+
+    # rezagados válidos contra frente verde real
     last_ts_bot = {}
-    for ev in eventos:
-        b = str(ev.get("bot"))
+    for e in ev_asset:
+        b = str(e.get("bot"))
         if b not in last_ts_bot:
-            last_ts_bot[b] = float(ev.get("ts", 0.0) or 0.0)
+            last_ts_bot[b] = float(e.get("ts", 0.0) or 0.0)
 
     rezagados_validos = []
-    for b in BOT_NAMES:
-        tsb = float(last_ts_bot.get(str(b), 0.0) or 0.0)
-        if tsb <= 0:
-            continue
-        lag = max(0.0, t_front - tsb)
-        if lag_min <= lag <= lag_max and wave_ttl_ok:
-            rezagados_validos.append(str(b))
+    if front_green_ts > 0:
+        for b in BOT_NAMES:
+            tsb = float(last_ts_bot.get(str(b), 0.0) or 0.0)
+            if tsb <= 0:
+                continue
+            lag = float(front_green_ts - tsb)
+            if float(CTT_LAG_MIN_S) <= lag <= float(CTT_LAG_MAX_S):
+                rezagados_validos.append(str(b))
 
-    no_participantes = [str(b) for b in BOT_NAMES if str(b) not in bots_wave and str(b) not in set(rezagados_validos)]
+    no_participantes = [str(b) for b in BOT_NAMES if str(b) not in bots_participantes and str(b) not in set(rezagados_validos)]
+    drop = float(g1 - g0)
+    wave_alive = bool((front_green_age_s is not None) and (front_green_age_s <= float(CTT_VIVO_MAX_FRONT_AGE_S)))
 
-    def _adj_score(cand, delta):
-        if not isinstance(cand, tuple) or len(cand) < 1:
-            return cand
-        try:
-            sc = float(cand[0])
-        except Exception:
-            return cand
-        sc2 = float(max(0.0, min(1.0, sc + float(delta))))
-        tmp = list(cand)
-        tmp[0] = sc2
-        return tuple(tmp)
+    state = "CTT_NEUTRO"
+    reason = "ctt_neutro"
+    if red_counter >= 2:
+        state = "CTT_RED_STRONG"
+        reason = "ctt_red_strong"
+    elif (
+        (front_green_ts <= 0)
+        or ((front_green_age_s or 9999.0) > float(CTT_TARDIO_MAX_FRONT_AGE_S))
+        or (drop >= float(CTT_TARDIO_DROP_DELTA))
+        or (resueltos_ratio > float(CTT_TARDIO_RESUELTOS_MAX_RATIO))
+        or (len(rezagados_validos) <= 0)
+    ):
+        state = "CTT_TARDIO"
+        reason = "ctt_tardio" if front_green_ts > 0 else "sin_front_green"
+    elif (
+        front_green_ts > 0
+        and g0 >= float(CTT_VIVO_MIN_G0)
+        and g1 >= float(CTT_VIVO_MIN_G1)
+        and confirmadores_verdes >= int(CTT_VIVO_MIN_CONFIRMADORES)
+        and (front_green_age_s or 9999.0) <= float(CTT_VIVO_MAX_FRONT_AGE_S)
+        and len(rezagados_validos) > 0
+        and resueltos_ratio <= float(CTT_TARDIO_RESUELTOS_MAX_RATIO)
+    ):
+        state = "CTT_VIVO"
+        reason = "ctt_vivo"
+    elif (
+        g0 >= float(CTT_ARM_MIN_GREEN)
+        and (g0 - g1) >= float(CTT_ARM_MIN_DELTA)
+        and confirmadores_verdes >= int(CTT_ARM_MIN_CONFIRMADORES)
+    ):
+        state = "CTT_ARMADO"
+        reason = "ctt_armado"
 
-    filtrados = list(candidatos)
-    if gate == "BLOCK":
-        filtrados = []
-    elif gate == "ALLOW_REZAGADOS":
-        rez_set = set(rezagados_validos)
-        filtrados = [_adj_score(c, roof_delta) for c in candidatos if len(c) > 1 and str(c[1]) in rez_set]
-    else:
-        if roof_policy == "harden" and abs(roof_delta) > 0:
-            filtrados = [_adj_score(c, roof_delta) for c in candidatos]
-        if str(CTT_NEUTRAL_POLICY).lower() == "block":
-            filtrados = []
+    rez_set = set(rezagados_validos)
+    cands = list(candidatos or [])
+    filtrados = [c for c in cands if len(c) > 1 and str(c[1]) in rez_set] if state == "CTT_VIVO" else []
+
+    density_cpm = float(len(w0) * 60.0 / max(1.0, w))
+    diversity_ratio = float(participantes_ola / max(1, sample))
 
     st = {
-        "status": status,
-        "regime": regime,
-        "gate": gate,
-        "asset": asset or None,
-        "t_front": t_front,
-        "wave_start": ts_min,
-        "wave_age_s": wave_age_s,
-        "wave_ttl_ok": wave_ttl_ok,
-        "wave_ratio": float(ratio),
-        "wave_total": int(sample),
+        "state": state,
+        "status": state,
+        "regime": "GREEN" if state in ("CTT_ARMADO", "CTT_VIVO") else "RED" if state == "CTT_RED_STRONG" else "NEUTRAL",
+        "gate": "ALLOW" if state == "CTT_VIVO" else "BLOCK",
+        "reason": reason,
+        "g0": float(g0),
+        "g1": float(g1),
+        "g2": float(g2),
+        "pendiente_verde": float(pendiente_verde),
+        "front_ts": float(front_green_ts),
+        "front_age_s": float(front_green_age_s) if front_green_age_s is not None else None,
+        "front_green_ts": float(front_green_ts),
+        "front_green_age_s": float(front_green_age_s) if front_green_age_s is not None else None,
+        "front_event_color": front_event_color,
+        "participantes_ola": int(participantes_ola),
         "confirmadores": int(confirmadores),
-        "density_cpm": float(density_cpm),
-        "diversity_ratio": float(diversity_ratio),
-        "redundancy_high": bool(redundancy_high),
-        "green_mode": green_mode,
+        "confirmadores_verdes": int(confirmadores_verdes),
+        "resueltos_ola": int(resueltos_ola),
+        "resueltos_ratio": float(resueltos_ratio),
+        "green_confirm_ratio": float(green_confirm_ratio),
         "rezagados_validos": list(rezagados_validos),
+        "asset": asset_ref or None,
         "no_participantes": list(no_participantes),
         "sample": int(sample),
-        "roof_policy": roof_policy,
-        "roof_delta": float(roof_delta),
-        "reason": reason,
+        "wave_alive": bool(wave_alive),
+        "red_counter": int(red_counter),
+        "deterioro_rojo": float(deterioro_rojo),
+        "debug_summary": f"{state}|g={g2:.2f}/{g1:.2f}/{g0:.2f}|frontG={float(front_green_age_s or 0.0):.1f}|cv={confirmadores_verdes}|rez={len(rezagados_validos)}",
+        # compat legacy
+        "t_front": float(front_green_ts),
+        "wave_start": float(max(0.0, wave_cut)),
+        "wave_age_s": float(front_green_age_s) if front_green_age_s is not None else None,
+        "wave_ttl_ok": bool(wave_alive),
+        "wave_ratio": float(g0),
+        "wave_total": int(len(w0)),
+        "density_cpm": float(density_cpm),
+        "diversity_ratio": float(diversity_ratio),
+        "redundancy_high": bool(confirmadores_verdes < max(1, int(_ctt_min_confirmadores()))),
+        "green_mode": "vivo" if state == "CTT_VIVO" else "armado" if state == "CTT_ARMADO" else "none",
+        "roof_policy": "normal",
+        "roof_delta": 0.0,
     }
     CTT_STATE.update(st)
+    _emit_state_log(st)
     return filtrados, st
+
 
 # Cargar datos bot
 # Cargar datos bot
@@ -13928,233 +14262,192 @@ async def main():
                         # Candidatos: prob válida, reciente, IA activa (no OFF)
                         candidatos = []
                         diag_gate = _leer_gate_desde_diagnostico(ttl_s=60.0)
-                        # CTT como autoridad contextual superior: si hay veto duro,
-                        # no se evalúan señales individuales/techo en este tick.
-                        ctt_pre_eval = None
-                        if not lock_activo:
+                        # CTT maestro se evalúa luego sobre candidatos base (antes del embudo).
+                        ctt_eval = dict(CTT_STATE) if isinstance(CTT_STATE, dict) else {}
+
+                        for b in BOT_NAMES:
                             try:
-                                _dummy, ctt_pre_eval = evaluar_ctt_fase([])
-                            except Exception:
-                                ctt_pre_eval = None
-
-                        if not lock_activo and str((ctt_pre_eval or {}).get("gate", "NEUTRAL")) == "BLOCK":
-                            ctt_status_pre = str((ctt_pre_eval or {}).get("status", "RED_STRONG"))
-                            ctt_reason_pre = str((ctt_pre_eval or {}).get("reason", "ctt_block"))
-                            agregar_evento(
-                                f"🟥 CTT veto previo ({ctt_status_pre}): techo/noise skip en tick ({ctt_reason_pre})."
-                            )
-                            candidatos = []
-                        elif not lock_activo:
-                            for b in BOT_NAMES:
-                                try:
-                                    modo_b = str(estado_bots.get(b, {}).get("modo_ia", "off")).lower()
-                                    if modo_b == "off":
-                                        continue
-                                    if not ia_prob_valida(b, max_age_s=12.0):
-                                        continue
-                                    # Redundancia: no bloquear en seco; aplicar penalización de score y desempate posterior.
-                                    redundante_tick = bool(estado_bots.get(b, {}).get("ia_input_redundante", False))
-
-                                    p = _prob_ia_operativa_bot(b, default=None)
-                                    if not isinstance(p, (int, float)):
-                                        continue
-                                    # Primer filtro suave: evitar basura por debajo del piso operativo.
-                                    piso_operativo = float(_umbral_real_operativo_actual()) if REAL_CLASSIC_GATE else float(IA_ACTIVACION_REAL_THR)
-                                    if float(p) < float(piso_operativo):
-                                        continue
-
-                                    # Modo clásico reforzado: compuerta dinámica anti-bug.
-                                    # Solo el mejor bot del tick puede pasar, con piso duro + GAP + confirmación doble.
-                                    if REAL_CLASSIC_GATE:
-                                        if not isinstance(dyn_gate, dict):
-                                            continue
-                                        if b != dyn_gate.get("best_bot"):
-                                            continue
-                                        if not bool(dyn_gate.get("allow_real", False)):
-                                            continue
-
-                                        regime_score = _score_regimen_contexto(_ultimo_contexto_operativo_bot(b))
-                                        p_post = float(p)
-                                        p_rank = float(estado_bots.get(b, {}).get("ia_prob_pre_cap", p_post) or p_post)
-                                        score_final = float(max(0.0, min(1.0, p_rank)))
-                                        estado_bots[b]["ia_regime_score"] = float(regime_score)
-                                        estado_bots[b]["ia_evidence_n"] = int(estado_bots[b].get("ia_evidence_n", 0) or 0)
-                                        estado_bots[b]["ia_evidence_wr"] = float(estado_bots[b].get("ia_evidence_wr", 0.0) or 0.0)
-                                        candidatos.append((float(score_final), b, float(p), float(p_post), float(regime_score), 0, 0.0, 0.0))
-                                        continue
-
-                                    # 1) Gate de calidad por racha/rebote (priorizar precisión real)
-                                    ctx = _ultimo_contexto_operativo_bot(b)
-                                    racha_now = float(ctx.get("racha_actual", 0.0) or 0.0)
-                                    rebote_now = float(ctx.get("es_rebote", 0.0) or 0.0)
-                                    if racha_now <= float(GATE_RACHA_NEG_BLOQUEO):
-                                        if not (bool(GATE_PERMITE_REBOTE_EN_NEG) and rebote_now >= 0.5):
-                                            continue
-
-                                    # 2) Validación por régimen/activo (evita mezclar HZ con mal tramo reciente)
-                                    activo_now = str(ctx.get("activo", "") or "").strip()
-                                    ok_reg, wr_reg, n_reg = _gate_regimen_activo_ok(b, activo=activo_now)
-                                    if not ok_reg:
-                                        agregar_evento(
-                                            f"🧯 Gate régimen: {b}/{activo_now or 'NA'} bloqueado "
-                                            f"(WR{n_reg}={wr_reg*100:.1f}% < {GATE_ACTIVO_MIN_WR*100:.1f}%)."
-                                        )
-                                        continue
-
-                                    # 3) Gate por segmento (payout/vol/hora) para ejecutar donde hay más señal estable
-                                    ok_seg, wr_seg, n_seg, seg_key = _gate_segmento_ok(b, ctx)
-                                    if not ok_seg:
-                                        agregar_evento(
-                                            f"🧱 Gate segmento: {b}/{seg_key} bloqueado "
-                                            f"(WR{n_seg}={wr_seg*100:.1f}% < {GATE_SEGMENTO_MIN_WR*100:.1f}%)."
-                                        )
-                                        continue
-
-                                    # 4) Capa A del embudo: score de régimen
-                                    regime_score = _score_regimen_contexto(ctx)
-                                    if regime_score < float(REGIME_GATE_MIN_SCORE):
-                                        continue
-
-                                    # 5) Índice de evidencia por bot en umbral objetivo (evita inflar 0.70+ sin soporte)
-                                    ev = _evidencia_bot_umbral_objetivo(b)
-                                    ev_n = int(ev.get("n", 0) or 0)
-                                    ev_wr = float(ev.get("wr", 0.0) or 0.0)
-                                    ev_lb = float(ev.get("lb", 0.0) or 0.0)
-                                    if (ev_n >= int(EVIDENCE_MIN_N_HARD)) and (not bool(ev.get("ok_hard", True))):
-                                        agregar_evento(
-                                            f"🧪 Evidencia: {b} bloqueado (n={ev_n}, WR={ev_wr*100:.1f}%, LB={ev_lb*100:.1f}% < LB_min {EVIDENCE_MIN_LB_HARD*100:.1f}%)."
-                                        )
-                                        continue
-
-                                    # Candado blando: con muestra intermedia exigimos LB mínimo intermedio.
-                                    if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (ev_lb < float(EVIDENCE_MIN_LB_SOFT)):
-                                        continue
-
-                                    # 6) Prob REAL posterior (modelo + régimen + evidencia + bound)
-                                    p_post = _prob_real_posterior(float(p), float(regime_score), int(ev_n), float(ev_wr), float(ev_lb))
-
-                                    # Guardas por bot (alineadas al HUD): evitar promoción cuando hay
-                                    # desalineación severa entre probabilidad y performance real reciente.
-                                    if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (ev_wr < float(IA_PROMO_MIN_WR_POR_BOT)):
-                                        agregar_evento(
-                                            f"🧱 Guarda WR bot: {b} bloqueado (WR={ev_wr*100:.1f}% < {IA_PROMO_MIN_WR_POR_BOT*100:.1f}%, n={ev_n})."
-                                        )
-                                        continue
-                                    overconf_gap = float(p_post) - float(ev_wr)
-                                    if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (overconf_gap > float(IA_PROMO_MAX_OVERCONF_GAP)):
-                                        agregar_evento(
-                                            f"🧯 Guarda calibración: {b} bloqueado (p_real-WR={overconf_gap*100:.1f}pp > {IA_PROMO_MAX_OVERCONF_GAP*100:.1f}pp)."
-                                        )
-                                        continue
-
-                                    # Guardas por bot (alineadas al HUD): evitar promoción cuando hay
-                                    # desalineación severa entre probabilidad y performance real reciente.
-                                    if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (ev_wr < float(IA_PROMO_MIN_WR_POR_BOT)):
-                                        agregar_evento(
-                                            f"🧱 Guarda WR bot: {b} bloqueado (WR={ev_wr*100:.1f}% < {IA_PROMO_MIN_WR_POR_BOT*100:.1f}%, n={ev_n})."
-                                        )
-                                        continue
-                                    overconf_gap = float(p_post) - float(ev_wr)
-                                    if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (overconf_gap > float(IA_PROMO_MAX_OVERCONF_GAP)):
-                                        agregar_evento(
-                                            f"🧯 Guarda calibración: {b} bloqueado (p_real-WR={overconf_gap*100:.1f}pp > {IA_PROMO_MAX_OVERCONF_GAP*100:.1f}pp)."
-                                        )
-                                        continue
-
-                                    # Candado final: el umbral REAL se valida sobre la probabilidad posterior (no p_model)
-                                    thr_post = float(umbral_ia_real)
-                                    if ev_n < int(EVIDENCE_MIN_N_SOFT):
-                                        thr_post = min(0.99, thr_post + float(EVIDENCE_LOW_N_EXTRA_MARGIN))
-                                    if float(p_post) < float(thr_post):
-                                        continue
-
-                                    # Candado anti-overconfidence global: si el diagnóstico reporta gap alto,
-                                    # solo promover con evidencia fuerte (LB + N) aunque p_post supere umbral.
-                                    if bool(diag_gate.get("force_evidence", False)):
-                                        if not ((ev_n >= int(EVIDENCE_MIN_N_HARD)) and (ev_lb >= float(EVIDENCE_MIN_LB_HARD))):
-                                            continue
-
-                                    # 7) Ranking final (Capa B + régimen + evidencia)
-                                    evidence_score = min(1.0, p_post + min(0.15, ev_n / 400.0))
-                                    suceso_idx_b = float(estado_bots.get(b, {}).get("ia_suceso_idx", 0.0) or 0.0) / 100.0
-                                    sensor_plano_b = bool(estado_bots.get(b, {}).get("ia_sensor_plano", False))
-                                    score_final = (
-                                        float(REGIME_GATE_WEIGHT_PROB) * float(p_post)
-                                        + float(REGIME_GATE_WEIGHT_REGIME) * float(regime_score)
-                                        + float(REGIME_GATE_WEIGHT_EVIDENCE) * float(evidence_score)
-                                        + float(IA_SUCESO_SCORE_WEIGHT) * float(max(0.0, min(1.0, suceso_idx_b)))
-                                    )
-                                    if redundante_tick:
-                                        score_final = float(score_final) - float(IA_REDUNDANCY_SCORE_PENALTY)
-                                    if sensor_plano_b:
-                                        score_final = float(score_final) - float(IA_SENSOR_PLANO_SCORE_PENALTY)
-
-                                    # Pattern V1 (gradual): score híbrido detrás de flag.
-                                    pattern_score_b = 0.0
-                                    pattern_bonus_b = 0.0
-                                    pattern_penal_b = 0.0
-                                    score_hibrido = float(score_final)
-                                    if bool(PATTERN_V1_ENABLE) and bool(PATTERN_V1_USE_HYBRID_RANKING):
-                                        q3_proxy, q2_proxy = _pattern_v1_thresholds_proxy()
-                                        pattern_score_b, pattern_bonus_b, pattern_penal_b, pattern_total_b = pattern_score_operativo_v1(ctx, q3_proxy, q2_proxy)
-                                        # Ajuste en escala probabilística (evita mezclar puntos de pattern con prob 0..1)
-                                        k_pts = float(PATTERN_V1_HYBRID_PTS_TO_PROB)
-                                        delta_hibrido = 0.0
-                                        if float(pattern_total_b) >= float(PATTERN_V1_SCORE_THR):
-                                            delta_hibrido = k_pts * (float(pattern_bonus_b) - float(pattern_penal_b))
-                                        else:
-                                            delta_hibrido = -k_pts * float(pattern_penal_b)
-                                        score_hibrido = float(score_final) + float(delta_hibrido)
-                                        score_hibrido = float(max(0.0, min(1.0, score_hibrido)))
-                                        _pattern_v1_log_bot(
-                                            b,
-                                            pattern_score=float(pattern_score_b),
-                                            bonus_dual=float(pattern_bonus_b),
-                                            penal_tardia=float(pattern_penal_b),
-                                            score_hibrido=float(score_hibrido),
-                                        )
-
-                                    estado_bots[b]["ia_pattern_score"] = float(pattern_score_b)
-                                    estado_bots[b]["ia_pattern_bonus"] = float(pattern_bonus_b)
-                                    estado_bots[b]["ia_pattern_penal"] = float(pattern_penal_b)
-                                    estado_bots[b]["ia_score_hibrido"] = float(score_hibrido)
-                                    estado_bots[b]["ia_score_hibrido_delta"] = float(score_hibrido - float(score_final))
-                                    estado_bots[b]["ia_regime_score"] = float(regime_score)
-                                    estado_bots[b]["ia_evidence_n"] = int(ev_n)
-                                    estado_bots[b]["ia_evidence_wr"] = float(ev_wr)
-
-                                    candidatos.append((float(score_hibrido), b, float(p), float(p_post), float(regime_score), int(ev_n), float(ev_wr), float(ev_lb)))
-                                except Exception:
+                                modo_b = str(estado_bots.get(b, {}).get("modo_ia", "off")).lower()
+                                if modo_b == "off":
                                     continue
+                                if not ia_prob_valida(b, max_age_s=12.0):
+                                    continue
+                                # Redundancia: no bloquear en seco; aplicar penalización de score y desempate posterior.
+                                redundante_tick = bool(estado_bots.get(b, {}).get("ia_input_redundante", False))
+
+                                p = _prob_ia_operativa_bot(b, default=None)
+                                if not isinstance(p, (int, float)):
+                                    continue
+                                # Primer filtro suave: evitar basura por debajo del piso operativo.
+                                piso_operativo = float(_umbral_real_operativo_actual()) if REAL_CLASSIC_GATE else float(IA_ACTIVACION_REAL_THR)
+                                if float(p) < float(piso_operativo):
+                                    continue
+
+                                # Embudo refactor v1:
+                                # - Fase 1 selecciona campeón provisional por prob operativa.
+                                # - Los candados blandos/moduladores se evalúan después sobre top-1.
+                                regime_score = _score_regimen_contexto(_ultimo_contexto_operativo_bot(b))
+                                p_post = float(p)
+                                p_rank = float(estado_bots.get(b, {}).get("ia_prob_pre_cap", p_post) or p_post)
+                                score_final = float(max(0.0, min(1.0, p_rank)))
+                                estado_bots[b]["ia_regime_score"] = float(regime_score)
+                                estado_bots[b]["ia_evidence_n"] = int(estado_bots[b].get("ia_evidence_n", 0) or 0)
+                                estado_bots[b]["ia_evidence_wr"] = float(estado_bots[b].get("ia_evidence_wr", 0.0) or 0.0)
+                                candidatos.append((float(score_final), b, float(p), float(p_post), float(regime_score), 0, 0.0, 0.0))
+                                continue
+
+                                # 1) Gate de calidad por racha/rebote (priorizar precisión real)
+                                ctx = _ultimo_contexto_operativo_bot(b)
+                                racha_now = float(ctx.get("racha_actual", 0.0) or 0.0)
+                                rebote_now = float(ctx.get("es_rebote", 0.0) or 0.0)
+                                if racha_now <= float(GATE_RACHA_NEG_BLOQUEO):
+                                    if not (bool(GATE_PERMITE_REBOTE_EN_NEG) and rebote_now >= 0.5):
+                                        continue
+
+                                # 2) Validación por régimen/activo (evita mezclar HZ con mal tramo reciente)
+                                activo_now = str(ctx.get("activo", "") or "").strip()
+                                ok_reg, wr_reg, n_reg = _gate_regimen_activo_ok(b, activo=activo_now)
+                                if not ok_reg:
+                                    agregar_evento(
+                                        f"🧯 Gate régimen: {b}/{activo_now or 'NA'} bloqueado "
+                                        f"(WR{n_reg}={wr_reg*100:.1f}% < {GATE_ACTIVO_MIN_WR*100:.1f}%)."
+                                    )
+                                    continue
+
+                                # 3) Gate por segmento (payout/vol/hora) para ejecutar donde hay más señal estable
+                                ok_seg, wr_seg, n_seg, seg_key = _gate_segmento_ok(b, ctx)
+                                if not ok_seg:
+                                    agregar_evento(
+                                        f"🧱 Gate segmento: {b}/{seg_key} bloqueado "
+                                        f"(WR{n_seg}={wr_seg*100:.1f}% < {GATE_SEGMENTO_MIN_WR*100:.1f}%)."
+                                    )
+                                    continue
+
+                                # 4) Capa A del embudo: score de régimen
+                                regime_score = _score_regimen_contexto(ctx)
+                                if regime_score < float(REGIME_GATE_MIN_SCORE):
+                                    continue
+
+                                # 5) Índice de evidencia por bot en umbral objetivo (evita inflar 0.70+ sin soporte)
+                                ev = _evidencia_bot_umbral_objetivo(b)
+                                ev_n = int(ev.get("n", 0) or 0)
+                                ev_wr = float(ev.get("wr", 0.0) or 0.0)
+                                ev_lb = float(ev.get("lb", 0.0) or 0.0)
+                                if (ev_n >= int(EVIDENCE_MIN_N_HARD)) and (not bool(ev.get("ok_hard", True))):
+                                    agregar_evento(
+                                        f"🧪 Evidencia: {b} bloqueado (n={ev_n}, WR={ev_wr*100:.1f}%, LB={ev_lb*100:.1f}% < LB_min {EVIDENCE_MIN_LB_HARD*100:.1f}%)."
+                                    )
+                                    continue
+
+                                # Candado blando: con muestra intermedia exigimos LB mínimo intermedio.
+                                if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (ev_lb < float(EVIDENCE_MIN_LB_SOFT)):
+                                    continue
+
+                                # 6) Prob REAL posterior (modelo + régimen + evidencia + bound)
+                                p_post = _prob_real_posterior(float(p), float(regime_score), int(ev_n), float(ev_wr), float(ev_lb))
+
+                                # Guardas por bot (alineadas al HUD): evitar promoción cuando hay
+                                # desalineación severa entre probabilidad y performance real reciente.
+                                if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (ev_wr < float(IA_PROMO_MIN_WR_POR_BOT)):
+                                    agregar_evento(
+                                        f"🧱 Guarda WR bot: {b} bloqueado (WR={ev_wr*100:.1f}% < {IA_PROMO_MIN_WR_POR_BOT*100:.1f}%, n={ev_n})."
+                                    )
+                                    continue
+                                overconf_gap = float(p_post) - float(ev_wr)
+                                if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (overconf_gap > float(IA_PROMO_MAX_OVERCONF_GAP)):
+                                    agregar_evento(
+                                        f"🧯 Guarda calibración: {b} bloqueado (p_real-WR={overconf_gap*100:.1f}pp > {IA_PROMO_MAX_OVERCONF_GAP*100:.1f}pp)."
+                                    )
+                                    continue
+
+                                # Guardas por bot (alineadas al HUD): evitar promoción cuando hay
+                                # desalineación severa entre probabilidad y performance real reciente.
+                                if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (ev_wr < float(IA_PROMO_MIN_WR_POR_BOT)):
+                                    agregar_evento(
+                                        f"🧱 Guarda WR bot: {b} bloqueado (WR={ev_wr*100:.1f}% < {IA_PROMO_MIN_WR_POR_BOT*100:.1f}%, n={ev_n})."
+                                    )
+                                    continue
+                                overconf_gap = float(p_post) - float(ev_wr)
+                                if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (overconf_gap > float(IA_PROMO_MAX_OVERCONF_GAP)):
+                                    agregar_evento(
+                                        f"🧯 Guarda calibración: {b} bloqueado (p_real-WR={overconf_gap*100:.1f}pp > {IA_PROMO_MAX_OVERCONF_GAP*100:.1f}pp)."
+                                    )
+                                    continue
+
+                                # Candado final: el umbral REAL se valida sobre la probabilidad posterior (no p_model)
+                                thr_post = float(umbral_ia_real)
+                                if ev_n < int(EVIDENCE_MIN_N_SOFT):
+                                    thr_post = min(0.99, thr_post + float(EVIDENCE_LOW_N_EXTRA_MARGIN))
+                                if float(p_post) < float(thr_post):
+                                    continue
+
+                                # Candado anti-overconfidence global: si el diagnóstico reporta gap alto,
+                                # solo promover con evidencia fuerte (LB + N) aunque p_post supere umbral.
+                                if bool(diag_gate.get("force_evidence", False)):
+                                    if not ((ev_n >= int(EVIDENCE_MIN_N_HARD)) and (ev_lb >= float(EVIDENCE_MIN_LB_HARD))):
+                                        continue
+
+                                # 7) Ranking final (Capa B + régimen + evidencia)
+                                evidence_score = min(1.0, p_post + min(0.15, ev_n / 400.0))
+                                suceso_idx_b = float(estado_bots.get(b, {}).get("ia_suceso_idx", 0.0) or 0.0) / 100.0
+                                sensor_plano_b = bool(estado_bots.get(b, {}).get("ia_sensor_plano", False))
+                                score_final = (
+                                    float(REGIME_GATE_WEIGHT_PROB) * float(p_post)
+                                    + float(REGIME_GATE_WEIGHT_REGIME) * float(regime_score)
+                                    + float(REGIME_GATE_WEIGHT_EVIDENCE) * float(evidence_score)
+                                    + float(IA_SUCESO_SCORE_WEIGHT) * float(max(0.0, min(1.0, suceso_idx_b)))
+                                )
+                                if redundante_tick:
+                                    score_final = float(score_final) - float(IA_REDUNDANCY_SCORE_PENALTY)
+                                if sensor_plano_b:
+                                    score_final = float(score_final) - float(IA_SENSOR_PLANO_SCORE_PENALTY)
+
+                                # Pattern V1 (gradual): score híbrido detrás de flag.
+                                pattern_score_b = 0.0
+                                pattern_bonus_b = 0.0
+                                pattern_penal_b = 0.0
+                                score_hibrido = float(score_final)
+                                if bool(PATTERN_V1_ENABLE) and bool(PATTERN_V1_USE_HYBRID_RANKING):
+                                    q3_proxy, q2_proxy = _pattern_v1_thresholds_proxy()
+                                    pattern_score_b, pattern_bonus_b, pattern_penal_b, pattern_total_b = pattern_score_operativo_v1(ctx, q3_proxy, q2_proxy)
+                                    # Ajuste en escala probabilística (evita mezclar puntos de pattern con prob 0..1)
+                                    k_pts = float(PATTERN_V1_HYBRID_PTS_TO_PROB)
+                                    delta_hibrido = 0.0
+                                    if float(pattern_total_b) >= float(PATTERN_V1_SCORE_THR):
+                                        delta_hibrido = k_pts * (float(pattern_bonus_b) - float(pattern_penal_b))
+                                    else:
+                                        delta_hibrido = -k_pts * float(pattern_penal_b)
+                                    score_hibrido = float(score_final) + float(delta_hibrido)
+                                    score_hibrido = float(max(0.0, min(1.0, score_hibrido)))
+                                    _pattern_v1_log_bot(
+                                        b,
+                                        pattern_score=float(pattern_score_b),
+                                        bonus_dual=float(pattern_bonus_b),
+                                        penal_tardia=float(pattern_penal_b),
+                                        score_hibrido=float(score_hibrido),
+                                    )
+
+                                estado_bots[b]["ia_pattern_score"] = float(pattern_score_b)
+                                estado_bots[b]["ia_pattern_bonus"] = float(pattern_bonus_b)
+                                estado_bots[b]["ia_pattern_penal"] = float(pattern_penal_b)
+                                estado_bots[b]["ia_score_hibrido"] = float(score_hibrido)
+                                estado_bots[b]["ia_score_hibrido_delta"] = float(score_hibrido - float(score_final))
+                                estado_bots[b]["ia_regime_score"] = float(regime_score)
+                                estado_bots[b]["ia_evidence_n"] = int(ev_n)
+                                estado_bots[b]["ia_evidence_wr"] = float(ev_wr)
+
+                                candidatos.append((float(score_hibrido), b, float(p), float(p_post), float(regime_score), int(ev_n), float(ev_wr), float(ev_lb)))
+                            except Exception:
+                                continue
 
                             candidatos.sort(key=lambda x: x[0], reverse=True)
 
-                            candidatos_prev = len(candidatos)
-                            candidatos, ctt_eval = evaluar_ctt_fase(candidatos)
-                            if candidatos_prev > 0:
-                                ctt_status = str(ctt_eval.get("status", "NEUTRAL"))
-                                ctt_gate = str(ctt_eval.get("gate", "NEUTRAL"))
-                                ctt_reason = str(ctt_eval.get("reason", "na"))
-                                if ctt_gate == "BLOCK":
-                                    agregar_evento(
-                                        f"🟥 CTT veto ({ctt_status}): ola {ctt_eval.get('asset','NA') or 'NA'} "
-                                        f"wr={float(ctt_eval.get('wave_ratio',0.0))*100:.1f}% "
-                                        f"m={int(ctt_eval.get('confirmadores',0))}/{_ctt_min_confirmadores()} · techo=NO-EVAL."
-                                    )
-                                elif ctt_gate == "ALLOW_REZAGADOS" and len(candidatos) < candidatos_prev:
-                                    agregar_evento(
-                                        f"🟩 CTT verde operable: {len(candidatos)}/{candidatos_prev} rezagados válidos "
-                                        f"(lag {int(CTT_LAG_MIN_S)}-{int(CTT_LAG_MAX_S)}s, dens={float(ctt_eval.get('density_cpm',0.0)):.2f}/min)."
-                                    )
-                                elif ctt_status == "GREEN_DIAGNOSTIC":
-                                    agregar_evento(
-                                        f"🟨 CTT verde diagnóstica: sin habilitación ({ctt_reason}) "
-                                        f"dens={float(ctt_eval.get('density_cpm',0.0)):.2f}/min redun={'sí' if bool(ctt_eval.get('redundancy_high', False)) else 'no'}."
-                                    )
-                                elif ctt_status == "RED_WEAK":
-                                    agregar_evento(
-                                        f"🟧 CTT rojo débil: endurece evaluación individual (delta={float(ctt_eval.get('roof_delta',0.0))*100:+.1f} pts)."
-                                    )
+                            candidatos_ctt, ctt_eval = evaluar_ctt_fase(candidatos)
+                            ctt_state_now = str(ctt_eval.get("state", "CTT_NEUTRO") or "CTT_NEUTRO")
+                            if ctt_state_now == "CTT_VIVO":
+                                candidatos = list(candidatos_ctt)
+                            else:
+                                candidatos = []
 
                             # Selección automática: tomar la mejor señal elegible >= umbral REAL vigente.
 
@@ -14181,50 +14474,25 @@ async def main():
                             estado_real = "SHADOW"
 
                         if candidatos and estado_real == "SHADOW":
-                            ok_shadow_micro, why_shadow_micro = _shadow_micro_gate_ok(candidatos, dyn_gate)
-                            if ok_shadow_micro:
-                                candidatos = candidatos[:max(1, int(REAL_SHADOW_MICRO_TOP_K))]
-                            else:
-                                if isinstance(why_shadow_micro, str) and why_shadow_micro.startswith("quota:"):
-                                    try:
-                                        left_q, used_q, window_q = _shadow_micro_quota_status()
-                                        agregar_evento(
-                                            f"🕶️ REAL=SHADOW: cuota micro agotada ({used_q}/{max(1, int(REAL_SHADOW_MICRO_MAX_ENTRIES))} en {int(window_q//60)}m)."
-                                        )
-                                    except Exception:
-                                        agregar_evento("🕶️ REAL=SHADOW: cuota micro agotada.")
-                                else:
-                                    agregar_evento(
-                                        "🕶️ REAL=SHADOW: sin madurez suficiente, se mantiene solo observación "
-                                        f"({why_shadow_micro})."
-                                    )
-                                candidatos = []
+                            candidatos.sort(key=lambda x: float(x[2]), reverse=True)
+                            candidatos = candidatos[:max(1, int(REAL_SHADOW_MICRO_TOP_K))]
                         elif candidatos and estado_real == "MICRO":
-                            filtrados = []
-                            for cand in candidatos:
-                                try:
-                                    _, b_c, _, _, _, _, _, _ = cand
-                                    ok_pat, why_pat = _micro_pattern_gate_ok(str(b_c), _ultimo_contexto_operativo_bot(str(b_c)))
-                                    if ok_pat:
-                                        filtrados.append(cand)
-                                except Exception:
-                                    continue
-                            if filtrados:
-                                filtrados.sort(key=lambda x: x[0], reverse=True)
-                                candidatos = filtrados[:max(1, int(REAL_MICRO_TOP_K))]
-                            else:
-                                ok_micro_fb, why_micro_fb = _micro_strong_gate_fallback_ok(candidatos, dyn_gate)
-                                if ok_micro_fb:
-                                    candidatos = candidatos[:1]
-                                    agregar_evento(
-                                        f"🟡 REAL=MICRO fallback: patrón incompleto, compuerta fuerte habilita 1 entrada ({why_micro_fb})."
-                                    )
-                                else:
-                                    agregar_evento(
-                                        "🧪 REAL=MICRO: sin patrón válido (dual+estructura+no_tardía) "
-                                        f"({why_micro_fb})."
-                                    )
-                                    candidatos = []
+                            candidatos.sort(key=lambda x: float(x[2]), reverse=True)
+                            candidatos = candidatos[:max(1, int(REAL_MICRO_TOP_K))]
+
+                        embudo = _resolver_embudo_final(candidatos, dyn_gate, estado_real, resolver_canary_estado(leer_model_meta() or {}), ctt_eval=ctt_eval)
+                        decision_final = str(embudo.get("decision_final", EMBUDO_FINAL_WAIT_SOFT))
+                        if decision_final == EMBUDO_FINAL_BLOCK_HARD:
+                            agregar_evento(f"🛑 EMBUDO {decision_final}: {embudo.get('hard_block_reason') or embudo.get('decision_reason')}")
+                            candidatos = []
+                        elif decision_final == EMBUDO_FINAL_WAIT_SOFT:
+                            agregar_evento(f"⏳ EMBUDO WAIT: {embudo.get('soft_wait_reason') or embudo.get('decision_reason')}")
+                            candidatos = []
+                        elif decision_final == EMBUDO_FINAL_SHADOW_OK:
+                            agregar_evento(f"🕶️ EMBUDO SHADOW_OK: {embudo.get('decision_reason')}")
+                            candidatos = []
+                        elif decision_final == EMBUDO_FINAL_REAL_MICRO:
+                            candidatos = candidatos[:1]
 
                         # ==================== AUTO-PRESELECCIÓN (MODO MANUAL) ====================
                         # Si la IA detecta señal y tú estás en manual, preselecciona el mejor bot y abre la ventana
@@ -14244,25 +14512,12 @@ async def main():
                                 ciclo_auto = ciclo_martingala_siguiente()
                                 if reset_martingala_por_saldo(ciclo_auto, saldo_val):
                                     ciclo_auto = 1
-                                repeat_min_prob_live = float(_marti_repeat_min_prob_live())
-                                mejor = elegir_candidato_rotacion_marti(
-                                    candidatos,
-                                    ciclo_auto,
-                                    allow_repeat_fallback=bool(MARTI_CYCLE_ALLOW_REPEAT_FALLBACK and int(ciclo_auto) > 1),
-                                    repeat_min_prob=repeat_min_prob_live,
-                                )
-                                if mejor is None and int(ciclo_auto) > 1:
-                                    agregar_evento(f"🧯 Rotación C{ciclo_auto}: sin bot elegible (nuevo o fallback p>={repeat_min_prob_live*100:.0f}%).")
+                                emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
+                                mejor_bot = str(emb.get("top1_bot") or "").strip()
+                                mejor = next((c for c in candidatos if str(c[1]) == mejor_bot), None)
                                 if mejor is not None:
                                     score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
-                                    if int(ciclo_auto) > 1 and bool(MARTI_CYCLE_ALLOW_REPEAT_FALLBACK):
-                                        _repeat_pick = (mejor_bot == ultimo_bot_real) or (mejor_bot in bots_usados_en_esta_marti)
-                                        if _repeat_pick:
-                                            agregar_evento(
-                                                f"♻️ Rotación C{ciclo_auto}: fallback controlado en {mejor_bot} "
-                                                f"(p_real={p_post*100:.1f}% >= {repeat_min_prob_live*100:.0f}%)."
-                                            )
-                                    agregar_evento(f"🧠 Embudo IA: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
+                                    agregar_evento(f"🧠 Embudo IA (manual): ganador único={mejor_bot} | p_oper={prob*100:.1f}% | risk={emb.get('risk_mode','--')}")
                                     PENDIENTE_FORZAR_BOT = mejor_bot
                                     PENDIENTE_FORZAR_INICIO = ahora
                                     PENDIENTE_FORZAR_EXPIRA = ahora + VENTANA_DECISION_IA_S
@@ -14279,158 +14534,27 @@ async def main():
 
                         if candidatos and not MODO_REAL_MANUAL:
                             meta_live = resolver_canary_estado(leer_model_meta() or {})
-                            modelo_reliable = bool(meta_live.get("reliable", False))
-                            canary_mode_live = bool(meta_live.get("canary_mode", False))
-                            if canary_mode_live:
-                                c_prog = int(meta_live.get("canary_closed_signals", 0) or 0)
-                                c_tgt = int(meta_live.get("canary_target_closed", 0) or 0)
-                                c_hit = float(meta_live.get("canary_hitrate", 0.0) or 0.0) * 100.0
-                                canary_escape = False
-                                canary_escape_why = ""
-                                try:
-                                    dgate = dyn_gate if isinstance(dyn_gate, dict) else {}
-                                    p_best_d = float(dgate.get("p_best", 0.0) or 0.0)
-                                    c_streak_d = int(dgate.get("confirm_streak", 0) or 0)
-                                    trig_ok_d = bool(dgate.get("trigger_ok", False))
-                                    if bool(CANARY_ALLOW_STRONG_GATE_REAL) and bool(dgate.get("allow_real", False)):
-                                        if (
-                                            p_best_d >= float(CANARY_STRONG_GATE_MIN_PROB)
-                                            and c_streak_d >= int(CANARY_STRONG_GATE_MIN_CONFIRM)
-                                            and trig_ok_d
-                                        ):
-                                            canary_escape = True
-                                            canary_escape_why = (
-                                                f"p_best={p_best_d*100:.1f}% confirm={c_streak_d} trigger_ok=sí"
-                                            )
-                                except Exception:
-                                    canary_escape = False
-
-                                if canary_escape:
-                                    agregar_evento(
-                                        f"🟠 IA AUTO CANARY escape: se habilita REAL por compuerta fuerte ({canary_escape_why})."
-                                    )
-                                else:
-                                    # Fallback anti-deadlock: con progreso mínimo en canary,
-                                    # permitir 1 entrada controlada si la compuerta fuerte se sostiene.
-                                    fallback_ok = False
-                                    try:
-                                        if (c_prog >= max(3, int(c_tgt * 0.25))) and candidatos:
-                                            top = candidatos[0]
-                                            b_top = str(top[1])
-                                            p_top = float(top[3])
-                                            dgate_fb = dyn_gate if isinstance(dyn_gate, dict) else {}
-                                            conf_need_fb = int(dgate_fb.get("confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
-                                            conf_ok_fb = int(dgate_fb.get("confirm_streak", 0) or 0) >= conf_need_fb
-                                            trig_ok_fb = bool(dgate_fb.get("trigger_ok", False))
-                                            floor_ok_fb = p_top >= float(_umbral_real_operativo_actual())
-                                            if b_top == str(dgate_fb.get("best_bot", "")) and conf_ok_fb and trig_ok_fb and floor_ok_fb:
-                                                fallback_ok = True
-                                    except Exception:
-                                        fallback_ok = False
-
-                                    if fallback_ok:
-                                        agregar_evento(
-                                            f"🟡 IA AUTO CANARY fallback: se permite 1 entrada controlada ({c_prog}/{c_tgt}, hit={c_hit:.1f}%)."
-                                        )
-                                        candidatos = candidatos[:1]
-                                    else:
-                                        agregar_evento(
-                                            f"🟡 IA AUTO en CANARY: REAL bloqueado temporalmente ({c_prog}/{c_tgt}, hit={c_hit:.1f}%)."
-                                        )
-                                        candidatos = []
-                            elif not modelo_reliable:
-                                n_samples_live = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
-                                auc_live = float(meta_live.get("auc", 0.0) or 0.0)
-                                warmup_live = bool(meta_live.get("warmup_mode", n_samples_live < int(TRAIN_WARMUP_MIN_ROWS)))
-                                post_n15 = bool(_todos_bots_con_n_minimo_real())
-                                best_prob = max((float(x[2]) for x in candidatos), default=0.0)
-                                best_bot_local = None
-                                try:
-                                    best_bot_local = max(candidatos, key=lambda x: float(x[2]))[1] if candidatos else None
-                                except Exception:
-                                    best_bot_local = None
-                                unrel_thr_live = float(_umbral_unrel_operativo(best_bot_local, best_prob))
-                                gate_strong_unrel = False
-                                guard_hard = _estado_guardrail_ia_fuerte(force=False)
-                                try:
-                                    dgate = dyn_gate if isinstance(dyn_gate, dict) else {}
-                                    gate_strong_unrel = bool(
-                                        AUTO_REAL_UNRELIABLE_ALLOW_STRONG_GATE
-                                        and (not bool(guard_hard.get("hard_block", False)))
-                                        and bool(dgate.get("allow_real", False))
-                                        and bool(dgate.get("trigger_ok", False))
-                                        and (float(dgate.get("p_best", 0.0) or 0.0) >= float(AUTO_REAL_UNRELIABLE_GATE_MIN_PROB))
-                                    )
-                                except Exception:
-                                    gate_strong_unrel = False
-                                allow_unreliable = bool(
-                                    AUTO_REAL_ALLOW_UNRELIABLE_POST_N15
-                                    and post_n15
-                                    and (n_samples_live >= int(AUTO_REAL_UNRELIABLE_MIN_N))
-                                    and (best_prob >= float(unrel_thr_live))
-                                    and (auc_live >= float(AUTO_REAL_UNRELIABLE_MIN_AUC))
-                                    and ((not (bool(AUTO_REAL_BLOCK_WHEN_WARMUP) and warmup_live)) or bool(gate_strong_unrel))
+                            embudo_live = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
+                            dec_live = str(embudo_live.get("decision_final", EMBUDO_FINAL_WAIT_SOFT))
+                            risk_live = str(embudo_live.get("risk_mode", "WAIT_SOFT"))
+                            if dec_live in (EMBUDO_FINAL_REAL_MICRO, EMBUDO_FINAL_REAL_NORMAL):
+                                agregar_evento(
+                                    f"🧭 EMBUDO listo: {dec_live} | risk={risk_live} | gate={embudo_live.get('gate_quality','--')} "
+                                    f"| top1={embudo_live.get('top1_bot') or '--'}"
                                 )
-                                if allow_unreliable:
-                                    if gate_strong_unrel and warmup_live:
-                                        agregar_evento(
-                                            f"🟠 IA AUTO bypass warmup: compuerta fuerte habilita REAL "
-                                            f"(p_best={best_prob*100:.1f}%, n={n_samples_live}, auc={auc_live:.3f})."
-                                        )
-                                    else:
-                                        agregar_evento(
-                                            f"⚠️ IA AUTO modo adaptativo: reliable=false, pero se habilita por post-n15 "
-                                            f"(n={n_samples_live}, auc={auc_live:.3f}, p_best={best_prob*100:.1f}%)."
-                                        )
-                                else:
-                                    why_nr = []
-                                    if n_samples_live < int(AUTO_REAL_UNRELIABLE_MIN_N):
-                                        why_nr.append(f"n<{int(AUTO_REAL_UNRELIABLE_MIN_N)}")
-                                    if best_prob < float(unrel_thr_live):
-                                        why_nr.append(f"p_best<{unrel_thr_live*100:.0f}%")
-                                    if auc_live < float(AUTO_REAL_UNRELIABLE_MIN_AUC):
-                                        why_nr.append(f"auc<{AUTO_REAL_UNRELIABLE_MIN_AUC:.2f}")
-                                    if bool(AUTO_REAL_BLOCK_WHEN_WARMUP) and warmup_live:
-                                        why_nr.append("warmup")
-                                    if bool(guard_hard.get("active", False)):
-                                        reasons_hg = guard_hard.get("reasons", []) if isinstance(guard_hard, dict) else []
-                                        if isinstance(reasons_hg, list) and reasons_hg:
-                                            why_nr.extend([str(x) for x in reasons_hg[:4]])
-                                        else:
-                                            why_nr.append("HG:ACTIVE")
-                                    why_nr_txt = ", ".join(why_nr) if why_nr else "regla_adapt"
-                                    agregar_evento(
-                                        f"🛡️ IA AUTO bloqueado: modelo no confiable (reliable=false, {why_nr_txt})."
-                                    )
-                                    candidatos = []
-                            elif time.time() < float(REAL_COOLDOWN_UNTIL_TS):
-                                restantes = max(0.0, float(REAL_COOLDOWN_UNTIL_TS) - time.time())
-                                agregar_evento(f"⏳ IA AUTO cooldown post-trade activo ({restantes:.0f}s).")
+                            else:
                                 candidatos = []
 
                         if candidatos and not MODO_REAL_MANUAL:
                             ciclo_auto = ciclo_martingala_siguiente()
                             if reset_martingala_por_saldo(ciclo_auto, saldo_val):
                                 ciclo_auto = 1
-                            repeat_min_prob_live = float(_marti_repeat_min_prob_live(meta_live if isinstance(meta_live, dict) else None))
-                            mejor = elegir_candidato_rotacion_marti(
-                                    candidatos,
-                                    ciclo_auto,
-                                    allow_repeat_fallback=bool(MARTI_CYCLE_ALLOW_REPEAT_FALLBACK and int(ciclo_auto) > 1),
-                                    repeat_min_prob=repeat_min_prob_live,
-                                )
-                            if mejor is None and int(ciclo_auto) > 1:
-                                agregar_evento(f"🧯 IA AUTO C{ciclo_auto}: sin bot elegible (nuevo o fallback p>={repeat_min_prob_live*100:.0f}%).")
+                            emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
+                            mejor_bot = str(emb.get("top1_bot") or "").strip()
+                            mejor = next((c for c in candidatos if str(c[1]) == mejor_bot), None)
                             if mejor is not None:
                                 score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
-                                if int(ciclo_auto) > 1 and bool(MARTI_CYCLE_ALLOW_REPEAT_FALLBACK):
-                                    _repeat_pick = (mejor_bot == ultimo_bot_real) or (mejor_bot in bots_usados_en_esta_marti)
-                                    if _repeat_pick:
-                                        agregar_evento(
-                                            f"♻️ IA AUTO C{ciclo_auto}: fallback controlado en {mejor_bot} "
-                                            f"(p_real={p_post*100:.1f}% >= {repeat_min_prob_live*100:.0f}%)."
-                                        )
-                                agregar_evento(f"⚙️ IA AUTO: {mejor_bot} score={score_top*100:.1f}% | p_model={prob*100:.1f}% | p_real={p_post*100:.1f}% | reg={reg_score*100:.1f}% | WR={ev_wr*100:.1f}% LB={ev_lb*100:.1f}% (n={ev_n})")
+                                agregar_evento(f"⚙️ IA AUTO (embudo único): {mejor_bot} p_oper={prob*100:.1f}% risk={emb.get('risk_mode','--')} gate={emb.get('gate_quality','--')}")
                                 monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_auto - 1))]
                                 val = obtener_valor_saldo()
                                 if val is None or val < monto:
