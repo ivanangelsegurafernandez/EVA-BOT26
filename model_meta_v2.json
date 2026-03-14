@@ -1,0 +1,28 @@
+{
+  "trained_at": "2026-03-09 12:48:07",
+  "n_samples": 22,
+  "pos": 2,
+  "neg": 20,
+  "auc": 1.0,
+  "brier": 0.007985444670191612,
+  "threshold": 0.5,
+  "reliable": false,
+  "warmup_mode": true,
+  "feature_names": [
+    "racha_actual",
+    "puntaje_estrategia",
+    "payout",
+    "ret_1m",
+    "ret_3m",
+    "ret_5m",
+    "slope_5m",
+    "rv_20",
+    "range_norm",
+    "bb_z",
+    "body_ratio",
+    "wick_imbalance",
+    "micro_trend_persist"
+  ],
+  "model_family": "sklearn_logreg_fallback",
+  "n": 22
+}
