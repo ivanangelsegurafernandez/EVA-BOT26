@@ -1800,6 +1800,8 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
         ruta = "dataset_incremental.csv"
         feats = feature_names or INCREMENTAL_FEATURES_V2
         cols = _canonical_incremental_cols(feats)
+        if "ts_ingest" not in cols:
+            cols = list(cols[:-1]) + ["ts_ingest", cols[-1]]
 
         if not isinstance(fila_dict_or_full, dict) or not fila_dict_or_full:
             return False
@@ -1824,6 +1826,12 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
 
         # Dict solo con features canónicas
         fila_dict = {k: fila_dict_or_full.get(k, None) for k in feats}
+        ts_ing = fila_dict_or_full.get("ts_ingest", None)
+        if ts_ing is None:
+            try:
+                ts_ing = float(time.time())
+            except Exception:
+                ts_ing = ""
 
         # Validación fuerte
         ok, why = validar_fila_incremental(fila_dict, feats)
@@ -1886,7 +1894,7 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
                 try:
                     with open(ruta, "a", newline="", encoding="utf-8") as f:
                         w = csv.writer(f)
-                        w.writerow(row_vals + [label])
+                        w.writerow(row_vals + [ts_ing, label])
                         f.flush()
                         os.fsync(f.fileno())
 
@@ -3856,6 +3864,8 @@ def leer_ultima_fila_con_resultado(bot: str) -> tuple[dict | None, int | None]:
 
 IA_SIGNALS_LOG = "ia_signals_log.csv"
 CANARY_STATE_CACHE = {"ts": 0.0, "meta": None}
+IA_SIGNALS_TELEMETRY_LAST = {"opens": 0, "closes": 0, "orphans": 0, "ts": 0.0}
+IA_SIGNALS_HISTORICAL_UNRECOVERABLE_EMITTED = False
 
 # Blindaje: evita crash si threading aún no estaba importado (aunque tú sí lo tienes)
 try:
@@ -4907,17 +4917,363 @@ def _cap_prob_por_madurez(prob: float | None, bot: str | None = None) -> float |
 
 
 def _ensure_ia_signals_log():
-    """Crea el archivo con header si no existe."""
-    if os.path.exists(IA_SIGNALS_LOG):
-        return
+    """
+    Asegura ia_signals_log.csv con header canónico.
+    - Si no existe o está vacío: crea header.
+    - Si existe con header roto/faltante: normaliza columnas sin inventar histórico.
+    - Emite evento único cuando no hay forma de reconstruir auditoría histórica.
+    """
+    global IA_SIGNALS_HISTORICAL_UNRECOVERABLE_EMITTED
+    expected = ["ts", "bot", "epoch", "prob", "thr", "modo", "y"]
     try:
-        with open(IA_SIGNALS_LOG, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["ts", "bot", "epoch", "prob", "thr", "modo", "y"])
-            f.flush()
-            os.fsync(f.fileno())
+        needs_boot_notice = False
+        if not os.path.exists(IA_SIGNALS_LOG) or os.path.getsize(IA_SIGNALS_LOG) <= 0:
+            with open(IA_SIGNALS_LOG, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(expected)
+                f.flush()
+                os.fsync(f.fileno())
+            needs_boot_notice = True
+        else:
+            df = _safe_read_csv_any_encoding(IA_SIGNALS_LOG)
+            if df is None:
+                with open(IA_SIGNALS_LOG, "w", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    w.writerow(expected)
+                    f.flush()
+                    os.fsync(f.fileno())
+                needs_boot_notice = True
+            else:
+                changed = False
+                for c in expected:
+                    if c not in df.columns:
+                        df[c] = ""
+                        changed = True
+                if list(df.columns) != expected:
+                    df = df.reindex(columns=expected, fill_value="")
+                    changed = True
+                if changed:
+                    _atomic_write_text(IA_SIGNALS_LOG, df.to_csv(index=False, lineterminator="\n"))
+                if df.empty:
+                    needs_boot_notice = True
+
+        if needs_boot_notice and not IA_SIGNALS_HISTORICAL_UNRECOVERABLE_EMITTED:
+            IA_SIGNALS_HISTORICAL_UNRECOVERABLE_EMITTED = True
+            _ag_evt("ℹ️ IA audit: histórico de señales no reconstruible; auditoría real desde ahora.")
     except Exception:
         pass
+
+def _collect_incremental_row_stats(path: str = "dataset_incremental.csv", sample_tail: int = 15000) -> dict:
+    """Diagnóstico rápido del incremental: raw, usable, dedup y madurez."""
+    stats = {
+        "raw_rows": 0,
+        "usable_rows": 0,
+        "post_dedup_rows": 0,
+        "invalid_label_rows": 0,
+        "duplicates_removed": 0,
+        "duplicate_ratio": 0.0,
+    }
+    try:
+        if not os.path.exists(path):
+            return stats
+        df = _safe_read_csv_any_encoding(path)
+        if df is None or df.empty:
+            return stats
+        stats["raw_rows"] = int(len(df))
+
+        lab = _pick_label_col_incremental(df)
+        if not lab:
+            return stats
+        y01 = _coerce_label_to_01(df[lab])
+        mask = y01.isin([0.0, 1.0])
+        stats["usable_rows"] = int(mask.sum())
+        stats["invalid_label_rows"] = max(0, int(len(df)) - int(mask.sum()))
+
+        if int(mask.sum()) <= 0:
+            return stats
+
+        d = df.loc[mask].copy()
+        if sample_tail and len(d) > int(sample_tail):
+            d = d.tail(int(sample_tail)).copy()
+
+        feats = [f for f in INCREMENTAL_FEATURES_V2 if f in d.columns]
+        if feats:
+            xx = d.reindex(columns=feats, fill_value=0.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            yy = _coerce_label_to_01(d[lab]).fillna(-1).astype(int)
+            sig = xx.round(6).astype(str).agg("|".join, axis=1) + "|" + yy.astype(str)
+            dedup_n = int((~sig.duplicated(keep="last")).sum())
+            stats["post_dedup_rows"] = dedup_n
+            stats["duplicates_removed"] = max(0, int(len(xx)) - dedup_n)
+        else:
+            stats["post_dedup_rows"] = int(mask.sum())
+            stats["duplicates_removed"] = 0
+
+        base = max(1, int(stats["usable_rows"]))
+        stats["duplicate_ratio"] = float(stats["duplicates_removed"]) / float(base)
+        return stats
+    except Exception:
+        return stats
+
+
+def auditar_refresh_campeon_stale(meta: dict | None = None, dataset_stats: dict | None = None, force_log: bool = False) -> dict:
+    """Audita desalineación campeón/dataset y decide revisión de refresh (no bloquea trading)."""
+    out = {
+        "needs_review": False,
+        "reasons": [],
+        "dataset": {},
+        "meta": {},
+    }
+    try:
+        ds = dataset_stats if isinstance(dataset_stats, dict) else _collect_incremental_row_stats("dataset_incremental.csv")
+        m = _normalize_model_meta(meta if isinstance(meta, dict) else (leer_model_meta() or {}))
+
+        raw_rows = int(ds.get("raw_rows", 0) or 0)
+        usable_rows = int(ds.get("usable_rows", 0) or 0)
+        post_dedup_rows = int(ds.get("post_dedup_rows", 0) or 0)
+        trained_rows = int(m.get("rows_total", m.get("n_samples", m.get("n", 0))) or 0)
+        n_samples = int(m.get("n_samples", trained_rows) or trained_rows)
+        reliable = bool(m.get("reliable", False))
+        reliable_candidate = bool(m.get("reliable_candidate", reliable))
+        warmup_mode = bool(m.get("warmup_mode", n_samples < int(TRAIN_WARMUP_MIN_ROWS)))
+        canary_mode = bool(m.get("canary_mode", False))
+        refresh_policy = str(m.get("refresh_policy", "")).strip()
+
+        dt_tr = None
+        ts_train = str(m.get("trained_at", "") or "").strip()
+        if ts_train:
+            try:
+                dt_tr = datetime.strptime(ts_train, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                dt_tr = None
+        age_s = (datetime.now() - dt_tr).total_seconds() if dt_tr is not None else None
+
+        min_abs_growth = int(TRAIN_REFRESH_MIN_ABS_ROWS)
+        if trained_rows > 0 and trained_rows <= int(TRAIN_REFRESH_LOWN_CUTOFF):
+            min_abs_growth = int(TRAIN_REFRESH_MIN_ABS_ROWS_LOWN)
+        growth_abs = max(0, post_dedup_rows - trained_rows)
+        growth_ratio = (float(post_dedup_rows) / float(max(1, trained_rows))) if trained_rows > 0 else (float(post_dedup_rows) if post_dedup_rows > 0 else 0.0)
+
+        reasons = []
+        if trained_rows <= 0 and post_dedup_rows >= int(MIN_FIT_ROWS_LOW):
+            reasons.append("meta_sin_rows_con_dataset_util")
+        if trained_rows > 0 and growth_abs >= int(min_abs_growth) and growth_ratio >= (1.0 + float(TRAIN_REFRESH_MIN_GROWTH)):
+            reasons.append("campeon_quedo_muy_por_debajo_del_incremental")
+        if warmup_mode and post_dedup_rows >= int(TRAIN_WARMUP_MIN_ROWS):
+            reasons.append("warmup_persistente_con_dataset_maduro")
+        if (not reliable) and post_dedup_rows >= int(max(TRAIN_WARMUP_MIN_ROWS, MIN_FIT_ROWS_PROD)):
+            reasons.append("reliable_false_prolongado_con_data_madura")
+        if age_s is not None and age_s >= float(TRAIN_REFRESH_STALE_MIN) and growth_abs >= int(min_abs_growth):
+            reasons.append("modelo_stale_por_tiempo_y_crecimiento")
+
+        artefacts = [globals().get("_MODEL_PATH", "modelo_xgb_v2.pkl"), globals().get("_SCALER_PATH", "scaler_v2.pkl"), globals().get("_FEATURES_PATH", "feature_names_v2.pkl"), globals().get("_META_PATH", "model_meta_v2.json")]
+        mtimes = [_safe_mtime(p) for p in artefacts]
+        if any(mt is None for mt in mtimes):
+            reasons.append("artefactos_faltantes")
+
+        out["needs_review"] = bool(reasons)
+        out["reasons"] = reasons
+        out["dataset"] = {
+            "raw_rows": raw_rows,
+            "usable_rows": usable_rows,
+            "post_dedup_rows": post_dedup_rows,
+            "duplicates_removed": int(ds.get("duplicates_removed", 0) or 0),
+            "duplicate_ratio": float(ds.get("duplicate_ratio", 0.0) or 0.0),
+        }
+        out["meta"] = {
+            "trained_rows": trained_rows,
+            "n_samples": n_samples,
+            "trained_at": ts_train,
+            "age_s": float(age_s) if age_s is not None else None,
+            "reliable": reliable,
+            "reliable_candidate": reliable_candidate,
+            "warmup_mode": warmup_mode,
+            "canary_mode": canary_mode,
+            "refresh_policy": refresh_policy,
+        }
+
+        sig = f"{out['dataset']['post_dedup_rows']}|{trained_rows}|{','.join(reasons)}"
+        last = globals().get("_IA_REFRESH_AUDIT_LAST", {}) or {}
+        now = time.time()
+        should = force_log or sig != str(last.get("sig", "")) or (now - float(last.get("ts", 0.0) or 0.0)) >= 45.0
+        if should:
+            _ag_evt(
+                "🧪 IA refresh-audit: raw={raw} usable={use} dedup={ded} trained={tr} n={n} rel={rel}/{rc} "
+                "warmup={wu} canary={ca} policy={po} reasons={rs}".format(
+                    raw=raw_rows,
+                    use=usable_rows,
+                    ded=post_dedup_rows,
+                    tr=trained_rows,
+                    n=n_samples,
+                    rel=int(reliable),
+                    rc=int(reliable_candidate),
+                    wu=int(warmup_mode),
+                    ca=int(canary_mode),
+                    po=(refresh_policy or "--"),
+                    rs=("|".join(reasons) if reasons else "ok"),
+                )
+            )
+            globals()["_IA_REFRESH_AUDIT_LAST"] = {"sig": sig, "ts": now}
+    except Exception:
+        pass
+    return out
+
+
+def auditar_degradacion_temporal_modelo(
+    path: str = "dataset_incremental.csv",
+    output_path: str = "ia_temporal_degradation_report.json",
+    windows: int = 4,
+    min_rows_window: int = 40,
+):
+    """Auditoría temporal de degradación de calidad (no bloquea trading)."""
+    try:
+        if not os.path.exists(path):
+            return None
+        df = _safe_read_csv_any_encoding(path)
+        if df is None or df.empty:
+            return None
+
+        d = df.copy().reset_index(drop=True)
+        d["__row_idx"] = np.arange(len(d), dtype=int)
+        has_ts = False
+        for tcol in ("ts_ingest", "epoch", "timestamp", "ts", "fecha"):
+            if tcol in d.columns:
+                vals = pd.to_numeric(d[tcol], errors="coerce")
+                if int(vals.notna().sum()) >= int(max(20, len(d) * 0.35)):
+                    d["__t"] = vals
+                    has_ts = True
+                    break
+        if not has_ts:
+            d["__t"] = d["__row_idx"].astype(float)
+
+        lab = _pick_label_col_incremental(d)
+        if not lab:
+            return None
+        d["__y"] = _coerce_label_to_01(d[lab])
+        d = d[d["__y"].isin([0.0, 1.0])].copy()
+        if d.empty:
+            return None
+
+        n = int(len(d))
+        nwin = max(2, int(windows))
+        wsize = max(int(min_rows_window), int(n // nwin) if nwin > 0 else int(min_rows_window))
+        chunks = []
+        start = 0
+        while start < n:
+            end = min(n, start + wsize)
+            chunks.append((start, end))
+            start = end
+        if len(chunks) < 2:
+            chunks = [(0, n)]
+
+        model, scaler, features, meta = get_oracle_assets()
+        feat_names = _resolve_oracle_feature_names(model, scaler, features, meta or {}) or list(INCREMENTAL_FEATURES_V2)
+
+        rows = []
+        for wi, (a, b) in enumerate(chunks, start=1):
+            seg = d.iloc[a:b].copy()
+            raw_rows = int(len(seg))
+            usable_rows = int(len(seg))
+            xx = seg.reindex(columns=feat_names, fill_value=0.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            yy = seg["__y"].astype(int).to_numpy()
+
+            sig = xx.round(6).astype(str).agg("|".join, axis=1) + "|" + pd.Series(yy).astype(str)
+            keep = ~sig.duplicated(keep="last")
+            xx = xx.loc[keep].copy()
+            yy = pd.Series(yy).loc[keep].astype(int).to_numpy()
+            post_rows = int(len(xx))
+            dup_rm = max(0, raw_rows - post_rows)
+
+            if post_rows <= 0:
+                continue
+
+            pred = np.full(post_rows, 0.5, dtype=float)
+            try:
+                if model is not None:
+                    Xuse = xx.copy()
+                    if scaler is not None:
+                        Xuse = pd.DataFrame(scaler.transform(Xuse), columns=Xuse.columns, index=Xuse.index)
+                    if hasattr(model, "predict_proba"):
+                        pred = np.asarray(model.predict_proba(Xuse)[:, 1], dtype=float)
+                    else:
+                        pred = np.asarray(model.predict(Xuse), dtype=float)
+                    pred = np.clip(pred, 0.0, 1.0)
+            except Exception:
+                pred = np.full(post_rows, 0.5, dtype=float)
+
+            try:
+                auc = float(roc_auc_score(yy, pred)) if len(np.unique(yy)) > 1 else None
+            except Exception:
+                auc = None
+            acc = float(np.mean((pred >= 0.5).astype(int) == yy)) if post_rows > 0 else None
+            try:
+                brier = float(brier_score_loss(yy, pred)) if post_rows > 0 else None
+            except Exception:
+                brier = None
+            base_rate = float(np.mean(yy)) if post_rows > 0 else None
+            drift = float(abs((float(np.mean(pred)) if post_rows > 0 else 0.5) - (base_rate if base_rate is not None else 0.5)))
+
+            rows.append({
+                "window": int(wi),
+                "start_idx": int(seg["__row_idx"].iloc[0]),
+                "end_idx": int(seg["__row_idx"].iloc[-1]),
+                "time_proxy": "timestamp" if has_ts else "row_order",
+                "raw_rows": raw_rows,
+                "usable_rows": usable_rows,
+                "duplicates_removed": int(dup_rm),
+                "post_dedup_rows": post_rows,
+                "auc": auc,
+                "accuracy": acc,
+                "brier": brier,
+                "base_rate": base_rate,
+                "drift_score": drift,
+            })
+
+        if not rows:
+            return None
+
+        recent = rows[-1]
+        hist = rows[:-1] if len(rows) > 1 else rows
+        def _avg(key):
+            vals = [r.get(key) for r in hist if isinstance(r.get(key), (int, float))]
+            return float(sum(vals) / len(vals)) if vals else None
+
+        avg_hist_auc = _avg("auc")
+        avg_hist_acc = _avg("accuracy")
+        avg_hist_brier = _avg("brier")
+        degraded = False
+        reasons = []
+        if avg_hist_auc is not None and isinstance(recent.get("auc"), (int, float)) and recent["auc"] < (avg_hist_auc - 0.08):
+            degraded = True
+            reasons.append("auc_drop")
+        if avg_hist_acc is not None and isinstance(recent.get("accuracy"), (int, float)) and recent["accuracy"] < (avg_hist_acc - 0.08):
+            degraded = True
+            reasons.append("accuracy_drop")
+        if avg_hist_brier is not None and isinstance(recent.get("brier"), (int, float)) and recent["brier"] > (avg_hist_brier + 0.06):
+            degraded = True
+            reasons.append("brier_worse")
+
+        report = {
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "time_proxy": "timestamp" if has_ts else "row_order",
+            "windows": rows,
+            "summary": {
+                "degradation_detected": bool(degraded),
+                "reasons": reasons,
+                "historical_auc": avg_hist_auc,
+                "historical_accuracy": avg_hist_acc,
+                "historical_brier": avg_hist_brier,
+                "recent_window": recent,
+            },
+        }
+        _json_dump_atomic(report, output_path)
+
+        if degraded:
+            _ag_evt(f"⚠️ IA degradación temporal detectada: {','.join(reasons)}")
+
+        return report
+    except Exception:
+        return None
+
 
 def _leer_stats_canary_desde_log(ts_inicio: str | None) -> tuple[int, int]:
     """
@@ -5253,6 +5609,11 @@ def log_ia_open(bot: str, epoch: int, prob: float, thr: float, modo: str):
 
             df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
             _atomic_write_text(IA_SIGNALS_LOG, df.to_csv(index=False, lineterminator="\n"))
+            try:
+                IA_SIGNALS_TELEMETRY_LAST["opens"] = int(IA_SIGNALS_TELEMETRY_LAST.get("opens", 0) or 0) + 1
+                IA_SIGNALS_TELEMETRY_LAST["ts"] = float(time.time())
+            except Exception:
+                pass
             return True
     except Exception:
         return False
@@ -5320,6 +5681,11 @@ def log_ia_close(
                         df.at[idx, "modo"] = str(modo_override)
 
                 _atomic_write_text(IA_SIGNALS_LOG, df.to_csv(index=False, lineterminator="\n"))
+                try:
+                    IA_SIGNALS_TELEMETRY_LAST["closes"] = int(IA_SIGNALS_TELEMETRY_LAST.get("closes", 0) or 0) + 1
+                    IA_SIGNALS_TELEMETRY_LAST["ts"] = float(time.time())
+                except Exception:
+                    pass
                 return True
 
             # 2) Si no hay exact match, cerrar la ABIERTA más reciente con epoch <= epoch_close
@@ -5345,6 +5711,11 @@ def log_ia_close(
                 df.at[pick_idx, "modo"] = str(modo_override)
 
             _atomic_write_text(IA_SIGNALS_LOG, df.to_csv(index=False, lineterminator="\n"))
+            try:
+                IA_SIGNALS_TELEMETRY_LAST["closes"] = int(IA_SIGNALS_TELEMETRY_LAST.get("closes", 0) or 0) + 1
+                IA_SIGNALS_TELEMETRY_LAST["ts"] = float(time.time())
+            except Exception:
+                pass
             return True
     except Exception:
         return False
@@ -5437,13 +5808,42 @@ def ia_audit_scan_close(bot: str, tail_lines: int = 2000, max_events: int = 6):
     if max_events and len(cierres) > int(max_events):
         cierres = cierres[:int(max_events)]
 
+    closes_ok = 0
+    unmatched = 0
     for ep, y in cierres:
+        closed = False
         try:
-            _ = bool(log_ia_close(bot, ep, y))
+            closed = bool(log_ia_close(bot, ep, y))
         except Exception:
-            pass
+            closed = False
+        if closed:
+            closes_ok += 1
+        else:
+            unmatched += 1
+            try:
+                IA_SIGNALS_TELEMETRY_LAST["orphans"] = int(IA_SIGNALS_TELEMETRY_LAST.get("orphans", 0) or 0) + 1
+            except Exception:
+                pass
         # Avanzamos el puntero siempre: si no había señal abierta (trade sin señal IA), no queremos trabarnos.
         IA_AUDIT_LAST_CLOSE_EPOCH[bot] = int(ep)
+
+    try:
+        _ensure_ia_signals_log()
+        dlog = _safe_read_csv_any_encoding(IA_SIGNALS_LOG)
+        pending = 0
+        if dlog is not None and not dlog.empty:
+            for c in ["bot", "y"]:
+                if c not in dlog.columns:
+                    dlog[c] = ""
+            pending = int(((dlog["bot"].astype(str).str.strip() == str(bot)) & (dlog["y"].astype(str).str.strip() == "")).sum())
+        orphan_rate = (float(unmatched) / float(max(1, closes_ok + unmatched)))
+        _ag_evt(
+            f"🧾 IA audit tick {bot}: opens+{int(IA_SIGNALS_TELEMETRY_LAST.get('opens',0) or 0)} closes+{closes_ok} pending={pending} unmatched={unmatched} orphan_rate={orphan_rate:.2f} last_close={IA_AUDIT_LAST_CLOSE_EPOCH.get(bot)}"
+        )
+        IA_SIGNALS_TELEMETRY_LAST["opens"] = 0
+        IA_SIGNALS_TELEMETRY_LAST["ts"] = float(time.time())
+    except Exception:
+        pass
 
 def semaforo_calibracion(n: int, infl_pp: float | None):
     """Devuelve (emoji, etiqueta, detalle) para lectura rápida de calibración."""
@@ -7908,7 +8308,8 @@ def build_xy_from_incremental(df: pd.DataFrame, feature_names: list | None = Non
         return None, None, label_col
 
     # X (reindex = blindaje)
-    X = df.reindex(columns=feats, fill_value=0.0).loc[mask].copy()
+    feats_no_time = [c for c in feats if c != "ts_ingest"]
+    X = df.reindex(columns=feats_no_time, fill_value=0.0).loc[mask].copy()
     X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     # y final
@@ -9435,13 +9836,18 @@ def _maybe_retrain_fallback_sklearn(force: bool = False):
         meta = {
             "trained_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "n_samples": int(len(X)),
+            "rows_total": int(len(X)),
+            "rows_train": int(len(X)),
             "pos": int(np.sum(yb == 1)),
             "neg": int(np.sum(yb == 0)),
             "auc": float(auc),
             "brier": float(brier),
             "threshold": float(THR_DEFAULT),
             "reliable": bool(len(X) >= int(MIN_FIT_ROWS_PROD)),
+            "reliable_candidate": bool(len(X) >= int(MIN_FIT_ROWS_PROD)),
             "warmup_mode": bool(len(X) < int(TRAIN_WARMUP_MIN_ROWS)),
+            "canary_mode": False,
+            "refresh_policy": "fallback_logreg",
             "feature_names": list(feats),
             "model_family": "sklearn_logreg_fallback",
         }
@@ -9463,7 +9869,21 @@ def _maybe_retrain_fallback_sklearn(force: bool = False):
 
         if ok_save:
             _IA_ASSETS_CACHE["loaded"] = False
+            try:
+                _ORACLE_CACHE["model"] = clf
+                _ORACLE_CACHE["scaler"] = scaler
+                _ORACLE_CACHE["features"] = list(feats)
+                _ORACLE_CACHE["meta"] = dict(meta)
+                _ORACLE_CACHE.setdefault("mtimes", {})
+                for pth in (globals().get("_MODEL_PATH", "modelo_xgb_v2.pkl"), globals().get("_SCALER_PATH", "scaler_v2.pkl"), globals().get("_FEATURES_PATH", "feature_names_v2.pkl"), globals().get("_META_PATH", "model_meta_v2.json")):
+                    _ORACLE_CACHE["mtimes"][pth] = _safe_mtime(pth)
+            except Exception:
+                pass
             agregar_evento(f"✅ IA fallback entrenada (LogReg) n={len(X)} AUC={auc:.3f}")
+            try:
+                auditar_refresh_campeon_stale(meta, force_log=True)
+            except Exception:
+                pass
             return True
         return False
     except Exception as e:
@@ -10202,6 +10622,7 @@ def maybe_retrain(force: bool = False):
         meta = {
             "trained_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "rows_total": int(n_total),
+            "n_samples": int(n_total),
             "rows_train": int(n_train),
             "rows_calib": int(n_cal),
             "rows_test": int(n_test),
@@ -10294,6 +10715,19 @@ def maybe_retrain(force: bool = False):
             _ORACLE_CACHE["mtimes"][scaler_path] = _mt(scaler_path)
             _ORACLE_CACHE["mtimes"][feats_path] = _mt(feats_path)
             _ORACLE_CACHE["mtimes"][meta_path] = _mt(meta_path)
+        except Exception:
+            pass
+
+        # 18.1) Verificación post-save de alineación meta/cache/artefactos (anti fósil n=22)
+        try:
+            meta_disk = leer_model_meta() or {}
+            n_disk = int(meta_disk.get("rows_total", meta_disk.get("n_samples", 0)) or 0)
+            if n_disk < int(max(1, n_total)):
+                agregar_evento(f"⚠️ IA post-save: meta en disco desalineada (disk={n_disk} train={int(n_total)}). Forzando reload cache.")
+            _ORACLE_CACHE["meta"] = _normalize_model_meta(meta_disk)
+            _ORACLE_CACHE["model"], _ORACLE_CACHE["scaler"], _ORACLE_CACHE["features"], _ = get_oracle_assets()
+            auditar_refresh_campeon_stale(meta_disk, force_log=True)
+            auditar_degradacion_temporal_modelo()
         except Exception:
             pass
 
@@ -13948,6 +14382,16 @@ async def main():
         except Exception as e:
             agregar_evento(f"⚠️ IA: error al intentar entrenar tras el backfill: {e}")
 
+        # Diagnóstico BOOT de desalineación campeón/dataset + degradación temporal (no bloquea operativa)
+        try:
+            meta_boot = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+            audit_boot = auditar_refresh_campeon_stale(meta_boot, force_log=True)
+            if bool(audit_boot.get("needs_review", False)):
+                maybe_retrain(force=True)
+            auditar_degradacion_temporal_modelo()
+        except Exception as e:
+            agregar_evento(f"⚠️ IA: auditoría boot parcial con error: {e}")
+
         set_etapa("BOOT_04", "Sincronizando HUD con CSV")
         # Pasada inicial para sincronizar HUD con CSV existentes
         token_actual_loop = "--"  # Dummy para carga inicial
@@ -13991,6 +14435,18 @@ async def main():
                     REAL_LOCK_MISMATCH_SINCE = 0.0
                 # Heartbeat: mantiene ACK alineado al HUD aunque no entren filas nuevas ese tick.
                 refrescar_ia_ack_desde_hud(intervalo_s=1.0)
+
+                try:
+                    last_a = globals().get("_IA_BOOT_STALE_AUDIT_TS", 0.0) or 0.0
+                    if (time.time() - float(last_a)) >= 90.0:
+                        globals()["_IA_BOOT_STALE_AUDIT_TS"] = float(time.time())
+                        meta_tick = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+                        audit_tick = auditar_refresh_campeon_stale(meta_tick, force_log=False)
+                        if bool(audit_tick.get("needs_review", False)):
+                            maybe_retrain(force=True)
+                        auditar_degradacion_temporal_modelo()
+                except Exception:
+                    pass
                 owner_mem = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
                 owner_file = token_actual_loop if token_actual_loop in BOT_NAMES else None
                 activo_real = owner_mem or owner_file or next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
