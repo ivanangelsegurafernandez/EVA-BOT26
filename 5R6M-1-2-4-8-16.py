@@ -2046,7 +2046,7 @@ def _escribir_orden_real_raw(bot: str, ciclo: int):
         except Exception:
             pass
 
-def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
+def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> bool:
 
     """
     Reserva REAL y actualiza HUD de forma INMEDIATA.
@@ -2060,7 +2060,7 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
 
     try:
         if bot not in BOT_NAMES:
-            return
+            return False
 
         now = time.time()
 
@@ -2080,12 +2080,11 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
                     limpiar_orden_real(bot)
             except Exception:
                 pass
-            return
-
+            return False
 
         # Anti doble-disparo (tecla rebotona)
         if (now - _last_real_push_ts.get(bot, 0.0)) < 0.25:
-            return
+            return False
         _last_real_push_ts[bot] = now
 
         ciclo_obj = max(1, min(int(ciclo), MAX_CICLOS))
@@ -2102,7 +2101,7 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
                 owner_now = leer_token_actual()
                 cyc_now = int(estado_bots.get(bot, {}).get("ciclo_actual", 1) or 1)
                 if owner_now == bot and cyc_now == ciclo_obj:
-                    return
+                    return True
             except Exception:
                 pass
 
@@ -2119,22 +2118,29 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
         except Exception:
             prev_holder = None
 
-        # Reservar lock owner en memoria + token REAL en archivo
-        REAL_OWNER_LOCK = bot
-
-        # Reservar token REAL en archivo SOLO cuando corresponde:
-        # - orden_real: orden explícita ya escrita por wrapper
-        # - manual: el propio activar_real_inmediato puede escribir orden_real
-        # - token_sync: sincroniza token sin tocar orden_real.json
+        # Persistir primero token REAL y confirmar después memoria/UI
         if origen in ("orden_real", "manual", "token_sync"):
             with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
-                if got:
-                    write_token_atomic(TOKEN_FILE, f"REAL:{bot}")
-                else:
+                if not got:
                     agregar_evento("⚠️ Token REAL no escrito: lock real.lock ocupado. Se evita activar sin exclusión.")
-                    return
+                    try:
+                        if origen == "orden_real":
+                            limpiar_orden_real(bot)
+                    except Exception:
+                        pass
+                    return False
+                ok_write = bool(write_token_atomic(TOKEN_FILE, f"REAL:{bot}"))
+                if not ok_write:
+                    agregar_evento("⚠️ Token REAL no escrito: fallo de persistencia en token_actual.txt.")
+                    try:
+                        if origen == "orden_real":
+                            limpiar_orden_real(bot)
+                    except Exception:
+                        pass
+                    return False
 
-
+        # Confirmación en memoria SOLO tras persistencia correcta
+        REAL_OWNER_LOCK = bot
 
         # 2) Estado interno inmediato (HUD)
         _set_ui_token_holder(bot)
@@ -2189,34 +2195,20 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
         try:
             fn_panel = globals().get("mostrar_panel", None)
             if callable(fn_panel):
-                with RENDER_LOCK:
-                    fn_panel()
+                fn_panel()
         except Exception:
             pass
 
-        # 4) Saldo en background (no frena UI)
+        # 4) Standby estricto del resto (evita doble-REAL visual)
         try:
-            loop = asyncio.get_running_loop()
-            fn_saldo = globals().get("obtener_saldo_real", None)
-            if callable(fn_saldo):
-                loop.create_task(fn_saldo())
-            else:
-                fn_refresh = globals().get("refresh_saldo_real", None)
-                if callable(fn_refresh):
-                    loop.create_task(fn_refresh(forzado=True))
+            _enforce_single_real_standby(bot)
         except Exception:
             pass
 
-        # 5) Log de promociones
-        try:
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            with open("registro_promociones.txt", "a", encoding="utf-8") as log:
-                log.write(f"{timestamp} - Token REAL (inmediato) asignado a {bot} (ciclo {ciclo_obj})\n")
-        except Exception:
-            pass
+        return True
 
     except Exception:
-        pass
+        return False
 
 def escribir_orden_real(bot: str, ciclo: int) -> bool:
     global REAL_OWNER_LOCK
@@ -2254,10 +2246,11 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
         pass
 
     _escribir_orden_real_raw(bot, ciclo)
-    activar_real_inmediato(bot, ciclo, origen="orden_real")
+    ok_activate = bool(activar_real_inmediato(bot, ciclo, origen="orden_real"))
 
-    owner_after = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
-    ok = owner_after == bot
+    owner_after_mem = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+    owner_after_file = leer_token_archivo_raw()
+    ok = bool(ok_activate and owner_after_mem == bot and owner_after_file == bot)
     if ok:
         _marti_audit_log_orden(ciclo, bot=bot, origen="escribir_orden_real")
         if int(ciclo) == 1:
@@ -2515,6 +2508,27 @@ def activar_remate(bot: str, reason: str):
 # Cerrar por WIN
 def cerrar_por_win(bot: str, reason: str):
     global REAL_OWNER_LOCK, REAL_COOLDOWN_UNTIL_TS
+
+    # Liberar token REAL en archivo primero (commit de salida)
+    liberado = False
+    try:
+        with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
+            if got:
+                liberado = bool(write_token_atomic(TOKEN_FILE, "REAL:none"))
+                if not liberado:
+                    agregar_evento("⚠️ Token REAL no liberado: fallo de persistencia en token_actual.txt.")
+            else:
+                agregar_evento("⚠️ Token REAL no liberado por lock ocupado (real.lock).")
+    except Exception:
+        liberado = False
+
+    if not liberado:
+        return
+
+    # Liberación consolidada: recién aquí memoria/UI pasan a DEMO
+    REAL_OWNER_LOCK = None
+    REAL_COOLDOWN_UNTIL_TS = time.time() + float(_cooldown_post_trade_s())
+
     # Limpieza total de “estado REAL” para evitar REAL fantasma
     try:
         estado_bots[bot]["token"] = "DEMO"
@@ -2538,29 +2552,18 @@ def cerrar_por_win(bot: str, reason: str):
     except Exception:
         pass
 
-    # Liberar token global REAL
-    REAL_OWNER_LOCK = None
-    REAL_COOLDOWN_UNTIL_TS = time.time() + float(_cooldown_post_trade_s())
-    try:
-        with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
-            if got:
-                write_token_atomic(TOKEN_FILE, "REAL:none")
-            else:
-                agregar_evento("⚠️ Token REAL no liberado por lock ocupado (real.lock).")
-    except Exception:
-        pass
     # Limpiar orden REAL para evitar re-entradas fantasma
     try:
         limpiar_orden_real(bot)
     except Exception:
         pass
-    
+
     # Sync inmediato del HUD/token para evitar “REAL fantasma”
     try:
         _set_ui_token_holder(None)
     except Exception:
         pass
-    
+
     # Resync de snapshots y panel
     try:
         REAL_ENTRY_BASELINE[bot] = 0
@@ -7658,6 +7661,27 @@ def reiniciar_bot(bot, borrar_csv=False):
 
 def cerrar_por_fin_de_ciclo(bot: str, reason: str):
     global REAL_OWNER_LOCK, REAL_COOLDOWN_UNTIL_TS
+
+    # Liberar token REAL en archivo primero (commit de salida)
+    liberado = False
+    try:
+        with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
+            if got:
+                liberado = bool(write_token_atomic(TOKEN_FILE, "REAL:none"))
+                if not liberado:
+                    agregar_evento("⚠️ Token REAL no liberado: fallo de persistencia en token_actual.txt.")
+            else:
+                agregar_evento("⚠️ Token REAL no liberado por lock ocupado (real.lock).")
+    except Exception:
+        liberado = False
+
+    if not liberado:
+        return
+
+    # Liberación consolidada: recién aquí memoria/UI pasan a DEMO
+    REAL_OWNER_LOCK = None
+    REAL_COOLDOWN_UNTIL_TS = time.time() + float(_cooldown_post_trade_s())
+
     # Limpieza total de “estado REAL” para evitar HUD/estado fantasma
     try:
         estado_bots[bot]["token"] = "DEMO"
@@ -7683,18 +7707,6 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
     except Exception:
         pass
 
-    # Liberar token global REAL
-    REAL_OWNER_LOCK = None
-    REAL_COOLDOWN_UNTIL_TS = time.time() + float(_cooldown_post_trade_s())
-    try:
-        with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
-            if got:
-                write_token_atomic(TOKEN_FILE, "REAL:none")
-            else:
-                agregar_evento("⚠️ Token REAL no liberado por lock ocupado (real.lock).")
-    except Exception:
-        pass
-
     # Limpiar orden REAL para evitar re-entradas fantasma (igual que cerrar_por_win)
     try:
         limpiar_orden_real(bot)
@@ -7707,7 +7719,6 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
     except Exception:
         pass
 
-   
     # Actualizar snapshots para que no relea la misma fila
     try:
         REAL_ENTRY_BASELINE[bot] = 0
