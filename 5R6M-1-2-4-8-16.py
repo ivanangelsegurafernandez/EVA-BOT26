@@ -10814,8 +10814,94 @@ def _runtime_audit_append(linea: str):
     except Exception:
         pass
 
+# Anti-spam conservador para telemetría ruidosa (no altera lógica operativa)
+_EVENT_SPAM_STATE = {}
+
+
+def _event_spam_policy(msg: str):
+    """
+    Devuelve (key, cooldown_s, material_sig) para categorías ruidosas.
+    Si no aplica filtro, retorna None.
+    """
+    try:
+        txt = str(msg or "")
+    except Exception:
+        return None
+
+    # 1) IA audit tick orphan/unmatched: resumir por bot + severidad material
+    if txt.startswith("🧾 IA audit tick "):
+        try:
+            m_bot = re.search(r"IA audit tick\s+([^:]+):", txt)
+            bot = (m_bot.group(1).strip() if m_bot else "?")
+            mu = re.search(r"unmatched=(\d+)", txt)
+            mp = re.search(r"pending=(\d+)", txt)
+            om = re.search(r"orphan_rate=([0-9]*\.?[0-9]+)", txt)
+            unmatched = int(mu.group(1)) if mu else 0
+            pending = int(mp.group(1)) if mp else 0
+            orphan = float(om.group(1)) if om else 0.0
+        except Exception:
+            bot, unmatched, pending, orphan = "?", 0, 0, 0.0
+
+        un_b = 0 if unmatched <= 0 else (1 if unmatched <= 2 else (2 if unmatched <= 5 else 3))
+        pe_b = 0 if pending <= 0 else (1 if pending <= 3 else 2)
+        or_b = int(max(0.0, min(1.0, orphan)) / 0.10)
+        sev = max(un_b, pe_b, 1 if orphan >= 0.25 else 0)
+        cooldown = 30.0 if sev >= 2 else 90.0
+        return (f"audit:{bot}", cooldown, f"u{un_b}|p{pe_b}|o{or_b}")
+
+    # 2) IA redundante no invalidante: no repetir misma firma por tick
+    if "⚠️ IA redundante (NO invalida)" in txt:
+        m = re.search(r"\[([^\]]+)\]", txt)
+        sig = m.group(1).strip() if m else txt[:100]
+        return (f"redund:{sig}", 180.0, sig)
+
+    # 3) Input duplicado (data quality): reportar con ventana mayor salvo cambio material
+    if "🧪 DATA QUALITY: INPUT DUPLICADO" in txt:
+        m = re.search(r"probs clonadas\s+(\d+)/(\d+)\s+por\s+(\d+)\s+ticks", txt)
+        if m:
+            n_live = int(m.group(1)); n_tot = int(m.group(2)); ticks = int(m.group(3))
+            sev = 0 if ticks < 4 else (1 if ticks < 8 else 2)
+            return (f"dup_prob:{n_live}/{n_tot}", 120.0, f"sev{sev}")
+        return ("dup_prob:generic", 120.0, txt[:80])
+
+    # 4) Warmup/low-data/AUC mensajes repetitivos no fatales
+    warmup_tags = (
+        "IA LOW_DATA activa",
+        "IA warmup:",
+        "IA capa warmup",
+        "AUC bajó",
+        "NO actualizo (AUC bajó",
+    )
+    if any(t in txt for t in warmup_tags):
+        base = re.sub(r"\d+(?:\.\d+)?", "#", txt)
+        base = base[:120]
+        return (f"warmup:{base}", 120.0, base)
+
+    return None
+
+
 def agregar_evento(texto: str):
     limpio = _normalizar_evento_texto(texto)
+
+    pol = _event_spam_policy(limpio)
+    if pol is not None:
+        key, cooldown, material = pol
+        now = float(time.time())
+        st = _EVENT_SPAM_STATE.get(key, {}) if isinstance(_EVENT_SPAM_STATE, dict) else {}
+        last_ts = float(st.get("ts", 0.0) or 0.0)
+        last_mat = str(st.get("mat", ""))
+        sup = int(st.get("sup", 0) or 0)
+
+        changed = (material != last_mat)
+        due = (now - last_ts) >= float(cooldown)
+        if (not changed) and (not due):
+            _EVENT_SPAM_STATE[key] = {"ts": last_ts, "mat": last_mat, "sup": sup + 1}
+            return
+
+        if sup > 0:
+            limpio = f"{limpio} · (+{sup} similares)"
+        _EVENT_SPAM_STATE[key] = {"ts": now, "mat": material, "sup": 0}
+
     eventos_recentes.append(f"[{time.strftime('%H:%M:%S')}] {limpio}")
     _runtime_audit_append(f"EVENTO: {limpio}")
 
