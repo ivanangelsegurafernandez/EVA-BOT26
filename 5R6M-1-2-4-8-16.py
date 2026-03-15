@@ -64,6 +64,14 @@ warnings.filterwarnings(
 
 def _load_optional_module(name: str):
     try:
+        if str(name) == "pygame":
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="pkg_resources is deprecated as an API.*",
+                    category=UserWarning,
+                )
+                return importlib.import_module(name)
         return importlib.import_module(name)
     except Exception:
         return None
@@ -14430,13 +14438,16 @@ def _boot_health_check():
         # Señales congeladas: diagnóstico operativo rápido por bot (no bloqueante)
         sat_all = _auditar_saturacion_todos_bots(lookback=900)
         hot_bots = sat_all.get("hot_bots", []) if isinstance(sat_all, dict) else []
+        sat_parts = []
         for hb in hot_bots[:6]:
             bot = hb.get("bot", "?")
             dom = hb.get("dominance", {}) if isinstance(hb.get("dominance", {}), dict) else {}
             feats = hb.get("features", []) if isinstance(hb.get("features", []), list) else []
             hot = [f"{k}={float(dom.get(k, 0.0))*100:.1f}%" for k in feats]
             if hot:
-                msgs.append(f"⚠️ Features saturadas en {bot}: " + ", ".join(hot))
+                sat_parts.append(f"{bot}: " + ", ".join(hot))
+        if sat_parts:
+            msgs.append("⚠️ Features saturadas detectadas: " + " | ".join(sat_parts))
 
         # Calidad de labels del incremental (si hay inválidas, la IA aprende con humo)
         incq = _auditar_calidad_incremental("dataset_incremental.csv")
