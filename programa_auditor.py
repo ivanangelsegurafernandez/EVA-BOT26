@@ -102,16 +102,42 @@ def normalizar_trade_status(v: Any) -> str:
 
 def parsear_tiempo(df: pd.DataFrame) -> pd.Series:
     n = len(df)
+    if n == 0:
+        return pd.Series([], dtype=float)
+
+    def _rellenar_tiempo(s: pd.Series) -> pd.Series:
+        out = pd.to_numeric(s, errors="coerce")
+        if out.notna().sum() == 0:
+            return pd.Series(np.arange(n), index=df.index, dtype=float)
+        out = out.ffill().bfill()
+        if out.isna().any():
+            faltantes = out.isna()
+            out.loc[faltantes] = pd.Series(np.arange(n), index=df.index, dtype=float).loc[faltantes]
+        return out.astype(float)
+
     if "epoch" in df.columns:
-        e = pd.to_numeric(df["epoch"], errors="coerce")
-        if e.notna().sum() > 0:
-            return e.fillna(method="ffill").fillna(method="bfill").fillna(np.arange(n))
+        e = _rellenar_tiempo(df["epoch"])
+        if pd.to_numeric(df["epoch"], errors="coerce").notna().sum() > 0:
+            return e
+
     for c in ("timestamp", "ts", "fecha", "datetime", "time"):
         if c in df.columns:
-            t = pd.to_datetime(df[c], errors="coerce", utc=True)
+            raw = df[c]
+            t = pd.to_datetime(raw, errors="coerce", utc=True, infer_datetime_format=True)
             if t.notna().sum() > 0:
-                return pd.Series((t.view("int64") // 10**9), index=df.index).fillna(method="ffill").fillna(method="bfill").fillna(np.arange(n))
+                t_int = pd.Series(np.where(t.notna(), (t.astype("int64") // 10**9), np.nan), index=df.index, dtype=float)
+                return _rellenar_tiempo(t_int)
+            raw_num = pd.to_numeric(raw, errors="coerce")
+            if raw_num.notna().sum() > 0:
+                return _rellenar_tiempo(raw_num)
     return pd.Series(np.arange(n), index=df.index, dtype=float)
+
+
+def elegir_columna_disponible(df: pd.DataFrame, candidatas: list[str]) -> str | None:
+    for c in candidatas:
+        if c in df.columns:
+            return c
+    return None
 
 
 def elegir_columna_prob(df: pd.DataFrame) -> str | None:
@@ -123,8 +149,33 @@ def elegir_columna_prob(df: pd.DataFrame) -> str | None:
 
 def construir_result_bin(df: pd.DataFrame) -> pd.Series:
     if "result_bin" in df.columns:
-        y = pd.to_numeric(df["result_bin"], errors="coerce")
-        return pd.Series(np.where(y >= 0.5, 1, np.where(y < 0.5, 0, np.nan)), index=df.index)
+        s = df["result_bin"].astype(str).str.strip().str.lower()
+        mapped = s.map(
+            {
+                "0": 0.0,
+                "0.0": 0.0,
+                "false": 0.0,
+                "no": 0.0,
+                "loss": 0.0,
+                "perdida": 0.0,
+                "pérdida": 0.0,
+                "1": 1.0,
+                "1.0": 1.0,
+                "true": 1.0,
+                "si": 1.0,
+                "sí": 1.0,
+                "yes": 1.0,
+                "win": 1.0,
+                "ganancia": 1.0,
+            }
+        )
+        num = pd.to_numeric(df["result_bin"], errors="coerce")
+        exact = pd.Series(np.nan, index=df.index, dtype=float)
+        exact.loc[num == 0] = 0.0
+        exact.loc[num == 1] = 1.0
+        out = mapped.combine_first(exact)
+        if out.isin([0.0, 1.0]).sum() > 0:
+            return out
     if "resultado" in df.columns:
         norm = df["resultado"].map(normalizar_resultado)
         return norm.map({"GANANCIA": 1, "PÉRDIDA": 0}).astype(float)
@@ -258,7 +309,8 @@ def calcular_metricas_inversion(df: pd.DataFrame) -> dict[str, Any]:
     out["pnl_por_bot"] = safe_group_pnl(d_closed, "bot")
     out["win_rate_por_ciclo_martingala"] = safe_group_wr(d_closed, "ciclo_martingala")
     out["pnl_por_ciclo_martingala"] = safe_group_pnl(d_closed, "ciclo_martingala")
-    out["win_rate_por_activo"] = safe_group_wr(d_closed, "symbol")
+    col_activo = elegir_columna_disponible(d_closed, ["activo", "symbol"])
+    out["win_rate_por_activo"] = safe_group_wr(d_closed, col_activo) if col_activo else {}
 
     if "payout" in d_closed.columns:
         d_closed["payout_band"] = d_closed["payout"].map(banda_payout)
@@ -266,7 +318,8 @@ def calcular_metricas_inversion(df: pd.DataFrame) -> dict[str, Any]:
     else:
         out["win_rate_por_banda_payout"] = {}
 
-    out["win_rate_por_modo_ia_ack"] = safe_group_wr(d_closed, "modo_ia_ack")
+    col_modo = elegir_columna_disponible(d_closed, ["ia_modo_ack", "modo_ia_ack"])
+    out["win_rate_por_modo_ia_ack"] = safe_group_wr(d_closed, col_modo) if col_modo else {}
 
     if "ia_gate_real" in d_closed.columns:
         g = d_closed["ia_gate_real"].astype(str).str.upper().str.strip()
@@ -316,6 +369,17 @@ def ventanas_rodantes(df: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
     return out
 
 
+def _coerce_numeric_columns(df: pd.DataFrame, min_valid_ratio: float = 0.6) -> list[str]:
+    numeric_cols: list[str] = []
+    for c in df.columns:
+        s = pd.to_numeric(df[c], errors="coerce")
+        if len(s) == 0:
+            continue
+        if float(s.notna().mean()) >= min_valid_ratio:
+            numeric_cols.append(c)
+    return numeric_cols
+
+
 def auditar_dataset(df_inc: pd.DataFrame | None) -> dict[str, Any]:
     if df_inc is None:
         return {"disponible": False}
@@ -324,13 +388,38 @@ def auditar_dataset(df_inc: pd.DataFrame | None) -> dict[str, Any]:
     out["pct_duplicados_exactos"] = float(d.duplicated().mean()) if len(d) else 0.0
     out["pct_nulos_por_columna"] = {c: float(d[c].isna().mean()) for c in d.columns}
 
-    num = d.select_dtypes(include=[np.number])
+    numeric_candidates = set(d.select_dtypes(include=[np.number]).columns.tolist())
+    numeric_candidates.update(_coerce_numeric_columns(d))
+    num = d[list(sorted(numeric_candidates))].apply(pd.to_numeric, errors="coerce") if numeric_candidates else pd.DataFrame(index=d.index)
     low_var = []
     for c in num.columns:
         v = float(num[c].fillna(0).var())
         if v < 1e-8:
             low_var.append(c)
     out["columnas_varianza_casi_cero"] = low_var
+    colapso_variedad = []
+    for c in d.columns:
+        nun = int(d[c].nunique(dropna=True))
+        if len(d) > 0 and nun <= 1:
+            colapso_variedad.append(c)
+    out["columnas_colapso_variedad"] = colapso_variedad
+    out["n_duplicados_exactos"] = int(d.duplicated().sum())
+
+    q = max(1, int(len(d) * 0.2))
+    inicio = d.iloc[:q]
+    final = d.iloc[-q:]
+    cobertura_inicio = {}
+    cobertura_final = {}
+    for c in d.columns:
+        cobertura_inicio[c] = float(inicio[c].notna().mean()) if len(inicio) else None
+        cobertura_final[c] = float(final[c].notna().mean()) if len(final) else None
+    out["cobertura_inicio_por_columna"] = cobertura_inicio
+    out["cobertura_final_por_columna"] = cobertura_final
+    out["delta_cobertura_inicio_final"] = {
+        c: (cobertura_final.get(c, 0.0) - cobertura_inicio.get(c, 0.0))
+        for c in d.columns
+        if cobertura_inicio.get(c) is not None and cobertura_final.get(c) is not None
+    }
 
     if "result_bin" in d.columns:
         y = pd.to_numeric(d["result_bin"], errors="coerce")
@@ -344,10 +433,10 @@ def auditar_dataset(df_inc: pd.DataFrame | None) -> dict[str, Any]:
         out["ratio_etiquetas_validas_result_bin"] = None
         out["distribucion_clases_0_1"] = {}
 
-    main_cols = [c for c in ("payout", "volatilidad", "hora_bucket", "racha_actual") if c in d.columns]
+    main_cols = [c for c in ("payout", "volatilidad", "hora_bucket", "racha_actual") if c in num.columns]
     drift = {}
     for c in main_cols:
-        x = pd.to_numeric(d[c], errors="coerce")
+        x = pd.to_numeric(num[c], errors="coerce")
         if x.notna().sum() < 20:
             continue
         q = max(1, int(len(x) * 0.2))
@@ -355,9 +444,95 @@ def auditar_dataset(df_inc: pd.DataFrame | None) -> dict[str, Any]:
         fin = x.iloc[-q:].dropna()
         if len(ini) == 0 or len(fin) == 0:
             continue
-        drift[c] = float(fin.mean() - ini.mean())
+        sigma = float(x.dropna().std()) if x.dropna().size else 0.0
+        delta = float(fin.mean() - ini.mean())
+        drift[c] = {
+            "delta_media": delta,
+            "delta_rel_std": float(delta / sigma) if sigma > 1e-12 else None,
+            "ini_media": float(ini.mean()),
+            "fin_media": float(fin.mean()),
+        }
     out["drift_inicio_vs_final"] = drift
+    out["resumen"] = {
+        "columnas_numericas_detectadas": len(num.columns),
+        "columnas_colapso_variedad": len(colapso_variedad),
+        "drift_cols_con_medicion": len(drift),
+    }
     return out
+
+
+def detectar_inicio_maduro(df: pd.DataFrame, model_meta: dict[str, Any], min_util: int = MIN_MADURE_SAMPLE) -> dict[str, Any]:
+    n = len(df)
+    if n == 0:
+        return {"idx_inicio_maduro": 0, "razon": "sin_datos", "fase_temprana_hasta": 0}
+
+    warmup_hint = bool(model_meta.get("warmup_mode", False)) if isinstance(model_meta, dict) else False
+    min_idx_by_warmup = int(n * 0.2) if warmup_hint else int(n * 0.1)
+    candidates = [0, min_idx_by_warmup, int(n * 0.15), int(n * 0.2), int(n * 0.25), int(n * 0.3), int(n * 0.35)]
+    candidates = [max(0, min(n - 1, c)) for c in candidates]
+    candidates = sorted(set(candidates))
+
+    best_idx = candidates[-1]
+    best_reason = "fallback_ultima_ventana"
+    for idx in candidates:
+        seg = df.iloc[idx:]
+        if len(seg) < min_util:
+            continue
+        m = calcular_metricas_prediccion(seg)
+        if int(m.get("n_util", 0) or 0) < min_util:
+            continue
+        ini_eval = calcular_metricas_prediccion(df.iloc[idx : min(n, idx + max(min_util, int(0.2 * len(seg))))])
+        if (ini_eval.get("inflacion_pp") is not None) and abs(float(ini_eval.get("inflacion_pp"))) > 25:
+            continue
+        best_idx = idx
+        best_reason = "cumple_min_util_y_sin_sobreinflacion_extrema"
+        break
+
+    return {
+        "idx_inicio_maduro": int(best_idx),
+        "fase_temprana_hasta": int(best_idx),
+        "warmup_hint": warmup_hint,
+        "razon": best_reason,
+    }
+
+
+def obtener_segmentos_maduros(df: pd.DataFrame, model_meta: dict[str, Any], min_util: int = MIN_MADURE_SAMPLE) -> dict[str, Any]:
+    if df.empty:
+        return {
+            "fase_temprana": df,
+            "inicio_maduro": df,
+            "final_maduro": df,
+            "metadata": {"insuficiente_muestra": True, "motivo": "sin_datos"},
+        }
+
+    det = detectar_inicio_maduro(df, model_meta, min_util=min_util)
+    idx = det["idx_inicio_maduro"]
+    fase_temprana = df.iloc[:idx]
+    maduro = df.iloc[idx:]
+    if maduro.empty:
+        maduro = df
+
+    n_mad = len(maduro)
+    q = max(1, int(n_mad * 0.3))
+    inicio_mad = maduro.iloc[:q]
+    final_mad = maduro.iloc[-q:]
+
+    m_ini = calcular_metricas_prediccion(inicio_mad)
+    m_fin = calcular_metricas_prediccion(final_mad)
+    insuf = int(m_ini.get("n_util", 0) or 0) < min_util or int(m_fin.get("n_util", 0) or 0) < min_util
+
+    return {
+        "fase_temprana": fase_temprana,
+        "inicio_maduro": inicio_mad,
+        "final_maduro": final_mad,
+        "metadata": {
+            **det,
+            "n_maduro_total": int(n_mad),
+            "n_util_inicio_maduro": int(m_ini.get("n_util", 0) or 0),
+            "n_util_final_maduro": int(m_fin.get("n_util", 0) or 0),
+            "insuficiente_muestra": insuf,
+        },
+    }
 
 
 def cargar_model_meta(path: str = "model_meta_v2.json") -> dict[str, Any]:
@@ -415,6 +590,47 @@ def construir_veredicto_estabilidad(pred_first: dict[str, Any], pred_final: dict
     }
 
 
+def puntaje_estado(estado: str) -> int:
+    order = {
+        "ESTABLE": 0,
+        "DEGRADACIÓN_LEVE": 1,
+        "DEGRADACIÓN_MODERADA": 2,
+        "DEGRADACIÓN_FUERTE": 3,
+        "SOBRECONFIANZA": 4,
+        "INSUFICIENTE_MUESTRA": 5,
+    }
+    return order.get(str(estado), 9)
+
+
+def construir_threshold_rows(df_seg: pd.DataFrame, segmento: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if df_seg.empty:
+        for t in PRED_THRESHOLDS:
+            rows.append({"segmento": segmento, "threshold": t, "precision": None, "cobertura": None})
+        return rows
+    prob_col = elegir_columna_prob(df_seg)
+    if prob_col is None:
+        for t in PRED_THRESHOLDS:
+            rows.append({"segmento": segmento, "threshold": t, "precision": None, "cobertura": None})
+        return rows
+    y = df_seg["result_bin_norm"] if "result_bin_norm" in df_seg.columns else construir_result_bin(df_seg)
+    p = pd.to_numeric(df_seg[prob_col], errors="coerce")
+    util = y.isin([0, 1]) & p.notna()
+    yu = y[util].astype(float).to_numpy()
+    pu = p[util].astype(float).to_numpy()
+    mts = metricas_thresholds(yu, pu, PRED_THRESHOLDS) if len(yu) else {}
+    for t in PRED_THRESHOLDS:
+        rows.append(
+            {
+                "segmento": segmento,
+                "threshold": t,
+                "precision": mts.get(f"precision_at_{int(t*100):03d}"),
+                "cobertura": mts.get(f"cobertura_at_{int(t*100):03d}"),
+            }
+        )
+    return rows
+
+
 def cargar_registros_enriquecidos() -> tuple[pd.DataFrame, InputAudit]:
     frames = []
     usados = []
@@ -436,6 +652,8 @@ def cargar_registros_enriquecidos() -> tuple[pd.DataFrame, InputAudit]:
         frames.append(d)
         usados.append(f)
 
+    falt_princ.extend([f for f in MAIN_FILES if not os.path.exists(f)])
+    falt_princ = sorted(set(falt_princ))
     falt_opt = [f for f in OPTIONAL_FILES if not os.path.exists(f)]
     all_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if not all_df.empty:
@@ -455,15 +673,16 @@ def generar_reportes(reporte: dict[str, Any], temporal_rows: list[dict[str, Any]
 
 def imprimir_resumen(reporte: dict[str, Any]) -> None:
     pred = reporte.get("prediccion_global", {})
-    ver = reporte.get("veredicto", {})
+    ver = reporte.get("veredicto_global", {})
     model = reporte.get("model_meta", {})
-    bots = reporte.get("bot_estabilidad", [])
+    bots = reporte.get("veredictos_por_bot", [])
 
-    top_est = bots[:3]
-    top_deg = list(reversed(bots[-3:])) if len(bots) >= 3 else bots
+    top_est = [b for b in bots if b.get("estado") == "ESTABLE"][:3]
+    top_deg = [b for b in bots if b.get("estado") in ("SOBRECONFIANZA", "DEGRADACIÓN_FUERTE", "DEGRADACIÓN_MODERADA", "DEGRADACIÓN_LEVE")][:3]
 
     ini = reporte.get("inicio_maduro", {})
     fin = reporte.get("final_maduro", {})
+    fase = reporte.get("fase_madura_meta", {})
 
     print("\n" + "=" * 72)
     print("AUDITOR EJECUTIVO — ESTABILIDAD DE CALIDAD")
@@ -471,6 +690,7 @@ def imprimir_resumen(reporte: dict[str, Any]) -> None:
     print(f"Trades útiles: {pred.get('n_util', 0)} | Bots auditados: {reporte.get('bots_auditados', 0)}")
     print(f"Modelo: reliable={model.get('reliable')} warmup={model.get('warmup_mode')} n={model.get('n_samples')}")
     print(f"Dataset: filas={reporte.get('dataset', {}).get('filas_dataset_incremental')} dup%={reporte.get('dataset', {}).get('pct_duplicados_exactos')}")
+    print(f"Fase temprana hasta idx={fase.get('fase_temprana_hasta')} | n_util_inicio_maduro={fase.get('n_util_inicio_maduro')} | n_util_final_maduro={fase.get('n_util_final_maduro')}")
     print(f"VEREDICTO GLOBAL: {ver.get('estado')} | detalle={ver}")
     print("--- Inicio maduro vs Final maduro ---")
     print(f"avg_pred: {ini.get('avg_pred')} -> {fin.get('avg_pred')}")
@@ -482,7 +702,7 @@ def imprimir_resumen(reporte: dict[str, Any]) -> None:
     print("Top 3 bots estables:", [x.get("bot") for x in top_est])
     print("Top 3 bots degradados:", [x.get("bot") for x in top_deg])
     print("Advertencias críticas:")
-    for w in reporte.get("advertencias", []):
+    for w in reporte.get("motivos_de_advertencia", []):
         print(" -", w)
 
 
@@ -508,6 +728,8 @@ def _run_lightweight_without_pd_np() -> int:
                     rows.append(r)
         except Exception:
             continue
+    falt.extend([f for f in MAIN_FILES if not os.path.exists(f)])
+    falt = sorted(set(falt))
 
     n_total = len(rows)
     n_util = 0
@@ -525,7 +747,9 @@ def _run_lightweight_without_pd_np() -> int:
         y = None
         if str(r.get("result_bin", "")).strip() != "":
             try:
-                y = 1.0 if float(r.get("result_bin")) >= 0.5 else 0.0
+                val = float(r.get("result_bin"))
+                if val in (0.0, 1.0):
+                    y = val
             except Exception:
                 y = None
         if y is None:
@@ -616,46 +840,82 @@ def main() -> int:
         m = calcular_metricas_prediccion(wdf)
         temporal_rows.append({"segmento": wname, **m})
 
-    bot_rows = []
-    if not df.empty and "bot" in df.columns:
-        for b, g in df.groupby("bot"):
-            m = calcular_metricas_prediccion(g)
-            bot_rows.append({"bot": str(b), **m})
-        bot_rows.sort(key=lambda x: (x.get("inflacion_pp") or 999, -(x.get("win_rate_real") or 0)))
-
-    thr_rows = []
-    if not df.empty:
-        prob_col = elegir_columna_prob(df)
-        y = df["result_bin_norm"] if "result_bin_norm" in df.columns else pd.Series(np.nan, index=df.index)
-        if prob_col is not None:
-            p = pd.to_numeric(df[prob_col], errors="coerce")
-            util = y.isin([0, 1]) & p.notna()
-            yu = y[util].astype(float).to_numpy()
-            pu = p[util].astype(float).to_numpy()
-            mts = metricas_thresholds(yu, pu, PRED_THRESHOLDS) if len(yu) else {}
-            for t in PRED_THRESHOLDS:
-                thr_rows.append({
-                    "threshold": t,
-                    "precision": mts.get(f"precision_at_{int(t*100):03d}"),
-                    "cobertura": mts.get(f"cobertura_at_{int(t*100):03d}"),
-                })
-
     ds = auditar_dataset(df_inc)
     ds_rows = [{"metrica": k, "valor": json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v} for k, v in ds.items()]
 
-    # Inicio maduro / final maduro
-    ini = blocks.get("first_20", pd.DataFrame())
-    fin = blocks.get("last_20", pd.DataFrame())
-    ini_m = calcular_metricas_prediccion(ini) if not ini.empty else {}
-    fin_m = calcular_metricas_prediccion(fin) if not fin.empty else {}
+    # Segmentación madura real
+    mad = obtener_segmentos_maduros(df, meta) if not df.empty else {
+        "fase_temprana": pd.DataFrame(),
+        "inicio_maduro": pd.DataFrame(),
+        "final_maduro": pd.DataFrame(),
+        "metadata": {"insuficiente_muestra": True, "motivo": "sin_datos"},
+    }
+    fase_temprana_df = mad["fase_temprana"]
+    inicio_mad_df = mad["inicio_maduro"]
+    final_mad_df = mad["final_maduro"]
+    fase_meta = mad["metadata"]
+
+    fase_temprana_m = calcular_metricas_prediccion(fase_temprana_df) if not fase_temprana_df.empty else {"n_total": 0, "n_util": 0}
+    ini_m = calcular_metricas_prediccion(inicio_mad_df) if not inicio_mad_df.empty else {"n_total": 0, "n_util": 0}
+    fin_m = calcular_metricas_prediccion(final_mad_df) if not final_mad_df.empty else {"n_total": 0, "n_util": 0}
     verdict = construir_veredicto_estabilidad(ini_m, fin_m, meta)
+
+    thr_rows = []
+    thr_rows.extend(construir_threshold_rows(df, "global"))
+    thr_rows.extend(construir_threshold_rows(inicio_mad_df, "inicio_maduro"))
+    thr_rows.extend(construir_threshold_rows(final_mad_df, "final_maduro"))
+
+    bot_rows = []
+    if not df.empty and "bot" in df.columns:
+        for b, g in df.groupby("bot"):
+            g = g.sort_values("tiempo_orden").reset_index(drop=True)
+            seg_bot = obtener_segmentos_maduros(g, meta, min_util=MIN_SEGMENT_SAMPLE)
+            b_ini_df = seg_bot["inicio_maduro"]
+            b_fin_df = seg_bot["final_maduro"]
+            b_ini_m = calcular_metricas_prediccion(b_ini_df) if not b_ini_df.empty else {"n_total": 0, "n_util": 0}
+            b_fin_m = calcular_metricas_prediccion(b_fin_df) if not b_fin_df.empty else {"n_total": 0, "n_util": 0}
+            b_ver = construir_veredicto_estabilidad(b_ini_m, b_fin_m, meta)
+            bot_rows.append(
+                {
+                    "bot": str(b),
+                    "estado": b_ver.get("estado"),
+                    "veredicto": b_ver,
+                    "inicio_maduro": b_ini_m,
+                    "final_maduro": b_fin_m,
+                    "fase_madura_meta": seg_bot.get("metadata", {}),
+                    "wr_drop_pp": b_ver.get("wr_drop_pp"),
+                    "infl_up_pp": b_ver.get("infl_up_pp"),
+                    "n_util_inicio": b_ini_m.get("n_util"),
+                    "n_util_final": b_fin_m.get("n_util"),
+                }
+            )
+    bot_rows.sort(key=lambda x: (puntaje_estado(x.get("estado", "")), -(x.get("wr_drop_pp") or 0), (x.get("infl_up_pp") or 0)))
+    bot_rows_csv = [
+        {
+            "bot": b.get("bot"),
+            "estado": b.get("estado"),
+            "wr_drop_pp": b.get("wr_drop_pp"),
+            "infl_up_pp": b.get("infl_up_pp"),
+            "n_util_inicio": b.get("n_util_inicio"),
+            "n_util_final": b.get("n_util_final"),
+        }
+        for b in bot_rows
+    ]
 
     if bool(meta.get("warmup_mode", False)):
         advertencias.append("modelo actual sigue en warmup")
+    if fase_meta.get("insuficiente_muestra"):
+        advertencias.append("inicio/final maduro con muestra insuficiente para diagnóstico firme")
+    if int(fin_m.get("n_util", 0) or 0) < MIN_MADURE_SAMPLE:
+        advertencias.append("final_maduro tiene poca muestra útil")
+    if int(ini_m.get("n_util", 0) or 0) < MIN_MADURE_SAMPLE:
+        advertencias.append("inicio_maduro tiene poca muestra útil")
+    if int(pred_global.get("n_util", 0) or 0) < (MIN_MADURE_SAMPLE * 2):
+        advertencias.append("comparación global apoyada en pocos casos útiles")
     if ds.get("pct_duplicados_exactos", 0) and float(ds.get("pct_duplicados_exactos", 0)) > 0.15:
         advertencias.append("dataset_incremental con duplicación elevada")
     if len(bot_rows) > 0:
-        bad = [b["bot"] for b in bot_rows if b.get("n_util", 0) >= MIN_SEGMENT_SAMPLE and (b.get("inflacion_pp") or 0) > 8]
+        bad = [b["bot"] for b in bot_rows if b.get("estado") == "SOBRECONFIANZA"]
         if bad:
             advertencias.append("sobreconfianza creciente en bots: " + ", ".join(bad[:3]))
 
@@ -672,9 +932,13 @@ def main() -> int:
         "inversion_global": inv_global,
         "dataset": ds,
         "model_meta": meta,
+        "fase_temprana": fase_temprana_m,
         "inicio_maduro": ini_m,
         "final_maduro": fin_m,
-        "veredicto": verdict,
+        "fase_madura_meta": fase_meta,
+        "veredicto_global": verdict,
+        "veredictos_por_bot": bot_rows,
+        "motivos_de_advertencia": advertencias,
         "bot_estabilidad": bot_rows,
         "advertencias": advertencias,
         "clasificacion_reglas": {
@@ -686,9 +950,10 @@ def main() -> int:
             "INSUFICIENTE_MUESTRA": "n útil insuficiente en comparación madura",
         },
         "archivos_salida": [OUT_JSON, OUT_TEMPORAL, OUT_BOT, OUT_THR, OUT_DATASET],
+        "bots_auditados": int(len(bot_rows)),
     }
 
-    generar_reportes(reporte, temporal_rows, bot_rows, thr_rows, ds_rows)
+    generar_reportes(reporte, temporal_rows, bot_rows_csv, thr_rows, ds_rows)
     imprimir_resumen(reporte)
     return 0
 
