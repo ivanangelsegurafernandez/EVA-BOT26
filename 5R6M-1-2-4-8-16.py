@@ -328,9 +328,9 @@ IA_WARMUP_LOW_EVIDENCE_CAP_POST_N15 = 0.85
 
 AUTO_REAL_ALLOW_UNRELIABLE_POST_N15 = True
 AUTO_REAL_UNRELIABLE_MIN_N = 0
-AUTO_REAL_UNRELIABLE_MIN_PROB = 0.50  # modo unreliable moderado: habilita entradas cuando el modelo discrimina en 50-56%
-AUTO_REAL_UNRELIABLE_MIN_AUC = 0.48   # tolerancia leve en unreliable para no congelar AUTO con AUC marginal
-AUTO_REAL_BLOCK_WHEN_WARMUP = False   # permitir REAL moderado en LOW_DATA/warmup si compuerta dinámica valida
+AUTO_REAL_UNRELIABLE_MIN_PROB = 0.56  # modo unreliable conservador: exige mejor discriminación antes de REAL
+AUTO_REAL_UNRELIABLE_MIN_AUC = 0.52   # unreliable conservador: evita activaciones con AUC marginal débil
+AUTO_REAL_BLOCK_WHEN_WARMUP = True   # bloquear REAL en warmup: solo observación/shadow-micro prudente
 # Ajuste mínimo anti-congelamiento lateral: permite bajar el umbral UNREL
 # solo cuando hay evidencia operativa consistente por bot.
 AUTO_REAL_UNREL_LATERAL_ADAPT_ENABLE = True
@@ -347,7 +347,7 @@ AUTO_REAL_UNREL_MICRO_RELAX_MAX_DELTA = 0.02
 AUTO_REAL_UNREL_MICRO_RELAX_LOG_COOLDOWN_S = 45.0
 # Bypass controlado: si la compuerta REAL ya está sólida en vivo, permitir AUTO
 # aunque el modelo siga en warmup/reliable=false.
-AUTO_REAL_UNRELIABLE_ALLOW_STRONG_GATE = True
+AUTO_REAL_UNRELIABLE_ALLOW_STRONG_GATE = False
 AUTO_REAL_UNRELIABLE_GATE_MIN_PROB = IA_ACTIVACION_REAL_THR_POST_N15
 
 # Guardas por bot para reducir desalineación Prob IA vs % Éxito observado en HUD.
@@ -361,7 +361,7 @@ GATE_ACTIVO_MIN_MUESTRA = 40         # mínimo de cierres por activo para evalua
 GATE_ACTIVO_MIN_WR = 0.48            # si WR reciente por activo cae debajo, bloquear temporalmente
 GATE_ACTIVO_LOOKBACK = 180           # cierres recientes por bot para estimar régimen
 # Gate por segmentos (payout/vol/hora): prioriza zonas con señal estable de racha_actual
-GATE_SEGMENTO_ENABLED = False  # transición v2: evitar dependencia legacy vol/hora hasta migrar gate
+GATE_SEGMENTO_ENABLED = True  # gate segmento operativo para filtrar contexto débil
 GATE_SEGMENTO_MIN_MUESTRA = 35
 GATE_SEGMENTO_MIN_WR = 0.50
 GATE_SEGMENTO_LOOKBACK = 240
@@ -437,7 +437,7 @@ PATTERN_V1_BONUS_DUAL = 1.0
 PATTERN_V1_PENAL_TARDIA = 2.0
 PATTERN_V1_REQUIRE_CONFIRM_FULL = True   # confirm=2/2
 PATTERN_V1_REQUIRE_TRIGGER_OK = True     # trigger_ok=sí
-PATTERN_V1_USE_HYBRID_RANKING = False    # transición v2: evitar sesgo legacy en ranking
+PATTERN_V1_USE_HYBRID_RANKING = True    # ranking híbrido operativo (prob + pattern + evidencia)
 PATTERN_V1_LOG_COOLDOWN_S = 25.0
 PATTERN_V1_HYBRID_PTS_TO_PROB = 0.03  # 1 punto pattern = 3pp sobre score probabilístico
 PATTERN_V1_Q3_PROXY = {
@@ -456,18 +456,18 @@ PATTERN_V1_Q2_PROXY = {
 PATTERN_V1_LAST_LOG_TS = {}
 # Fase operativa REAL por madurez: SHADOW -> MICRO -> NORMAL
 REAL_PILOT_MODE_ENABLE = True
-REAL_MICRO_REQUIRE_PATTERN = False
+REAL_MICRO_REQUIRE_PATTERN = True
 REAL_MICRO_PATTERN_MIN_TOTAL = 4.0
 REAL_MICRO_REQUIRE_DUAL = False
 REAL_MICRO_REQUIRE_STRUCTURE = True
 REAL_MICRO_MIN_WR = 0.50
 REAL_MICRO_MIN_TRADES = 40
 REAL_MICRO_TOP_K = 1
-REAL_MICRO_ALLOW_SOFT_HIGH_PROB = True
+REAL_MICRO_ALLOW_SOFT_HIGH_PROB = False
 REAL_MICRO_SOFT_MIN_PROB = 0.66
 REAL_MICRO_SOFT_MIN_SUCESO = 18.0
 REAL_MICRO_SOFT_MIN_WR = 0.47
-REAL_SHADOW_MICRO_ENABLE = True
+REAL_SHADOW_MICRO_ENABLE = False
 REAL_SHADOW_MICRO_MIN_PROB = 0.60
 REAL_SHADOW_MICRO_MAX_ENTRIES = 4
 REAL_SHADOW_MICRO_WINDOW_S = 15 * 60
@@ -475,7 +475,7 @@ REAL_SHADOW_MICRO_TOP_K = 1
 REAL_SHADOW_MICRO_LOG_COOLDOWN_S = 20.0
 _REAL_SHADOW_MICRO_OPEN_TS = deque(maxlen=64)
 _REAL_SHADOW_MICRO_LAST_LOG_TS = 0.0
-REAL_MICRO_STRONG_GATE_FALLBACK_ENABLE = True
+REAL_MICRO_STRONG_GATE_FALLBACK_ENABLE = False
 REAL_MICRO_STRONG_GATE_MIN_PROB = 0.64
 EMBUDO_FINAL_BLOCK_HARD = "BLOCK_HARD"
 EMBUDO_FINAL_WAIT_SOFT = "WAIT_SOFT"
@@ -875,7 +875,7 @@ FEATURE_NAMES_INTERACCIONES = [
 
 # Gobernanza calidad>cantidad: entrenar solo con features que realmente aporten.
 FEATURE_ALWAYS_KEEP = ["racha_actual"]
-FEATURE_MAX_PROD = 4
+FEATURE_MAX_PROD = 6
 FEATURE_SET_PROD_WARMUP = ["racha_actual", "payout", "ret_3m", "range_norm", "rv_20", "puntaje_estrategia"]
 FEATURE_SET_CORE_EXT = [
     "racha_actual", "payout", "ret_1m", "ret_3m",
@@ -1810,6 +1810,17 @@ def validar_fila_incremental(fila_dict, feature_names):
             v = float(fila_dict.get(k, 0.0) or 0.0)
             if not (lo <= v <= hi):
                 return False, f"{k} fuera de rango [{lo},{hi}]"
+
+    # Cuarentena conservadora: filas sospechosas que contaminan entrenamiento
+    try:
+        vals = [float(fila_dict.get(k, 0.0) or 0.0) for k in feature_names]
+        nz = sum(1 for v in vals if abs(v) > 1e-12)
+        if len(vals) >= 8 and nz <= 2:
+            return False, "fila_sospechosa: casi_todo_cero"
+        if sum(1 for v in vals if not np.isfinite(v)) > 0:
+            return False, "fila_sospechosa: no_finito"
+    except Exception:
+        return False, "fila_sospechosa: parse"
 
     return True, ""
         
@@ -10003,11 +10014,33 @@ def maybe_retrain(force: bool = False):
 
             # Si no hay modelo aún, reintentar entrenamiento aunque no se cumplan gatillos de filas/tiempo.
             if modelo_presente:
+                quality_trigger = False
+                quality_reason = ""
+                try:
+                    rep_q = auditar_calibracion_seniales_reales(min_prob=float(IA_CALIB_THRESHOLD)) or {}
+                    infl_q = rep_q.get("inflacion_pp", None)
+                    brier_q = rep_q.get("brier", None)
+                    n_q = int(rep_q.get("n", 0) or 0)
+                    if isinstance(infl_q, (int, float)) and n_q >= 20 and abs(float(infl_q)) >= 12.0:
+                        quality_trigger = True
+                        quality_reason = "calibracion_gap"
+                    if isinstance(brier_q, (int, float)) and float(brier_q) >= 0.30:
+                        quality_trigger = True
+                        quality_reason = quality_reason or "brier"
+                    dg = _leer_gate_desde_diagnostico(ttl_s=60.0) if "_leer_gate_desde_diagnostico" in globals() else {}
+                    if isinstance(dg, dict) and float(dg.get("drift_score", 0.0) or 0.0) >= 0.18:
+                        quality_trigger = True
+                        quality_reason = quality_reason or "drift"
+                except Exception:
+                    quality_trigger = False
+
                 if new_rows >= int(RETRAIN_INTERVAL_ROWS):
                     pass
                 else:
                     if mins >= float(RETRAIN_INTERVAL_MIN) and new_rows >= int(MIN_NEW_ROWS_FOR_TIME):
                         pass
+                    elif quality_trigger:
+                        agregar_evento(f"🧪 IA reentreno por calidad: {quality_reason} (rows+={new_rows}, min={mins:.1f}).")
                     else:
                         return False
 
@@ -10046,7 +10079,7 @@ def maybe_retrain(force: bool = False):
             return False
 
         # 4) Construir X/y robusto (usa tus builders)
-        feats_pref = list(INCREMENTAL_FEATURES_V2)
+        feats_pref = list(dict.fromkeys(list(INCREMENTAL_FEATURES_V2) + list(FEATURE_NAMES_INTERACCIONES)))
 
         X, y, feats_used, label_col = _build_Xy_incremental(df, feature_names=feats_pref)
         if X is None or y is None or feats_used is None:
@@ -10674,6 +10707,17 @@ def maybe_retrain(force: bool = False):
             if len(feats_used) < int(TRAIN_PROMOTE_MIN_FEATURES):
                 promote_ok = False
                 promote_reasons.append(f"feats<{int(TRAIN_PROMOTE_MIN_FEATURES)}")
+            if float(test_prec_at_thr) < float(IA_TARGET_PRECISION_FLOOR):
+                promote_ok = False
+                promote_reasons.append(f"p@thr<{float(IA_TARGET_PRECISION_FLOOR):.2f}")
+            if isinstance(brier, (int, float)) and float(brier) > 0.28:
+                promote_ok = False
+                promote_reasons.append("brier_alto")
+            rep_prom = auditar_calibracion_seniales_reales(min_prob=float(IA_CALIB_THRESHOLD)) or {}
+            infl_prom = rep_prom.get("inflacion_pp", None)
+            if isinstance(infl_prom, (int, float)) and abs(float(infl_prom)) > 15.0:
+                promote_ok = False
+                promote_reasons.append("gap_pred_real")
             hg_train = _estado_guardrail_ia_fuerte(force=True)
             if bool(hg_train.get("hard_block", False)):
                 promote_ok = False
@@ -12905,6 +12949,37 @@ def _umbral_real_operativo_actual() -> float:
     return float(max(piso_conf, float(IA_ACTIVACION_REAL_THR)))
 
 
+
+
+def _umbral_real_por_bot_contexto(bot: str, ctx: dict | None, base_thr: float | None = None) -> tuple[float, str]:
+    """Umbral REAL conservador por bot/contexto con fallback seguro al umbral global."""
+    thr = float(_umbral_real_operativo_actual() if base_thr is None else base_thr)
+    reason = "base"
+    try:
+        b = str(bot or "")
+        ev = _evidencia_bot_umbral_objetivo(b)
+        ev_n = int(ev.get("n", 0) or 0)
+        ev_lb = float(ev.get("lb", 0.0) or 0.0)
+        c = ctx if isinstance(ctx, dict) else {}
+        hb = float(c.get("hora_bucket", 0.0) or 0.0)
+        pay = float(c.get("payout", 0.0) or 0.0)
+        vol = float(c.get("volatilidad", 0.0) or 0.0)
+
+        if ev_n >= int(EVIDENCE_MIN_N_HARD) and ev_lb >= float(EVIDENCE_MIN_LB_HARD):
+            thr = max(0.50, thr - 0.01)
+            reason = "evidence_strong"
+        elif ev_n < int(EVIDENCE_MIN_N_SOFT):
+            thr = min(0.99, thr + 0.02)
+            reason = "evidence_low"
+
+        # Contexto riesgoso: subir ligeramente el umbral
+        if (pay < 0.25) or (vol > 0.85) or (hb <= 0.05):
+            thr = min(0.99, thr + 0.01)
+            reason = reason + "+ctx_risk"
+    except Exception:
+        pass
+    return float(max(0.0, min(0.99, thr))), str(reason)
+
 def _n_minimo_real_status() -> tuple[int, int]:
     """Retorna (mínimo n actual entre bots, n requerido) para diagnóstico en HUD."""
     try:
@@ -13393,12 +13468,14 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         else:
             trigger_ok = bool(crossed_up)
         if warmup_mode and (not mode_c_active):
-            # En modo B (post-n15) no anular trigger por warmup si la compuerta ya
-            # pasó allow_real y hay suceso_ok; evita bloqueo infinito en EXPERIMENTAL.
-            if not modo_relajado_n15:
-                trigger_ok = bool(trigger_ok and suceso_ok)
+            # Modo precisión conservador: bloquear REAL en warmup.
+            if bool(AUTO_REAL_BLOCK_WHEN_WARMUP):
+                trigger_ok = False
             else:
-                trigger_ok = bool(trigger_ok)
+                if not modo_relajado_n15:
+                    trigger_ok = bool(trigger_ok and suceso_ok)
+                else:
+                    trigger_ok = bool(trigger_ok)
 
         last_open_tick = int(DYN_ROOF_STATE.get("last_open_tick", 0) or 0)
         new_open = bool(
@@ -13561,6 +13638,12 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
             risk_mode = "REAL_MICRO"
             degrade_from = "canary"
             reason = "canary->micro"
+
+        if bool(AUTO_REAL_BLOCK_WHEN_WARMUP) and bool(meta.get("warmup_mode", n_samples < int(TRAIN_WARMUP_MIN_ROWS))) and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
+            decision = EMBUDO_FINAL_SHADOW_OK
+            risk_mode = "SHADOW_OK"
+            degrade_from = "warmup"
+            reason = "warmup->shadow"
         if not reliable:
             if decision == EMBUDO_FINAL_REAL_NORMAL:
                 decision = EMBUDO_FINAL_REAL_MICRO
@@ -13572,6 +13655,23 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
                 risk_mode = "SHADOW_OK"
                 degrade_from = "unreliable"
                 reason = "unreliable->shadow"
+
+        # Prudencia extra en Martingala avanzada C2..C5: exigir contexto vivo.
+        try:
+            ciclo_adv = int(ciclo_martingala_siguiente())
+        except Exception:
+            ciclo_adv = 1
+        if ciclo_adv > 1 and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
+            confirm_bot = str(dgate.get("confirm_bot", DYN_ROOF_STATE.get("confirm_bot", "")) or "")
+            confirm_streak_adv = int(dgate.get("confirm_streak", DYN_ROOF_STATE.get("confirm_streak", 0)) or 0)
+            trigger_adv = bool(dgate.get("trigger_ok", False))
+            allow_adv = bool(dgate.get("allow_real", False))
+            if (not allow_adv) or (not trigger_adv) or (confirm_streak_adv < max(1, confirm_need)) or (confirm_bot and confirm_bot != top1_bot):
+                decision = EMBUDO_FINAL_WAIT_SOFT
+                risk_mode = "WAIT_SOFT"
+                soft_wait_reason = "marti_contexto_degradado"
+                degrade_from = "marti_context"
+                reason = f"marti_C{ciclo_adv}_contexto"
 
         # Consistencia explícita: no permitir doble ganador entre dyn_gate y embudo.
         best_dyn = str(dgate.get("best_bot", "") or "").strip()
@@ -14752,6 +14852,7 @@ async def main():
 
                         # Candidatos: prob válida, reciente, IA activa (no OFF)
                         candidatos = []
+                        raw_rank_scores = []
                         diag_gate = _leer_gate_desde_diagnostico(ttl_s=60.0)
                         # CTT como autoridad contextual superior: si hay veto duro,
                         # no se evalúan señales individuales/techo en este tick.
@@ -14877,8 +14978,10 @@ async def main():
                                     )
                                     continue
 
-                                # Candado final: el umbral REAL se valida sobre la probabilidad posterior (no p_model)
-                                thr_post = float(umbral_ia_real)
+                                # Candado final: umbral REAL por bot/contexto con fallback global
+                                thr_post, thr_reason = _umbral_real_por_bot_contexto(b, ctx, umbral_ia_real)
+                                estado_bots[b]["ia_thr_real_bot"] = float(thr_post)
+                                estado_bots[b]["ia_thr_real_reason"] = str(thr_reason)
                                 if ev_n < int(EVIDENCE_MIN_N_SOFT):
                                     thr_post = min(0.99, thr_post + float(EVIDENCE_LOW_N_EXTRA_MARGIN))
                                 if float(p_post) < float(thr_post):
@@ -14938,12 +15041,24 @@ async def main():
                                 estado_bots[b]["ia_regime_score"] = float(regime_score)
                                 estado_bots[b]["ia_evidence_n"] = int(ev_n)
                                 estado_bots[b]["ia_evidence_wr"] = float(ev_wr)
+                                raw_rank_scores.append((float(score_final), b))
 
                                 candidatos.append((float(score_hibrido), b, float(p), float(p_post), float(regime_score), int(ev_n), float(ev_wr), float(ev_lb)))
                             except Exception:
                                 continue
 
                             candidatos.sort(key=lambda x: x[0], reverse=True)
+                            if bool(PATTERN_V1_ENABLE) and bool(PATTERN_V1_USE_HYBRID_RANKING) and candidatos and raw_rank_scores:
+                                try:
+                                    raw_rank_scores.sort(key=lambda x: x[0], reverse=True)
+                                    top_raw = str(raw_rank_scores[0][1])
+                                    top_hyb = str(candidatos[0][1])
+                                    ts_last = float(globals().get("_PATTERN_RANK_SHIFT_LAST_TS", 0.0) or 0.0)
+                                    if top_raw != top_hyb and (time.time() - ts_last) >= float(PATTERN_V1_RANK_SHIFT_LOG_COOLDOWN_S):
+                                        globals()["_PATTERN_RANK_SHIFT_LAST_TS"] = float(time.time())
+                                        agregar_evento(f"🧠 PatternV1 reordenó top: raw={top_raw} -> híbrido={top_hyb}.")
+                                except Exception:
+                                    pass
 
                             ctt_eval = evaluar_ctt_fase([])[1]
                             if candidatos:
