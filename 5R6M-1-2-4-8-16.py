@@ -62,6 +62,8 @@ warnings.filterwarnings(
 )
 
 
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+
 def _load_optional_module(name: str):
     try:
         if str(name) == "pygame":
@@ -75,6 +77,21 @@ def _load_optional_module(name: str):
         return importlib.import_module(name)
     except Exception:
         return None
+
+
+def _safe_mean_np(values, default=None):
+    """Media robusta: evita RuntimeWarning en slices vacíos y NaN-only."""
+    try:
+        arr = np.asarray(values)
+        if arr.size <= 0:
+            return default
+        with np.errstate(invalid="ignore", divide="ignore"):
+            m = np.nanmean(arr.astype(float))
+        if not np.isfinite(m):
+            return default
+        return float(m)
+    except Exception:
+        return default
 
 
 websockets = _load_optional_module("websockets")
@@ -5218,13 +5235,14 @@ def auditar_degradacion_temporal_modelo(
                 auc = float(roc_auc_score(yy, pred)) if len(np.unique(yy)) > 1 else None
             except Exception:
                 auc = None
-            acc = float(np.mean((pred >= 0.5).astype(int) == yy)) if post_rows > 0 else None
+            acc = _safe_mean_np((pred >= 0.5).astype(int) == yy, None) if post_rows > 0 else None
             try:
                 brier = float(brier_score_loss(yy, pred)) if post_rows > 0 else None
             except Exception:
                 brier = None
-            base_rate = float(np.mean(yy)) if post_rows > 0 else None
-            drift = float(abs((float(np.mean(pred)) if post_rows > 0 else 0.5) - (base_rate if base_rate is not None else 0.5)))
+            base_rate = _safe_mean_np(yy, None) if post_rows > 0 else None
+            mean_pred = _safe_mean_np(pred, 0.5) if post_rows > 0 else 0.5
+            drift = float(abs(float(mean_pred) - (base_rate if base_rate is not None else 0.5)))
 
             rows.append({
                 "window": int(wi),
@@ -6044,8 +6062,8 @@ def auditar_calibracion_seniales_reales(min_prob: float = 0.70, max_rows: int = 
                 ece += abs(avg_p - avg_y) * (cnt / n)
             return float(ece)
 
-        win_rate = float(np.mean(y))
-        avg_pred = float(np.mean(p))
+        win_rate = _safe_mean_np(y, None)
+        avg_pred = _safe_mean_np(p, None)
         infl_pp = (avg_pred - win_rate) * 100.0
 
         factor = 1.0
@@ -6053,7 +6071,7 @@ def auditar_calibracion_seniales_reales(min_prob: float = 0.70, max_rows: int = 
             factor = win_rate / avg_pred
             factor = max(0.60, min(1.30, factor))  # clamp defensivo
 
-        brier = float(np.mean((p - y) ** 2))
+        brier = _safe_mean_np((p - y) ** 2, None)
         ece = _ece(y, p, bins=n_bins)
 
         por_bot = {}
@@ -6063,8 +6081,8 @@ def auditar_calibracion_seniales_reales(min_prob: float = 0.70, max_rows: int = 
                 yb = g["y"].to_numpy(dtype=float)
                 pb = g["prob"].to_numpy(dtype=float)
 
-                wr = float(np.mean(yb)) if n else None
-                ap = float(np.mean(pb)) if n else None
+                wr = _safe_mean_np(yb, None) if n else None
+                ap = _safe_mean_np(pb, None) if n else None
                 inf = ((ap - wr) * 100.0) if (wr is not None and ap is not None) else None
 
                 fb = 1.0
@@ -6078,7 +6096,7 @@ def auditar_calibracion_seniales_reales(min_prob: float = 0.70, max_rows: int = 
                     "avg_pred": ap,
                     "inflacion_pp": inf,
                     "factor": fb,
-                    "brier": float(np.mean((pb - yb) ** 2)) if n else None,
+                    "brier": _safe_mean_np((pb - yb) ** 2, None) if n else None,
                     "ece": _ece(yb, pb, bins=n_bins) if n else None,
                 }
         except Exception:
@@ -10407,7 +10425,7 @@ def maybe_retrain(force: bool = False):
                     mask = (yp == 1)
                     n_sig = int(np.sum(mask))
                     if n_sig > 0:
-                        prec = float(np.mean(np.asarray(y_calib)[mask] == 1))
+                        prec = _safe_mean_np(np.asarray(y_calib)[mask] == 1, 0.0)
                     else:
                         prec = 0.0
 
@@ -10432,7 +10450,7 @@ def maybe_retrain(force: bool = False):
                     mask_fb = (p >= thr)
                     calib_n_at_thr = int(np.sum(mask_fb))
                     if calib_n_at_thr > 0:
-                        calib_prec_at_thr = float(np.mean(np.asarray(y_calib)[mask_fb] == 1))
+                        calib_prec_at_thr = _safe_mean_np(np.asarray(y_calib)[mask_fb] == 1, 0.0)
         except Exception:
             thr = float(THR_DEFAULT)
 
@@ -10505,7 +10523,7 @@ def maybe_retrain(force: bool = False):
                     aucs.append(float(roc_auc_score(yva, pp)))
 
                 if aucs:
-                    cv_auc = float(np.mean(aucs))
+                    cv_auc = _safe_mean_np(aucs, None)
         except Exception:
             cv_auc = None
 
@@ -10518,7 +10536,7 @@ def maybe_retrain(force: bool = False):
                 mask_t = (p_test >= float(thr))
                 test_n_at_thr = int(np.sum(mask_t))
                 if test_n_at_thr > 0:
-                    test_prec_at_thr = float(np.mean(np.asarray(y_test)[mask_t] == 1))
+                    test_prec_at_thr = _safe_mean_np(np.asarray(y_test)[mask_t] == 1, 0.0)
         except Exception:
             test_prec_at_thr = 0.0
             test_n_at_thr = 0
