@@ -155,7 +155,7 @@ init(autoreset=True)
 
 # === BLOQUE 2 — CONFIGURACIÓN GLOBAL (MARTINGALA, HUD, AUDIO, IA) ===
 # === CONFIGURACIÓN DE MARTINGALA ===
-MARTI_ESCALADO = [1, 2, 4, 8, 16, 32]  # Escalado ajustado a 6 pasos
+MARTI_ESCALADO = [1, 2, 4, 8, 16]  # Escalado oficial de 5 pasos
 MONTO_TOL = 0.01  # Tolerancia para redondeos
 SONAR_TAMBIEN_EN_DEMO = False  # Activar sonidos para victorias en DEMO
 SONAR_SOLO_EN_GATEWIN = True   # Solo sonar dentro de la ventana GateWIN
@@ -180,7 +180,7 @@ CTT_REQUIRE_SAME_ASSET = True      # no mezclar activos en consenso
 CTT_ACTIVO_UNICO = "1HZ50V"         # opción 1: todos los bots operan el mismo sintético
 CTT_NEUTRAL_POLICY = "normal"      # normal | block
 CTT_CIERRE_LOOKBACK_MAX = 600       # higiene memoria eventos
-CTT_ENABLE_GREEN_IN_MARTI_ADVANCED = False  # C2..C6: CTT actúa como freno más que como habilitador
+CTT_ENABLE_GREEN_IN_MARTI_ADVANCED = False  # C2..C5: CTT actúa como freno más que como habilitador
 
 def _ctt_min_confirmadores() -> int:
     n = int(len(BOT_NAMES))
@@ -755,7 +755,7 @@ ultimo_bot_real = None
 # Rotación por corrida de martingala REAL (C1..C5)
 # Guarda el orden de bots usados en la corrida activa para evitar repeticiones.
 bots_usados_en_esta_marti = []
-# Continuidad inteligente C2..C6: si no hay bot nuevo elegible, permitir repetir
+# Continuidad inteligente C2..C5: si no hay bot nuevo elegible, permitir repetir
 # el mejor candidato SOLO bajo umbral mínimo de probabilidad operativa.
 MARTI_CYCLE_ALLOW_REPEAT_FALLBACK = True
 MARTI_CYCLE_REPEAT_MIN_PROB = 0.68
@@ -763,7 +763,7 @@ MARTI_CYCLE_REPEAT_MIN_PROB_UNRELIABLE_CAP = 0.66
 
 
 def _marti_repeat_min_prob_live(meta_live=None):
-    """Umbral vivo para fallback C2..C6, con ajuste conservador en modo no confiable."""
+    """Umbral vivo para fallback C2..C5, con ajuste conservador en modo no confiable."""
     base = float(MARTI_CYCLE_REPEAT_MIN_PROB)
     try:
         if not isinstance(meta_live, dict):
@@ -1043,7 +1043,7 @@ def write_token_atomic(path, content):
 # 2) fulll50/fulll45: rendimiento similar pero con muestra algo mayor.
 # 3) fulll48: intermedio, baja muestra.
 # 4) fulll49/fulll46: sobreconfianza alta y peor hit-rate reciente.
-BOT_NAMES = ["fulll47", "fulll50", "fulll45", "fulll48", "fulll49", "fulll46", "fulll51", "fulll52", "fulll53", "fulll54"]
+BOT_NAMES = ["fulll47", "fulll50", "fulll45", "fulll48", "fulll49", "fulll46"]
 IA53_TRIGGERED = {bot: False for bot in BOT_NAMES}
 IA53_LAST_TS = {bot: 0.0 for bot in BOT_NAMES}
 TOKEN_FILE = "token_actual.txt"
@@ -1226,6 +1226,8 @@ def contar_filas_csv(bot_name: str) -> int:
             print(f"⚠️ Error contando filas en {ruta}: {e}")
             continue
     return 0
+
+INCREMENTAL_LOCK_FILE = "incremental.lock"
 
 # Contar filas en dataset_incremental.csv (sin contar header)
 def contar_filas_incremental() -> int:
@@ -2044,7 +2046,7 @@ def _escribir_orden_real_raw(bot: str, ciclo: int):
         except Exception:
             pass
 
-def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
+def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> bool:
 
     """
     Reserva REAL y actualiza HUD de forma INMEDIATA.
@@ -2058,7 +2060,7 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
 
     try:
         if bot not in BOT_NAMES:
-            return
+            return False
 
         now = time.time()
 
@@ -2078,12 +2080,11 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
                     limpiar_orden_real(bot)
             except Exception:
                 pass
-            return
-
+            return False
 
         # Anti doble-disparo (tecla rebotona)
         if (now - _last_real_push_ts.get(bot, 0.0)) < 0.25:
-            return
+            return False
         _last_real_push_ts[bot] = now
 
         ciclo_obj = max(1, min(int(ciclo), MAX_CICLOS))
@@ -2100,7 +2101,7 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
                 owner_now = leer_token_actual()
                 cyc_now = int(estado_bots.get(bot, {}).get("ciclo_actual", 1) or 1)
                 if owner_now == bot and cyc_now == ciclo_obj:
-                    return
+                    return True
             except Exception:
                 pass
 
@@ -2117,18 +2118,29 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
         except Exception:
             prev_holder = None
 
-        # Reservar lock owner en memoria + token REAL en archivo
-        REAL_OWNER_LOCK = bot
-
-        # Reservar token REAL en archivo SOLO cuando corresponde:
-        # - orden_real: orden explícita ya escrita por wrapper
-        # - manual: el propio activar_real_inmediato puede escribir orden_real
-        # - token_sync: sincroniza token sin tocar orden_real.json
+        # Persistir primero token REAL y confirmar después memoria/UI
         if origen in ("orden_real", "manual", "token_sync"):
-            with file_lock():
-                write_token_atomic(TOKEN_FILE, f"REAL:{bot}")
+            with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
+                if not got:
+                    agregar_evento("⚠️ Token REAL no escrito: lock real.lock ocupado. Se evita activar sin exclusión.")
+                    try:
+                        if origen == "orden_real":
+                            limpiar_orden_real(bot)
+                    except Exception:
+                        pass
+                    return False
+                ok_write = bool(write_token_atomic(TOKEN_FILE, f"REAL:{bot}"))
+                if not ok_write:
+                    agregar_evento("⚠️ Token REAL no escrito: fallo de persistencia en token_actual.txt.")
+                    try:
+                        if origen == "orden_real":
+                            limpiar_orden_real(bot)
+                    except Exception:
+                        pass
+                    return False
 
-
+        # Confirmación en memoria SOLO tras persistencia correcta
+        REAL_OWNER_LOCK = bot
 
         # 2) Estado interno inmediato (HUD)
         _set_ui_token_holder(bot)
@@ -2183,34 +2195,20 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
         try:
             fn_panel = globals().get("mostrar_panel", None)
             if callable(fn_panel):
-                with RENDER_LOCK:
-                    fn_panel()
+                fn_panel()
         except Exception:
             pass
 
-        # 4) Saldo en background (no frena UI)
+        # 4) Standby estricto del resto (evita doble-REAL visual)
         try:
-            loop = asyncio.get_running_loop()
-            fn_saldo = globals().get("obtener_saldo_real", None)
-            if callable(fn_saldo):
-                loop.create_task(fn_saldo())
-            else:
-                fn_refresh = globals().get("refresh_saldo_real", None)
-                if callable(fn_refresh):
-                    loop.create_task(fn_refresh(forzado=True))
+            _enforce_single_real_standby(bot)
         except Exception:
             pass
 
-        # 5) Log de promociones
-        try:
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            with open("registro_promociones.txt", "a", encoding="utf-8") as log:
-                log.write(f"{timestamp} - Token REAL (inmediato) asignado a {bot} (ciclo {ciclo_obj})\n")
-        except Exception:
-            pass
+        return True
 
     except Exception:
-        pass
+        return False
 
 def escribir_orden_real(bot: str, ciclo: int) -> bool:
     global REAL_OWNER_LOCK
@@ -2248,10 +2246,11 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
         pass
 
     _escribir_orden_real_raw(bot, ciclo)
-    activar_real_inmediato(bot, ciclo, origen="orden_real")
+    ok_activate = bool(activar_real_inmediato(bot, ciclo, origen="orden_real"))
 
-    owner_after = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
-    ok = owner_after == bot
+    owner_after_mem = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+    owner_after_file = leer_token_archivo_raw()
+    ok = bool(ok_activate and owner_after_mem == bot and owner_after_file == bot)
     if ok:
         _marti_audit_log_orden(ciclo, bot=bot, origen="escribir_orden_real")
         if int(ciclo) == 1:
@@ -2509,6 +2508,27 @@ def activar_remate(bot: str, reason: str):
 # Cerrar por WIN
 def cerrar_por_win(bot: str, reason: str):
     global REAL_OWNER_LOCK, REAL_COOLDOWN_UNTIL_TS
+
+    # Liberar token REAL en archivo primero (commit de salida)
+    liberado = False
+    try:
+        with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
+            if got:
+                liberado = bool(write_token_atomic(TOKEN_FILE, "REAL:none"))
+                if not liberado:
+                    agregar_evento("⚠️ Token REAL no liberado: fallo de persistencia en token_actual.txt.")
+            else:
+                agregar_evento("⚠️ Token REAL no liberado por lock ocupado (real.lock).")
+    except Exception:
+        liberado = False
+
+    if not liberado:
+        return
+
+    # Liberación consolidada: recién aquí memoria/UI pasan a DEMO
+    REAL_OWNER_LOCK = None
+    REAL_COOLDOWN_UNTIL_TS = time.time() + float(_cooldown_post_trade_s())
+
     # Limpieza total de “estado REAL” para evitar REAL fantasma
     try:
         estado_bots[bot]["token"] = "DEMO"
@@ -2532,26 +2552,18 @@ def cerrar_por_win(bot: str, reason: str):
     except Exception:
         pass
 
-    # Liberar token global REAL
-    REAL_OWNER_LOCK = None
-    REAL_COOLDOWN_UNTIL_TS = time.time() + float(_cooldown_post_trade_s())
-    try:
-        with file_lock():
-            write_token_atomic(TOKEN_FILE, "REAL:none")
-    except Exception:
-        pass
     # Limpiar orden REAL para evitar re-entradas fantasma
     try:
         limpiar_orden_real(bot)
     except Exception:
         pass
-    
+
     # Sync inmediato del HUD/token para evitar “REAL fantasma”
     try:
         _set_ui_token_holder(None)
     except Exception:
         pass
-    
+
     # Resync de snapshots y panel
     try:
         REAL_ENTRY_BASELINE[bot] = 0
@@ -7529,8 +7541,11 @@ def detectar_martingala_perdida_completa(bot):
 # Reinicio completo - Corregido para no resetear métricas en modo suave
 def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True):
     global LIMPIEZA_PANEL_HASTA, marti_paso, marti_activa, marti_ciclos_perdidos, ultimo_bot_real, bots_usados_en_esta_marti, REAL_OWNER_LOCK
-    with file_lock():
-        write_token_atomic(TOKEN_FILE, "REAL:none")
+    with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
+        if got:
+            write_token_atomic(TOKEN_FILE, "REAL:none")
+        else:
+            agregar_evento("⚠️ Reinicio: no se pudo escribir token_actual por lock ocupado (real.lock).")
     
     if borrar_csv and os.path.exists("dataset_incremental.csv"):
         os.remove("dataset_incremental.csv")
@@ -7646,6 +7661,27 @@ def reiniciar_bot(bot, borrar_csv=False):
 
 def cerrar_por_fin_de_ciclo(bot: str, reason: str):
     global REAL_OWNER_LOCK, REAL_COOLDOWN_UNTIL_TS
+
+    # Liberar token REAL en archivo primero (commit de salida)
+    liberado = False
+    try:
+        with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
+            if got:
+                liberado = bool(write_token_atomic(TOKEN_FILE, "REAL:none"))
+                if not liberado:
+                    agregar_evento("⚠️ Token REAL no liberado: fallo de persistencia en token_actual.txt.")
+            else:
+                agregar_evento("⚠️ Token REAL no liberado por lock ocupado (real.lock).")
+    except Exception:
+        liberado = False
+
+    if not liberado:
+        return
+
+    # Liberación consolidada: recién aquí memoria/UI pasan a DEMO
+    REAL_OWNER_LOCK = None
+    REAL_COOLDOWN_UNTIL_TS = time.time() + float(_cooldown_post_trade_s())
+
     # Limpieza total de “estado REAL” para evitar HUD/estado fantasma
     try:
         estado_bots[bot]["token"] = "DEMO"
@@ -7671,15 +7707,6 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
     except Exception:
         pass
 
-    # Liberar token global REAL
-    REAL_OWNER_LOCK = None
-    REAL_COOLDOWN_UNTIL_TS = time.time() + float(_cooldown_post_trade_s())
-    try:
-        with file_lock():
-            write_token_atomic(TOKEN_FILE, "REAL:none")
-    except Exception:
-        pass
-
     # Limpiar orden REAL para evitar re-entradas fantasma (igual que cerrar_por_win)
     try:
         limpiar_orden_real(bot)
@@ -7692,7 +7719,6 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
     except Exception:
         pass
 
-   
     # Actualizar snapshots para que no relea la misma fila
     try:
         REAL_ENTRY_BASELINE[bot] = 0
@@ -7741,7 +7767,7 @@ def _marti_audit_record(kind: str, ciclo: int | None = None, bot: str | None = N
 
 def _marti_audit_log_orden(ciclo: int, bot: str | None = None, origen: str = ""):
     """
-    Verifica orden esperado C1->C6 por corrida y deja eventos explícitos.
+    Verifica orden esperado C1->C5 por corrida y deja eventos explícitos.
     No bloquea operación; solo audita y alerta desviaciones.
     """
     global marti_audit_run_id, marti_audit_desviaciones, marti_audit_ultimo_ciclo_ordenado
@@ -7910,7 +7936,7 @@ def elegir_candidato_rotacion_marti(
       * permite repetir SOLO si `allow_repeat_fallback=True` y la probabilidad
         operativa del candidato cumple `repeat_min_prob`.
 
-    El fallback protege continuidad de ciclo C2..C6 sin abrir la compuerta a
+    El fallback protege continuidad de ciclo C2..C5 sin abrir la compuerta a
     repeticiones indiscriminadas.
     """
     try:
@@ -9371,7 +9397,10 @@ def anexar_incremental_desde_bot(bot: str):
         for attempt in range(max_retries):
             try:
                 # LOCK ÚNICO: mismo que maybe_retrain/backfill
-                with file_lock("inc.lock"):
+                with file_lock_required(INCREMENTAL_LOCK_FILE, timeout=6.0, stale_after=30.0) as got:
+                    if not got:
+                        agregar_evento("⚠️ Incremental: lock ocupado; se omite escritura para evitar corrupción.")
+                        return
                     # Repara incremental mutante antes de escribir
                     try:
                         repaired = reparar_dataset_incremental_mutante(ruta=ruta_inc, cols=cols)
@@ -9947,7 +9976,10 @@ def maybe_retrain(force: bool = False):
                 pass
             return False
         try:
-            with file_lock("inc.lock"):
+            with file_lock_required(INCREMENTAL_LOCK_FILE, timeout=6.0, stale_after=30.0) as got:
+                if not got:
+                    agregar_evento("⚠️ IA: incremental.lock ocupado; se pospone lectura/reentreno para evitar carreras.")
+                    return False
                 try:
                     reparar_dataset_incremental_mutante(
                         ruta=ruta_inc,
@@ -10782,8 +10814,94 @@ def _runtime_audit_append(linea: str):
     except Exception:
         pass
 
+# Anti-spam conservador para telemetría ruidosa (no altera lógica operativa)
+_EVENT_SPAM_STATE = {}
+
+
+def _event_spam_policy(msg: str):
+    """
+    Devuelve (key, cooldown_s, material_sig) para categorías ruidosas.
+    Si no aplica filtro, retorna None.
+    """
+    try:
+        txt = str(msg or "")
+    except Exception:
+        return None
+
+    # 1) IA audit tick orphan/unmatched: resumir por bot + severidad material
+    if txt.startswith("🧾 IA audit tick "):
+        try:
+            m_bot = re.search(r"IA audit tick\s+([^:]+):", txt)
+            bot = (m_bot.group(1).strip() if m_bot else "?")
+            mu = re.search(r"unmatched=(\d+)", txt)
+            mp = re.search(r"pending=(\d+)", txt)
+            om = re.search(r"orphan_rate=([0-9]*\.?[0-9]+)", txt)
+            unmatched = int(mu.group(1)) if mu else 0
+            pending = int(mp.group(1)) if mp else 0
+            orphan = float(om.group(1)) if om else 0.0
+        except Exception:
+            bot, unmatched, pending, orphan = "?", 0, 0, 0.0
+
+        un_b = 0 if unmatched <= 0 else (1 if unmatched <= 2 else (2 if unmatched <= 5 else 3))
+        pe_b = 0 if pending <= 0 else (1 if pending <= 3 else 2)
+        or_b = int(max(0.0, min(1.0, orphan)) / 0.10)
+        sev = max(un_b, pe_b, 1 if orphan >= 0.25 else 0)
+        cooldown = 30.0 if sev >= 2 else 90.0
+        return (f"audit:{bot}", cooldown, f"u{un_b}|p{pe_b}|o{or_b}")
+
+    # 2) IA redundante no invalidante: no repetir misma firma por tick
+    if "⚠️ IA redundante (NO invalida)" in txt:
+        m = re.search(r"\[([^\]]+)\]", txt)
+        sig = m.group(1).strip() if m else txt[:100]
+        return (f"redund:{sig}", 180.0, sig)
+
+    # 3) Input duplicado (data quality): reportar con ventana mayor salvo cambio material
+    if "🧪 DATA QUALITY: INPUT DUPLICADO" in txt:
+        m = re.search(r"probs clonadas\s+(\d+)/(\d+)\s+por\s+(\d+)\s+ticks", txt)
+        if m:
+            n_live = int(m.group(1)); n_tot = int(m.group(2)); ticks = int(m.group(3))
+            sev = 0 if ticks < 4 else (1 if ticks < 8 else 2)
+            return (f"dup_prob:{n_live}/{n_tot}", 120.0, f"sev{sev}")
+        return ("dup_prob:generic", 120.0, txt[:80])
+
+    # 4) Warmup/low-data/AUC mensajes repetitivos no fatales
+    warmup_tags = (
+        "IA LOW_DATA activa",
+        "IA warmup:",
+        "IA capa warmup",
+        "AUC bajó",
+        "NO actualizo (AUC bajó",
+    )
+    if any(t in txt for t in warmup_tags):
+        base = re.sub(r"\d+(?:\.\d+)?", "#", txt)
+        base = base[:120]
+        return (f"warmup:{base}", 120.0, base)
+
+    return None
+
+
 def agregar_evento(texto: str):
     limpio = _normalizar_evento_texto(texto)
+
+    pol = _event_spam_policy(limpio)
+    if pol is not None:
+        key, cooldown, material = pol
+        now = float(time.time())
+        st = _EVENT_SPAM_STATE.get(key, {}) if isinstance(_EVENT_SPAM_STATE, dict) else {}
+        last_ts = float(st.get("ts", 0.0) or 0.0)
+        last_mat = str(st.get("mat", ""))
+        sup = int(st.get("sup", 0) or 0)
+
+        changed = (material != last_mat)
+        due = (now - last_ts) >= float(cooldown)
+        if (not changed) and (not due):
+            _EVENT_SPAM_STATE[key] = {"ts": last_ts, "mat": last_mat, "sup": sup + 1}
+            return
+
+        if sup > 0:
+            limpio = f"{limpio} · (+{sup} similares)"
+        _EVENT_SPAM_STATE[key] = {"ts": now, "mat": material, "sup": 0}
+
     eventos_recentes.append(f"[{time.strftime('%H:%M:%S')}] {limpio}")
     _runtime_audit_append(f"EVENTO: {limpio}")
 
@@ -12380,7 +12498,10 @@ def backfill_incremental(ultimas=500):
         cols = feature_names + ["result_bin"]
 
         # 0) Reparar incremental si quedó "mutante" (header corrupto / columnas extra / mezcla de campos)
-        with file_lock("inc.lock"):
+        with file_lock_required(INCREMENTAL_LOCK_FILE, timeout=6.0, stale_after=30.0) as got:
+            if not got:
+                agregar_evento("⚠️ Backfill: incremental.lock ocupado; se omite ejecución en este tick.")
+                return
             if reparar_dataset_incremental_mutante(inc, cols):
                 agregar_evento("🧹 Incremental: esquema reparado (header/filas inconsistentes).")
             if not os.path.exists(inc) or os.stat(inc).st_size == 0:
@@ -12536,7 +12657,10 @@ def backfill_incremental(ultimas=500):
                 nuevas_filas.append(fila_dict)
 
             if nuevas_filas:
-                with file_lock("inc.lock"):
+                with file_lock_required(INCREMENTAL_LOCK_FILE, timeout=6.0, stale_after=30.0) as got:
+                    if not got:
+                        agregar_evento("⚠️ Backfill: lock ocupado al anexar incremental; bloque omitido.")
+                        continue
                     with open(inc, "a", newline="", encoding="utf-8") as f:
                         w = csv.DictWriter(f, fieldnames=cols)
                         for rd in nuevas_filas:
