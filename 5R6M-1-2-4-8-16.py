@@ -155,7 +155,7 @@ init(autoreset=True)
 
 # === BLOQUE 2 — CONFIGURACIÓN GLOBAL (MARTINGALA, HUD, AUDIO, IA) ===
 # === CONFIGURACIÓN DE MARTINGALA ===
-MARTI_ESCALADO = [1, 2, 4, 8, 16, 32]  # Escalado ajustado a 6 pasos
+MARTI_ESCALADO = [1, 2, 4, 8, 16]  # Escalado oficial de 5 pasos
 MONTO_TOL = 0.01  # Tolerancia para redondeos
 SONAR_TAMBIEN_EN_DEMO = False  # Activar sonidos para victorias en DEMO
 SONAR_SOLO_EN_GATEWIN = True   # Solo sonar dentro de la ventana GateWIN
@@ -180,7 +180,7 @@ CTT_REQUIRE_SAME_ASSET = True      # no mezclar activos en consenso
 CTT_ACTIVO_UNICO = "1HZ50V"         # opción 1: todos los bots operan el mismo sintético
 CTT_NEUTRAL_POLICY = "normal"      # normal | block
 CTT_CIERRE_LOOKBACK_MAX = 600       # higiene memoria eventos
-CTT_ENABLE_GREEN_IN_MARTI_ADVANCED = False  # C2..C6: CTT actúa como freno más que como habilitador
+CTT_ENABLE_GREEN_IN_MARTI_ADVANCED = False  # C2..C5: CTT actúa como freno más que como habilitador
 
 def _ctt_min_confirmadores() -> int:
     n = int(len(BOT_NAMES))
@@ -755,7 +755,7 @@ ultimo_bot_real = None
 # Rotación por corrida de martingala REAL (C1..C5)
 # Guarda el orden de bots usados en la corrida activa para evitar repeticiones.
 bots_usados_en_esta_marti = []
-# Continuidad inteligente C2..C6: si no hay bot nuevo elegible, permitir repetir
+# Continuidad inteligente C2..C5: si no hay bot nuevo elegible, permitir repetir
 # el mejor candidato SOLO bajo umbral mínimo de probabilidad operativa.
 MARTI_CYCLE_ALLOW_REPEAT_FALLBACK = True
 MARTI_CYCLE_REPEAT_MIN_PROB = 0.68
@@ -763,7 +763,7 @@ MARTI_CYCLE_REPEAT_MIN_PROB_UNRELIABLE_CAP = 0.66
 
 
 def _marti_repeat_min_prob_live(meta_live=None):
-    """Umbral vivo para fallback C2..C6, con ajuste conservador en modo no confiable."""
+    """Umbral vivo para fallback C2..C5, con ajuste conservador en modo no confiable."""
     base = float(MARTI_CYCLE_REPEAT_MIN_PROB)
     try:
         if not isinstance(meta_live, dict):
@@ -1043,7 +1043,7 @@ def write_token_atomic(path, content):
 # 2) fulll50/fulll45: rendimiento similar pero con muestra algo mayor.
 # 3) fulll48: intermedio, baja muestra.
 # 4) fulll49/fulll46: sobreconfianza alta y peor hit-rate reciente.
-BOT_NAMES = ["fulll47", "fulll50", "fulll45", "fulll48", "fulll49", "fulll46", "fulll51", "fulll52", "fulll53", "fulll54"]
+BOT_NAMES = ["fulll47", "fulll50", "fulll45", "fulll48", "fulll49", "fulll46"]
 IA53_TRIGGERED = {bot: False for bot in BOT_NAMES}
 IA53_LAST_TS = {bot: 0.0 for bot in BOT_NAMES}
 TOKEN_FILE = "token_actual.txt"
@@ -1226,6 +1226,8 @@ def contar_filas_csv(bot_name: str) -> int:
             print(f"⚠️ Error contando filas en {ruta}: {e}")
             continue
     return 0
+
+INCREMENTAL_LOCK_FILE = "incremental.lock"
 
 # Contar filas en dataset_incremental.csv (sin contar header)
 def contar_filas_incremental() -> int:
@@ -2125,8 +2127,12 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
         # - manual: el propio activar_real_inmediato puede escribir orden_real
         # - token_sync: sincroniza token sin tocar orden_real.json
         if origen in ("orden_real", "manual", "token_sync"):
-            with file_lock():
-                write_token_atomic(TOKEN_FILE, f"REAL:{bot}")
+            with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
+                if got:
+                    write_token_atomic(TOKEN_FILE, f"REAL:{bot}")
+                else:
+                    agregar_evento("⚠️ Token REAL no escrito: lock real.lock ocupado. Se evita activar sin exclusión.")
+                    return
 
 
 
@@ -2536,8 +2542,11 @@ def cerrar_por_win(bot: str, reason: str):
     REAL_OWNER_LOCK = None
     REAL_COOLDOWN_UNTIL_TS = time.time() + float(_cooldown_post_trade_s())
     try:
-        with file_lock():
-            write_token_atomic(TOKEN_FILE, "REAL:none")
+        with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
+            if got:
+                write_token_atomic(TOKEN_FILE, "REAL:none")
+            else:
+                agregar_evento("⚠️ Token REAL no liberado por lock ocupado (real.lock).")
     except Exception:
         pass
     # Limpiar orden REAL para evitar re-entradas fantasma
@@ -7529,8 +7538,11 @@ def detectar_martingala_perdida_completa(bot):
 # Reinicio completo - Corregido para no resetear métricas en modo suave
 def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True):
     global LIMPIEZA_PANEL_HASTA, marti_paso, marti_activa, marti_ciclos_perdidos, ultimo_bot_real, bots_usados_en_esta_marti, REAL_OWNER_LOCK
-    with file_lock():
-        write_token_atomic(TOKEN_FILE, "REAL:none")
+    with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
+        if got:
+            write_token_atomic(TOKEN_FILE, "REAL:none")
+        else:
+            agregar_evento("⚠️ Reinicio: no se pudo escribir token_actual por lock ocupado (real.lock).")
     
     if borrar_csv and os.path.exists("dataset_incremental.csv"):
         os.remove("dataset_incremental.csv")
@@ -7675,8 +7687,11 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
     REAL_OWNER_LOCK = None
     REAL_COOLDOWN_UNTIL_TS = time.time() + float(_cooldown_post_trade_s())
     try:
-        with file_lock():
-            write_token_atomic(TOKEN_FILE, "REAL:none")
+        with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
+            if got:
+                write_token_atomic(TOKEN_FILE, "REAL:none")
+            else:
+                agregar_evento("⚠️ Token REAL no liberado por lock ocupado (real.lock).")
     except Exception:
         pass
 
@@ -7741,7 +7756,7 @@ def _marti_audit_record(kind: str, ciclo: int | None = None, bot: str | None = N
 
 def _marti_audit_log_orden(ciclo: int, bot: str | None = None, origen: str = ""):
     """
-    Verifica orden esperado C1->C6 por corrida y deja eventos explícitos.
+    Verifica orden esperado C1->C5 por corrida y deja eventos explícitos.
     No bloquea operación; solo audita y alerta desviaciones.
     """
     global marti_audit_run_id, marti_audit_desviaciones, marti_audit_ultimo_ciclo_ordenado
@@ -7910,7 +7925,7 @@ def elegir_candidato_rotacion_marti(
       * permite repetir SOLO si `allow_repeat_fallback=True` y la probabilidad
         operativa del candidato cumple `repeat_min_prob`.
 
-    El fallback protege continuidad de ciclo C2..C6 sin abrir la compuerta a
+    El fallback protege continuidad de ciclo C2..C5 sin abrir la compuerta a
     repeticiones indiscriminadas.
     """
     try:
@@ -9371,7 +9386,10 @@ def anexar_incremental_desde_bot(bot: str):
         for attempt in range(max_retries):
             try:
                 # LOCK ÚNICO: mismo que maybe_retrain/backfill
-                with file_lock("inc.lock"):
+                with file_lock_required(INCREMENTAL_LOCK_FILE, timeout=6.0, stale_after=30.0) as got:
+                    if not got:
+                        agregar_evento("⚠️ Incremental: lock ocupado; se omite escritura para evitar corrupción.")
+                        return
                     # Repara incremental mutante antes de escribir
                     try:
                         repaired = reparar_dataset_incremental_mutante(ruta=ruta_inc, cols=cols)
@@ -9947,7 +9965,10 @@ def maybe_retrain(force: bool = False):
                 pass
             return False
         try:
-            with file_lock("inc.lock"):
+            with file_lock_required(INCREMENTAL_LOCK_FILE, timeout=6.0, stale_after=30.0) as got:
+                if not got:
+                    agregar_evento("⚠️ IA: incremental.lock ocupado; se pospone lectura/reentreno para evitar carreras.")
+                    return False
                 try:
                     reparar_dataset_incremental_mutante(
                         ruta=ruta_inc,
@@ -12380,7 +12401,10 @@ def backfill_incremental(ultimas=500):
         cols = feature_names + ["result_bin"]
 
         # 0) Reparar incremental si quedó "mutante" (header corrupto / columnas extra / mezcla de campos)
-        with file_lock("inc.lock"):
+        with file_lock_required(INCREMENTAL_LOCK_FILE, timeout=6.0, stale_after=30.0) as got:
+            if not got:
+                agregar_evento("⚠️ Backfill: incremental.lock ocupado; se omite ejecución en este tick.")
+                return
             if reparar_dataset_incremental_mutante(inc, cols):
                 agregar_evento("🧹 Incremental: esquema reparado (header/filas inconsistentes).")
             if not os.path.exists(inc) or os.stat(inc).st_size == 0:
@@ -12536,7 +12560,10 @@ def backfill_incremental(ultimas=500):
                 nuevas_filas.append(fila_dict)
 
             if nuevas_filas:
-                with file_lock("inc.lock"):
+                with file_lock_required(INCREMENTAL_LOCK_FILE, timeout=6.0, stale_after=30.0) as got:
+                    if not got:
+                        agregar_evento("⚠️ Backfill: lock ocupado al anexar incremental; bloque omitido.")
+                        continue
                     with open(inc, "a", newline="", encoding="utf-8") as f:
                         w = csv.DictWriter(f, fieldnames=cols)
                         for rd in nuevas_filas:
