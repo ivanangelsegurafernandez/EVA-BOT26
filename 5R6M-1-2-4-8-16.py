@@ -1222,8 +1222,7 @@ def contar_filas_csv(bot_name: str) -> int:
             with open(ruta, "r", newline="", encoding=encoding, errors="replace") as f:
                 n = sum(1 for _ in f) - 1
                 return max(0, n)
-        except Exception as e:
-            print(f"⚠️ Error contando filas en {ruta}: {e}")
+        except Exception:
             continue
     return 0
 
@@ -3200,17 +3199,12 @@ def calcular_hora_features(row_dict: dict) -> tuple[float, float]:
       - hora_bucket: 0..1
       - hora_missing: 1.0 cuando falta hora parseable, 0.0 en caso contrario.
 
-    Si no hay timestamp parseable, usa hora local actual como fallback suave
-    para evitar colapsar hora_bucket en un valor constante histórico.
+    Si no hay timestamp parseable, usa fallback neutro estable (0.0)
+    para mantener reproducibilidad histórica sin depender del reloj actual.
     """
     hb, parsed_ok = _parse_hora_bucket(row_dict)
     if not bool(parsed_ok):
-        try:
-            lt = time.localtime()
-            idx48 = int(lt.tm_hour * 2 + (1 if lt.tm_min >= 30 else 0))
-            hb = float(max(0, min(47, idx48))) / 47.0
-        except Exception:
-            hb = 0.0
+        hb = 0.0
     try:
         hb = float(hb)
     except Exception:
@@ -5993,6 +5987,32 @@ def auditar_calibracion_seniales_reales(min_prob: float = 0.70, max_rows: int = 
 
         y = d["y"].to_numpy(dtype=float)
         p = d["prob"].to_numpy(dtype=float)
+
+        # Guardas anti-vacío/NaN: evita RuntimeWarning de numpy en métricas
+        try:
+            m_valid = np.isfinite(y) & np.isfinite(p)
+            y = y[m_valid]
+            p = p[m_valid]
+        except Exception:
+            y = np.asarray([], dtype=float)
+            p = np.asarray([], dtype=float)
+
+        if y.size == 0 or p.size == 0:
+            return {
+                "n": 0,
+                "n_total_closed": n_total_closed,
+                "n_after_threshold": 0,
+                "min_prob": float(min_prob),
+                "win_rate": None,
+                "avg_pred": None,
+                "inflacion_pp": None,
+                "factor": 1.0,
+                "brier": None,
+                "ece": 0.0,
+                "stable_sample": False,
+                "min_recommended_n": int(IA_CALIB_MIN_CLOSED),
+                "por_bot": {},
+            }
 
         def _ece(_y, _p, bins: int = 10) -> float:
             _y = np.asarray(_y, dtype=float)
@@ -9329,7 +9349,7 @@ def anexar_incremental_desde_bot(bot: str):
             agregar_evento(f"⚠️ Incremental: volatilidad no disponible ({bot}); se guarda fila con vol=0.0")
         row_dict_full["volatilidad"] = float(max(0.0, min(float(vol_calc), 1.0)))
 
-        # 2) Hora bucket: prioriza valor ya enriquecido; fallback a parseo y luego hora actual.
+        # 2) Hora bucket: prioriza valor ya enriquecido; fallback a parseo y luego neutro estable.
         hb = None
         hm = 0.0
         try:
@@ -9354,12 +9374,10 @@ def anexar_incremental_desde_bot(bot: str):
                 hb = None
 
         if hb is None:
-            # fallback final: hora local actual (no descartar fila por timestamp faltante)
-            lt = time.localtime()
-            idx48 = int(lt.tm_hour * 2 + (1 if lt.tm_min >= 30 else 0))
-            hb = float(max(0, min(47, idx48))) / 47.0
+            # fallback final estable: no depende del reloj actual del sistema
+            hb = 0.0
             hm = 1.0
-            agregar_evento(f"⚠️ Incremental: hora no parseable ({bot}); fallback hora actual aplicado")
+            agregar_evento(f"⚠️ Incremental: hora no parseable ({bot}); fallback neutro aplicado")
 
         row_dict_full["hora_bucket"] = float(max(0.0, min(1.0, float(hb))))
         row_dict_full["hora_missing"] = float(hm)
@@ -10706,7 +10724,9 @@ def maybe_retrain(force: bool = False):
                         f.write(text)
                     os.replace(tmp, path)
 
-                with file_lock("oracle_assets.lock"):
+                with file_lock_required("oracle_assets.lock", timeout=8.0, stale_after=45.0) as got:
+                    if not got:
+                        raise RuntimeError("oracle_assets.lock ocupado")
                     _joblib_dump_atomic(modelo_final, model_path)
                     _joblib_dump_atomic(scaler, scaler_path)
                     _joblib_dump_atomic(list(feats_used), feats_path)
@@ -12626,9 +12646,7 @@ def backfill_incremental(ultimas=500):
                 fila["es_rebote"]   = float(max(0.0, min(1.0, _safe_float_local(row_dict_full.get("es_rebote")) or calcular_es_rebote(row_dict_full))))
                 hb, hm = calcular_hora_features(row_dict_full)
                 if float(hm) >= 1.0:
-                    lt = time.localtime()
-                    idx48 = int(lt.tm_hour * 2 + (1 if lt.tm_min >= 30 else 0))
-                    hb = float(max(0, min(47, idx48))) / 47.0
+                    hb = 0.0
                 fila["hora_bucket"] = float(max(0.0, min(1.0, float(hb))))
 
                 # ==========================
