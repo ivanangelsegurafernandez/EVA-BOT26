@@ -13841,7 +13841,25 @@ def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
 
     eventos.sort(key=lambda x: float(x.get("ts", 0.0)), reverse=True)
     base = eventos[0]
-    asset_target = str(CTT_ACTIVO_UNICO or "").strip().upper()
+
+    # Candidate-aware (mínimo cambio): priorizar activo del candidato actual.
+    asset_candidate = ""
+    try:
+        for c in list(candidatos or []):
+            if not isinstance(c, (list, tuple)) or len(c) < 2:
+                continue
+            b_cand = str(c[1])
+            if not b_cand:
+                continue
+            ctx_cand = _ultimo_contexto_operativo_bot(b_cand)
+            a_cand = str((ctx_cand or {}).get("activo", "") or "").strip().upper()
+            if a_cand:
+                asset_candidate = a_cand
+                break
+    except Exception:
+        asset_candidate = ""
+
+    asset_target = str(asset_candidate or CTT_ACTIVO_UNICO or "").strip().upper()
     asset = asset_target if asset_target else str(base.get("asset", "") or "").upper()
     t_front = float(base.get("ts", 0.0) or 0.0)
 
@@ -15036,7 +15054,7 @@ async def main():
                                 except Exception:
                                     pass
 
-                            ctt_eval = evaluar_ctt_fase([])[1]
+                            ctt_eval = evaluar_ctt_fase(candidatos)[1]
                             if candidatos:
                                 ctt_status = str(ctt_eval.get("status", "NEUTRAL"))
                                 ctt_gate = str(ctt_eval.get("gate", "NEUTRAL"))

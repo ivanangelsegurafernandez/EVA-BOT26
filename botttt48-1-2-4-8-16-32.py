@@ -138,7 +138,7 @@ NOMBRE_BOT = "fulll48"
 ARCHIVO_CSV = f"registro_enriquecido_{NOMBRE_BOT}.csv"
 ARCHIVO_TOKEN = "token_actual.txt"  # Fuente única de verdad (coincide con 5R6M)
 DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
-ACTIVOS = ["1HZ50V"]
+ACTIVOS = ["1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
 MARTINGALA_DEMO = [1, 2, 4, 8]
 MARTINGALA_REAL = [1, 2, 4, 8]
 VELAS = 20
