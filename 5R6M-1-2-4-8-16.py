@@ -1398,6 +1398,19 @@ except Exception:
         "ret_1m", "ret_3m", "ret_5m", "slope_5m", "rv_20",
         "range_norm", "bb_z", "body_ratio", "wick_imbalance", "micro_trend_persist",
     ]
+
+INCREMENTAL_SCALPING_FEATURES_10 = [
+    "ret_1m", "ret_3m", "ret_5m", "slope_5m", "rv_20",
+    "range_norm", "bb_z", "body_ratio", "wick_imbalance", "micro_trend_persist",
+]
+
+# Flujo limpio paralelo (v3): explícito y separado del legacy
+DATASET_INCREMENTAL_V3 = "dataset_incremental_v3.csv"
+IA_SIGNALS_LOG_V3 = "ia_signals_log_v3.csv"
+MODEL_PATH_V3 = "modelo_xgb_v3.pkl"
+SCALER_PATH_V3 = "scaler_v3.pkl"
+FEATURES_PATH_V3 = "feature_names_v3.pkl"
+META_PATH_V3 = "model_meta_v3.json"
 # === LOCK ESTRICTO (solo para escrituras sensibles como incremental.csv) ===
 @contextmanager
 def file_lock_required(path: str, timeout: float = 6.0, stale_after: float = 30.0):
@@ -1824,6 +1837,77 @@ def validar_fila_incremental(fila_dict, feature_names):
 
     return True, ""
         
+def _fila_core13_v3_completa(fila_dict: dict, feature_names: list | None = None) -> tuple[bool, str]:
+    """Valida presencia estricta de CORE13 para flujo limpio v3 (sin fallback neutro)."""
+    feats = list(feature_names) if feature_names else list(FEATURE_NAMES_CORE_13)
+    if not isinstance(fila_dict, dict):
+        return False, "fila_no_dict"
+
+    missing = []
+    for k in feats:
+        v = fila_dict.get(k, None)
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            missing.append(k)
+            continue
+        try:
+            vf = float(v)
+            if not np.isfinite(vf):
+                missing.append(k)
+        except Exception:
+            missing.append(k)
+
+    if missing:
+        if any(k in INCREMENTAL_SCALPING_FEATURES_10 for k in missing):
+            return False, f"faltan_scalping_core10:{missing}"
+        return False, f"faltan_core13:{missing}"
+
+    return True, ""
+
+
+def _anexar_incremental_v3_desde_fila(bot: str, fila_dict_raw: dict, label: int) -> bool:
+    """Anexa fila al incremental limpio v3 si cumple CORE13 completo y validación estricta."""
+    try:
+        feats = list(FEATURE_NAMES_CORE_13)
+        ruta = DATASET_INCREMENTAL_V3
+        cols = list(feats) + ["ts_ingest", "result_bin"]
+
+        ok_core, _ = _fila_core13_v3_completa(fila_dict_raw, feats)
+        if not ok_core:
+            return False
+
+        fila_dict = {k: fila_dict_raw.get(k, None) for k in feats}
+        ok_val, _ = validar_fila_incremental(fila_dict, feats)
+        if not ok_val:
+            return False
+
+        ts_ing = fila_dict_raw.get("ts_ingest", float(time.time()))
+        sig = _firma_registro(feats, [float(fila_dict[k]) for k in feats], int(label))
+        if _incremental_signature_exists(ruta, sig, feats):
+            return False
+
+        with file_lock_required(INCREMENTAL_LOCK_FILE, timeout=6.0, stale_after=30.0) as got:
+            if not got:
+                return False
+
+            if os.path.exists(ruta):
+                try:
+                    reparar_dataset_incremental_mutante(ruta=ruta, cols=cols)
+                except Exception:
+                    pass
+            else:
+                with open(ruta, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(cols)
+                    f.flush(); os.fsync(f.fileno())
+
+            with open(ruta, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow([float(fila_dict[k]) for k in feats] + [ts_ing, int(label)])
+                f.flush(); os.fsync(f.fileno())
+
+        return True
+    except Exception:
+        return False
+
+
 def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label: int | None = None, feature_names: list | None = None) -> bool:
     """
     Anexa 1 fila al dataset_incremental.csv de forma estable:
@@ -9325,8 +9409,10 @@ def anexar_incremental_desde_bot(bot: str):
         ruta_inc = "dataset_incremental.csv"
 
         # Construir row completo + features derivadas (volatilidad/hora_bucket)
-        row_dict_full = dict(fila_dict)
-        row_dict_full["result_bin"] = label
+        row_dict_source = dict(fila_dict)
+        row_dict_source["result_bin"] = label
+
+        row_dict_full = dict(row_dict_source)
         row_dict_full = _enriquecer_scalping_features_row(row_dict_full)
 
         # 1) Volatilidad: prioriza valor ya enriquecido; recalcula solo si falta/inválido.
@@ -9464,6 +9550,12 @@ def anexar_incremental_desde_bot(bot: str):
                     if now - float(d.get(bot, 0.0)) >= 60.0:
                         d[bot] = now
                         agregar_evento(f"✅ Incremental: +1 fila desde {bot} ({'G' if label == 1 else 'P'}).")
+                except Exception:
+                    pass
+
+                # Flujo limpio v3 en paralelo: estricto CORE13 (sin fallback neutro).
+                try:
+                    _anexar_incremental_v3_desde_fila(bot, row_dict_source, label)
                 except Exception:
                     pass
 
@@ -10867,6 +10959,59 @@ RUNTIME_AUDIT_ENABLE = True
 # HUD observabilidad de rachas (solo diagnóstico; no altera trading/gates).
 HUD_RACHA_WINDOWS = (5, 8, 12)
 HUD_RACHA_MIN_MUESTRA = 8
+
+def entrenar_modelo_limpio_v3(force: bool = False) -> bool:
+    """Entrenamiento limpio v3 desde dataset_incremental_v3.csv (artefactos paralelos)."""
+    try:
+        ruta = DATASET_INCREMENTAL_V3
+        if not os.path.exists(ruta):
+            return False
+
+        df = pd.read_csv(ruta, encoding="utf-8", on_bad_lines="skip")
+        if df is None or df.empty:
+            return False
+
+        feats = list(FEATURE_NAMES_CORE_13)
+        X, y, feats_used, _ = _build_Xy_incremental(df, feature_names=feats)
+        if X is None or y is None or len(X) < max(60, MIN_TRAIN_ROWS_ADAPTIVE):
+            return False
+
+        scaler = StandardScaler()
+        Xs = scaler.fit_transform(X.values)
+
+        if XGBClassifier is not None:
+            modelo = XGBClassifier(
+                n_estimators=220,
+                max_depth=4,
+                learning_rate=0.05,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                random_state=42,
+                eval_metric="logloss",
+            )
+        else:
+            modelo = LogisticRegression(max_iter=400, class_weight="balanced")
+
+        modelo.fit(Xs, y)
+
+        meta = {
+            "schema": "core13_v3_clean",
+            "trained_on_incremental": "dataset_incremental_v3",
+            "n": int(len(X)),
+            "n_samples": int(len(X)),
+            "feature_names": list(feats_used),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+        for path, obj in ((MODEL_PATH_V3, modelo), (SCALER_PATH_V3, scaler), (FEATURES_PATH_V3, list(feats_used))):
+            tmp = path + ".tmp"
+            joblib.dump(obj, tmp)
+            os.replace(tmp, path)
+        _json_dump_atomic(meta, META_PATH_V3)
+        return True
+    except Exception:
+        return False
+
 
 def _runtime_audit_append(linea: str):
     try:
@@ -12733,6 +12878,88 @@ def backfill_incremental(ultimas=500):
         agregar_evento("✅ IA: backfill incremental completado.")
     except Exception as e:
         agregar_evento(f"⚠️ IA: fallo en backfill: {e}")
+
+
+def backfill_incremental_v3(ultimas=500):
+    """Backfill limpio v3: solo CERRADO auditables con CORE13 completo."""
+    try:
+        feats = list(FEATURE_NAMES_CORE_13)
+        cols = feats + ["ts_ingest", "result_bin"]
+        inc = DATASET_INCREMENTAL_V3
+
+        with file_lock_required(INCREMENTAL_LOCK_FILE, timeout=6.0, stale_after=30.0) as got:
+            if not got:
+                agregar_evento("⚠️ Backfill v3: incremental.lock ocupado; se omite ejecución.")
+                return
+            if reparar_dataset_incremental_mutante(inc, cols):
+                agregar_evento("🧹 IA v3: dataset_incremental_v3 reparado.")
+            if not os.path.exists(inc) or os.stat(inc).st_size == 0:
+                with open(inc, "w", newline="", encoding="utf-8") as f:
+                    csv.DictWriter(f, fieldnames=cols).writeheader()
+
+        firmas_existentes = set()
+        if os.path.exists(inc):
+            df_inc = pd.read_csv(inc, encoding="utf-8", on_bad_lines="skip")
+            if not df_inc.empty and set(feats + ["result_bin"]).issubset(df_inc.columns):
+                sigs = df_inc[feats].round(6).astype(str).agg("|".join, axis=1) + "|" + df_inc["result_bin"].astype(int).astype(str)
+                firmas_existentes = set(sigs.tolist())
+
+        for bot in BOT_NAMES:
+            ruta = f"registro_enriquecido_{bot}.csv"
+            if not os.path.exists(ruta):
+                continue
+
+            df = None
+            for enc in ("utf-8", "latin-1", "windows-1252"):
+                try:
+                    df = pd.read_csv(ruta, encoding=enc, on_bad_lines="skip")
+                    break
+                except Exception:
+                    continue
+            if df is None or df.empty or "trade_status" not in df.columns or "resultado" not in df.columns:
+                continue
+
+            df["trade_status_norm"] = df["trade_status"].apply(normalizar_trade_status)
+            df["resultado_norm"] = df["resultado"].apply(normalizar_resultado)
+            sub = df[df["trade_status_norm"].eq("CERRADO") & df["resultado_norm"].isin(["GANANCIA", "PÉRDIDA"])].tail(ultimas)
+            if sub.empty:
+                continue
+
+            nuevas = []
+            for _, r in sub.iterrows():
+                rd = canonicalizar_campos_bot_maestro(r.to_dict())
+                ok_core, _ = _fila_core13_v3_completa(rd, feats)
+                if not ok_core:
+                    continue
+
+                label = 1 if str(r.get("resultado_norm", "")).upper() == "GANANCIA" else 0
+                fila = {k: rd.get(k, None) for k in feats}
+                ok_val, _ = validar_fila_incremental(fila, feats)
+                if not ok_val:
+                    continue
+
+                sig = "|".join([str(round(float(fila[k]), 6)) for k in feats]) + f"|{int(label)}"
+                if sig in firmas_existentes:
+                    continue
+                firmas_existentes.add(sig)
+
+                fila["ts_ingest"] = rd.get("ts_ingest", rd.get("timestamp", rd.get("ts", time.time())))
+                fila["result_bin"] = int(label)
+                nuevas.append(fila)
+
+            if nuevas:
+                with file_lock_required(INCREMENTAL_LOCK_FILE, timeout=6.0, stale_after=30.0) as got:
+                    if not got:
+                        continue
+                    with open(inc, "a", newline="", encoding="utf-8") as f:
+                        w = csv.DictWriter(f, fieldnames=cols)
+                        for rd in nuevas:
+                            w.writerow(rd)
+                        f.flush(); os.fsync(f.fileno())
+
+        agregar_evento("✅ IA v3: backfill limpio completado.")
+    except Exception as e:
+        agregar_evento(f"⚠️ IA v3: fallo en backfill limpio: {e}")
 # === FIN BLOQUE 12 ===
 
 # === BLOQUE 13 — LOOP PRINCIPAL, WEBSOCKET Y TECLADO ===
