@@ -4,7 +4,7 @@
 #
 # Este script coordina:
 # - Lectura de CSV enriquecidos de los bots fulll45–fulll50
-# - Control de Martingala 1-2-4-8-16
+# - Control de Martingala 1-2-4-8
 # - Gestión de tokens DEMO/REAL
 # - IA (XGBoost) para probabilidades de éxito
 # - HUD visual con Prob IA, % éxito, saldo, meta y eventos
@@ -180,7 +180,7 @@ init(autoreset=True)
 
 # === BLOQUE 2 — CONFIGURACIÓN GLOBAL (MARTINGALA, HUD, AUDIO, IA) ===
 # === CONFIGURACIÓN DE MARTINGALA ===
-MARTI_ESCALADO = [1, 2, 4, 8, 16]  # Escalado oficial de 5 pasos
+MARTI_ESCALADO = [1, 2, 4, 8]  # Escalado oficial de 4 pasos
 MONTO_TOL = 0.01  # Tolerancia para redondeos
 SONAR_TAMBIEN_EN_DEMO = False  # Activar sonidos para victorias en DEMO
 SONAR_SOLO_EN_GATEWIN = True   # Solo sonar dentro de la ventana GateWIN
@@ -205,7 +205,7 @@ CTT_REQUIRE_SAME_ASSET = True      # no mezclar activos en consenso
 CTT_ACTIVO_UNICO = "1HZ50V"         # opción 1: todos los bots operan el mismo sintético
 CTT_NEUTRAL_POLICY = "normal"      # normal | block
 CTT_CIERRE_LOOKBACK_MAX = 600       # higiene memoria eventos
-CTT_ENABLE_GREEN_IN_MARTI_ADVANCED = False  # C2..C5: CTT actúa como freno más que como habilitador
+CTT_ENABLE_GREEN_IN_MARTI_ADVANCED = False  # C2..C{MAX_CICLOS}: CTT actúa como freno más que como habilitador
 
 def _ctt_min_confirmadores() -> int:
     n = int(len(BOT_NAMES))
@@ -777,10 +777,10 @@ marti_ciclos_perdidos = 0
 # - Si el HUD está en C2..C{MAX_CICLOS}, se prioriza no repetir; puede haber fallback controlado.
 ultimo_bot_real = None
 
-# Rotación por corrida de martingala REAL (C1..C5)
+# Rotación por corrida de martingala REAL (C1..C{MAX_CICLOS})
 # Guarda el orden de bots usados en la corrida activa para evitar repeticiones.
 bots_usados_en_esta_marti = []
-# Continuidad inteligente C2..C5: si no hay bot nuevo elegible, permitir repetir
+# Continuidad inteligente C2..C{MAX_CICLOS}: si no hay bot nuevo elegible, permitir repetir
 # el mejor candidato SOLO bajo umbral mínimo de probabilidad operativa.
 MARTI_CYCLE_ALLOW_REPEAT_FALLBACK = True
 MARTI_CYCLE_REPEAT_MIN_PROB = 0.68
@@ -788,7 +788,7 @@ MARTI_CYCLE_REPEAT_MIN_PROB_UNRELIABLE_CAP = 0.66
 
 
 def _marti_repeat_min_prob_live(meta_live=None):
-    """Umbral vivo para fallback C2..C5, con ajuste conservador en modo no confiable."""
+    """Umbral vivo para fallback C2..C{MAX_CICLOS}, con ajuste conservador en modo no confiable."""
     base = float(MARTI_CYCLE_REPEAT_MIN_PROB)
     try:
         if not isinstance(meta_live, dict):
@@ -2949,7 +2949,7 @@ def clip_feature_values(fila_dict, feature_names):
     return clipped
     
 def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
-    """Completa CORE13_v2 scalping desde campos legacy cuando falten."""
+    """Completa CORE13_v2 con datos reales existentes; fallback neutro si faltan."""
     out = dict(fila_dict or {})
 
     def _missing(name: str) -> bool:
@@ -2964,44 +2964,20 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
         except Exception:
             return True
 
-    def _f(name, default=0.0):
-        try:
-            v = float(out.get(name, default) if out.get(name, default) not in (None, "") else default)
-            return v if math.isfinite(v) else float(default)
-        except Exception:
-            return float(default)
+    def _set_if_missing(name: str, neutral: float, lo: float, hi: float):
+        if _missing(name):
+            out[name] = float(np.clip(neutral, lo, hi))
 
-    # Legacy proxies (si no vienen directos de bot):
-    rsi9 = _f("rsi_9", 50.0)
-    rsi14 = _f("rsi_14", 50.0)
-    sma_spread = _f("sma_spread", 0.0)
-    cruce_sma = _f("cruce_sma", 0.0)
-    breakout = _f("breakout", 0.0)
-    rsi_rev = _f("rsi_reversion", 0.0)
-    vol = _f("volatilidad", 0.0)
-    reb = _f("es_rebote", 0.0)
-    racha = _f("racha_actual", 0.0)
-
-    if _missing("ret_1m"):
-        out["ret_1m"] = float(np.clip((rsi9 - 50.0) / 50.0, -1.0, 1.0))
-    if _missing("ret_3m"):
-        out["ret_3m"] = float(np.clip((rsi14 - 50.0) / 50.0, -1.0, 1.0))
-    if _missing("ret_5m"):
-        out["ret_5m"] = float(np.clip(0.6 * float(out.get("ret_3m", 0.0)) + 0.4 * float(out.get("ret_1m", 0.0)), -1.0, 1.0))
-    if _missing("slope_5m"):
-        out["slope_5m"] = float(np.clip(sma_spread + 0.05 * cruce_sma, -1.0, 1.0))
-    if _missing("rv_20"):
-        out["rv_20"] = float(np.clip(vol, 0.0, 1.0))
-    if _missing("range_norm"):
-        out["range_norm"] = float(np.clip(breakout, 0.0, 1.0))
-    if _missing("bb_z"):
-        out["bb_z"] = float(np.clip((2.0 * rsi_rev) - 1.0, -3.0, 3.0))
-    if _missing("body_ratio"):
-        out["body_ratio"] = float(np.clip(abs(float(out.get("ret_1m", 0.0))), 0.0, 1.0))
-    if _missing("wick_imbalance"):
-        out["wick_imbalance"] = float(np.clip((2.0 * reb) - 1.0, -1.0, 1.0))
-    if _missing("micro_trend_persist"):
-        out["micro_trend_persist"] = float(np.clip(racha / 10.0, -1.0, 1.0))
+    _set_if_missing("ret_1m", 0.0, -1.0, 1.0)
+    _set_if_missing("ret_3m", 0.0, -1.0, 1.0)
+    _set_if_missing("ret_5m", 0.0, -1.0, 1.0)
+    _set_if_missing("slope_5m", 0.0, -1.0, 1.0)
+    _set_if_missing("rv_20", 0.5, 0.0, 1.0)
+    _set_if_missing("range_norm", 0.5, 0.0, 1.0)
+    _set_if_missing("bb_z", 0.0, -3.0, 3.0)
+    _set_if_missing("body_ratio", 0.5, 0.0, 1.0)
+    _set_if_missing("wick_imbalance", 0.0, -1.0, 1.0)
+    _set_if_missing("micro_trend_persist", 0.0, -1.0, 1.0)
 
     return out
 
@@ -7824,7 +7800,7 @@ def _marti_audit_record(kind: str, ciclo: int | None = None, bot: str | None = N
 
 def _marti_audit_log_orden(ciclo: int, bot: str | None = None, origen: str = ""):
     """
-    Verifica orden esperado C1->C5 por corrida y deja eventos explícitos.
+    Verifica orden esperado C1->C{MAX_CICLOS} por corrida y deja eventos explícitos.
     No bloquea operación; solo audita y alerta desviaciones.
     """
     global marti_audit_run_id, marti_audit_desviaciones, marti_audit_ultimo_ciclo_ordenado
@@ -7993,7 +7969,7 @@ def elegir_candidato_rotacion_marti(
       * permite repetir SOLO si `allow_repeat_fallback=True` y la probabilidad
         operativa del candidato cumple `repeat_min_prob`.
 
-    El fallback protege continuidad de ciclo C2..C5 sin abrir la compuerta a
+    El fallback protege continuidad de ciclo C2..C{MAX_CICLOS} sin abrir la compuerta a
     repeticiones indiscriminadas.
     """
     try:
@@ -8321,27 +8297,27 @@ def _enriquecer_df_con_derivadas(df: pd.DataFrame, feats: list[str]) -> pd.DataF
             base = sma20.abs().clip(lower=1e-9)
             out["sma_spread"] = ((sma5 - sma20).abs() / base).clip(lower=0.0, upper=5.0)
 
-        # CORE13_v2 scalping (backfill desde columnas legacy si existen)
+        # CORE13_v2 scalping: usar columnas reales si existen; fallback neutro estable.
         if "ret_1m" in feats:
-            out["ret_1m"] = ((_col_num("rsi_9", 50.0) - 50.0) / 50.0).clip(lower=-1.0, upper=1.0)
+            out["ret_1m"] = _col_num("ret_1m", 0.0).clip(lower=-1.0, upper=1.0)
         if "ret_3m" in feats:
-            out["ret_3m"] = ((_col_num("rsi_14", 50.0) - 50.0) / 50.0).clip(lower=-1.0, upper=1.0)
+            out["ret_3m"] = _col_num("ret_3m", 0.0).clip(lower=-1.0, upper=1.0)
         if "ret_5m" in feats:
-            out["ret_5m"] = (0.6 * _col_num("ret_3m", 0.0) + 0.4 * _col_num("ret_1m", 0.0)).clip(lower=-1.0, upper=1.0)
+            out["ret_5m"] = _col_num("ret_5m", 0.0).clip(lower=-1.0, upper=1.0)
         if "slope_5m" in feats:
-            out["slope_5m"] = (_col_num("sma_spread", 0.0) + 0.05 * _col_num("cruce_sma", 0.0)).clip(lower=-1.0, upper=1.0)
+            out["slope_5m"] = _col_num("slope_5m", 0.0).clip(lower=-1.0, upper=1.0)
         if "rv_20" in feats:
-            out["rv_20"] = _col_num("volatilidad", 0.0).clip(lower=0.0, upper=1.0)
+            out["rv_20"] = _col_num("rv_20", 0.5).clip(lower=0.0, upper=1.0)
         if "range_norm" in feats:
-            out["range_norm"] = _col_num("breakout", 0.0).clip(lower=0.0, upper=1.0)
+            out["range_norm"] = _col_num("range_norm", 0.5).clip(lower=0.0, upper=1.0)
         if "bb_z" in feats:
-            out["bb_z"] = ((2.0 * _col_num("rsi_reversion", 0.0)) - 1.0).clip(lower=-3.0, upper=3.0)
+            out["bb_z"] = _col_num("bb_z", 0.0).clip(lower=-3.0, upper=3.0)
         if "body_ratio" in feats:
-            out["body_ratio"] = _col_num("ret_1m", 0.0).abs().clip(lower=0.0, upper=1.0)
+            out["body_ratio"] = _col_num("body_ratio", 0.5).clip(lower=0.0, upper=1.0)
         if "wick_imbalance" in feats:
-            out["wick_imbalance"] = ((2.0 * _col_num("es_rebote", 0.0)) - 1.0).clip(lower=-1.0, upper=1.0)
+            out["wick_imbalance"] = _col_num("wick_imbalance", 0.0).clip(lower=-1.0, upper=1.0)
         if "micro_trend_persist" in feats:
-            out["micro_trend_persist"] = (_col_num("racha_actual", 0.0) / 10.0).clip(lower=-1.0, upper=1.0)
+            out["micro_trend_persist"] = _col_num("micro_trend_persist", 0.0).clip(lower=-1.0, upper=1.0)
 
         return out
     except Exception:
@@ -13656,7 +13632,7 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
                 degrade_from = "unreliable"
                 reason = "unreliable->shadow"
 
-        # Prudencia extra en Martingala avanzada C2..C5: exigir contexto vivo.
+        # Prudencia extra en Martingala avanzada C2..C{MAX_CICLOS}: exigir contexto vivo.
         try:
             ciclo_adv = int(ciclo_martingala_siguiente())
         except Exception:
@@ -13865,7 +13841,25 @@ def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
 
     eventos.sort(key=lambda x: float(x.get("ts", 0.0)), reverse=True)
     base = eventos[0]
-    asset_target = str(CTT_ACTIVO_UNICO or "").strip().upper()
+
+    # Candidate-aware (mínimo cambio): priorizar activo del candidato actual.
+    asset_candidate = ""
+    try:
+        for c in list(candidatos or []):
+            if not isinstance(c, (list, tuple)) or len(c) < 2:
+                continue
+            b_cand = str(c[1])
+            if not b_cand:
+                continue
+            ctx_cand = _ultimo_contexto_operativo_bot(b_cand)
+            a_cand = str((ctx_cand or {}).get("activo", "") or "").strip().upper()
+            if a_cand:
+                asset_candidate = a_cand
+                break
+    except Exception:
+        asset_candidate = ""
+
+    asset_target = str(asset_candidate or CTT_ACTIVO_UNICO or "").strip().upper()
     asset = asset_target if asset_target else str(base.get("asset", "") or "").upper()
     t_front = float(base.get("ts", 0.0) or 0.0)
 
@@ -15060,7 +15054,7 @@ async def main():
                                 except Exception:
                                     pass
 
-                            ctt_eval = evaluar_ctt_fase([])[1]
+                            ctt_eval = evaluar_ctt_fase(candidatos)[1]
                             if candidatos:
                                 ctt_status = str(ctt_eval.get("status", "NEUTRAL"))
                                 ctt_gate = str(ctt_eval.get("gate", "NEUTRAL"))
@@ -15277,7 +15271,7 @@ if __name__ == "__main__":
 # === BLOQUE 99 — RESUMEN FINAL DE LO QUE SE LOGRA ===
 #
 # - Bot maestro 5R6M-1-2-4-8-16 con:
-#   * Martingala 1-2-4-8-16 intacta.
+#   * Martingala 1-2-4-8 intacta.
 #   * Tokens DEMO/REAL y handshake maestro→bots intactos.
 #   * CSV enriquecidos, dataset_incremental.csv, IA XGBoost, reentrenos intactos.
 #   * HUD visual con Prob IA, % éxito, saldo, meta, eventos

@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 import asyncio
-import websockets
+try:
+    import websockets
+    WEBSOCKETS_OK = True
+except Exception:
+    websockets = None
+    WEBSOCKETS_OK = False
 import json
 import csv
 import os
@@ -134,14 +139,14 @@ ARCHIVO_CSV = f"registro_enriquecido_{NOMBRE_BOT}.csv"
 ARCHIVO_TOKEN = "token_actual.txt"  # Fuente única de verdad (coincide con 5R6M)
 DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 ACTIVOS = ["1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
-MARTINGALA_DEMO = [1, 2, 4, 8, 16, 32]
-MARTINGALA_REAL = [1, 2, 4, 8, 16, 32]
+MARTINGALA_DEMO = [1, 2, 4, 8]
+MARTINGALA_REAL = [1, 2, 4, 8]
 VELAS = 20
 PAUSA_POST_OPERACION_S = 40  # Pausa uniforme tras cada operación con resultado definido (BLOQUE 1)
 # ==================== VENTANA DE DECISIÓN IA ====================
 # Objetivo: dar tiempo al MAESTRO + humano para decidir pasar a REAL ANTES del BUY.
 # (0 para desactivar)
-VENTANA_DECISION_IA_S = 60        # segundos
+VENTANA_DECISION_IA_S = 30        # segundos
 VENTANA_DECISION_IA_POLL_S = 0.10 # granularidad de espera
 # === Filtro avanzado (sin cambiar 13 features) ===
 SCORE_MIN = 2.80            # score mínimo para aceptar un setup
@@ -287,6 +292,24 @@ async def _silencio_temporal(seg=90, fuente=None):
 
 # >>> PATCH (globals) BLOQUE 3
 _contratos_procesados = set()
+_CONTRATOS_MAX_TRACK = 4000
+
+def _registrar_contrato_procesado(contract_id) -> bool:
+    """True si se registró; False si ya estaba. Evita crecimiento infinito del set."""
+    try:
+        cid = int(contract_id)
+    except Exception:
+        return False
+    if cid in _contratos_procesados:
+        return False
+    _contratos_procesados.add(cid)
+    if len(_contratos_procesados) > _CONTRATOS_MAX_TRACK:
+        try:
+            _contratos_procesados.clear()
+            _contratos_procesados.add(cid)
+        except Exception:
+            pass
+    return True
 # <<< PATCH
 
 # >>> PATCH (globals) BLOQUE 3 y BLOQUE 4
@@ -410,6 +433,38 @@ def _write_row_dict_atomic(archivo_csv: str, row_dict: dict):
     write_csv_atomic(archivo_csv, row)
 
 # === FIN HEADER FINAL ===
+def _normalizar_payout_desde_monto(payout_raw, monto_raw):
+    """Normaliza payout con semántica única: multiplier (ratio total) y payout_total."""
+    payout_total_f = 0.0
+    payout_mult_f = 0.0
+    try:
+        monto_f = float(monto_raw) if monto_raw not in (None, "", "nan", "NaN") else 0.0
+    except Exception:
+        monto_f = 0.0
+    try:
+        p = float(payout_raw) if payout_raw not in (None, "", "nan", "NaN") else 0.0
+    except Exception:
+        p = 0.0
+    try:
+        import math
+        if not math.isfinite(p):
+            p = 0.0
+        if not math.isfinite(monto_f):
+            monto_f = 0.0
+    except Exception:
+        pass
+    try:
+        if p > 0 and p <= 3.5:
+            payout_mult_f = p
+            payout_total_f = (monto_f * payout_mult_f) if monto_f > 0 else 0.0
+        elif p > 3.5:
+            payout_total_f = p
+            payout_mult_f = (payout_total_f / monto_f) if monto_f > 0 else 0.0
+    except Exception:
+        payout_total_f = 0.0
+        payout_mult_f = 0.0
+    return float(monto_f), float(payout_total_f), float(payout_mult_f)
+
 def write_pretrade_snapshot(
     archivo_csv,
     symbol=None,
@@ -486,40 +541,8 @@ def write_pretrade_snapshot(
         except Exception:
             es_rebote_flag = 1 if (racha_prev <= -4) else 0
 
-    # -------------------------
-    # monto float
-    # -------------------------
-    try:
-        monto_f = float(monto or 0.0)
-    except Exception:
-        monto_f = 0.0
-
-    # -------------------------
-    # payout robusto
-    # -------------------------
-    payout_total_f = 0.0
-    payout_mult_f = 0.0
-    try:
-        p = float(payout) if payout not in (None, "", "nan", "NaN") else 0.0
-        # si NaN/inf, lo anulamos
-        try:
-            import math
-            if not math.isfinite(p):
-                p = 0.0
-            if not math.isfinite(monto_f):
-                monto_f = 0.0
-        except Exception:
-            pass
-
-        if p > 0 and p <= 3.5:
-            payout_mult_f = p
-            payout_total_f = (monto_f * payout_mult_f) if monto_f > 0 else 0.0
-        elif p > 3.5:
-            payout_total_f = p
-            payout_mult_f = (payout_total_f / monto_f) if monto_f > 0 else 0.0
-    except Exception:
-        payout_total_f = 0.0
-        payout_mult_f = 0.0
+    # monto/payout normalizados (semántica única)
+    monto_f, payout_total_f, payout_mult_f = _normalizar_payout_desde_monto(payout, monto)
 
     # -------------------------
     # puntaje 0..1
@@ -669,6 +692,28 @@ def write_csv_atomic(path: str, row):
     old_header = []
     data_rows = []
     file_exists = os.path.exists(path) and os.path.getsize(path) > 0
+
+    # Fast-path append: cuando el header coincide, evitar reescritura completa.
+    try:
+        if file_exists:
+            with open(path, "r", newline="", encoding="utf-8", errors="replace") as f:
+                reader = csv.reader(f)
+                current_header = next(reader, None) or []
+            if current_header == CSV_HEADER:
+                new_row = _norm_len(row, num_cols)
+                with open(path, "a", newline="", encoding="utf-8", errors="replace") as f:
+                    w = csv.writer(f)
+                    w.writerow(new_row)
+                    f.flush()
+                    os.fsync(f.fileno())
+                if fd is not None:
+                    try: os.close(fd)
+                    except Exception: pass
+                    try: os.remove(lock_path)
+                    except Exception: pass
+                return
+    except Exception:
+        pass
 
     needs_repair = False
 
@@ -961,7 +1006,7 @@ def leer_token_desde_archivo():
             linea = f.read().strip()
             if linea == f"REAL:{NOMBRE_BOT}":
                 return TOKEN_REAL
-    except:
+    except Exception:
         pass
     return TOKEN_DEMO
 
@@ -1230,7 +1275,7 @@ async def check_token_and_reconnect(ws, current_token):
             print(Fore.YELLOW + Style.BRIGHT + f"Token cambió a {'REAL' if token_desde_archivo == TOKEN_REAL else 'DEMO'}. Reconectando...")
             try:
                 await ws.close()
-            except:
+            except Exception:
                 pass
             ws = await websockets.connect(DERIV_WS_URL, **WS_KW)  # BLOQUE 1.2
             await authorize_ws(ws, token_desde_archivo)
@@ -1500,9 +1545,8 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
             color = Fore.GREEN if profit > 0 else Fore.RED
             print(color + Style.BRIGHT + f"{resultado}: {profit:.2f} USD")
             # >>> PATCH BLOQUE 3 y 5
-            if contract_id in _contratos_procesados:
+            if not _registrar_contrato_procesado(contract_id):
                 return resultado, profit
-            _contratos_procesados.add(contract_id)
             # <<< PATCH
             # Registrar resultado SOLO si es definido, con features enriquecidas
             try:
@@ -1525,43 +1569,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                 # Resultado SIEMPRE coherente:
                 #   payout_total_f y ratio_total
                 # ==========================================================
-                payout_total_f = 0.0
-                ratio_total = 0.0
-                # monto
-                try:
-                    monto_f = float(monto) if monto not in (None, "", "nan", "NaN") else 0.0
-                except Exception:
-                    monto_f = 0.0
-
-                # payout (puede venir como multiplier o como total)
-                try:
-                    p = float(payout) if payout not in (None, "", "nan", "NaN") else 0.0
-                except Exception:
-                    p = 0.0
-                # si p es NaN/inf, lo anulamos
-                try:
-                    import math
-                    if not math.isfinite(p):
-                        p = 0.0
-                    if not math.isfinite(monto_f):
-                        monto_f = 0.0
-                except Exception:
-                    pass                   
-                try:
-                    if p > 0 and p <= 3.5:
-                        # payout viene como multiplier (1.95 etc.)
-                        ratio_total = p
-                        payout_total_f = (monto_f * ratio_total) if monto_f > 0 else 0.0
-                    elif p > 3.5:
-                        # payout viene como total (USD)
-                        payout_total_f = p
-                        ratio_total = (payout_total_f / monto_f) if monto_f > 0 else 0.0
-                    else:
-                        payout_total_f = 0.0
-                        ratio_total = 0.0
-                except Exception:
-                    payout_total_f = 0.0
-                    ratio_total = 0.0
+                monto_f, payout_total_f, ratio_total = _normalizar_payout_desde_monto(payout, monto)
 
                 now = datetime.now(timezone.utc)
                 epoch_val = int(epoch_pretrade) if epoch_pretrade is not None else int(now.timestamp())
@@ -1720,9 +1728,8 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
             pass
 
         # === Evitar doble commit por mismo contrato ===
-        if contract_id in _contratos_procesados:
+        if not _registrar_contrato_procesado(contract_id):
             return
-        _contratos_procesados.add(contract_id)
 
         # === IA / racha / es_rebote (SIN FUGA) ===
         try:
@@ -1756,46 +1763,7 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
         #   payout_total = monto * payout_multiplier
         #   payout_multiplier = payout_total / monto
         # ==========================================================
-        payout_total = 0.0
-        payout_ratio_total = 0.0
-
-        # monto
-        try:
-            monto_f = float(monto) if monto not in (None, "", "nan", "NaN") else 0.0
-        except Exception:
-            monto_f = 0.0
-
-        # payout (puede venir como multiplier o como total)
-        try:
-            p = float(payout) if payout not in (None, "", "nan", "NaN") else 0.0
-        except Exception:
-            p = 0.0
-
-        # si p es NaN/inf, lo anulamos
-        try:
-            import math
-            if not math.isfinite(p):
-                p = 0.0
-            if not math.isfinite(monto_f):
-                monto_f = 0.0
-        except Exception:
-            pass
-
-        try:
-            if p > 0 and p <= 3.5:
-                # payout viene como multiplier (1.95 etc.)
-                payout_ratio_total = p
-                payout_total = (monto_f * payout_ratio_total) if monto_f > 0 else 0.0
-            elif p > 3.5:
-                # payout viene como total (15.62 etc.)
-                payout_total = p
-                payout_ratio_total = (payout_total / monto_f) if monto_f > 0 else 0.0
-            else:
-                payout_total = 0.0
-                payout_ratio_total = 0.0
-        except Exception:
-            payout_total = 0.0
-            payout_ratio_total = 0.0
+        monto_f, payout_total, payout_ratio_total = _normalizar_payout_desde_monto(payout, monto)
 
         async with csv_lock:
             # ==========================
@@ -1945,6 +1913,7 @@ async def mostrar_saldos():
 async def ejecutar_panel():
     global ultimo_token
     global _ws_fail_streak
+    global primer_ingreso_real, real_activado_en_bot
 
     # Eliminado: reset_csv_and_total() para acumular histórico completo
     await mostrar_saldos()
@@ -2414,11 +2383,11 @@ async def ejecutar_panel():
 
                     # ✅ Importantísimo: resetear ventana para que PASO_A_REAL suene la próxima vez
                     try:
-                        globals()["primer_ingreso_real"] = False
+                        primer_ingreso_real = False
                     except Exception:
                         pass
                     try:
-                        globals()["real_activado_en_bot"] = 0.0
+                        real_activado_en_bot = 0.0
                     except Exception:
                         pass
 
@@ -2483,6 +2452,9 @@ async def main():
     await monitor()
 
 if __name__ == "__main__":
+    if not WEBSOCKETS_OK:
+        print(Fore.RED + "⛔ Dependencia faltante: websockets. Instálala para ejecutar el bot.")
+        sys.exit(1)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
