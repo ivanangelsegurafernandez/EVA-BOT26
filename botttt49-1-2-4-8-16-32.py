@@ -10,6 +10,7 @@ import json
 import csv
 import os
 import sys
+import math
 from datetime import datetime, timezone
 from statistics import mean
 from colorama import Fore, Back, Style, init
@@ -374,6 +375,16 @@ CSV_HEADER = [
     "trade_status",          # "PRE_TRADE" o "CERRADO"
     "epoch",
     "ts",
+    "ret_1m",
+    "ret_3m",
+    "ret_5m",
+    "slope_5m",
+    "rv_20",
+    "range_norm",
+    "bb_z",
+    "body_ratio",
+    "wick_imbalance",
+    "micro_trend_persist",
     "ia_prob_en_juego",
     "ia_prob_source",
     "ia_decision_id",
