@@ -2949,7 +2949,7 @@ def clip_feature_values(fila_dict, feature_names):
     return clipped
     
 def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
-    """Completa CORE13_v2 scalping desde campos legacy cuando falten."""
+    """Completa CORE13_v2 con datos reales existentes; fallback neutro si faltan."""
     out = dict(fila_dict or {})
 
     def _missing(name: str) -> bool:
@@ -2964,44 +2964,20 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
         except Exception:
             return True
 
-    def _f(name, default=0.0):
-        try:
-            v = float(out.get(name, default) if out.get(name, default) not in (None, "") else default)
-            return v if math.isfinite(v) else float(default)
-        except Exception:
-            return float(default)
+    def _set_if_missing(name: str, neutral: float, lo: float, hi: float):
+        if _missing(name):
+            out[name] = float(np.clip(neutral, lo, hi))
 
-    # Legacy proxies (si no vienen directos de bot):
-    rsi9 = _f("rsi_9", 50.0)
-    rsi14 = _f("rsi_14", 50.0)
-    sma_spread = _f("sma_spread", 0.0)
-    cruce_sma = _f("cruce_sma", 0.0)
-    breakout = _f("breakout", 0.0)
-    rsi_rev = _f("rsi_reversion", 0.0)
-    vol = _f("volatilidad", 0.0)
-    reb = _f("es_rebote", 0.0)
-    racha = _f("racha_actual", 0.0)
-
-    if _missing("ret_1m"):
-        out["ret_1m"] = float(np.clip((rsi9 - 50.0) / 50.0, -1.0, 1.0))
-    if _missing("ret_3m"):
-        out["ret_3m"] = float(np.clip((rsi14 - 50.0) / 50.0, -1.0, 1.0))
-    if _missing("ret_5m"):
-        out["ret_5m"] = float(np.clip(0.6 * float(out.get("ret_3m", 0.0)) + 0.4 * float(out.get("ret_1m", 0.0)), -1.0, 1.0))
-    if _missing("slope_5m"):
-        out["slope_5m"] = float(np.clip(sma_spread + 0.05 * cruce_sma, -1.0, 1.0))
-    if _missing("rv_20"):
-        out["rv_20"] = float(np.clip(vol, 0.0, 1.0))
-    if _missing("range_norm"):
-        out["range_norm"] = float(np.clip(breakout, 0.0, 1.0))
-    if _missing("bb_z"):
-        out["bb_z"] = float(np.clip((2.0 * rsi_rev) - 1.0, -3.0, 3.0))
-    if _missing("body_ratio"):
-        out["body_ratio"] = float(np.clip(abs(float(out.get("ret_1m", 0.0))), 0.0, 1.0))
-    if _missing("wick_imbalance"):
-        out["wick_imbalance"] = float(np.clip((2.0 * reb) - 1.0, -1.0, 1.0))
-    if _missing("micro_trend_persist"):
-        out["micro_trend_persist"] = float(np.clip(racha / 10.0, -1.0, 1.0))
+    _set_if_missing("ret_1m", 0.0, -1.0, 1.0)
+    _set_if_missing("ret_3m", 0.0, -1.0, 1.0)
+    _set_if_missing("ret_5m", 0.0, -1.0, 1.0)
+    _set_if_missing("slope_5m", 0.0, -1.0, 1.0)
+    _set_if_missing("rv_20", 0.5, 0.0, 1.0)
+    _set_if_missing("range_norm", 0.5, 0.0, 1.0)
+    _set_if_missing("bb_z", 0.0, -3.0, 3.0)
+    _set_if_missing("body_ratio", 0.5, 0.0, 1.0)
+    _set_if_missing("wick_imbalance", 0.0, -1.0, 1.0)
+    _set_if_missing("micro_trend_persist", 0.0, -1.0, 1.0)
 
     return out
 
@@ -8321,27 +8297,27 @@ def _enriquecer_df_con_derivadas(df: pd.DataFrame, feats: list[str]) -> pd.DataF
             base = sma20.abs().clip(lower=1e-9)
             out["sma_spread"] = ((sma5 - sma20).abs() / base).clip(lower=0.0, upper=5.0)
 
-        # CORE13_v2 scalping (backfill desde columnas legacy si existen)
+        # CORE13_v2 scalping: usar columnas reales si existen; fallback neutro estable.
         if "ret_1m" in feats:
-            out["ret_1m"] = ((_col_num("rsi_9", 50.0) - 50.0) / 50.0).clip(lower=-1.0, upper=1.0)
+            out["ret_1m"] = _col_num("ret_1m", 0.0).clip(lower=-1.0, upper=1.0)
         if "ret_3m" in feats:
-            out["ret_3m"] = ((_col_num("rsi_14", 50.0) - 50.0) / 50.0).clip(lower=-1.0, upper=1.0)
+            out["ret_3m"] = _col_num("ret_3m", 0.0).clip(lower=-1.0, upper=1.0)
         if "ret_5m" in feats:
-            out["ret_5m"] = (0.6 * _col_num("ret_3m", 0.0) + 0.4 * _col_num("ret_1m", 0.0)).clip(lower=-1.0, upper=1.0)
+            out["ret_5m"] = _col_num("ret_5m", 0.0).clip(lower=-1.0, upper=1.0)
         if "slope_5m" in feats:
-            out["slope_5m"] = (_col_num("sma_spread", 0.0) + 0.05 * _col_num("cruce_sma", 0.0)).clip(lower=-1.0, upper=1.0)
+            out["slope_5m"] = _col_num("slope_5m", 0.0).clip(lower=-1.0, upper=1.0)
         if "rv_20" in feats:
-            out["rv_20"] = _col_num("volatilidad", 0.0).clip(lower=0.0, upper=1.0)
+            out["rv_20"] = _col_num("rv_20", 0.5).clip(lower=0.0, upper=1.0)
         if "range_norm" in feats:
-            out["range_norm"] = _col_num("breakout", 0.0).clip(lower=0.0, upper=1.0)
+            out["range_norm"] = _col_num("range_norm", 0.5).clip(lower=0.0, upper=1.0)
         if "bb_z" in feats:
-            out["bb_z"] = ((2.0 * _col_num("rsi_reversion", 0.0)) - 1.0).clip(lower=-3.0, upper=3.0)
+            out["bb_z"] = _col_num("bb_z", 0.0).clip(lower=-3.0, upper=3.0)
         if "body_ratio" in feats:
-            out["body_ratio"] = _col_num("ret_1m", 0.0).abs().clip(lower=0.0, upper=1.0)
+            out["body_ratio"] = _col_num("body_ratio", 0.5).clip(lower=0.0, upper=1.0)
         if "wick_imbalance" in feats:
-            out["wick_imbalance"] = ((2.0 * _col_num("es_rebote", 0.0)) - 1.0).clip(lower=-1.0, upper=1.0)
+            out["wick_imbalance"] = _col_num("wick_imbalance", 0.0).clip(lower=-1.0, upper=1.0)
         if "micro_trend_persist" in feats:
-            out["micro_trend_persist"] = (_col_num("racha_actual", 0.0) / 10.0).clip(lower=-1.0, upper=1.0)
+            out["micro_trend_persist"] = _col_num("micro_trend_persist", 0.0).clip(lower=-1.0, upper=1.0)
 
         return out
     except Exception:
