@@ -168,6 +168,7 @@ estado_bot = {
     "score_senal": None,
     "ciclo_actual": 1,
     "trade_snapshots": {},
+    "cancelled_pretrades": set(),
 }  # Added modo_manual and barra_activa
 racha_actual_bot = 0  # racha del bot: >0 = racha de GANANCIAS, <0 = racha de PÉRDIDAS
 
@@ -674,6 +675,98 @@ def pop_trade_snapshot(epoch_pretrade, symbol, direccion, ciclo):
         return snaps.pop(_trade_snapshot_key(epoch_pretrade, symbol, direccion, ciclo), None)
     except Exception:
         return None
+
+
+async def registrar_pretrade_cancelado(
+    archivo_csv,
+    epoch_pretrade,
+    symbol,
+    direccion,
+    ciclo,
+    monto=None,
+    rsi9=None,
+    rsi14=None,
+    sma5=None,
+    sma20=None,
+    cruce=None,
+    breakout=None,
+    rsi_reversion=None,
+    payout=None,
+    condiciones=None,
+):
+    if epoch_pretrade is None:
+        return False
+    try:
+        epoch_val = int(epoch_pretrade)
+        key = _trade_snapshot_key(epoch_val, symbol, direccion, ciclo)
+    except Exception:
+        return False
+
+    cancelled = estado_bot.setdefault("cancelled_pretrades", set())
+    if key in cancelled:
+        return False
+
+    snap = get_trade_snapshot(epoch_val, symbol, direccion, ciclo) or {}
+    ack_ctx = estado_bot.get("ack_ctx", {}) if isinstance(estado_bot.get("ack_ctx", {}), dict) else {}
+    ia_prob_en_juego = ack_ctx.get("ia_prob_en_juego", "")
+    ia_prob_source = str(ack_ctx.get("ia_prob_source", "") or "").strip()
+    ia_ready_ack = bool(ack_ctx.get("ia_ready_ack", False))
+    if isinstance(ia_prob_en_juego, (int, float)):
+        ia_prob_source = ia_prob_source or "HUD"
+        ia_ready_ack = True
+    else:
+        ia_prob_source = ia_prob_source or "NO_READY"
+
+    monto_f, payout_total_f, payout_mult_f = _normalizar_payout_desde_monto(payout, monto)
+    puntaje01 = _norm_puntaje_01(condiciones)
+    now = datetime.now(timezone.utc)
+
+    row_dict = {
+        "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "activo": symbol,
+        "direction": direccion,
+        "monto": float(monto_f),
+        "resultado": "CANCELADO",
+        "ganancia_perdida": "",
+        "rsi_9": rsi9,
+        "rsi_14": rsi14,
+        "sma_5": sma5,
+        "sma_20": sma20,
+        "cruce_sma": int(cruce) if cruce is not None else "",
+        "breakout": int(breakout) if breakout is not None else "",
+        "rsi_reversion": int(rsi_reversion) if rsi_reversion is not None else "",
+        "racha_actual": int(racha_actual_bot),
+        "es_rebote": 1 if int(racha_actual_bot) <= -4 else 0,
+        "ciclo_martingala": int(ciclo),
+        "payout_total": float(round(payout_total_f, 2)),
+        "payout_multiplier": float(round(payout_mult_f, 6)),
+        "puntaje_estrategia": float(round(float(puntaje01), 6)),
+        "result_bin": "",
+        "trade_status": "CANCELADO",
+        "epoch": epoch_val,
+        "ts": now.isoformat(),
+        "ret_1m": _safe_clip(snap.get("ret_1m", 0.0), -1.0, 1.0, 0.0),
+        "ret_3m": _safe_clip(snap.get("ret_3m", 0.0), -1.0, 1.0, 0.0),
+        "ret_5m": _safe_clip(snap.get("ret_5m", 0.0), -1.0, 1.0, 0.0),
+        "slope_5m": _safe_clip(snap.get("slope_5m", 0.0), -1.0, 1.0, 0.0),
+        "rv_20": _safe_clip(snap.get("rv_20", 0.0), 0.0, 1.0, 0.0),
+        "range_norm": _safe_clip(snap.get("range_norm", 0.0), 0.0, 1.0, 0.0),
+        "bb_z": _safe_clip(snap.get("bb_z", 0.0), -3.0, 3.0, 0.0),
+        "body_ratio": _safe_clip(snap.get("body_ratio", 0.0), 0.0, 1.0, 0.0),
+        "wick_imbalance": _safe_clip(snap.get("wick_imbalance", 0.0), -1.0, 1.0, 0.0),
+        "micro_trend_persist": _safe_clip(snap.get("micro_trend_persist", 0.0), -1.0, 1.0, 0.0),
+        "ia_prob_en_juego": ia_prob_en_juego,
+        "ia_prob_source": ia_prob_source,
+        "ia_decision_id": ack_ctx.get("ia_decision_id", f"{NOMBRE_BOT}|{epoch_val}"),
+        "ia_gate_real": ack_ctx.get("ia_gate_real", ""),
+        "ia_modo_ack": ack_ctx.get("ia_modo_ack", ""),
+        "ia_ready_ack": ia_ready_ack,
+    }
+
+    async with csv_lock:
+        _write_row_dict_atomic(archivo_csv, row_dict)
+    cancelled.add(key)
+    return True
 
 
 def write_token_atomic(path: str, content: str):
@@ -2562,6 +2655,14 @@ async def ejecutar_panel():
                             Fore.YELLOW + Style.BRIGHT +
                             f"[VENTANA IA] Token cambió durante la decisión. Reintentando ciclo #{ciclo} (sin comprar)."
                         )
+                        if epoch_pre is not None:
+                            await registrar_pretrade_cancelado(
+                                ARCHIVO_CSV, epoch_pre, symbol, direccion, ciclo,
+                                monto=monto, rsi9=rsi9, rsi14=rsi14, sma5=sma5, sma20=sma20,
+                                cruce=cruce, breakout=breakout, rsi_reversion=rsi_reversion,
+                                payout=payout, condiciones=condiciones,
+                            )
+                            pop_trade_snapshot(int(epoch_pre), symbol, direccion, ciclo)
                         reinicio_forzado.clear()
                         await asyncio.sleep(0.8)
                         continue
@@ -2584,6 +2685,14 @@ async def ejecutar_panel():
                     }, expect_msg_type="buy", timeout=8.0)
                 except RuntimeError as api_e:
                     print(Fore.RED + Style.BRIGHT + f"[ERROR] Compra: {api_e}. Reintentando mismo ciclo...")
+                    if epoch_pre is not None:
+                        await registrar_pretrade_cancelado(
+                            ARCHIVO_CSV, epoch_pre, symbol, direccion, ciclo,
+                            monto=monto, rsi9=rsi9, rsi14=rsi14, sma5=sma5, sma20=sma20,
+                            cruce=cruce, breakout=breakout, rsi_reversion=rsi_reversion,
+                            payout=payout, condiciones=condiciones,
+                        )
+                        pop_trade_snapshot(int(epoch_pre), symbol, direccion, ciclo)
                     estado_bot["token_msg_mostrado"] = False
                     await asyncio.sleep(10 + random.uniform(0.0, 0.5))
                     continue
@@ -2591,10 +2700,26 @@ async def ejecutar_panel():
                     if _es_error_transitorio_ws(e):
                         if _print_once("buy-transient", ttl=8):
                             print(Fore.YELLOW + Style.BRIGHT + f"[WARN] Compra inestable ({type(e).__name__}). Reabro WS y mantengo ciclo #{ciclo}.")
+                        if epoch_pre is not None:
+                            await registrar_pretrade_cancelado(
+                                ARCHIVO_CSV, epoch_pre, symbol, direccion, ciclo,
+                                monto=monto, rsi9=rsi9, rsi14=rsi14, sma5=sma5, sma20=sma20,
+                                cruce=cruce, breakout=breakout, rsi_reversion=rsi_reversion,
+                                payout=payout, condiciones=condiciones,
+                            )
+                            pop_trade_snapshot(int(epoch_pre), symbol, direccion, ciclo)
                         await _cerrar_ws(ws)
                         ws = await _abrir_ws(current_token)
                         await asyncio.sleep(0.6 + random.uniform(0.0, 0.4))
                         continue
+                    if epoch_pre is not None:
+                        await registrar_pretrade_cancelado(
+                            ARCHIVO_CSV, epoch_pre, symbol, direccion, ciclo,
+                            monto=monto, rsi9=rsi9, rsi14=rsi14, sma5=sma5, sma20=sma20,
+                            cruce=cruce, breakout=breakout, rsi_reversion=rsi_reversion,
+                            payout=payout, condiciones=condiciones,
+                        )
+                        pop_trade_snapshot(int(epoch_pre), symbol, direccion, ciclo)
                     raise
 
                 contract_id = data_buy["buy"]["contract_id"]
