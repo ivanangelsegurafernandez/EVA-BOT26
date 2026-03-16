@@ -18,6 +18,7 @@ import pandas as pd
 import time  # Added for timestamps in orden_real and BLOQUE 5
 import random  # Added for jitter in BLOQUE 1.3
 import itertools  # For req_counter in api_call
+import math
 
 # === BLINDAJE: señales limpias ===
 import signal
@@ -166,6 +167,7 @@ estado_bot = {
     "barra_activa": False,
     "score_senal": None,
     "ciclo_actual": 1,
+    "trade_snapshots": {},
 }  # Added modo_manual and barra_activa
 racha_actual_bot = 0  # racha del bot: >0 = racha de GANANCIAS, <0 = racha de PÉRDIDAS
 
@@ -372,6 +374,16 @@ CSV_HEADER = [
     "trade_status",          # "PRE_TRADE" o "CERRADO"
     "epoch",
     "ts",
+    "ret_1m",
+    "ret_3m",
+    "ret_5m",
+    "slope_5m",
+    "rv_20",
+    "range_norm",
+    "bb_z",
+    "body_ratio",
+    "wick_imbalance",
+    "micro_trend_persist",
     "ia_prob_en_juego",
     "ia_prob_source",
     "ia_decision_id",
@@ -541,6 +553,19 @@ def write_pretrade_snapshot(
         except Exception:
             es_rebote_flag = 1 if (racha_prev <= -4) else 0
 
+    # scalping features (snapshot inmutable del trade)
+    sf = kwargs.get("scalping_features") if isinstance(kwargs.get("scalping_features"), dict) else {}
+    ret_1m = _safe_clip(sf.get("ret_1m", 0.0), -1.0, 1.0, 0.0)
+    ret_3m = _safe_clip(sf.get("ret_3m", 0.0), -1.0, 1.0, 0.0)
+    ret_5m = _safe_clip(sf.get("ret_5m", 0.0), -1.0, 1.0, 0.0)
+    slope_5m = _safe_clip(sf.get("slope_5m", 0.0), -1.0, 1.0, 0.0)
+    rv_20 = _safe_clip(sf.get("rv_20", 0.0), 0.0, 1.0, 0.0)
+    range_norm = _safe_clip(sf.get("range_norm", 0.0), 0.0, 1.0, 0.0)
+    bb_z = _safe_clip(sf.get("bb_z", 0.0), -3.0, 3.0, 0.0)
+    body_ratio = _safe_clip(sf.get("body_ratio", 0.0), 0.0, 1.0, 0.0)
+    wick_imbalance = _safe_clip(sf.get("wick_imbalance", 0.0), -1.0, 1.0, 0.0)
+    micro_trend_persist = _safe_clip(sf.get("micro_trend_persist", 0.0), -1.0, 1.0, 0.0)
+
     # monto/payout normalizados (semántica única)
     monto_f, payout_total_f, payout_mult_f = _normalizar_payout_desde_monto(payout, monto)
 
@@ -580,6 +605,16 @@ def write_pretrade_snapshot(
         "trade_status": "PRE_TRADE",
         "epoch": int(epoch_val),
         "ts": ts_val,
+        "ret_1m": ret_1m,
+        "ret_3m": ret_3m,
+        "ret_5m": ret_5m,
+        "slope_5m": slope_5m,
+        "rv_20": rv_20,
+        "range_norm": range_norm,
+        "bb_z": bb_z,
+        "body_ratio": body_ratio,
+        "wick_imbalance": wick_imbalance,
+        "micro_trend_persist": micro_trend_persist,
         "ia_prob_en_juego": "",
         "ia_prob_source": "",
         "ia_decision_id": f"{NOMBRE_BOT}|{int(epoch_val)}|C{int(ciclo) if ciclo is not None else 1}|{symbol}|{direccion}|{str(kwargs.get('token', 'NA')).upper()}",
@@ -590,6 +625,56 @@ def write_pretrade_snapshot(
 
     _write_row_dict_atomic(archivo_csv, row_dict)
     return epoch_val
+
+
+def _trade_snapshot_key(epoch_pretrade, symbol, direccion, ciclo):
+    return f"{int(epoch_pretrade)}|{str(symbol)}|{str(direccion)}|{int(ciclo)}"
+
+
+def set_trade_snapshot(epoch_pretrade, symbol, direccion, ciclo, scalping_features):
+    try:
+        key = _trade_snapshot_key(epoch_pretrade, symbol, direccion, ciclo)
+        snaps = estado_bot.setdefault("trade_snapshots", {})
+        sf = scalping_features if isinstance(scalping_features, dict) else {}
+        snaps[key] = {
+            "epoch_pretrade": int(epoch_pretrade),
+            "symbol": str(symbol),
+            "direccion": str(direccion),
+            "ciclo": int(ciclo),
+            "ret_1m": _safe_clip(sf.get("ret_1m", 0.0), -1.0, 1.0, 0.0),
+            "ret_3m": _safe_clip(sf.get("ret_3m", 0.0), -1.0, 1.0, 0.0),
+            "ret_5m": _safe_clip(sf.get("ret_5m", 0.0), -1.0, 1.0, 0.0),
+            "slope_5m": _safe_clip(sf.get("slope_5m", 0.0), -1.0, 1.0, 0.0),
+            "rv_20": _safe_clip(sf.get("rv_20", 0.0), 0.0, 1.0, 0.0),
+            "range_norm": _safe_clip(sf.get("range_norm", 0.0), 0.0, 1.0, 0.0),
+            "bb_z": _safe_clip(sf.get("bb_z", 0.0), -3.0, 3.0, 0.0),
+            "body_ratio": _safe_clip(sf.get("body_ratio", 0.0), 0.0, 1.0, 0.0),
+            "wick_imbalance": _safe_clip(sf.get("wick_imbalance", 0.0), -1.0, 1.0, 0.0),
+            "micro_trend_persist": _safe_clip(sf.get("micro_trend_persist", 0.0), -1.0, 1.0, 0.0),
+        }
+    except Exception:
+        pass
+
+
+def get_trade_snapshot(epoch_pretrade, symbol, direccion, ciclo):
+    try:
+        snaps = estado_bot.get("trade_snapshots", {})
+        if not isinstance(snaps, dict):
+            return None
+        return snaps.get(_trade_snapshot_key(epoch_pretrade, symbol, direccion, ciclo))
+    except Exception:
+        return None
+
+
+def pop_trade_snapshot(epoch_pretrade, symbol, direccion, ciclo):
+    try:
+        snaps = estado_bot.get("trade_snapshots", {})
+        if not isinstance(snaps, dict):
+            return None
+        return snaps.pop(_trade_snapshot_key(epoch_pretrade, symbol, direccion, ciclo), None)
+    except Exception:
+        return None
+
 
 def write_token_atomic(path: str, content: str):
     """
@@ -1021,6 +1106,157 @@ def calcular_rsi(cierres, periodo=14):
     media_per = mean(perdidas) if perdidas else 0.0001
     rs = media_gan / media_per
     return round(100 - (100 / (1 + rs)), 2)
+
+def _safe_clip(value, low, high, default=0.0):
+    try:
+        v = float(value)
+        if not math.isfinite(v):
+            return float(default)
+        if v < low:
+            return float(low)
+        if v > high:
+            return float(high)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _safe_div(num, den, default=0.0):
+    try:
+        n = float(num)
+        d = float(den)
+        if (not math.isfinite(n)) or (not math.isfinite(d)) or abs(d) <= 1e-12:
+            return float(default)
+        out = n / d
+        if not math.isfinite(out):
+            return float(default)
+        return float(out)
+    except Exception:
+        return float(default)
+
+
+def calcular_scalping_features(velas):
+    """
+    Calcula 10 features de scalping desde OHLC reales.
+    Robusta: no lanza excepción, devuelve finitos y acotados.
+    """
+    neutrals = {
+        "ret_1m": 0.0,
+        "ret_3m": 0.0,
+        "ret_5m": 0.0,
+        "slope_5m": 0.0,
+        "rv_20": 0.0,
+        "range_norm": 0.0,
+        "bb_z": 0.0,
+        "body_ratio": 0.0,
+        "wick_imbalance": 0.0,
+        "micro_trend_persist": 0.0,
+    }
+    try:
+        if not isinstance(velas, list) or len(velas) < 2:
+            return dict(neutrals)
+
+        o = [float(v.get("open", 0.0) or 0.0) for v in velas]
+        h = [float(v.get("high", 0.0) or 0.0) for v in velas]
+        l = [float(v.get("low", 0.0) or 0.0) for v in velas]
+        c = [float(v.get("close", 0.0) or 0.0) for v in velas]
+
+        for arr in (o, h, l, c):
+            if any((not math.isfinite(x)) for x in arr):
+                return dict(neutrals)
+
+        n = len(c)
+        last_close = c[-1] if n >= 1 else 0.0
+
+        ret_1m = _safe_div((c[-1] - c[-2]), c[-2], 0.0) if n >= 2 else 0.0
+        ret_3m = _safe_div((c[-1] - c[-4]), c[-4], 0.0) if n >= 4 else 0.0
+        ret_5m = _safe_div((c[-1] - c[-6]), c[-6], 0.0) if n >= 6 else 0.0
+
+        slope_5m = 0.0
+        if n >= 5:
+            y = c[-5:]
+            x = [0.0, 1.0, 2.0, 3.0, 4.0]
+            x_mean = 2.0
+            y_mean = sum(y) / 5.0
+            num = sum((x[i] - x_mean) * (y[i] - y_mean) for i in range(5))
+            den = sum((x[i] - x_mean) ** 2 for i in range(5))
+            slope_raw = _safe_div(num, den, 0.0)
+            slope_5m = _safe_div(slope_raw, max(abs(y_mean), 1e-9), 0.0)
+
+        returns = []
+        for i in range(1, n):
+            r = _safe_div((c[i] - c[i - 1]), c[i - 1], 0.0)
+            returns.append(r)
+        if returns:
+            mu = sum(returns) / float(len(returns))
+            var = sum((r - mu) ** 2 for r in returns) / float(len(returns))
+            rv_20 = math.sqrt(var) if var > 0 else 0.0
+        else:
+            rv_20 = 0.0
+
+        hl_range = (h[-1] - l[-1]) if n >= 1 else 0.0
+        range_norm = _safe_div(hl_range, last_close, 0.0)
+
+        win20 = c[-20:] if n >= 20 else c
+        if win20:
+            sma20 = sum(win20) / float(len(win20))
+            var20 = sum((x - sma20) ** 2 for x in win20) / float(len(win20))
+            std20 = math.sqrt(var20) if var20 > 0 else 0.0
+        else:
+            sma20 = 0.0
+            std20 = 0.0
+        bb_z = _safe_div((last_close - sma20), (2.0 * std20), 0.0)
+
+        body_ratio = _safe_div(abs(c[-1] - o[-1]), hl_range, 0.0) if n >= 1 else 0.0
+
+        up_wick = (h[-1] - max(o[-1], c[-1])) if n >= 1 else 0.0
+        low_wick = (min(o[-1], c[-1]) - l[-1]) if n >= 1 else 0.0
+        if up_wick < 0:
+            up_wick = 0.0
+        if low_wick < 0:
+            low_wick = 0.0
+        wick_imbalance = _safe_div((up_wick - low_wick), hl_range, 0.0)
+
+        micro_trend_persist = 0.0
+        if n >= 2:
+            signs = []
+            for i in range(1, n):
+                d = c[i] - c[i - 1]
+                if d > 0:
+                    signs.append(1)
+                elif d < 0:
+                    signs.append(-1)
+                else:
+                    signs.append(0)
+            streak = 0
+            final_sign = signs[-1]
+            if final_sign != 0:
+                for sg in reversed(signs):
+                    if sg == final_sign:
+                        streak += 1
+                    else:
+                        break
+                micro_trend_persist = final_sign * _safe_div(streak, max(len(signs), 1), 0.0)
+
+        feats = {
+            "ret_1m": _safe_clip(ret_1m, -1.0, 1.0, 0.0),
+            "ret_3m": _safe_clip(ret_3m, -1.0, 1.0, 0.0),
+            "ret_5m": _safe_clip(ret_5m, -1.0, 1.0, 0.0),
+            "slope_5m": _safe_clip(slope_5m, -1.0, 1.0, 0.0),
+            "rv_20": _safe_clip(rv_20, 0.0, 1.0, 0.0),
+            "range_norm": _safe_clip(range_norm, 0.0, 1.0, 0.0),
+            "bb_z": _safe_clip(bb_z, -3.0, 3.0, 0.0),
+            "body_ratio": _safe_clip(body_ratio, 0.0, 1.0, 0.0),
+            "wick_imbalance": _safe_clip(wick_imbalance, -1.0, 1.0, 0.0),
+            "micro_trend_persist": _safe_clip(micro_trend_persist, -1.0, 1.0, 0.0),
+        }
+        for k, v in feats.items():
+            if not math.isfinite(v):
+                feats[k] = 0.0
+        return feats
+    except Exception:
+        return dict(neutrals)
+
 
 def evaluar_estrategia(velas):
     # Normaliza a float por si Deriv devuelve strings
@@ -1546,6 +1782,8 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
             print(color + Style.BRIGHT + f"{resultado}: {profit:.2f} USD")
             # >>> PATCH BLOQUE 3 y 5
             if not _registrar_contrato_procesado(contract_id):
+                if epoch_pretrade is not None:
+                    pop_trade_snapshot(int(epoch_pretrade), symbol, direccion, ciclo)
                 return resultado, profit
             # <<< PATCH
             # Registrar resultado SOLO si es definido, con features enriquecidas
@@ -1574,7 +1812,8 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                 now = datetime.now(timezone.utc)
                 epoch_val = int(epoch_pretrade) if epoch_pretrade is not None else int(now.timestamp())
                 ts_val = now.isoformat()
-                
+                snap = get_trade_snapshot(epoch_val, symbol, direccion, ciclo) or {}
+
                 async with csv_lock:
                     # ==========================
                     # CIERRE CERRADO (DICT MODERNO)
@@ -1614,6 +1853,16 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                         "trade_status": "CERRADO",
                         "epoch": int(epoch_val),
                         "ts": ts_val,
+                        "ret_1m": _safe_clip(snap.get("ret_1m", 0.0), -1.0, 1.0, 0.0),
+                        "ret_3m": _safe_clip(snap.get("ret_3m", 0.0), -1.0, 1.0, 0.0),
+                        "ret_5m": _safe_clip(snap.get("ret_5m", 0.0), -1.0, 1.0, 0.0),
+                        "slope_5m": _safe_clip(snap.get("slope_5m", 0.0), -1.0, 1.0, 0.0),
+                        "rv_20": _safe_clip(snap.get("rv_20", 0.0), 0.0, 1.0, 0.0),
+                        "range_norm": _safe_clip(snap.get("range_norm", 0.0), 0.0, 1.0, 0.0),
+                        "bb_z": _safe_clip(snap.get("bb_z", 0.0), -3.0, 3.0, 0.0),
+                        "body_ratio": _safe_clip(snap.get("body_ratio", 0.0), 0.0, 1.0, 0.0),
+                        "wick_imbalance": _safe_clip(snap.get("wick_imbalance", 0.0), -1.0, 1.0, 0.0),
+                        "micro_trend_persist": _safe_clip(snap.get("micro_trend_persist", 0.0), -1.0, 1.0, 0.0),
                         "ia_prob_en_juego": ia_prob_en_juego,
                         "ia_prob_source": ia_prob_source,
                         "ia_decision_id": ack_ctx.get("ia_decision_id", f"{NOMBRE_BOT}|{int(epoch_val)}"),
@@ -1672,6 +1921,8 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
             # >>> PATCH BLOQUE 5
             print(Fore.CYAN + f"Ciclo #{ciclo} | {symbol} {direccion} | payout={float(payout or 0):.2f} | {resultado} {profit:+.2f} USD")
             # <<< PATCH
+            if epoch_pretrade is not None:
+                pop_trade_snapshot(int(epoch_pretrade), symbol, direccion, ciclo)
             return resultado, profit
         except websockets.exceptions.ConnectionClosed:
             if _print_once("no-close-frame", ttl=15):
@@ -1729,6 +1980,8 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
 
         # === Evitar doble commit por mismo contrato ===
         if not _registrar_contrato_procesado(contract_id):
+            if epoch_pretrade is not None:
+                pop_trade_snapshot(int(epoch_pretrade), symbol, direccion, ciclo)
             return
 
         # === IA / racha / es_rebote (SIN FUGA) ===
@@ -1754,6 +2007,7 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
         now = datetime.now(timezone.utc)
         epoch_val = int(epoch_pretrade) if epoch_pretrade is not None else int(now.timestamp())
         ts_val = now.isoformat()
+        snap = get_trade_snapshot(epoch_val, symbol, direccion, ciclo) or {}
 
         # ==========================================================
         # payout robusto:
@@ -1806,8 +2060,20 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
                 "trade_status": "CERRADO",
                 "epoch": int(epoch_val),
                 "ts": ts_val,
+                "ret_1m": _safe_clip(snap.get("ret_1m", 0.0), -1.0, 1.0, 0.0),
+                "ret_3m": _safe_clip(snap.get("ret_3m", 0.0), -1.0, 1.0, 0.0),
+                "ret_5m": _safe_clip(snap.get("ret_5m", 0.0), -1.0, 1.0, 0.0),
+                "slope_5m": _safe_clip(snap.get("slope_5m", 0.0), -1.0, 1.0, 0.0),
+                "rv_20": _safe_clip(snap.get("rv_20", 0.0), 0.0, 1.0, 0.0),
+                "range_norm": _safe_clip(snap.get("range_norm", 0.0), 0.0, 1.0, 0.0),
+                "bb_z": _safe_clip(snap.get("bb_z", 0.0), -3.0, 3.0, 0.0),
+                "body_ratio": _safe_clip(snap.get("body_ratio", 0.0), 0.0, 1.0, 0.0),
+                "wick_imbalance": _safe_clip(snap.get("wick_imbalance", 0.0), -1.0, 1.0, 0.0),
+                "micro_trend_persist": _safe_clip(snap.get("micro_trend_persist", 0.0), -1.0, 1.0, 0.0),
             }
             _write_row_dict_atomic(ARCHIVO_CSV, row_dict)
+        if epoch_pretrade is not None:
+            pop_trade_snapshot(int(epoch_pretrade), symbol, direccion, ciclo)
         # === Logs ===
         msg = Fore.CYAN + f"Contrato #{contract_id} finalizado en background: {resultado} {profit:.2f} USD"
         if estado_bot.get("barra_activa", False):
@@ -2093,6 +2359,8 @@ async def ejecutar_panel():
                             await asyncio.sleep(15 + random.uniform(0.0, 0.5))
                         continue
 
+                scalping_snapshot_final = {}
+
                 # ========= REVALIDACIÓN PRE-BUY =========
                 try:
                     score_sel = estado_bot.get("score_senal")
@@ -2112,8 +2380,19 @@ async def ejecutar_panel():
                         # refresca snapshot para compra/log consistentes
                         direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion, condiciones = dir2, rsi9_2, rsi14_2, sma5_2, sma20_2, br2, cr2, rev2, cond2
                         estado_bot["score_senal"] = float(score2)
+                        scalping_snapshot_final = calcular_scalping_features(velas_rv)
+                    elif velas_rv:
+                        scalping_snapshot_final = calcular_scalping_features(velas_rv)
                 except Exception:
-                    pass
+                    scalping_snapshot_final = {}
+
+                if not scalping_snapshot_final:
+                    try:
+                        velas_sf = await obtener_velas(ws, symbol, current_token, reintentos=1)
+                        if velas_sf:
+                            scalping_snapshot_final = calcular_scalping_features(velas_sf)
+                    except Exception:
+                        scalping_snapshot_final = {}
 
                 # ========= PROPOSAL =========
                 try:
@@ -2192,7 +2471,10 @@ async def ejecutar_panel():
                         payout=float(payout),
                         puntaje_estrategia=float(condiciones),  # tu score
                         token=current_token,
+                        scalping_features=scalping_snapshot_final,
                     )
+                    if epoch_pre is not None:
+                        set_trade_snapshot(epoch_pre, symbol, direccion, ciclo, scalping_snapshot_final)
                 except Exception:
                     epoch_pre = None
 
