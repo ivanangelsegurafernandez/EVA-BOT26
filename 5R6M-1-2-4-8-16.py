@@ -3936,12 +3936,10 @@ def leer_ultima_fila_con_resultado(bot: str) -> tuple[dict | None, int | None]:
         except Exception:
             pass
 
-        # 8) Features requeridas (13 core, estricto)
-        required = [
-            "rsi_9","rsi_14","sma_5","sma_spread","cruce_sma","breakout",
-            "rsi_reversion","racha_actual","payout","puntaje_estrategia",
-            "volatilidad","es_rebote","hora_bucket",
-        ]
+        # 8) Features requeridas: CORE13 canónico del incremental actual.
+        #    IMPORTANTE: aquí NO recortamos a set legacy, porque esta salida
+        #    alimenta anexar_incremental_desde_bot() y debe conservar scalping real.
+        required = list(INCREMENTAL_FEATURES_V2)
 
         fila_dict = {}
         for k in required:
@@ -12742,21 +12740,13 @@ def backfill_incremental(ultimas=500):
             if df is None or df.empty:
                 continue
 
-            req = [
-                "rsi_9","rsi_14","sma_5","sma_20","cruce_sma","breakout",
-                "rsi_reversion","racha_actual","puntaje_estrategia"
-            ]
-            if not set(req).issubset(df.columns) or "resultado" not in df.columns:
+            if "resultado" not in df.columns:
                 continue
-
-            for c in req + ["payout","payout_decimal_rounded"]:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
 
             df["resultado_norm"] = df["resultado"].apply(normalizar_resultado)
 
             sub = df[df["resultado_norm"].isin(["GANANCIA","PÉRDIDA"])]
-            sub = sub[sub[req].notna().all(axis=1)].tail(ultimas)
+            sub = sub.tail(ultimas)
             if sub.empty:
                 continue
 
@@ -12765,80 +12755,39 @@ def backfill_incremental(ultimas=500):
             
             nuevas_filas = []
             for _, r in sub.iterrows():
-                # base mínima
-                fila = {k: float(r[k]) for k in req}
-                sp = _calcular_sma_spread_robusto({
-                    "sma_5": r.get("sma_5", 0.0),
-                    "sma_20": r.get("sma_20", 0.0),
-                    "close": r.get("close", r.get("cierre", None)),
-                })
-                if sp is None or not np.isfinite(float(sp)):
-                    descartadas += 1
-                    continue
-                fila["sma_spread"] = float(sp)
-
                 # Diccionario completo para helpers enriquecidos
                 row_dict_full = r.to_dict()
 
-                                # ==========================
-                # payout normalizado (ROI 0–1.5 aprox)
-                # ==========================
+                # Canoniza + completa faltantes reales del CORE13.
+                row_dict_full = canonicalizar_campos_bot_maestro(row_dict_full)
+
                 pay = calcular_payout_feature(row_dict_full)
-                # Si falta payout, NO lo inventamos como 0.0: descartamos la fila
-                # (backfill es entrenamiento, aquí ser conservador = IA más estable)
                 if pay is None or pay < 0.05:
                     descartadas += 1
                     continue
-
-                # ✅ FIX: estas asignaciones DEBEN ocurrir antes del continue
-                fila["payout"] = float(pay)
                 row_dict_full["payout"] = float(pay)
 
-                # Enriquecer señales evento antes de extraer features finales
-                row_dict_full = enriquecer_features_evento(row_dict_full)
-
-                # ==========================
-                # puntaje_estrategia normalizado 0–1
-                # ==========================
                 pe = calcular_puntaje_estrategia_normalizado(row_dict_full)
-                if pe is None and "puntaje_estrategia" in r:
-                    pe = _norm_01(r.get("puntaje_estrategia"))
-                if pe is not None:
-                    fila["puntaje_estrategia"] = pe
+                if pe is None:
+                    pe = _safe_float_local(row_dict_full.get("puntaje_estrategia"))
+                if pe is None or (not math.isfinite(float(pe))):
+                    descartadas += 1
+                    continue
+                row_dict_full["puntaje_estrategia"] = float(max(0.0, min(1.0, float(pe))))
 
-                # ==========================
-                # volatilidad: normalizada a [0,1]
-                # - si viene en el CSV y es válida, la usamos
-                # - si falta / NaN, la calculamos con calcular_volatilidad_simple (proxy SMA5 vs SMA20)
-                # ==========================
-                vol_raw = row_dict_full.get("volatilidad", None)
-                try:
-                    vol = float(vol_raw) if vol_raw not in (None, "") else np.nan
-                except Exception:
-                    vol = np.nan
-                if pd.isna(vol):
-                    vol = calcular_volatilidad_simple(row_dict_full)
-                try:
-                    vol_f = float(vol)
-                except Exception:
-                    vol_f = float("nan")
-                if (not math.isfinite(vol_f)) or vol_f <= 0.0:
-                    vol_hist = calcular_volatilidad_por_bot(bot, lookback=50)
-                    if vol_hist is not None:
-                        vol_f = float(vol_hist)
-                if (not math.isfinite(vol_f)):
-                    vol_f = 0.0
+                row_dict_full = _enriquecer_scalping_features_row(row_dict_full)
 
-                fila["volatilidad"] = max(0.0, min(float(vol_f), 1.0))
-
-                # ==========================
-                # nuevas features: rebote y hora (0–1)
-                # ==========================
-                fila["es_rebote"]   = float(max(0.0, min(1.0, _safe_float_local(row_dict_full.get("es_rebote")) or calcular_es_rebote(row_dict_full))))
-                hb, hm = calcular_hora_features(row_dict_full)
-                if float(hm) >= 1.0:
-                    hb = 0.0
-                fila["hora_bucket"] = float(max(0.0, min(1.0, float(hb))))
+                fila = {}
+                missing = False
+                for k in feature_names:
+                    fv = _safe_float_local(row_dict_full.get(k))
+                    if fv is None or (not math.isfinite(float(fv))):
+                        missing = True
+                        break
+                    fila[k] = float(fv)
+                if missing:
+                    descartadas += 1
+                    continue
 
                 # ==========================
                 # label final (GANANCIA / PÉRDIDA)
