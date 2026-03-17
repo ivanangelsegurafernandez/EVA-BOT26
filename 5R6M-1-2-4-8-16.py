@@ -6665,6 +6665,13 @@ def predecir_prob_ia_bot(bot: str) -> tuple[float | None, str | None]:
         if row is None:
             return None, "NO_FEATURE_ROW"
 
+        try:
+            sc_diag = _diagnosticar_scalping_row(row)
+            if int(sc_diag.get("reales", 0)) < int(SCALPING_MIN_REALES_POR_FILA):
+                return None, "SCALPING_DEAD"
+        except Exception:
+            pass
+
         if model is None:
             # Modo LOW_DATA: aún sin modelo, pero entrega prob heurística para no quedar en OFF.
             try:
@@ -8825,6 +8832,8 @@ def oraculo_predict_visible(fila_dict):
             if fn:
                 meta_local["feature_names"] = fn
                 prob = oraculo_predict(fila_dict, model, scaler, meta_local, bot_name="HUD")
+                if prob is None:
+                    return None, "SCALPING_DEAD"
                 return prob, "modelo"
 
         # Sin modelo: fallback visual (NO opera, solo pinta)
@@ -8890,6 +8899,13 @@ def oraculo_predict(fila_dict, modelo, scaler, meta, bot_name=""):
     try:
         if fila_dict is None:
             return 0.0
+
+        try:
+            sc_diag = _diagnosticar_scalping_row(fila_dict)
+            if int(sc_diag.get("reales", 0)) < int(SCALPING_MIN_REALES_POR_FILA):
+                return None
+        except Exception:
+            pass
 
         feature_names = _resolve_oracle_feature_names(modelo, scaler, (meta or {}).get("feature_names"), meta or {})
         if not feature_names:
