@@ -8446,13 +8446,13 @@ def _enriquecer_df_con_derivadas(df: pd.DataFrame, feats: list[str]) -> pd.DataF
         if "slope_5m" in feats:
             out["slope_5m"] = _col_num("slope_5m", 0.0).clip(lower=-1.0, upper=1.0)
         if "rv_20" in feats:
-            out["rv_20"] = _col_num("rv_20", 0.5).clip(lower=0.0, upper=1.0)
+            out["rv_20"] = _col_num("rv_20", float(INCREMENTAL_SCALPING_DEFAULTS["rv_20"])).clip(lower=0.0, upper=1.0)
         if "range_norm" in feats:
-            out["range_norm"] = _col_num("range_norm", 0.5).clip(lower=0.0, upper=1.0)
+            out["range_norm"] = _col_num("range_norm", float(INCREMENTAL_SCALPING_DEFAULTS["range_norm"])).clip(lower=0.0, upper=1.0)
         if "bb_z" in feats:
             out["bb_z"] = _col_num("bb_z", 0.0).clip(lower=-3.0, upper=3.0)
         if "body_ratio" in feats:
-            out["body_ratio"] = _col_num("body_ratio", 0.5).clip(lower=0.0, upper=1.0)
+            out["body_ratio"] = _col_num("body_ratio", float(INCREMENTAL_SCALPING_DEFAULTS["body_ratio"])).clip(lower=0.0, upper=1.0)
         if "wick_imbalance" in feats:
             out["wick_imbalance"] = _col_num("wick_imbalance", 0.0).clip(lower=-1.0, upper=1.0)
         if "micro_trend_persist" in feats:
