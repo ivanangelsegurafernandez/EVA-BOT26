@@ -1404,6 +1404,23 @@ INCREMENTAL_SCALPING_FEATURES_10 = [
     "range_norm", "bb_z", "body_ratio", "wick_imbalance", "micro_trend_persist",
 ]
 
+INCREMENTAL_SCALPING_DEFAULTS = {
+    "ret_1m": 0.0,
+    "ret_3m": 0.0,
+    "ret_5m": 0.0,
+    "slope_5m": 0.0,
+    "rv_20": 0.5,
+    "range_norm": 0.5,
+    "bb_z": 0.0,
+    "body_ratio": 0.5,
+    "wick_imbalance": 0.0,
+    "micro_trend_persist": 0.0,
+}
+
+SCALPING_MIN_REALES_POR_FILA = 4
+SCALPING_MAX_DEFAULT_RATIO_TRAIN = 0.80
+SCALPING_RECENT_WINDOW = 120
+
 # Flujo limpio paralelo (v3): explícito y separado del legacy
 DATASET_INCREMENTAL_V3 = "dataset_incremental_v3.csv"
 IA_SIGNALS_LOG_V3 = "ia_signals_log_v3.csv"
@@ -3066,6 +3083,34 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
     return out
 
 
+
+
+def _diagnosticar_scalping_row(fila_dict: dict) -> dict:
+    """Clasifica scalping por fila en real/default/missing para trazabilidad."""
+    out = {"reales": 0, "defaults": 0, "missing": 0, "detail": {}}
+    try:
+        row = dict(fila_dict or {})
+        for k in INCREMENTAL_SCALPING_FEATURES_10:
+            vv = row.get(k, None)
+            st = "missing"
+            if vv is not None and not (isinstance(vv, str) and vv.strip() == ""):
+                try:
+                    fv = float(vv)
+                    if math.isfinite(fv):
+                        d0 = float(INCREMENTAL_SCALPING_DEFAULTS.get(k, 0.0))
+                        st = "default" if abs(fv - d0) <= 1e-12 else "real"
+                except Exception:
+                    st = "missing"
+            out["detail"][k] = st
+            if st == "real":
+                out["reales"] += 1
+            elif st == "default":
+                out["defaults"] += 1
+            else:
+                out["missing"] += 1
+    except Exception:
+        pass
+    return out
 def calcular_volatilidad_simple(row_dict: dict) -> float:
     """
     Proxy de volatilidad 0–1 menos saturante que el clip lineal.
@@ -3936,12 +3981,10 @@ def leer_ultima_fila_con_resultado(bot: str) -> tuple[dict | None, int | None]:
         except Exception:
             pass
 
-        # 8) Features requeridas (13 core, estricto)
-        required = [
-            "rsi_9","rsi_14","sma_5","sma_spread","cruce_sma","breakout",
-            "rsi_reversion","racha_actual","payout","puntaje_estrategia",
-            "volatilidad","es_rebote","hora_bucket",
-        ]
+        # 8) Features requeridas: CORE13 canónico del incremental actual.
+        #    IMPORTANTE: aquí NO recortamos a set legacy, porque esta salida
+        #    alimenta anexar_incremental_desde_bot() y debe conservar scalping real.
+        required = list(INCREMENTAL_FEATURES_V2)
 
         fila_dict = {}
         for k in required:
@@ -9413,6 +9456,14 @@ def anexar_incremental_desde_bot(bot: str):
         row_dict_source["result_bin"] = label
 
         row_dict_full = dict(row_dict_source)
+        scalping_diag_raw = _diagnosticar_scalping_row(row_dict_full)
+        if int(scalping_diag_raw.get("reales", 0)) < int(SCALPING_MIN_REALES_POR_FILA):
+            agregar_evento(
+                f"⚠️ Incremental: scalping insuficiente ({bot}) reales={scalping_diag_raw.get('reales', 0)}/10 "
+                f"defaults={scalping_diag_raw.get('defaults', 0)} missing={scalping_diag_raw.get('missing', 0)}"
+            )
+            return
+
         row_dict_full = _enriquecer_scalping_features_row(row_dict_full)
 
         # 1) Volatilidad: prioriza valor ya enriquecido; recalcula solo si falta/inválido.
@@ -9792,6 +9843,29 @@ def _dataset_quality_gate_for_training(X_df: pd.DataFrame, feats: list[str]):
         # Si casi todo está casi-constante, bloqueamos para evitar entrenos basura.
         if len(feats) > 0 and dom_hot >= max(1, int(len(feats) * 0.8)):
             reasons.append(f"dominancia_alta:{dom_hot}/{len(feats)}")
+
+        # Guardrail específico: detectar scalping muerto por defaults neutros.
+        try:
+            scalping_cols = [c for c in INCREMENTAL_SCALPING_FEATURES_10 if c in X_df.columns]
+            if scalping_cols:
+                n = max(1, len(X_df))
+                recent_n = min(int(SCALPING_RECENT_WINDOW), n)
+                recent = X_df.tail(recent_n).copy()
+                dead_cols = 0
+                for c in scalping_cols:
+                    d0 = float(INCREMENTAL_SCALPING_DEFAULTS.get(c, 0.0))
+                    s_all = pd.to_numeric(X_df[c], errors="coerce").fillna(d0)
+                    s_recent = pd.to_numeric(recent[c], errors="coerce").fillna(d0)
+                    ratio_all = float((s_all == d0).mean()) if len(s_all) else 1.0
+                    ratio_recent = float((s_recent == d0).mean()) if len(s_recent) else 1.0
+                    health.setdefault(c, {})["default_ratio"] = ratio_all
+                    health[c]["default_ratio_recent"] = ratio_recent
+                    if ratio_recent >= float(SCALPING_MAX_DEFAULT_RATIO_TRAIN):
+                        dead_cols += 1
+                if dead_cols >= max(4, int(len(scalping_cols) * 0.6)):
+                    reasons.append(f"scalping_muerto_recent:{dead_cols}/{len(scalping_cols)}")
+        except Exception:
+            pass
 
         return len(reasons) == 0, reasons, health
     except Exception as e:
@@ -12742,21 +12816,13 @@ def backfill_incremental(ultimas=500):
             if df is None or df.empty:
                 continue
 
-            req = [
-                "rsi_9","rsi_14","sma_5","sma_20","cruce_sma","breakout",
-                "rsi_reversion","racha_actual","puntaje_estrategia"
-            ]
-            if not set(req).issubset(df.columns) or "resultado" not in df.columns:
+            if "resultado" not in df.columns:
                 continue
-
-            for c in req + ["payout","payout_decimal_rounded"]:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
 
             df["resultado_norm"] = df["resultado"].apply(normalizar_resultado)
 
             sub = df[df["resultado_norm"].isin(["GANANCIA","PÉRDIDA"])]
-            sub = sub[sub[req].notna().all(axis=1)].tail(ultimas)
+            sub = sub.tail(ultimas)
             if sub.empty:
                 continue
 
@@ -12765,80 +12831,44 @@ def backfill_incremental(ultimas=500):
             
             nuevas_filas = []
             for _, r in sub.iterrows():
-                # base mínima
-                fila = {k: float(r[k]) for k in req}
-                sp = _calcular_sma_spread_robusto({
-                    "sma_5": r.get("sma_5", 0.0),
-                    "sma_20": r.get("sma_20", 0.0),
-                    "close": r.get("close", r.get("cierre", None)),
-                })
-                if sp is None or not np.isfinite(float(sp)):
-                    descartadas += 1
-                    continue
-                fila["sma_spread"] = float(sp)
-
                 # Diccionario completo para helpers enriquecidos
                 row_dict_full = r.to_dict()
 
-                                # ==========================
-                # payout normalizado (ROI 0–1.5 aprox)
-                # ==========================
-                pay = calcular_payout_feature(row_dict_full)
-                # Si falta payout, NO lo inventamos como 0.0: descartamos la fila
-                # (backfill es entrenamiento, aquí ser conservador = IA más estable)
-                if pay is None or pay < 0.05:
+                # Canoniza + completa faltantes reales del CORE13.
+                row_dict_full = canonicalizar_campos_bot_maestro(row_dict_full)
+
+                scalping_diag_raw = _diagnosticar_scalping_row(row_dict_full)
+                if int(scalping_diag_raw.get("reales", 0)) < int(SCALPING_MIN_REALES_POR_FILA):
                     descartadas += 1
                     continue
 
-                # ✅ FIX: estas asignaciones DEBEN ocurrir antes del continue
-                fila["payout"] = float(pay)
+                pay = calcular_payout_feature(row_dict_full)
+                if pay is None or pay < 0.05:
+                    descartadas += 1
+                    continue
                 row_dict_full["payout"] = float(pay)
 
-                # Enriquecer señales evento antes de extraer features finales
-                row_dict_full = enriquecer_features_evento(row_dict_full)
-
-                # ==========================
-                # puntaje_estrategia normalizado 0–1
-                # ==========================
                 pe = calcular_puntaje_estrategia_normalizado(row_dict_full)
-                if pe is None and "puntaje_estrategia" in r:
-                    pe = _norm_01(r.get("puntaje_estrategia"))
-                if pe is not None:
-                    fila["puntaje_estrategia"] = pe
+                if pe is None:
+                    pe = _safe_float_local(row_dict_full.get("puntaje_estrategia"))
+                if pe is None or (not math.isfinite(float(pe))):
+                    descartadas += 1
+                    continue
+                row_dict_full["puntaje_estrategia"] = float(max(0.0, min(1.0, float(pe))))
 
-                # ==========================
-                # volatilidad: normalizada a [0,1]
-                # - si viene en el CSV y es válida, la usamos
-                # - si falta / NaN, la calculamos con calcular_volatilidad_simple (proxy SMA5 vs SMA20)
-                # ==========================
-                vol_raw = row_dict_full.get("volatilidad", None)
-                try:
-                    vol = float(vol_raw) if vol_raw not in (None, "") else np.nan
-                except Exception:
-                    vol = np.nan
-                if pd.isna(vol):
-                    vol = calcular_volatilidad_simple(row_dict_full)
-                try:
-                    vol_f = float(vol)
-                except Exception:
-                    vol_f = float("nan")
-                if (not math.isfinite(vol_f)) or vol_f <= 0.0:
-                    vol_hist = calcular_volatilidad_por_bot(bot, lookback=50)
-                    if vol_hist is not None:
-                        vol_f = float(vol_hist)
-                if (not math.isfinite(vol_f)):
-                    vol_f = 0.0
+                row_dict_full = _enriquecer_scalping_features_row(row_dict_full)
 
-                fila["volatilidad"] = max(0.0, min(float(vol_f), 1.0))
-
-                # ==========================
-                # nuevas features: rebote y hora (0–1)
-                # ==========================
-                fila["es_rebote"]   = float(max(0.0, min(1.0, _safe_float_local(row_dict_full.get("es_rebote")) or calcular_es_rebote(row_dict_full))))
-                hb, hm = calcular_hora_features(row_dict_full)
-                if float(hm) >= 1.0:
-                    hb = 0.0
-                fila["hora_bucket"] = float(max(0.0, min(1.0, float(hb))))
+                fila = {}
+                missing = False
+                for k in feature_names:
+                    fv = _safe_float_local(row_dict_full.get(k))
+                    if fv is None or (not math.isfinite(float(fv))):
+                        missing = True
+                        break
+                    fila[k] = float(fv)
+                if missing:
+                    descartadas += 1
+                    continue
 
                 # ==========================
                 # label final (GANANCIA / PÉRDIDA)
