@@ -1404,15 +1404,17 @@ INCREMENTAL_SCALPING_FEATURES_10 = [
     "range_norm", "bb_z", "body_ratio", "wick_imbalance", "micro_trend_persist",
 ]
 
+# Defaults canónicos alineados con bots (calcular_scalping_features -> neutrals=0.0)
+# para evitar falsos "real" en diagnóstico por discrepancia bot↔maestro.
 INCREMENTAL_SCALPING_DEFAULTS = {
     "ret_1m": 0.0,
     "ret_3m": 0.0,
     "ret_5m": 0.0,
     "slope_5m": 0.0,
-    "rv_20": 0.5,
-    "range_norm": 0.5,
+    "rv_20": 0.0,
+    "range_norm": 0.0,
     "bb_z": 0.0,
-    "body_ratio": 0.5,
+    "body_ratio": 0.0,
     "wick_imbalance": 0.0,
     "micro_trend_persist": 0.0,
 }
@@ -3073,10 +3075,10 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
     _set_if_missing("ret_3m", 0.0, -1.0, 1.0)
     _set_if_missing("ret_5m", 0.0, -1.0, 1.0)
     _set_if_missing("slope_5m", 0.0, -1.0, 1.0)
-    _set_if_missing("rv_20", 0.5, 0.0, 1.0)
-    _set_if_missing("range_norm", 0.5, 0.0, 1.0)
+    _set_if_missing("rv_20", float(INCREMENTAL_SCALPING_DEFAULTS["rv_20"]), 0.0, 1.0)
+    _set_if_missing("range_norm", float(INCREMENTAL_SCALPING_DEFAULTS["range_norm"]), 0.0, 1.0)
     _set_if_missing("bb_z", 0.0, -3.0, 3.0)
-    _set_if_missing("body_ratio", 0.5, 0.0, 1.0)
+    _set_if_missing("body_ratio", float(INCREMENTAL_SCALPING_DEFAULTS["body_ratio"]), 0.0, 1.0)
     _set_if_missing("wick_imbalance", 0.0, -1.0, 1.0)
     _set_if_missing("micro_trend_persist", 0.0, -1.0, 1.0)
 
@@ -3087,7 +3089,7 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
 
 def _diagnosticar_scalping_row(fila_dict: dict) -> dict:
     """Clasifica scalping por fila en real/default/missing para trazabilidad."""
-    out = {"reales": 0, "defaults": 0, "missing": 0, "detail": {}}
+    out = {"ok": True, "error": None, "reales": 0, "defaults": 0, "missing": 0, "detail": {}}
     try:
         row = dict(fila_dict or {})
         for k in INCREMENTAL_SCALPING_FEATURES_10:
@@ -3108,8 +3110,9 @@ def _diagnosticar_scalping_row(fila_dict: dict) -> dict:
                 out["defaults"] += 1
             else:
                 out["missing"] += 1
-    except Exception:
-        pass
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = f"{type(e).__name__}: {e}"
     return out
 def calcular_volatilidad_simple(row_dict: dict) -> float:
     """
@@ -6665,12 +6668,12 @@ def predecir_prob_ia_bot(bot: str) -> tuple[float | None, str | None]:
         if row is None:
             return None, "NO_FEATURE_ROW"
 
-        try:
-            sc_diag = _diagnosticar_scalping_row(row)
-            if int(sc_diag.get("reales", 0)) < int(SCALPING_MIN_REALES_POR_FILA):
-                return None, "SCALPING_DEAD"
-        except Exception:
-            pass
+        sc_diag = _diagnosticar_scalping_row(row)
+        if not bool(sc_diag.get("ok", True)):
+            agregar_evento(f"❌ IA scalping diag error ({bot}): {sc_diag.get('error')}")
+            return None, "SCALPING_DIAG_ERROR"
+        if int(sc_diag.get("reales", 0)) < int(SCALPING_MIN_REALES_POR_FILA):
+            return None, "SCALPING_DEAD"
 
         if model is None:
             # Modo LOW_DATA: aún sin modelo, pero entrega prob heurística para no quedar en OFF.
@@ -8163,6 +8166,8 @@ _ORACLE_CACHE = {
     "meta": None,
     "mtimes": {}  # {path: mtime}
 }
+
+_LAST_ORACULO_PRED_STATUS = None
 # ============================
 # PATCH IA (FIX): Label canónico + builder X/y ultra-robusto
 # - NO asume columna 'y'
@@ -8833,7 +8838,8 @@ def oraculo_predict_visible(fila_dict):
                 meta_local["feature_names"] = fn
                 prob = oraculo_predict(fila_dict, model, scaler, meta_local, bot_name="HUD")
                 if prob is None:
-                    return None, "SCALPING_DEAD"
+                    status = str(_LAST_ORACULO_PRED_STATUS or "SCALPING_DEAD")
+                    return None, status
                 return prob, "modelo"
 
         # Sin modelo: fallback visual (NO opera, solo pinta)
@@ -8896,16 +8902,20 @@ def oraculo_predict(fila_dict, modelo, scaler, meta, bot_name=""):
     Predicción IA robusta.
     payout se trata como ROI [0..1.5].
     """
+    global _LAST_ORACULO_PRED_STATUS
     try:
+        _LAST_ORACULO_PRED_STATUS = None
         if fila_dict is None:
             return 0.0
 
-        try:
-            sc_diag = _diagnosticar_scalping_row(fila_dict)
-            if int(sc_diag.get("reales", 0)) < int(SCALPING_MIN_REALES_POR_FILA):
-                return None
-        except Exception:
-            pass
+        sc_diag = _diagnosticar_scalping_row(fila_dict)
+        if not bool(sc_diag.get("ok", True)):
+            _LAST_ORACULO_PRED_STATUS = "SCALPING_DIAG_ERROR"
+            agregar_evento(f"❌ IA oráculo scalping diag error ({bot_name or 'N/A'}): {sc_diag.get('error')}")
+            return None
+        if int(sc_diag.get("reales", 0)) < int(SCALPING_MIN_REALES_POR_FILA):
+            _LAST_ORACULO_PRED_STATUS = "SCALPING_DEAD"
+            return None
 
         feature_names = _resolve_oracle_feature_names(modelo, scaler, (meta or {}).get("feature_names"), meta or {})
         if not feature_names:
@@ -9473,6 +9483,9 @@ def anexar_incremental_desde_bot(bot: str):
 
         row_dict_full = dict(row_dict_source)
         scalping_diag_raw = _diagnosticar_scalping_row(row_dict_full)
+        if not bool(scalping_diag_raw.get("ok", True)):
+            agregar_evento(f"❌ Incremental: error diagnóstico scalping ({bot}): {scalping_diag_raw.get('error')}")
+            return
         if int(scalping_diag_raw.get("reales", 0)) < int(SCALPING_MIN_REALES_POR_FILA):
             agregar_evento(
                 f"⚠️ Incremental: scalping insuficiente ({bot}) reales={scalping_diag_raw.get('reales', 0)}/10 "
@@ -12854,6 +12867,10 @@ def backfill_incremental(ultimas=500):
                 row_dict_full = canonicalizar_campos_bot_maestro(row_dict_full)
 
                 scalping_diag_raw = _diagnosticar_scalping_row(row_dict_full)
+                if not bool(scalping_diag_raw.get("ok", True)):
+                    agregar_evento(f"❌ Backfill: error diagnóstico scalping ({bot}): {scalping_diag_raw.get('error')}")
+                    descartadas += 1
+                    continue
                 if int(scalping_diag_raw.get("reales", 0)) < int(SCALPING_MIN_REALES_POR_FILA):
                     descartadas += 1
                     continue
