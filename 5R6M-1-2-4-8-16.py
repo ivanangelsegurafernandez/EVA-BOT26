@@ -1404,6 +1404,23 @@ INCREMENTAL_SCALPING_FEATURES_10 = [
     "range_norm", "bb_z", "body_ratio", "wick_imbalance", "micro_trend_persist",
 ]
 
+INCREMENTAL_SCALPING_DEFAULTS = {
+    "ret_1m": 0.0,
+    "ret_3m": 0.0,
+    "ret_5m": 0.0,
+    "slope_5m": 0.0,
+    "rv_20": 0.5,
+    "range_norm": 0.5,
+    "bb_z": 0.0,
+    "body_ratio": 0.5,
+    "wick_imbalance": 0.0,
+    "micro_trend_persist": 0.0,
+}
+
+SCALPING_MIN_REALES_POR_FILA = 4
+SCALPING_MAX_DEFAULT_RATIO_TRAIN = 0.80
+SCALPING_RECENT_WINDOW = 120
+
 # Flujo limpio paralelo (v3): explícito y separado del legacy
 DATASET_INCREMENTAL_V3 = "dataset_incremental_v3.csv"
 IA_SIGNALS_LOG_V3 = "ia_signals_log_v3.csv"
@@ -3066,6 +3083,34 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
     return out
 
 
+
+
+def _diagnosticar_scalping_row(fila_dict: dict) -> dict:
+    """Clasifica scalping por fila en real/default/missing para trazabilidad."""
+    out = {"reales": 0, "defaults": 0, "missing": 0, "detail": {}}
+    try:
+        row = dict(fila_dict or {})
+        for k in INCREMENTAL_SCALPING_FEATURES_10:
+            vv = row.get(k, None)
+            st = "missing"
+            if vv is not None and not (isinstance(vv, str) and vv.strip() == ""):
+                try:
+                    fv = float(vv)
+                    if math.isfinite(fv):
+                        d0 = float(INCREMENTAL_SCALPING_DEFAULTS.get(k, 0.0))
+                        st = "default" if abs(fv - d0) <= 1e-12 else "real"
+                except Exception:
+                    st = "missing"
+            out["detail"][k] = st
+            if st == "real":
+                out["reales"] += 1
+            elif st == "default":
+                out["defaults"] += 1
+            else:
+                out["missing"] += 1
+    except Exception:
+        pass
+    return out
 def calcular_volatilidad_simple(row_dict: dict) -> float:
     """
     Proxy de volatilidad 0–1 menos saturante que el clip lineal.
@@ -9411,6 +9456,14 @@ def anexar_incremental_desde_bot(bot: str):
         row_dict_source["result_bin"] = label
 
         row_dict_full = dict(row_dict_source)
+        scalping_diag_raw = _diagnosticar_scalping_row(row_dict_full)
+        if int(scalping_diag_raw.get("reales", 0)) < int(SCALPING_MIN_REALES_POR_FILA):
+            agregar_evento(
+                f"⚠️ Incremental: scalping insuficiente ({bot}) reales={scalping_diag_raw.get('reales', 0)}/10 "
+                f"defaults={scalping_diag_raw.get('defaults', 0)} missing={scalping_diag_raw.get('missing', 0)}"
+            )
+            return
+
         row_dict_full = _enriquecer_scalping_features_row(row_dict_full)
 
         # 1) Volatilidad: prioriza valor ya enriquecido; recalcula solo si falta/inválido.
@@ -9790,6 +9843,29 @@ def _dataset_quality_gate_for_training(X_df: pd.DataFrame, feats: list[str]):
         # Si casi todo está casi-constante, bloqueamos para evitar entrenos basura.
         if len(feats) > 0 and dom_hot >= max(1, int(len(feats) * 0.8)):
             reasons.append(f"dominancia_alta:{dom_hot}/{len(feats)}")
+
+        # Guardrail específico: detectar scalping muerto por defaults neutros.
+        try:
+            scalping_cols = [c for c in INCREMENTAL_SCALPING_FEATURES_10 if c in X_df.columns]
+            if scalping_cols:
+                n = max(1, len(X_df))
+                recent_n = min(int(SCALPING_RECENT_WINDOW), n)
+                recent = X_df.tail(recent_n).copy()
+                dead_cols = 0
+                for c in scalping_cols:
+                    d0 = float(INCREMENTAL_SCALPING_DEFAULTS.get(c, 0.0))
+                    s_all = pd.to_numeric(X_df[c], errors="coerce").fillna(d0)
+                    s_recent = pd.to_numeric(recent[c], errors="coerce").fillna(d0)
+                    ratio_all = float((s_all == d0).mean()) if len(s_all) else 1.0
+                    ratio_recent = float((s_recent == d0).mean()) if len(s_recent) else 1.0
+                    health.setdefault(c, {})["default_ratio"] = ratio_all
+                    health[c]["default_ratio_recent"] = ratio_recent
+                    if ratio_recent >= float(SCALPING_MAX_DEFAULT_RATIO_TRAIN):
+                        dead_cols += 1
+                if dead_cols >= max(4, int(len(scalping_cols) * 0.6)):
+                    reasons.append(f"scalping_muerto_recent:{dead_cols}/{len(scalping_cols)}")
+        except Exception:
+            pass
 
         return len(reasons) == 0, reasons, health
     except Exception as e:
@@ -12760,6 +12836,11 @@ def backfill_incremental(ultimas=500):
 
                 # Canoniza + completa faltantes reales del CORE13.
                 row_dict_full = canonicalizar_campos_bot_maestro(row_dict_full)
+
+                scalping_diag_raw = _diagnosticar_scalping_row(row_dict_full)
+                if int(scalping_diag_raw.get("reales", 0)) < int(SCALPING_MIN_REALES_POR_FILA):
+                    descartadas += 1
+                    continue
 
                 pay = calcular_payout_feature(row_dict_full)
                 if pay is None or pay < 0.05:
