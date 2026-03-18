@@ -1,17 +1,17 @@
 {
-  "trained_at": "2026-03-17 21:13:10",
-  "rows_total": 330,
-  "n_samples": 330,
-  "rows_train": 198,
-  "rows_calib": 66,
-  "rows_test": 66,
-  "pos": 170,
-  "neg": 160,
-  "auc": 0.5488479262672811,
-  "f1": 0.0,
-  "brier": 0.2625692712963278,
-  "cv_auc": null,
-  "threshold": 0.5,
+  "trained_at": "2026-03-17 22:15:48",
+  "rows_total": 457,
+  "n_samples": 457,
+  "rows_train": 286,
+  "rows_calib": 80,
+  "rows_test": 91,
+  "pos": 228,
+  "neg": 229,
+  "auc": 0.29339250493096647,
+  "f1": 0.32098765432098764,
+  "brier": 0.2660037410940789,
+  "cv_auc": 0.487696608946609,
+  "threshold": 0.515,
   "reliable": false,
   "reliable_candidate": false,
   "canary_mode": false,
@@ -19,102 +19,102 @@
   "canary_target_closed": 0,
   "refresh_policy": "champion_direct",
   "calibration": "sigmoid",
-  "calib_precision_at_thr": null,
-  "calib_n_at_thr": 0,
-  "test_precision_at_thr": 0.0,
-  "test_n_at_thr": 0,
+  "calib_precision_at_thr": 0.5555555555555556,
+  "calib_n_at_thr": 54,
+  "test_precision_at_thr": 0.30952380952380953,
+  "test_n_at_thr": 42,
   "feature_names": [
     "racha_actual",
-    "slope_5m",
     "ret_5m",
     "ret_3m",
-    "bb_z"
+    "micro_trend_persist",
+    "ret_1m"
   ],
   "label_col": "result_bin",
   "schema_version": "core13_v2_scalping",
   "trained_on_incremental": "dataset_incremental_v2",
   "feature_health": {
     "racha_actual": {
-      "nunique": 15,
-      "dominance": 0.25757575757575757,
+      "nunique": 17,
+      "dominance": 0.24726477024070023,
       "status": "OK"
     },
     "puntaje_estrategia": {
-      "nunique": 305,
-      "dominance": 0.00909090909090909,
+      "nunique": 431,
+      "dominance": 0.006564551422319475,
       "status": "OK"
     },
     "payout": {
       "nunique": 4,
-      "dominance": 0.6181818181818182,
+      "dominance": 0.5973741794310722,
       "status": "OK"
     },
     "ret_1m": {
-      "nunique": 291,
-      "dominance": 0.012121212121212121,
+      "nunique": 401,
+      "dominance": 0.0087527352297593,
       "status": "OK",
       "default_ratio": 0.0,
       "default_ratio_recent": 0.0
     },
     "ret_3m": {
-      "nunique": 291,
-      "dominance": 0.012121212121212121,
+      "nunique": 401,
+      "dominance": 0.0087527352297593,
       "status": "OK",
       "default_ratio": 0.0,
       "default_ratio_recent": 0.0
     },
     "ret_5m": {
-      "nunique": 291,
-      "dominance": 0.012121212121212121,
+      "nunique": 401,
+      "dominance": 0.0087527352297593,
       "status": "OK",
       "default_ratio": 0.0,
       "default_ratio_recent": 0.0
     },
     "slope_5m": {
-      "nunique": 291,
-      "dominance": 0.012121212121212121,
+      "nunique": 401,
+      "dominance": 0.0087527352297593,
       "status": "OK",
       "default_ratio": 0.0,
       "default_ratio_recent": 0.0
     },
     "rv_20": {
-      "nunique": 315,
-      "dominance": 0.00909090909090909,
+      "nunique": 432,
+      "dominance": 0.006564551422319475,
       "status": "OK",
       "default_ratio": 0.0,
       "default_ratio_recent": 0.0
     },
     "range_norm": {
-      "nunique": 316,
-      "dominance": 0.00909090909090909,
+      "nunique": 433,
+      "dominance": 0.006564551422319475,
       "status": "OK",
       "default_ratio": 0.0,
       "default_ratio_recent": 0.0
     },
     "bb_z": {
-      "nunique": 315,
-      "dominance": 0.00909090909090909,
+      "nunique": 432,
+      "dominance": 0.006564551422319475,
       "status": "OK",
       "default_ratio": 0.0,
       "default_ratio_recent": 0.0
     },
     "body_ratio": {
-      "nunique": 268,
-      "dominance": 0.08484848484848485,
+      "nunique": 376,
+      "dominance": 0.06564551422319474,
       "status": "OK",
       "default_ratio": 0.0,
       "default_ratio_recent": 0.0
     },
     "wick_imbalance": {
-      "nunique": 267,
-      "dominance": 0.08787878787878788,
+      "nunique": 374,
+      "dominance": 0.0700218818380744,
       "status": "OK",
-      "default_ratio": 0.08787878787878788,
-      "default_ratio_recent": 0.1
+      "default_ratio": 0.0700218818380744,
+      "default_ratio_recent": 0.025
     },
     "micro_trend_persist": {
-      "nunique": 21,
-      "dominance": 0.21212121212121213,
+      "nunique": 22,
+      "dominance": 0.2188183807439825,
       "status": "OK",
       "default_ratio": 0.0,
       "default_ratio_recent": 0.0
@@ -140,5 +140,5 @@
       "reason": "ROTA:nunique=1"
     }
   ],
-  "n": 330
+  "n": 457
 }
