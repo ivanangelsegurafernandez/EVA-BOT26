@@ -1,0 +1,13 @@
+segmento,threshold,precision,cobertura
+global,0.6,0.4972375690607735,1.0
+global,0.7,0.5454545454545454,0.020257826887661142
+global,0.75,,0.0
+global,0.8,,0.0
+inicio_maduro,0.6,0.49107142857142855,1.0
+inicio_maduro,0.7,0.5,0.017857142857142856
+inicio_maduro,0.75,,0.0
+inicio_maduro,0.8,,0.0
+final_maduro,0.6,0.5027322404371585,1.0
+final_maduro,0.7,0.5714285714285714,0.03825136612021858
+final_maduro,0.75,,0.0
+final_maduro,0.8,,0.0

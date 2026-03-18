@@ -1,0 +1,16 @@
+metrica,valor
+disponible,True
+filas_dataset_incremental,10491
+columnas_dataset_incremental,14
+pct_duplicados_exactos,0.10018110761605185
+pct_nulos_por_columna,"{""racha_actual"": 0.0, ""puntaje_estrategia"": 0.0, ""payout"": 0.0, ""ret_1m"": 0.0, ""ret_3m"": 0.0, ""ret_5m"": 0.0, ""slope_5m"": 0.0, ""rv_20"": 0.0, ""range_norm"": 0.0, ""bb_z"": 0.0, ""body_ratio"": 0.0, ""wick_imbalance"": 0.0, ""micro_trend_persist"": 0.0, ""result_bin"": 0.0}"
+columnas_varianza_casi_cero,[]
+columnas_colapso_variedad,[]
+n_duplicados_exactos,1051
+cobertura_inicio_por_columna,"{""racha_actual"": 1.0, ""puntaje_estrategia"": 1.0, ""payout"": 1.0, ""ret_1m"": 1.0, ""ret_3m"": 1.0, ""ret_5m"": 1.0, ""slope_5m"": 1.0, ""rv_20"": 1.0, ""range_norm"": 1.0, ""bb_z"": 1.0, ""body_ratio"": 1.0, ""wick_imbalance"": 1.0, ""micro_trend_persist"": 1.0, ""result_bin"": 1.0}"
+cobertura_final_por_columna,"{""racha_actual"": 1.0, ""puntaje_estrategia"": 1.0, ""payout"": 1.0, ""ret_1m"": 1.0, ""ret_3m"": 1.0, ""ret_5m"": 1.0, ""slope_5m"": 1.0, ""rv_20"": 1.0, ""range_norm"": 1.0, ""bb_z"": 1.0, ""body_ratio"": 1.0, ""wick_imbalance"": 1.0, ""micro_trend_persist"": 1.0, ""result_bin"": 1.0}"
+delta_cobertura_inicio_final,"{""racha_actual"": 0.0, ""puntaje_estrategia"": 0.0, ""payout"": 0.0, ""ret_1m"": 0.0, ""ret_3m"": 0.0, ""ret_5m"": 0.0, ""slope_5m"": 0.0, ""rv_20"": 0.0, ""range_norm"": 0.0, ""bb_z"": 0.0, ""body_ratio"": 0.0, ""wick_imbalance"": 0.0, ""micro_trend_persist"": 0.0, ""result_bin"": 0.0}"
+ratio_etiquetas_validas_result_bin,1.0
+distribucion_clases_0_1,"{""class_0"": 5262, ""class_1"": 5229}"
+drift_inicio_vs_final,"{""payout"": {""delta_media"": -7.939180171578908e-05, ""delta_rel_std"": -0.03733971909691271, ""ini_media"": 0.9517272402287892, ""fin_media"": 0.9516478484270734}, ""racha_actual"": {""delta_media"": 0.1935176358436606, ""delta_rel_std"": 0.0795329418281126, ""ini_media"": -0.07721639656816015, ""fin_media"": 0.11630123927550047}}"
+resumen,"{""columnas_numericas_detectadas"": 14, ""columnas_colapso_variedad"": 0, ""drift_cols_con_medicion"": 2}"

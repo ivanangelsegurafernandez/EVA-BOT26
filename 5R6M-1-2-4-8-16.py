@@ -1398,38 +1398,6 @@ except Exception:
         "ret_1m", "ret_3m", "ret_5m", "slope_5m", "rv_20",
         "range_norm", "bb_z", "body_ratio", "wick_imbalance", "micro_trend_persist",
     ]
-
-INCREMENTAL_SCALPING_FEATURES_10 = [
-    "ret_1m", "ret_3m", "ret_5m", "slope_5m", "rv_20",
-    "range_norm", "bb_z", "body_ratio", "wick_imbalance", "micro_trend_persist",
-]
-
-# Defaults canónicos alineados con bots (calcular_scalping_features -> neutrals=0.0)
-# para evitar falsos "real" en diagnóstico por discrepancia bot↔maestro.
-INCREMENTAL_SCALPING_DEFAULTS = {
-    "ret_1m": 0.0,
-    "ret_3m": 0.0,
-    "ret_5m": 0.0,
-    "slope_5m": 0.0,
-    "rv_20": 0.0,
-    "range_norm": 0.0,
-    "bb_z": 0.0,
-    "body_ratio": 0.0,
-    "wick_imbalance": 0.0,
-    "micro_trend_persist": 0.0,
-}
-
-SCALPING_MIN_REALES_POR_FILA = 4
-SCALPING_MAX_DEFAULT_RATIO_TRAIN = 0.80
-SCALPING_RECENT_WINDOW = 120
-
-# Flujo limpio paralelo (v3): explícito y separado del legacy
-DATASET_INCREMENTAL_V3 = "dataset_incremental_v3.csv"
-IA_SIGNALS_LOG_V3 = "ia_signals_log_v3.csv"
-MODEL_PATH_V3 = "modelo_xgb_v3.pkl"
-SCALER_PATH_V3 = "scaler_v3.pkl"
-FEATURES_PATH_V3 = "feature_names_v3.pkl"
-META_PATH_V3 = "model_meta_v3.json"
 # === LOCK ESTRICTO (solo para escrituras sensibles como incremental.csv) ===
 @contextmanager
 def file_lock_required(path: str, timeout: float = 6.0, stale_after: float = 30.0):
@@ -1856,77 +1824,6 @@ def validar_fila_incremental(fila_dict, feature_names):
 
     return True, ""
         
-def _fila_core13_v3_completa(fila_dict: dict, feature_names: list | None = None) -> tuple[bool, str]:
-    """Valida presencia estricta de CORE13 para flujo limpio v3 (sin fallback neutro)."""
-    feats = list(feature_names) if feature_names else list(FEATURE_NAMES_CORE_13)
-    if not isinstance(fila_dict, dict):
-        return False, "fila_no_dict"
-
-    missing = []
-    for k in feats:
-        v = fila_dict.get(k, None)
-        if v is None or (isinstance(v, str) and v.strip() == ""):
-            missing.append(k)
-            continue
-        try:
-            vf = float(v)
-            if not np.isfinite(vf):
-                missing.append(k)
-        except Exception:
-            missing.append(k)
-
-    if missing:
-        if any(k in INCREMENTAL_SCALPING_FEATURES_10 for k in missing):
-            return False, f"faltan_scalping_core10:{missing}"
-        return False, f"faltan_core13:{missing}"
-
-    return True, ""
-
-
-def _anexar_incremental_v3_desde_fila(bot: str, fila_dict_raw: dict, label: int) -> bool:
-    """Anexa fila al incremental limpio v3 si cumple CORE13 completo y validación estricta."""
-    try:
-        feats = list(FEATURE_NAMES_CORE_13)
-        ruta = DATASET_INCREMENTAL_V3
-        cols = list(feats) + ["ts_ingest", "result_bin"]
-
-        ok_core, _ = _fila_core13_v3_completa(fila_dict_raw, feats)
-        if not ok_core:
-            return False
-
-        fila_dict = {k: fila_dict_raw.get(k, None) for k in feats}
-        ok_val, _ = validar_fila_incremental(fila_dict, feats)
-        if not ok_val:
-            return False
-
-        ts_ing = fila_dict_raw.get("ts_ingest", float(time.time()))
-        sig = _firma_registro(feats, [float(fila_dict[k]) for k in feats], int(label))
-        if _incremental_signature_exists(ruta, sig, feats):
-            return False
-
-        with file_lock_required(INCREMENTAL_LOCK_FILE, timeout=6.0, stale_after=30.0) as got:
-            if not got:
-                return False
-
-            if os.path.exists(ruta):
-                try:
-                    reparar_dataset_incremental_mutante(ruta=ruta, cols=cols)
-                except Exception:
-                    pass
-            else:
-                with open(ruta, "w", newline="", encoding="utf-8") as f:
-                    csv.writer(f).writerow(cols)
-                    f.flush(); os.fsync(f.fileno())
-
-            with open(ruta, "a", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow([float(fila_dict[k]) for k in feats] + [ts_ing, int(label)])
-                f.flush(); os.fsync(f.fileno())
-
-        return True
-    except Exception:
-        return False
-
-
 def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label: int | None = None, feature_names: list | None = None) -> bool:
     """
     Anexa 1 fila al dataset_incremental.csv de forma estable:
@@ -3052,7 +2949,7 @@ def clip_feature_values(fila_dict, feature_names):
     return clipped
     
 def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
-    """Completa CORE13_v2 con datos reales existentes; fallback neutro si faltan."""
+    """Completa CORE13_v2 scalping desde campos legacy cuando falten."""
     out = dict(fila_dict or {})
 
     def _missing(name: str) -> bool:
@@ -3067,53 +2964,48 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
         except Exception:
             return True
 
-    def _set_if_missing(name: str, neutral: float, lo: float, hi: float):
-        if _missing(name):
-            out[name] = float(np.clip(neutral, lo, hi))
+    def _f(name, default=0.0):
+        try:
+            v = float(out.get(name, default) if out.get(name, default) not in (None, "") else default)
+            return v if math.isfinite(v) else float(default)
+        except Exception:
+            return float(default)
 
-    _set_if_missing("ret_1m", 0.0, -1.0, 1.0)
-    _set_if_missing("ret_3m", 0.0, -1.0, 1.0)
-    _set_if_missing("ret_5m", 0.0, -1.0, 1.0)
-    _set_if_missing("slope_5m", 0.0, -1.0, 1.0)
-    _set_if_missing("rv_20", float(INCREMENTAL_SCALPING_DEFAULTS["rv_20"]), 0.0, 1.0)
-    _set_if_missing("range_norm", float(INCREMENTAL_SCALPING_DEFAULTS["range_norm"]), 0.0, 1.0)
-    _set_if_missing("bb_z", 0.0, -3.0, 3.0)
-    _set_if_missing("body_ratio", float(INCREMENTAL_SCALPING_DEFAULTS["body_ratio"]), 0.0, 1.0)
-    _set_if_missing("wick_imbalance", 0.0, -1.0, 1.0)
-    _set_if_missing("micro_trend_persist", 0.0, -1.0, 1.0)
+    # Legacy proxies (si no vienen directos de bot):
+    rsi9 = _f("rsi_9", 50.0)
+    rsi14 = _f("rsi_14", 50.0)
+    sma_spread = _f("sma_spread", 0.0)
+    cruce_sma = _f("cruce_sma", 0.0)
+    breakout = _f("breakout", 0.0)
+    rsi_rev = _f("rsi_reversion", 0.0)
+    vol = _f("volatilidad", 0.0)
+    reb = _f("es_rebote", 0.0)
+    racha = _f("racha_actual", 0.0)
+
+    if _missing("ret_1m"):
+        out["ret_1m"] = float(np.clip((rsi9 - 50.0) / 50.0, -1.0, 1.0))
+    if _missing("ret_3m"):
+        out["ret_3m"] = float(np.clip((rsi14 - 50.0) / 50.0, -1.0, 1.0))
+    if _missing("ret_5m"):
+        out["ret_5m"] = float(np.clip(0.6 * float(out.get("ret_3m", 0.0)) + 0.4 * float(out.get("ret_1m", 0.0)), -1.0, 1.0))
+    if _missing("slope_5m"):
+        out["slope_5m"] = float(np.clip(sma_spread + 0.05 * cruce_sma, -1.0, 1.0))
+    if _missing("rv_20"):
+        out["rv_20"] = float(np.clip(vol, 0.0, 1.0))
+    if _missing("range_norm"):
+        out["range_norm"] = float(np.clip(breakout, 0.0, 1.0))
+    if _missing("bb_z"):
+        out["bb_z"] = float(np.clip((2.0 * rsi_rev) - 1.0, -3.0, 3.0))
+    if _missing("body_ratio"):
+        out["body_ratio"] = float(np.clip(abs(float(out.get("ret_1m", 0.0))), 0.0, 1.0))
+    if _missing("wick_imbalance"):
+        out["wick_imbalance"] = float(np.clip((2.0 * reb) - 1.0, -1.0, 1.0))
+    if _missing("micro_trend_persist"):
+        out["micro_trend_persist"] = float(np.clip(racha / 10.0, -1.0, 1.0))
 
     return out
 
 
-
-
-def _diagnosticar_scalping_row(fila_dict: dict) -> dict:
-    """Clasifica scalping por fila en real/default/missing para trazabilidad."""
-    out = {"ok": True, "error": None, "reales": 0, "defaults": 0, "missing": 0, "detail": {}}
-    try:
-        row = dict(fila_dict or {})
-        for k in INCREMENTAL_SCALPING_FEATURES_10:
-            vv = row.get(k, None)
-            st = "missing"
-            if vv is not None and not (isinstance(vv, str) and vv.strip() == ""):
-                try:
-                    fv = float(vv)
-                    if math.isfinite(fv):
-                        d0 = float(INCREMENTAL_SCALPING_DEFAULTS.get(k, 0.0))
-                        st = "default" if abs(fv - d0) <= 1e-12 else "real"
-                except Exception:
-                    st = "missing"
-            out["detail"][k] = st
-            if st == "real":
-                out["reales"] += 1
-            elif st == "default":
-                out["defaults"] += 1
-            else:
-                out["missing"] += 1
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = f"{type(e).__name__}: {e}"
-    return out
 def calcular_volatilidad_simple(row_dict: dict) -> float:
     """
     Proxy de volatilidad 0–1 menos saturante que el clip lineal.
@@ -3984,10 +3876,12 @@ def leer_ultima_fila_con_resultado(bot: str) -> tuple[dict | None, int | None]:
         except Exception:
             pass
 
-        # 8) Features requeridas: CORE13 canónico del incremental actual.
-        #    IMPORTANTE: aquí NO recortamos a set legacy, porque esta salida
-        #    alimenta anexar_incremental_desde_bot() y debe conservar scalping real.
-        required = list(INCREMENTAL_FEATURES_V2)
+        # 8) Features requeridas (13 core, estricto)
+        required = [
+            "rsi_9","rsi_14","sma_5","sma_spread","cruce_sma","breakout",
+            "rsi_reversion","racha_actual","payout","puntaje_estrategia",
+            "volatilidad","es_rebote","hora_bucket",
+        ]
 
         fila_dict = {}
         for k in required:
@@ -6668,13 +6562,6 @@ def predecir_prob_ia_bot(bot: str) -> tuple[float | None, str | None]:
         if row is None:
             return None, "NO_FEATURE_ROW"
 
-        sc_diag = _diagnosticar_scalping_row(row)
-        if not bool(sc_diag.get("ok", True)):
-            agregar_evento(f"❌ IA scalping diag error ({bot}): {sc_diag.get('error')}")
-            return None, "SCALPING_DIAG_ERROR"
-        if int(sc_diag.get("reales", 0)) < int(SCALPING_MIN_REALES_POR_FILA):
-            return None, "SCALPING_DEAD"
-
         if model is None:
             # Modo LOW_DATA: aún sin modelo, pero entrega prob heurística para no quedar en OFF.
             try:
@@ -8166,8 +8053,6 @@ _ORACLE_CACHE = {
     "meta": None,
     "mtimes": {}  # {path: mtime}
 }
-
-_LAST_ORACULO_PRED_STATUS = None
 # ============================
 # PATCH IA (FIX): Label canónico + builder X/y ultra-robusto
 # - NO asume columna 'y'
@@ -8436,27 +8321,27 @@ def _enriquecer_df_con_derivadas(df: pd.DataFrame, feats: list[str]) -> pd.DataF
             base = sma20.abs().clip(lower=1e-9)
             out["sma_spread"] = ((sma5 - sma20).abs() / base).clip(lower=0.0, upper=5.0)
 
-        # CORE13_v2 scalping: usar columnas reales si existen; fallback neutro estable.
+        # CORE13_v2 scalping (backfill desde columnas legacy si existen)
         if "ret_1m" in feats:
-            out["ret_1m"] = _col_num("ret_1m", 0.0).clip(lower=-1.0, upper=1.0)
+            out["ret_1m"] = ((_col_num("rsi_9", 50.0) - 50.0) / 50.0).clip(lower=-1.0, upper=1.0)
         if "ret_3m" in feats:
-            out["ret_3m"] = _col_num("ret_3m", 0.0).clip(lower=-1.0, upper=1.0)
+            out["ret_3m"] = ((_col_num("rsi_14", 50.0) - 50.0) / 50.0).clip(lower=-1.0, upper=1.0)
         if "ret_5m" in feats:
-            out["ret_5m"] = _col_num("ret_5m", 0.0).clip(lower=-1.0, upper=1.0)
+            out["ret_5m"] = (0.6 * _col_num("ret_3m", 0.0) + 0.4 * _col_num("ret_1m", 0.0)).clip(lower=-1.0, upper=1.0)
         if "slope_5m" in feats:
-            out["slope_5m"] = _col_num("slope_5m", 0.0).clip(lower=-1.0, upper=1.0)
+            out["slope_5m"] = (_col_num("sma_spread", 0.0) + 0.05 * _col_num("cruce_sma", 0.0)).clip(lower=-1.0, upper=1.0)
         if "rv_20" in feats:
-            out["rv_20"] = _col_num("rv_20", float(INCREMENTAL_SCALPING_DEFAULTS["rv_20"])).clip(lower=0.0, upper=1.0)
+            out["rv_20"] = _col_num("volatilidad", 0.0).clip(lower=0.0, upper=1.0)
         if "range_norm" in feats:
-            out["range_norm"] = _col_num("range_norm", float(INCREMENTAL_SCALPING_DEFAULTS["range_norm"])).clip(lower=0.0, upper=1.0)
+            out["range_norm"] = _col_num("breakout", 0.0).clip(lower=0.0, upper=1.0)
         if "bb_z" in feats:
-            out["bb_z"] = _col_num("bb_z", 0.0).clip(lower=-3.0, upper=3.0)
+            out["bb_z"] = ((2.0 * _col_num("rsi_reversion", 0.0)) - 1.0).clip(lower=-3.0, upper=3.0)
         if "body_ratio" in feats:
-            out["body_ratio"] = _col_num("body_ratio", float(INCREMENTAL_SCALPING_DEFAULTS["body_ratio"])).clip(lower=0.0, upper=1.0)
+            out["body_ratio"] = _col_num("ret_1m", 0.0).abs().clip(lower=0.0, upper=1.0)
         if "wick_imbalance" in feats:
-            out["wick_imbalance"] = _col_num("wick_imbalance", 0.0).clip(lower=-1.0, upper=1.0)
+            out["wick_imbalance"] = ((2.0 * _col_num("es_rebote", 0.0)) - 1.0).clip(lower=-1.0, upper=1.0)
         if "micro_trend_persist" in feats:
-            out["micro_trend_persist"] = _col_num("micro_trend_persist", 0.0).clip(lower=-1.0, upper=1.0)
+            out["micro_trend_persist"] = (_col_num("racha_actual", 0.0) / 10.0).clip(lower=-1.0, upper=1.0)
 
         return out
     except Exception:
@@ -8837,9 +8722,6 @@ def oraculo_predict_visible(fila_dict):
             if fn:
                 meta_local["feature_names"] = fn
                 prob = oraculo_predict(fila_dict, model, scaler, meta_local, bot_name="HUD")
-                if prob is None:
-                    status = str(_LAST_ORACULO_PRED_STATUS or "SCALPING_DEAD")
-                    return None, status
                 return prob, "modelo"
 
         # Sin modelo: fallback visual (NO opera, solo pinta)
@@ -8902,20 +8784,9 @@ def oraculo_predict(fila_dict, modelo, scaler, meta, bot_name=""):
     Predicción IA robusta.
     payout se trata como ROI [0..1.5].
     """
-    global _LAST_ORACULO_PRED_STATUS
     try:
-        _LAST_ORACULO_PRED_STATUS = None
         if fila_dict is None:
             return 0.0
-
-        sc_diag = _diagnosticar_scalping_row(fila_dict)
-        if not bool(sc_diag.get("ok", True)):
-            _LAST_ORACULO_PRED_STATUS = "SCALPING_DIAG_ERROR"
-            agregar_evento(f"❌ IA oráculo scalping diag error ({bot_name or 'N/A'}): {sc_diag.get('error')}")
-            return None
-        if int(sc_diag.get("reales", 0)) < int(SCALPING_MIN_REALES_POR_FILA):
-            _LAST_ORACULO_PRED_STATUS = "SCALPING_DEAD"
-            return None
 
         feature_names = _resolve_oracle_feature_names(modelo, scaler, (meta or {}).get("feature_names"), meta or {})
         if not feature_names:
@@ -9478,21 +9349,8 @@ def anexar_incremental_desde_bot(bot: str):
         ruta_inc = "dataset_incremental.csv"
 
         # Construir row completo + features derivadas (volatilidad/hora_bucket)
-        row_dict_source = dict(fila_dict)
-        row_dict_source["result_bin"] = label
-
-        row_dict_full = dict(row_dict_source)
-        scalping_diag_raw = _diagnosticar_scalping_row(row_dict_full)
-        if not bool(scalping_diag_raw.get("ok", True)):
-            agregar_evento(f"❌ Incremental: error diagnóstico scalping ({bot}): {scalping_diag_raw.get('error')}")
-            return
-        if int(scalping_diag_raw.get("reales", 0)) < int(SCALPING_MIN_REALES_POR_FILA):
-            agregar_evento(
-                f"⚠️ Incremental: scalping insuficiente ({bot}) reales={scalping_diag_raw.get('reales', 0)}/10 "
-                f"defaults={scalping_diag_raw.get('defaults', 0)} missing={scalping_diag_raw.get('missing', 0)}"
-            )
-            return
-
+        row_dict_full = dict(fila_dict)
+        row_dict_full["result_bin"] = label
         row_dict_full = _enriquecer_scalping_features_row(row_dict_full)
 
         # 1) Volatilidad: prioriza valor ya enriquecido; recalcula solo si falta/inválido.
@@ -9630,12 +9488,6 @@ def anexar_incremental_desde_bot(bot: str):
                     if now - float(d.get(bot, 0.0)) >= 60.0:
                         d[bot] = now
                         agregar_evento(f"✅ Incremental: +1 fila desde {bot} ({'G' if label == 1 else 'P'}).")
-                except Exception:
-                    pass
-
-                # Flujo limpio v3 en paralelo: estricto CORE13 (sin fallback neutro).
-                try:
-                    _anexar_incremental_v3_desde_fila(bot, row_dict_source, label)
                 except Exception:
                     pass
 
@@ -9872,29 +9724,6 @@ def _dataset_quality_gate_for_training(X_df: pd.DataFrame, feats: list[str]):
         # Si casi todo está casi-constante, bloqueamos para evitar entrenos basura.
         if len(feats) > 0 and dom_hot >= max(1, int(len(feats) * 0.8)):
             reasons.append(f"dominancia_alta:{dom_hot}/{len(feats)}")
-
-        # Guardrail específico: detectar scalping muerto por defaults neutros.
-        try:
-            scalping_cols = [c for c in INCREMENTAL_SCALPING_FEATURES_10 if c in X_df.columns]
-            if scalping_cols:
-                n = max(1, len(X_df))
-                recent_n = min(int(SCALPING_RECENT_WINDOW), n)
-                recent = X_df.tail(recent_n).copy()
-                dead_cols = 0
-                for c in scalping_cols:
-                    d0 = float(INCREMENTAL_SCALPING_DEFAULTS.get(c, 0.0))
-                    s_all = pd.to_numeric(X_df[c], errors="coerce").fillna(d0)
-                    s_recent = pd.to_numeric(recent[c], errors="coerce").fillna(d0)
-                    ratio_all = float((s_all == d0).mean()) if len(s_all) else 1.0
-                    ratio_recent = float((s_recent == d0).mean()) if len(s_recent) else 1.0
-                    health.setdefault(c, {})["default_ratio"] = ratio_all
-                    health[c]["default_ratio_recent"] = ratio_recent
-                    if ratio_recent >= float(SCALPING_MAX_DEFAULT_RATIO_TRAIN):
-                        dead_cols += 1
-                if dead_cols >= max(4, int(len(scalping_cols) * 0.6)):
-                    reasons.append(f"scalping_muerto_recent:{dead_cols}/{len(scalping_cols)}")
-        except Exception:
-            pass
 
         return len(reasons) == 0, reasons, health
     except Exception as e:
@@ -11062,59 +10891,6 @@ RUNTIME_AUDIT_ENABLE = True
 # HUD observabilidad de rachas (solo diagnóstico; no altera trading/gates).
 HUD_RACHA_WINDOWS = (5, 8, 12)
 HUD_RACHA_MIN_MUESTRA = 8
-
-def entrenar_modelo_limpio_v3(force: bool = False) -> bool:
-    """Entrenamiento limpio v3 desde dataset_incremental_v3.csv (artefactos paralelos)."""
-    try:
-        ruta = DATASET_INCREMENTAL_V3
-        if not os.path.exists(ruta):
-            return False
-
-        df = pd.read_csv(ruta, encoding="utf-8", on_bad_lines="skip")
-        if df is None or df.empty:
-            return False
-
-        feats = list(FEATURE_NAMES_CORE_13)
-        X, y, feats_used, _ = _build_Xy_incremental(df, feature_names=feats)
-        if X is None or y is None or len(X) < max(60, MIN_TRAIN_ROWS_ADAPTIVE):
-            return False
-
-        scaler = StandardScaler()
-        Xs = scaler.fit_transform(X.values)
-
-        if XGBClassifier is not None:
-            modelo = XGBClassifier(
-                n_estimators=220,
-                max_depth=4,
-                learning_rate=0.05,
-                subsample=0.9,
-                colsample_bytree=0.9,
-                random_state=42,
-                eval_metric="logloss",
-            )
-        else:
-            modelo = LogisticRegression(max_iter=400, class_weight="balanced")
-
-        modelo.fit(Xs, y)
-
-        meta = {
-            "schema": "core13_v3_clean",
-            "trained_on_incremental": "dataset_incremental_v3",
-            "n": int(len(X)),
-            "n_samples": int(len(X)),
-            "feature_names": list(feats_used),
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-        }
-
-        for path, obj in ((MODEL_PATH_V3, modelo), (SCALER_PATH_V3, scaler), (FEATURES_PATH_V3, list(feats_used))):
-            tmp = path + ".tmp"
-            joblib.dump(obj, tmp)
-            os.replace(tmp, path)
-        _json_dump_atomic(meta, META_PATH_V3)
-        return True
-    except Exception:
-        return False
-
 
 def _runtime_audit_append(linea: str):
     try:
@@ -12845,13 +12621,21 @@ def backfill_incremental(ultimas=500):
             if df is None or df.empty:
                 continue
 
-            if "resultado" not in df.columns:
+            req = [
+                "rsi_9","rsi_14","sma_5","sma_20","cruce_sma","breakout",
+                "rsi_reversion","racha_actual","puntaje_estrategia"
+            ]
+            if not set(req).issubset(df.columns) or "resultado" not in df.columns:
                 continue
+
+            for c in req + ["payout","payout_decimal_rounded"]:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
 
             df["resultado_norm"] = df["resultado"].apply(normalizar_resultado)
 
             sub = df[df["resultado_norm"].isin(["GANANCIA","PÉRDIDA"])]
-            sub = sub.tail(ultimas)
+            sub = sub[sub[req].notna().all(axis=1)].tail(ultimas)
             if sub.empty:
                 continue
 
@@ -12860,48 +12644,80 @@ def backfill_incremental(ultimas=500):
             
             nuevas_filas = []
             for _, r in sub.iterrows():
+                # base mínima
+                fila = {k: float(r[k]) for k in req}
+                sp = _calcular_sma_spread_robusto({
+                    "sma_5": r.get("sma_5", 0.0),
+                    "sma_20": r.get("sma_20", 0.0),
+                    "close": r.get("close", r.get("cierre", None)),
+                })
+                if sp is None or not np.isfinite(float(sp)):
+                    descartadas += 1
+                    continue
+                fila["sma_spread"] = float(sp)
+
                 # Diccionario completo para helpers enriquecidos
                 row_dict_full = r.to_dict()
 
-                # Canoniza + completa faltantes reales del CORE13.
-                row_dict_full = canonicalizar_campos_bot_maestro(row_dict_full)
-
-                scalping_diag_raw = _diagnosticar_scalping_row(row_dict_full)
-                if not bool(scalping_diag_raw.get("ok", True)):
-                    agregar_evento(f"❌ Backfill: error diagnóstico scalping ({bot}): {scalping_diag_raw.get('error')}")
-                    descartadas += 1
-                    continue
-                if int(scalping_diag_raw.get("reales", 0)) < int(SCALPING_MIN_REALES_POR_FILA):
-                    descartadas += 1
-                    continue
-
+                                # ==========================
+                # payout normalizado (ROI 0–1.5 aprox)
+                # ==========================
                 pay = calcular_payout_feature(row_dict_full)
+                # Si falta payout, NO lo inventamos como 0.0: descartamos la fila
+                # (backfill es entrenamiento, aquí ser conservador = IA más estable)
                 if pay is None or pay < 0.05:
                     descartadas += 1
                     continue
+
+                # ✅ FIX: estas asignaciones DEBEN ocurrir antes del continue
+                fila["payout"] = float(pay)
                 row_dict_full["payout"] = float(pay)
 
+                # Enriquecer señales evento antes de extraer features finales
+                row_dict_full = enriquecer_features_evento(row_dict_full)
+
+                # ==========================
+                # puntaje_estrategia normalizado 0–1
+                # ==========================
                 pe = calcular_puntaje_estrategia_normalizado(row_dict_full)
-                if pe is None:
-                    pe = _safe_float_local(row_dict_full.get("puntaje_estrategia"))
-                if pe is None or (not math.isfinite(float(pe))):
-                    descartadas += 1
-                    continue
-                row_dict_full["puntaje_estrategia"] = float(max(0.0, min(1.0, float(pe))))
+                if pe is None and "puntaje_estrategia" in r:
+                    pe = _norm_01(r.get("puntaje_estrategia"))
+                if pe is not None:
+                    fila["puntaje_estrategia"] = pe
 
-                row_dict_full = _enriquecer_scalping_features_row(row_dict_full)
+                # ==========================
+                # volatilidad: normalizada a [0,1]
+                # - si viene en el CSV y es válida, la usamos
+                # - si falta / NaN, la calculamos con calcular_volatilidad_simple (proxy SMA5 vs SMA20)
+                # ==========================
+                vol_raw = row_dict_full.get("volatilidad", None)
+                try:
+                    vol = float(vol_raw) if vol_raw not in (None, "") else np.nan
+                except Exception:
+                    vol = np.nan
+                if pd.isna(vol):
+                    vol = calcular_volatilidad_simple(row_dict_full)
+                try:
+                    vol_f = float(vol)
+                except Exception:
+                    vol_f = float("nan")
+                if (not math.isfinite(vol_f)) or vol_f <= 0.0:
+                    vol_hist = calcular_volatilidad_por_bot(bot, lookback=50)
+                    if vol_hist is not None:
+                        vol_f = float(vol_hist)
+                if (not math.isfinite(vol_f)):
+                    vol_f = 0.0
 
-                fila = {}
-                missing = False
-                for k in feature_names:
-                    fv = _safe_float_local(row_dict_full.get(k))
-                    if fv is None or (not math.isfinite(float(fv))):
-                        missing = True
-                        break
-                    fila[k] = float(fv)
-                if missing:
-                    descartadas += 1
-                    continue
+                fila["volatilidad"] = max(0.0, min(float(vol_f), 1.0))
+
+                # ==========================
+                # nuevas features: rebote y hora (0–1)
+                # ==========================
+                fila["es_rebote"]   = float(max(0.0, min(1.0, _safe_float_local(row_dict_full.get("es_rebote")) or calcular_es_rebote(row_dict_full))))
+                hb, hm = calcular_hora_features(row_dict_full)
+                if float(hm) >= 1.0:
+                    hb = 0.0
+                fila["hora_bucket"] = float(max(0.0, min(1.0, float(hb))))
 
                 # ==========================
                 # label final (GANANCIA / PÉRDIDA)
@@ -12941,88 +12757,6 @@ def backfill_incremental(ultimas=500):
         agregar_evento("✅ IA: backfill incremental completado.")
     except Exception as e:
         agregar_evento(f"⚠️ IA: fallo en backfill: {e}")
-
-
-def backfill_incremental_v3(ultimas=500):
-    """Backfill limpio v3: solo CERRADO auditables con CORE13 completo."""
-    try:
-        feats = list(FEATURE_NAMES_CORE_13)
-        cols = feats + ["ts_ingest", "result_bin"]
-        inc = DATASET_INCREMENTAL_V3
-
-        with file_lock_required(INCREMENTAL_LOCK_FILE, timeout=6.0, stale_after=30.0) as got:
-            if not got:
-                agregar_evento("⚠️ Backfill v3: incremental.lock ocupado; se omite ejecución.")
-                return
-            if reparar_dataset_incremental_mutante(inc, cols):
-                agregar_evento("🧹 IA v3: dataset_incremental_v3 reparado.")
-            if not os.path.exists(inc) or os.stat(inc).st_size == 0:
-                with open(inc, "w", newline="", encoding="utf-8") as f:
-                    csv.DictWriter(f, fieldnames=cols).writeheader()
-
-        firmas_existentes = set()
-        if os.path.exists(inc):
-            df_inc = pd.read_csv(inc, encoding="utf-8", on_bad_lines="skip")
-            if not df_inc.empty and set(feats + ["result_bin"]).issubset(df_inc.columns):
-                sigs = df_inc[feats].round(6).astype(str).agg("|".join, axis=1) + "|" + df_inc["result_bin"].astype(int).astype(str)
-                firmas_existentes = set(sigs.tolist())
-
-        for bot in BOT_NAMES:
-            ruta = f"registro_enriquecido_{bot}.csv"
-            if not os.path.exists(ruta):
-                continue
-
-            df = None
-            for enc in ("utf-8", "latin-1", "windows-1252"):
-                try:
-                    df = pd.read_csv(ruta, encoding=enc, on_bad_lines="skip")
-                    break
-                except Exception:
-                    continue
-            if df is None or df.empty or "trade_status" not in df.columns or "resultado" not in df.columns:
-                continue
-
-            df["trade_status_norm"] = df["trade_status"].apply(normalizar_trade_status)
-            df["resultado_norm"] = df["resultado"].apply(normalizar_resultado)
-            sub = df[df["trade_status_norm"].eq("CERRADO") & df["resultado_norm"].isin(["GANANCIA", "PÉRDIDA"])].tail(ultimas)
-            if sub.empty:
-                continue
-
-            nuevas = []
-            for _, r in sub.iterrows():
-                rd = canonicalizar_campos_bot_maestro(r.to_dict())
-                ok_core, _ = _fila_core13_v3_completa(rd, feats)
-                if not ok_core:
-                    continue
-
-                label = 1 if str(r.get("resultado_norm", "")).upper() == "GANANCIA" else 0
-                fila = {k: rd.get(k, None) for k in feats}
-                ok_val, _ = validar_fila_incremental(fila, feats)
-                if not ok_val:
-                    continue
-
-                sig = "|".join([str(round(float(fila[k]), 6)) for k in feats]) + f"|{int(label)}"
-                if sig in firmas_existentes:
-                    continue
-                firmas_existentes.add(sig)
-
-                fila["ts_ingest"] = rd.get("ts_ingest", rd.get("timestamp", rd.get("ts", time.time())))
-                fila["result_bin"] = int(label)
-                nuevas.append(fila)
-
-            if nuevas:
-                with file_lock_required(INCREMENTAL_LOCK_FILE, timeout=6.0, stale_after=30.0) as got:
-                    if not got:
-                        continue
-                    with open(inc, "a", newline="", encoding="utf-8") as f:
-                        w = csv.DictWriter(f, fieldnames=cols)
-                        for rd in nuevas:
-                            w.writerow(rd)
-                        f.flush(); os.fsync(f.fileno())
-
-        agregar_evento("✅ IA v3: backfill limpio completado.")
-    except Exception as e:
-        agregar_evento(f"⚠️ IA v3: fallo en backfill limpio: {e}")
 # === FIN BLOQUE 12 ===
 
 # === BLOQUE 13 — LOOP PRINCIPAL, WEBSOCKET Y TECLADO ===
@@ -14131,25 +13865,7 @@ def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
 
     eventos.sort(key=lambda x: float(x.get("ts", 0.0)), reverse=True)
     base = eventos[0]
-
-    # Candidate-aware (mínimo cambio): priorizar activo del candidato actual.
-    asset_candidate = ""
-    try:
-        for c in list(candidatos or []):
-            if not isinstance(c, (list, tuple)) or len(c) < 2:
-                continue
-            b_cand = str(c[1])
-            if not b_cand:
-                continue
-            ctx_cand = _ultimo_contexto_operativo_bot(b_cand)
-            a_cand = str((ctx_cand or {}).get("activo", "") or "").strip().upper()
-            if a_cand:
-                asset_candidate = a_cand
-                break
-    except Exception:
-        asset_candidate = ""
-
-    asset_target = str(asset_candidate or CTT_ACTIVO_UNICO or "").strip().upper()
+    asset_target = str(CTT_ACTIVO_UNICO or "").strip().upper()
     asset = asset_target if asset_target else str(base.get("asset", "") or "").upper()
     t_front = float(base.get("ts", 0.0) or 0.0)
 
@@ -15344,7 +15060,7 @@ async def main():
                                 except Exception:
                                     pass
 
-                            ctt_eval = evaluar_ctt_fase(candidatos)[1]
+                            ctt_eval = evaluar_ctt_fase([])[1]
                             if candidatos:
                                 ctt_status = str(ctt_eval.get("status", "NEUTRAL"))
                                 ctt_gate = str(ctt_eval.get("gate", "NEUTRAL"))

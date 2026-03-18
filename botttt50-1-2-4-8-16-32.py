@@ -1,16 +1,10 @@
 # -*- coding: utf-8 -*-
 import asyncio
-try:
-    import websockets
-    WEBSOCKETS_OK = True
-except Exception:
-    websockets = None
-    WEBSOCKETS_OK = False
+import websockets
 import json
 import csv
 import os
 import sys
-import math
 from datetime import datetime, timezone
 from statistics import mean
 from colorama import Fore, Back, Style, init
@@ -140,14 +134,14 @@ ARCHIVO_CSV = f"registro_enriquecido_{NOMBRE_BOT}.csv"
 ARCHIVO_TOKEN = "token_actual.txt"  # Fuente única de verdad (coincide con 5R6M)
 DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 ACTIVOS = ["1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
-MARTINGALA_DEMO = [1, 2, 4, 8]
-MARTINGALA_REAL = [1, 2, 4, 8]
+MARTINGALA_DEMO = [1, 2, 4, 8, 16, 32]
+MARTINGALA_REAL = [1, 2, 4, 8, 16, 32]
 VELAS = 20
 PAUSA_POST_OPERACION_S = 40  # Pausa uniforme tras cada operación con resultado definido (BLOQUE 1)
 # ==================== VENTANA DE DECISIÓN IA ====================
 # Objetivo: dar tiempo al MAESTRO + humano para decidir pasar a REAL ANTES del BUY.
 # (0 para desactivar)
-VENTANA_DECISION_IA_S = 30        # segundos
+VENTANA_DECISION_IA_S = 60        # segundos
 VENTANA_DECISION_IA_POLL_S = 0.10 # granularidad de espera
 # === Filtro avanzado (sin cambiar 13 features) ===
 SCORE_MIN = 2.80            # score mínimo para aceptar un setup
@@ -167,8 +161,6 @@ estado_bot = {
     "barra_activa": False,
     "score_senal": None,
     "ciclo_actual": 1,
-    "trade_snapshots": {},
-    "cancelled_pretrades": set(),
 }  # Added modo_manual and barra_activa
 racha_actual_bot = 0  # racha del bot: >0 = racha de GANANCIAS, <0 = racha de PÉRDIDAS
 
@@ -295,24 +287,6 @@ async def _silencio_temporal(seg=90, fuente=None):
 
 # >>> PATCH (globals) BLOQUE 3
 _contratos_procesados = set()
-_CONTRATOS_MAX_TRACK = 4000
-
-def _registrar_contrato_procesado(contract_id) -> bool:
-    """True si se registró; False si ya estaba. Evita crecimiento infinito del set."""
-    try:
-        cid = int(contract_id)
-    except Exception:
-        return False
-    if cid in _contratos_procesados:
-        return False
-    _contratos_procesados.add(cid)
-    if len(_contratos_procesados) > _CONTRATOS_MAX_TRACK:
-        try:
-            _contratos_procesados.clear()
-            _contratos_procesados.add(cid)
-        except Exception:
-            pass
-    return True
 # <<< PATCH
 
 # >>> PATCH (globals) BLOQUE 3 y BLOQUE 4
@@ -375,16 +349,6 @@ CSV_HEADER = [
     "trade_status",          # "PRE_TRADE" o "CERRADO"
     "epoch",
     "ts",
-    "ret_1m",
-    "ret_3m",
-    "ret_5m",
-    "slope_5m",
-    "rv_20",
-    "range_norm",
-    "bb_z",
-    "body_ratio",
-    "wick_imbalance",
-    "micro_trend_persist",
     "ia_prob_en_juego",
     "ia_prob_source",
     "ia_decision_id",
@@ -446,38 +410,6 @@ def _write_row_dict_atomic(archivo_csv: str, row_dict: dict):
     write_csv_atomic(archivo_csv, row)
 
 # === FIN HEADER FINAL ===
-def _normalizar_payout_desde_monto(payout_raw, monto_raw):
-    """Normaliza payout con semántica única: multiplier (ratio total) y payout_total."""
-    payout_total_f = 0.0
-    payout_mult_f = 0.0
-    try:
-        monto_f = float(monto_raw) if monto_raw not in (None, "", "nan", "NaN") else 0.0
-    except Exception:
-        monto_f = 0.0
-    try:
-        p = float(payout_raw) if payout_raw not in (None, "", "nan", "NaN") else 0.0
-    except Exception:
-        p = 0.0
-    try:
-        import math
-        if not math.isfinite(p):
-            p = 0.0
-        if not math.isfinite(monto_f):
-            monto_f = 0.0
-    except Exception:
-        pass
-    try:
-        if p > 0 and p <= 3.5:
-            payout_mult_f = p
-            payout_total_f = (monto_f * payout_mult_f) if monto_f > 0 else 0.0
-        elif p > 3.5:
-            payout_total_f = p
-            payout_mult_f = (payout_total_f / monto_f) if monto_f > 0 else 0.0
-    except Exception:
-        payout_total_f = 0.0
-        payout_mult_f = 0.0
-    return float(monto_f), float(payout_total_f), float(payout_mult_f)
-
 def write_pretrade_snapshot(
     archivo_csv,
     symbol=None,
@@ -554,21 +486,40 @@ def write_pretrade_snapshot(
         except Exception:
             es_rebote_flag = 1 if (racha_prev <= -4) else 0
 
-    # scalping features (snapshot inmutable del trade)
-    sf = kwargs.get("scalping_features") if isinstance(kwargs.get("scalping_features"), dict) else {}
-    ret_1m = _safe_clip(sf.get("ret_1m", 0.0), -1.0, 1.0, 0.0)
-    ret_3m = _safe_clip(sf.get("ret_3m", 0.0), -1.0, 1.0, 0.0)
-    ret_5m = _safe_clip(sf.get("ret_5m", 0.0), -1.0, 1.0, 0.0)
-    slope_5m = _safe_clip(sf.get("slope_5m", 0.0), -1.0, 1.0, 0.0)
-    rv_20 = _safe_clip(sf.get("rv_20", 0.0), 0.0, 1.0, 0.0)
-    range_norm = _safe_clip(sf.get("range_norm", 0.0), 0.0, 1.0, 0.0)
-    bb_z = _safe_clip(sf.get("bb_z", 0.0), -3.0, 3.0, 0.0)
-    body_ratio = _safe_clip(sf.get("body_ratio", 0.0), 0.0, 1.0, 0.0)
-    wick_imbalance = _safe_clip(sf.get("wick_imbalance", 0.0), -1.0, 1.0, 0.0)
-    micro_trend_persist = _safe_clip(sf.get("micro_trend_persist", 0.0), -1.0, 1.0, 0.0)
+    # -------------------------
+    # monto float
+    # -------------------------
+    try:
+        monto_f = float(monto or 0.0)
+    except Exception:
+        monto_f = 0.0
 
-    # monto/payout normalizados (semántica única)
-    monto_f, payout_total_f, payout_mult_f = _normalizar_payout_desde_monto(payout, monto)
+    # -------------------------
+    # payout robusto
+    # -------------------------
+    payout_total_f = 0.0
+    payout_mult_f = 0.0
+    try:
+        p = float(payout) if payout not in (None, "", "nan", "NaN") else 0.0
+        # si NaN/inf, lo anulamos
+        try:
+            import math
+            if not math.isfinite(p):
+                p = 0.0
+            if not math.isfinite(monto_f):
+                monto_f = 0.0
+        except Exception:
+            pass
+
+        if p > 0 and p <= 3.5:
+            payout_mult_f = p
+            payout_total_f = (monto_f * payout_mult_f) if monto_f > 0 else 0.0
+        elif p > 3.5:
+            payout_total_f = p
+            payout_mult_f = (payout_total_f / monto_f) if monto_f > 0 else 0.0
+    except Exception:
+        payout_total_f = 0.0
+        payout_mult_f = 0.0
 
     # -------------------------
     # puntaje 0..1
@@ -606,16 +557,6 @@ def write_pretrade_snapshot(
         "trade_status": "PRE_TRADE",
         "epoch": int(epoch_val),
         "ts": ts_val,
-        "ret_1m": ret_1m,
-        "ret_3m": ret_3m,
-        "ret_5m": ret_5m,
-        "slope_5m": slope_5m,
-        "rv_20": rv_20,
-        "range_norm": range_norm,
-        "bb_z": bb_z,
-        "body_ratio": body_ratio,
-        "wick_imbalance": wick_imbalance,
-        "micro_trend_persist": micro_trend_persist,
         "ia_prob_en_juego": "",
         "ia_prob_source": "",
         "ia_decision_id": f"{NOMBRE_BOT}|{int(epoch_val)}|C{int(ciclo) if ciclo is not None else 1}|{symbol}|{direccion}|{str(kwargs.get('token', 'NA')).upper()}",
@@ -626,148 +567,6 @@ def write_pretrade_snapshot(
 
     _write_row_dict_atomic(archivo_csv, row_dict)
     return epoch_val
-
-
-def _trade_snapshot_key(epoch_pretrade, symbol, direccion, ciclo):
-    return f"{int(epoch_pretrade)}|{str(symbol)}|{str(direccion)}|{int(ciclo)}"
-
-
-def set_trade_snapshot(epoch_pretrade, symbol, direccion, ciclo, scalping_features):
-    try:
-        key = _trade_snapshot_key(epoch_pretrade, symbol, direccion, ciclo)
-        snaps = estado_bot.setdefault("trade_snapshots", {})
-        sf = scalping_features if isinstance(scalping_features, dict) else {}
-        snaps[key] = {
-            "epoch_pretrade": int(epoch_pretrade),
-            "symbol": str(symbol),
-            "direccion": str(direccion),
-            "ciclo": int(ciclo),
-            "ret_1m": _safe_clip(sf.get("ret_1m", 0.0), -1.0, 1.0, 0.0),
-            "ret_3m": _safe_clip(sf.get("ret_3m", 0.0), -1.0, 1.0, 0.0),
-            "ret_5m": _safe_clip(sf.get("ret_5m", 0.0), -1.0, 1.0, 0.0),
-            "slope_5m": _safe_clip(sf.get("slope_5m", 0.0), -1.0, 1.0, 0.0),
-            "rv_20": _safe_clip(sf.get("rv_20", 0.0), 0.0, 1.0, 0.0),
-            "range_norm": _safe_clip(sf.get("range_norm", 0.0), 0.0, 1.0, 0.0),
-            "bb_z": _safe_clip(sf.get("bb_z", 0.0), -3.0, 3.0, 0.0),
-            "body_ratio": _safe_clip(sf.get("body_ratio", 0.0), 0.0, 1.0, 0.0),
-            "wick_imbalance": _safe_clip(sf.get("wick_imbalance", 0.0), -1.0, 1.0, 0.0),
-            "micro_trend_persist": _safe_clip(sf.get("micro_trend_persist", 0.0), -1.0, 1.0, 0.0),
-        }
-    except Exception:
-        pass
-
-
-def get_trade_snapshot(epoch_pretrade, symbol, direccion, ciclo):
-    try:
-        snaps = estado_bot.get("trade_snapshots", {})
-        if not isinstance(snaps, dict):
-            return None
-        return snaps.get(_trade_snapshot_key(epoch_pretrade, symbol, direccion, ciclo))
-    except Exception:
-        return None
-
-
-def pop_trade_snapshot(epoch_pretrade, symbol, direccion, ciclo):
-    try:
-        snaps = estado_bot.get("trade_snapshots", {})
-        if not isinstance(snaps, dict):
-            return None
-        return snaps.pop(_trade_snapshot_key(epoch_pretrade, symbol, direccion, ciclo), None)
-    except Exception:
-        return None
-
-
-async def registrar_pretrade_cancelado(
-    archivo_csv,
-    epoch_pretrade,
-    symbol,
-    direccion,
-    ciclo,
-    monto=None,
-    rsi9=None,
-    rsi14=None,
-    sma5=None,
-    sma20=None,
-    cruce=None,
-    breakout=None,
-    rsi_reversion=None,
-    payout=None,
-    condiciones=None,
-):
-    if epoch_pretrade is None:
-        return False
-    try:
-        epoch_val = int(epoch_pretrade)
-        key = _trade_snapshot_key(epoch_val, symbol, direccion, ciclo)
-    except Exception:
-        return False
-
-    cancelled = estado_bot.setdefault("cancelled_pretrades", set())
-    if key in cancelled:
-        return False
-
-    snap = get_trade_snapshot(epoch_val, symbol, direccion, ciclo) or {}
-    ack_ctx = estado_bot.get("ack_ctx", {}) if isinstance(estado_bot.get("ack_ctx", {}), dict) else {}
-    ia_prob_en_juego = ack_ctx.get("ia_prob_en_juego", "")
-    ia_prob_source = str(ack_ctx.get("ia_prob_source", "") or "").strip()
-    ia_ready_ack = bool(ack_ctx.get("ia_ready_ack", False))
-    if isinstance(ia_prob_en_juego, (int, float)):
-        ia_prob_source = ia_prob_source or "HUD"
-        ia_ready_ack = True
-    else:
-        ia_prob_source = ia_prob_source or "NO_READY"
-
-    monto_f, payout_total_f, payout_mult_f = _normalizar_payout_desde_monto(payout, monto)
-    puntaje01 = _norm_puntaje_01(condiciones)
-    now = datetime.now(timezone.utc)
-
-    row_dict = {
-        "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "activo": symbol,
-        "direction": direccion,
-        "monto": float(monto_f),
-        "resultado": "CANCELADO",
-        "ganancia_perdida": "",
-        "rsi_9": rsi9,
-        "rsi_14": rsi14,
-        "sma_5": sma5,
-        "sma_20": sma20,
-        "cruce_sma": int(cruce) if cruce is not None else "",
-        "breakout": int(breakout) if breakout is not None else "",
-        "rsi_reversion": int(rsi_reversion) if rsi_reversion is not None else "",
-        "racha_actual": int(racha_actual_bot),
-        "es_rebote": 1 if int(racha_actual_bot) <= -4 else 0,
-        "ciclo_martingala": int(ciclo),
-        "payout_total": float(round(payout_total_f, 2)),
-        "payout_multiplier": float(round(payout_mult_f, 6)),
-        "puntaje_estrategia": float(round(float(puntaje01), 6)),
-        "result_bin": "",
-        "trade_status": "CANCELADO",
-        "epoch": epoch_val,
-        "ts": now.isoformat(),
-        "ret_1m": _safe_clip(snap.get("ret_1m", 0.0), -1.0, 1.0, 0.0),
-        "ret_3m": _safe_clip(snap.get("ret_3m", 0.0), -1.0, 1.0, 0.0),
-        "ret_5m": _safe_clip(snap.get("ret_5m", 0.0), -1.0, 1.0, 0.0),
-        "slope_5m": _safe_clip(snap.get("slope_5m", 0.0), -1.0, 1.0, 0.0),
-        "rv_20": _safe_clip(snap.get("rv_20", 0.0), 0.0, 1.0, 0.0),
-        "range_norm": _safe_clip(snap.get("range_norm", 0.0), 0.0, 1.0, 0.0),
-        "bb_z": _safe_clip(snap.get("bb_z", 0.0), -3.0, 3.0, 0.0),
-        "body_ratio": _safe_clip(snap.get("body_ratio", 0.0), 0.0, 1.0, 0.0),
-        "wick_imbalance": _safe_clip(snap.get("wick_imbalance", 0.0), -1.0, 1.0, 0.0),
-        "micro_trend_persist": _safe_clip(snap.get("micro_trend_persist", 0.0), -1.0, 1.0, 0.0),
-        "ia_prob_en_juego": ia_prob_en_juego,
-        "ia_prob_source": ia_prob_source,
-        "ia_decision_id": ack_ctx.get("ia_decision_id", f"{NOMBRE_BOT}|{epoch_val}"),
-        "ia_gate_real": ack_ctx.get("ia_gate_real", ""),
-        "ia_modo_ack": ack_ctx.get("ia_modo_ack", ""),
-        "ia_ready_ack": ia_ready_ack,
-    }
-
-    async with csv_lock:
-        _write_row_dict_atomic(archivo_csv, row_dict)
-    cancelled.add(key)
-    return True
-
 
 def write_token_atomic(path: str, content: str):
     """
@@ -870,28 +669,6 @@ def write_csv_atomic(path: str, row):
     old_header = []
     data_rows = []
     file_exists = os.path.exists(path) and os.path.getsize(path) > 0
-
-    # Fast-path append: cuando el header coincide, evitar reescritura completa.
-    try:
-        if file_exists:
-            with open(path, "r", newline="", encoding="utf-8", errors="replace") as f:
-                reader = csv.reader(f)
-                current_header = next(reader, None) or []
-            if current_header == CSV_HEADER:
-                new_row = _norm_len(row, num_cols)
-                with open(path, "a", newline="", encoding="utf-8", errors="replace") as f:
-                    w = csv.writer(f)
-                    w.writerow(new_row)
-                    f.flush()
-                    os.fsync(f.fileno())
-                if fd is not None:
-                    try: os.close(fd)
-                    except Exception: pass
-                    try: os.remove(lock_path)
-                    except Exception: pass
-                return
-    except Exception:
-        pass
 
     needs_repair = False
 
@@ -1177,14 +954,14 @@ if not os.path.exists(ARCHIVO_CSV):
 
 def leer_token_desde_archivo():
     """
-    Lee ARCHIVO_TOKEN. Si contiene f'REAL:{NOMBRE_BOT}' -> autoriza con TOKEN_REAL, si no -> TOKEN_DEMO.
+    Lee ARCHIVO_TOKEN. Si contiene 'REAL:fulll45' -> autoriza con TOKEN_REAL, si no -> TOKEN_DEMO.
     """
     try:
         with open(ARCHIVO_TOKEN, "r", encoding="utf-8", errors="replace") as f:
             linea = f.read().strip()
             if linea == f"REAL:{NOMBRE_BOT}":
                 return TOKEN_REAL
-    except Exception:
+    except:
         pass
     return TOKEN_DEMO
 
@@ -1199,136 +976,6 @@ def calcular_rsi(cierres, periodo=14):
     media_per = mean(perdidas) if perdidas else 0.0001
     rs = media_gan / media_per
     return round(100 - (100 / (1 + rs)), 2)
-
-
-def _safe_clip(value, low, high, default=0.0):
-    try:
-        v = float(value)
-        if not math.isfinite(v):
-            return float(default)
-        if v < low:
-            return float(low)
-        if v > high:
-            return float(high)
-        return float(v)
-    except Exception:
-        return float(default)
-
-
-def _safe_div(num, den, default=0.0):
-    try:
-        n = float(num)
-        d = float(den)
-        if (not math.isfinite(n)) or (not math.isfinite(d)) or abs(d) <= 1e-12:
-            return float(default)
-        out = n / d
-        if not math.isfinite(out):
-            return float(default)
-        return float(out)
-    except Exception:
-        return float(default)
-
-
-def calcular_scalping_features(velas):
-    """
-    Calcula 10 features de scalping desde OHLC reales.
-    Robusta: no lanza excepción, devuelve finitos y acotados.
-    """
-    neutrals = {
-        "ret_1m": 0.0,
-        "ret_3m": 0.0,
-        "ret_5m": 0.0,
-        "slope_5m": 0.0,
-        "rv_20": 0.0,
-        "range_norm": 0.0,
-        "bb_z": 0.0,
-        "body_ratio": 0.0,
-        "wick_imbalance": 0.0,
-        "micro_trend_persist": 0.0,
-    }
-    try:
-        if not isinstance(velas, list) or len(velas) < 2:
-            return dict(neutrals)
-
-        o = [float(v.get("open", 0.0) or 0.0) for v in velas]
-        h = [float(v.get("high", 0.0) or 0.0) for v in velas]
-        l = [float(v.get("low", 0.0) or 0.0) for v in velas]
-        c = [float(v.get("close", 0.0) or 0.0) for v in velas]
-
-        for arr in (o, h, l, c):
-            if any((not math.isfinite(x)) for x in arr):
-                return dict(neutrals)
-
-        n = len(c)
-        last_close = c[-1] if n >= 1 else 0.0
-
-        ret_1m = _safe_div((c[-1] - c[-2]), c[-2], 0.0) if n >= 2 else 0.0
-        ret_3m = _safe_div((c[-1] - c[-4]), c[-4], 0.0) if n >= 4 else 0.0
-        ret_5m = _safe_div((c[-1] - c[-6]), c[-6], 0.0) if n >= 6 else 0.0
-
-        slope_5m = 0.0
-        if n >= 5:
-            y = c[-5:]
-            x = [0.0, 1.0, 2.0, 3.0, 4.0]
-            x_mean = 2.0
-            y_mean = sum(y) / 5.0
-            num = sum((x[i] - x_mean) * (y[i] - y_mean) for i in range(5))
-            den = sum((x[i] - x_mean) ** 2 for i in range(5))
-            slope_raw = _safe_div(num, den, 0.0)
-            slope_5m = _safe_div(slope_raw, max(abs(y_mean), 1e-9), 0.0)
-
-        rets = []
-        for i in range(1, min(20, n)):
-            prev = c[-i - 1]
-            cur = c[-i]
-            rets.append(_safe_div((cur - prev), prev, 0.0))
-        rv_20 = (sum(r * r for r in rets) / max(1, len(rets))) ** 0.5 if rets else 0.0
-
-        tr = []
-        for i in range(max(1, n - 20), n):
-            hi = h[i]
-            lo = l[i]
-            pc = c[i - 1] if i - 1 >= 0 else c[i]
-            tr_i = max(hi - lo, abs(hi - pc), abs(lo - pc))
-            tr.append(max(0.0, tr_i))
-        atr_20 = (sum(tr) / max(1, len(tr))) if tr else 0.0
-        range_norm = _safe_div(atr_20, max(abs(last_close), 1e-9), 0.0)
-
-        win = c[-20:] if n >= 20 else c[:]
-        mu = (sum(win) / len(win)) if win else 0.0
-        var = (sum((x - mu) ** 2 for x in win) / max(1, len(win))) if win else 0.0
-        sigma = var ** 0.5
-        bb_z = _safe_div((last_close - mu), max(sigma, 1e-9), 0.0)
-
-        o1, h1, l1, c1 = o[-1], h[-1], l[-1], c[-1]
-        rng = max(h1 - l1, 1e-9)
-        body_ratio = abs(c1 - o1) / rng
-        upper_w = h1 - max(o1, c1)
-        lower_w = min(o1, c1) - l1
-        wick_imbalance = _safe_div((upper_w - lower_w), rng, 0.0)
-
-        signs = []
-        for i in range(max(1, n - 5), n):
-            d = c[i] - c[i - 1]
-            signs.append(1.0 if d > 0 else -1.0 if d < 0 else 0.0)
-        micro_trend_persist = (sum(signs) / len(signs)) if signs else 0.0
-
-        out = {
-            "ret_1m": _safe_clip(ret_1m, -1.0, 1.0, 0.0),
-            "ret_3m": _safe_clip(ret_3m, -1.0, 1.0, 0.0),
-            "ret_5m": _safe_clip(ret_5m, -1.0, 1.0, 0.0),
-            "slope_5m": _safe_clip(slope_5m, -1.0, 1.0, 0.0),
-            "rv_20": _safe_clip(rv_20, 0.0, 1.0, 0.0),
-            "range_norm": _safe_clip(range_norm, 0.0, 1.0, 0.0),
-            "bb_z": _safe_clip(bb_z, -3.0, 3.0, 0.0),
-            "body_ratio": _safe_clip(body_ratio, 0.0, 1.0, 0.0),
-            "wick_imbalance": _safe_clip(wick_imbalance, -1.0, 1.0, 0.0),
-            "micro_trend_persist": _safe_clip(micro_trend_persist, -1.0, 1.0, 0.0),
-        }
-        return out
-    except Exception:
-        return dict(neutrals)
-
 
 def evaluar_estrategia(velas):
     # Normaliza a float por si Deriv devuelve strings
@@ -1583,7 +1230,7 @@ async def check_token_and_reconnect(ws, current_token):
             print(Fore.YELLOW + Style.BRIGHT + f"Token cambió a {'REAL' if token_desde_archivo == TOKEN_REAL else 'DEMO'}. Reconectando...")
             try:
                 await ws.close()
-            except Exception:
+            except:
                 pass
             ws = await websockets.connect(DERIV_WS_URL, **WS_KW)  # BLOQUE 1.2
             await authorize_ws(ws, token_desde_archivo)
@@ -1853,10 +1500,9 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
             color = Fore.GREEN if profit > 0 else Fore.RED
             print(color + Style.BRIGHT + f"{resultado}: {profit:.2f} USD")
             # >>> PATCH BLOQUE 3 y 5
-            if not _registrar_contrato_procesado(contract_id):
-                if epoch_pretrade is not None:
-                    pop_trade_snapshot(int(epoch_pretrade), symbol, direccion, ciclo)
+            if contract_id in _contratos_procesados:
                 return resultado, profit
+            _contratos_procesados.add(contract_id)
             # <<< PATCH
             # Registrar resultado SOLO si es definido, con features enriquecidas
             try:
@@ -1879,13 +1525,48 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                 # Resultado SIEMPRE coherente:
                 #   payout_total_f y ratio_total
                 # ==========================================================
-                monto_f, payout_total_f, ratio_total = _normalizar_payout_desde_monto(payout, monto)
+                payout_total_f = 0.0
+                ratio_total = 0.0
+                # monto
+                try:
+                    monto_f = float(monto) if monto not in (None, "", "nan", "NaN") else 0.0
+                except Exception:
+                    monto_f = 0.0
+
+                # payout (puede venir como multiplier o como total)
+                try:
+                    p = float(payout) if payout not in (None, "", "nan", "NaN") else 0.0
+                except Exception:
+                    p = 0.0
+                # si p es NaN/inf, lo anulamos
+                try:
+                    import math
+                    if not math.isfinite(p):
+                        p = 0.0
+                    if not math.isfinite(monto_f):
+                        monto_f = 0.0
+                except Exception:
+                    pass                   
+                try:
+                    if p > 0 and p <= 3.5:
+                        # payout viene como multiplier (1.95 etc.)
+                        ratio_total = p
+                        payout_total_f = (monto_f * ratio_total) if monto_f > 0 else 0.0
+                    elif p > 3.5:
+                        # payout viene como total (USD)
+                        payout_total_f = p
+                        ratio_total = (payout_total_f / monto_f) if monto_f > 0 else 0.0
+                    else:
+                        payout_total_f = 0.0
+                        ratio_total = 0.0
+                except Exception:
+                    payout_total_f = 0.0
+                    ratio_total = 0.0
 
                 now = datetime.now(timezone.utc)
                 epoch_val = int(epoch_pretrade) if epoch_pretrade is not None else int(now.timestamp())
                 ts_val = now.isoformat()
-                snap = get_trade_snapshot(epoch_val, symbol, direccion, ciclo) or {}
-
+                
                 async with csv_lock:
                     # ==========================
                     # CIERRE CERRADO (DICT MODERNO)
@@ -1925,16 +1606,6 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                         "trade_status": "CERRADO",
                         "epoch": int(epoch_val),
                         "ts": ts_val,
-                        "ret_1m": _safe_clip(snap.get("ret_1m", 0.0), -1.0, 1.0, 0.0),
-                        "ret_3m": _safe_clip(snap.get("ret_3m", 0.0), -1.0, 1.0, 0.0),
-                        "ret_5m": _safe_clip(snap.get("ret_5m", 0.0), -1.0, 1.0, 0.0),
-                        "slope_5m": _safe_clip(snap.get("slope_5m", 0.0), -1.0, 1.0, 0.0),
-                        "rv_20": _safe_clip(snap.get("rv_20", 0.0), 0.0, 1.0, 0.0),
-                        "range_norm": _safe_clip(snap.get("range_norm", 0.0), 0.0, 1.0, 0.0),
-                        "bb_z": _safe_clip(snap.get("bb_z", 0.0), -3.0, 3.0, 0.0),
-                        "body_ratio": _safe_clip(snap.get("body_ratio", 0.0), 0.0, 1.0, 0.0),
-                        "wick_imbalance": _safe_clip(snap.get("wick_imbalance", 0.0), -1.0, 1.0, 0.0),
-                        "micro_trend_persist": _safe_clip(snap.get("micro_trend_persist", 0.0), -1.0, 1.0, 0.0),
                         "ia_prob_en_juego": ia_prob_en_juego,
                         "ia_prob_source": ia_prob_source,
                         "ia_decision_id": ack_ctx.get("ia_decision_id", f"{NOMBRE_BOT}|{int(epoch_val)}"),
@@ -1993,8 +1664,6 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
             # >>> PATCH BLOQUE 5
             print(Fore.CYAN + f"Ciclo #{ciclo} | {symbol} {direccion} | payout={float(payout or 0):.2f} | {resultado} {profit:+.2f} USD")
             # <<< PATCH
-            if epoch_pretrade is not None:
-                pop_trade_snapshot(int(epoch_pretrade), symbol, direccion, ciclo)
             return resultado, profit
         except websockets.exceptions.ConnectionClosed:
             if _print_once("no-close-frame", ttl=15):
@@ -2051,10 +1720,9 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
             pass
 
         # === Evitar doble commit por mismo contrato ===
-        if not _registrar_contrato_procesado(contract_id):
-            if epoch_pretrade is not None:
-                pop_trade_snapshot(int(epoch_pretrade), symbol, direccion, ciclo)
+        if contract_id in _contratos_procesados:
             return
+        _contratos_procesados.add(contract_id)
 
         # === IA / racha / es_rebote (SIN FUGA) ===
         try:
@@ -2079,7 +1747,6 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
         now = datetime.now(timezone.utc)
         epoch_val = int(epoch_pretrade) if epoch_pretrade is not None else int(now.timestamp())
         ts_val = now.isoformat()
-        snap = get_trade_snapshot(epoch_val, symbol, direccion, ciclo) or {}
 
         # ==========================================================
         # payout robusto:
@@ -2089,7 +1756,46 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
         #   payout_total = monto * payout_multiplier
         #   payout_multiplier = payout_total / monto
         # ==========================================================
-        monto_f, payout_total, payout_ratio_total = _normalizar_payout_desde_monto(payout, monto)
+        payout_total = 0.0
+        payout_ratio_total = 0.0
+
+        # monto
+        try:
+            monto_f = float(monto) if monto not in (None, "", "nan", "NaN") else 0.0
+        except Exception:
+            monto_f = 0.0
+
+        # payout (puede venir como multiplier o como total)
+        try:
+            p = float(payout) if payout not in (None, "", "nan", "NaN") else 0.0
+        except Exception:
+            p = 0.0
+
+        # si p es NaN/inf, lo anulamos
+        try:
+            import math
+            if not math.isfinite(p):
+                p = 0.0
+            if not math.isfinite(monto_f):
+                monto_f = 0.0
+        except Exception:
+            pass
+
+        try:
+            if p > 0 and p <= 3.5:
+                # payout viene como multiplier (1.95 etc.)
+                payout_ratio_total = p
+                payout_total = (monto_f * payout_ratio_total) if monto_f > 0 else 0.0
+            elif p > 3.5:
+                # payout viene como total (15.62 etc.)
+                payout_total = p
+                payout_ratio_total = (payout_total / monto_f) if monto_f > 0 else 0.0
+            else:
+                payout_total = 0.0
+                payout_ratio_total = 0.0
+        except Exception:
+            payout_total = 0.0
+            payout_ratio_total = 0.0
 
         async with csv_lock:
             # ==========================
@@ -2132,20 +1838,8 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
                 "trade_status": "CERRADO",
                 "epoch": int(epoch_val),
                 "ts": ts_val,
-                "ret_1m": _safe_clip(snap.get("ret_1m", 0.0), -1.0, 1.0, 0.0),
-                "ret_3m": _safe_clip(snap.get("ret_3m", 0.0), -1.0, 1.0, 0.0),
-                "ret_5m": _safe_clip(snap.get("ret_5m", 0.0), -1.0, 1.0, 0.0),
-                "slope_5m": _safe_clip(snap.get("slope_5m", 0.0), -1.0, 1.0, 0.0),
-                "rv_20": _safe_clip(snap.get("rv_20", 0.0), 0.0, 1.0, 0.0),
-                "range_norm": _safe_clip(snap.get("range_norm", 0.0), 0.0, 1.0, 0.0),
-                "bb_z": _safe_clip(snap.get("bb_z", 0.0), -3.0, 3.0, 0.0),
-                "body_ratio": _safe_clip(snap.get("body_ratio", 0.0), 0.0, 1.0, 0.0),
-                "wick_imbalance": _safe_clip(snap.get("wick_imbalance", 0.0), -1.0, 1.0, 0.0),
-                "micro_trend_persist": _safe_clip(snap.get("micro_trend_persist", 0.0), -1.0, 1.0, 0.0),
             }
             _write_row_dict_atomic(ARCHIVO_CSV, row_dict)
-        if epoch_pretrade is not None:
-            pop_trade_snapshot(int(epoch_pretrade), symbol, direccion, ciclo)
         # === Logs ===
         msg = Fore.CYAN + f"Contrato #{contract_id} finalizado en background: {resultado} {profit:.2f} USD"
         if estado_bot.get("barra_activa", False):
@@ -2251,7 +1945,6 @@ async def mostrar_saldos():
 async def ejecutar_panel():
     global ultimo_token
     global _ws_fail_streak
-    global primer_ingreso_real, real_activado_en_bot
 
     # Eliminado: reset_csv_and_total() para acumular histórico completo
     await mostrar_saldos()
@@ -2431,8 +2124,6 @@ async def ejecutar_panel():
                             await asyncio.sleep(15 + random.uniform(0.0, 0.5))
                         continue
 
-                scalping_snapshot_final = {}
-
                 # ========= REVALIDACIÓN PRE-BUY =========
                 try:
                     score_sel = estado_bot.get("score_senal")
@@ -2452,19 +2143,8 @@ async def ejecutar_panel():
                         # refresca snapshot para compra/log consistentes
                         direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion, condiciones = dir2, rsi9_2, rsi14_2, sma5_2, sma20_2, br2, cr2, rev2, cond2
                         estado_bot["score_senal"] = float(score2)
-                        scalping_snapshot_final = calcular_scalping_features(velas_rv)
-                    elif velas_rv:
-                        scalping_snapshot_final = calcular_scalping_features(velas_rv)
                 except Exception:
-                    scalping_snapshot_final = {}
-
-                if not scalping_snapshot_final:
-                    try:
-                        velas_sf = await obtener_velas(ws, symbol, current_token, reintentos=1)
-                        if velas_sf:
-                            scalping_snapshot_final = calcular_scalping_features(velas_sf)
-                    except Exception:
-                        scalping_snapshot_final = {}
+                    pass
 
                 # ========= PROPOSAL =========
                 try:
@@ -2543,10 +2223,7 @@ async def ejecutar_panel():
                         payout=float(payout),
                         puntaje_estrategia=float(condiciones),  # tu score
                         token=current_token,
-                        scalping_features=scalping_snapshot_final,
                     )
-                    if epoch_pre is not None:
-                        set_trade_snapshot(epoch_pre, symbol, direccion, ciclo, scalping_snapshot_final)
                 except Exception:
                     epoch_pre = None
 
@@ -2634,14 +2311,6 @@ async def ejecutar_panel():
                             Fore.YELLOW + Style.BRIGHT +
                             f"[VENTANA IA] Token cambió durante la decisión. Reintentando ciclo #{ciclo} (sin comprar)."
                         )
-                        if epoch_pre is not None:
-                            await registrar_pretrade_cancelado(
-                                ARCHIVO_CSV, epoch_pre, symbol, direccion, ciclo,
-                                monto=monto, rsi9=rsi9, rsi14=rsi14, sma5=sma5, sma20=sma20,
-                                cruce=cruce, breakout=breakout, rsi_reversion=rsi_reversion,
-                                payout=payout, condiciones=condiciones,
-                            )
-                            pop_trade_snapshot(int(epoch_pre), symbol, direccion, ciclo)
                         reinicio_forzado.clear()
                         await asyncio.sleep(0.8)
                         continue
@@ -2664,14 +2333,6 @@ async def ejecutar_panel():
                     }, expect_msg_type="buy", timeout=8.0)
                 except RuntimeError as api_e:
                     print(Fore.RED + Style.BRIGHT + f"[ERROR] Compra: {api_e}. Reintentando mismo ciclo...")
-                    if epoch_pre is not None:
-                        await registrar_pretrade_cancelado(
-                            ARCHIVO_CSV, epoch_pre, symbol, direccion, ciclo,
-                            monto=monto, rsi9=rsi9, rsi14=rsi14, sma5=sma5, sma20=sma20,
-                            cruce=cruce, breakout=breakout, rsi_reversion=rsi_reversion,
-                            payout=payout, condiciones=condiciones,
-                        )
-                        pop_trade_snapshot(int(epoch_pre), symbol, direccion, ciclo)
                     estado_bot["token_msg_mostrado"] = False
                     await asyncio.sleep(10 + random.uniform(0.0, 0.5))
                     continue
@@ -2679,26 +2340,10 @@ async def ejecutar_panel():
                     if _es_error_transitorio_ws(e):
                         if _print_once("buy-transient", ttl=8):
                             print(Fore.YELLOW + Style.BRIGHT + f"[WARN] Compra inestable ({type(e).__name__}). Reabro WS y mantengo ciclo #{ciclo}.")
-                        if epoch_pre is not None:
-                            await registrar_pretrade_cancelado(
-                                ARCHIVO_CSV, epoch_pre, symbol, direccion, ciclo,
-                                monto=monto, rsi9=rsi9, rsi14=rsi14, sma5=sma5, sma20=sma20,
-                                cruce=cruce, breakout=breakout, rsi_reversion=rsi_reversion,
-                                payout=payout, condiciones=condiciones,
-                            )
-                            pop_trade_snapshot(int(epoch_pre), symbol, direccion, ciclo)
                         await _cerrar_ws(ws)
                         ws = await _abrir_ws(current_token)
                         await asyncio.sleep(0.6 + random.uniform(0.0, 0.4))
                         continue
-                    if epoch_pre is not None:
-                        await registrar_pretrade_cancelado(
-                            ARCHIVO_CSV, epoch_pre, symbol, direccion, ciclo,
-                            monto=monto, rsi9=rsi9, rsi14=rsi14, sma5=sma5, sma20=sma20,
-                            cruce=cruce, breakout=breakout, rsi_reversion=rsi_reversion,
-                            payout=payout, condiciones=condiciones,
-                        )
-                        pop_trade_snapshot(int(epoch_pre), symbol, direccion, ciclo)
                     raise
 
                 contract_id = data_buy["buy"]["contract_id"]
@@ -2769,11 +2414,11 @@ async def ejecutar_panel():
 
                     # ✅ Importantísimo: resetear ventana para que PASO_A_REAL suene la próxima vez
                     try:
-                        primer_ingreso_real = False
+                        globals()["primer_ingreso_real"] = False
                     except Exception:
                         pass
                     try:
-                        real_activado_en_bot = 0.0
+                        globals()["real_activado_en_bot"] = 0.0
                     except Exception:
                         pass
 
@@ -2838,9 +2483,6 @@ async def main():
     await monitor()
 
 if __name__ == "__main__":
-    if not WEBSOCKETS_OK:
-        print(Fore.RED + "⛔ Dependencia faltante: websockets. Instálala para ejecutar el bot.")
-        sys.exit(1)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

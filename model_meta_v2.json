@@ -1,144 +1,28 @@
 {
-  "trained_at": "2026-03-17 22:15:48",
-  "rows_total": 457,
-  "n_samples": 457,
-  "rows_train": 286,
-  "rows_calib": 80,
-  "rows_test": 91,
-  "pos": 228,
-  "neg": 229,
-  "auc": 0.29339250493096647,
-  "f1": 0.32098765432098764,
-  "brier": 0.2660037410940789,
-  "cv_auc": 0.487696608946609,
-  "threshold": 0.515,
+  "trained_at": "2026-03-09 12:48:07",
+  "n_samples": 22,
+  "pos": 2,
+  "neg": 20,
+  "auc": 1.0,
+  "brier": 0.007985444670191612,
+  "threshold": 0.5,
   "reliable": false,
-  "reliable_candidate": false,
-  "canary_mode": false,
-  "canary_started_at": null,
-  "canary_target_closed": 0,
-  "refresh_policy": "champion_direct",
-  "calibration": "sigmoid",
-  "calib_precision_at_thr": 0.5555555555555556,
-  "calib_n_at_thr": 54,
-  "test_precision_at_thr": 0.30952380952380953,
-  "test_n_at_thr": 42,
+  "warmup_mode": true,
   "feature_names": [
     "racha_actual",
-    "ret_5m",
+    "puntaje_estrategia",
+    "payout",
+    "ret_1m",
     "ret_3m",
-    "micro_trend_persist",
-    "ret_1m"
+    "ret_5m",
+    "slope_5m",
+    "rv_20",
+    "range_norm",
+    "bb_z",
+    "body_ratio",
+    "wick_imbalance",
+    "micro_trend_persist"
   ],
-  "label_col": "result_bin",
-  "schema_version": "core13_v2_scalping",
-  "trained_on_incremental": "dataset_incremental_v2",
-  "feature_health": {
-    "racha_actual": {
-      "nunique": 17,
-      "dominance": 0.24726477024070023,
-      "status": "OK"
-    },
-    "puntaje_estrategia": {
-      "nunique": 431,
-      "dominance": 0.006564551422319475,
-      "status": "OK"
-    },
-    "payout": {
-      "nunique": 4,
-      "dominance": 0.5973741794310722,
-      "status": "OK"
-    },
-    "ret_1m": {
-      "nunique": 401,
-      "dominance": 0.0087527352297593,
-      "status": "OK",
-      "default_ratio": 0.0,
-      "default_ratio_recent": 0.0
-    },
-    "ret_3m": {
-      "nunique": 401,
-      "dominance": 0.0087527352297593,
-      "status": "OK",
-      "default_ratio": 0.0,
-      "default_ratio_recent": 0.0
-    },
-    "ret_5m": {
-      "nunique": 401,
-      "dominance": 0.0087527352297593,
-      "status": "OK",
-      "default_ratio": 0.0,
-      "default_ratio_recent": 0.0
-    },
-    "slope_5m": {
-      "nunique": 401,
-      "dominance": 0.0087527352297593,
-      "status": "OK",
-      "default_ratio": 0.0,
-      "default_ratio_recent": 0.0
-    },
-    "rv_20": {
-      "nunique": 432,
-      "dominance": 0.006564551422319475,
-      "status": "OK",
-      "default_ratio": 0.0,
-      "default_ratio_recent": 0.0
-    },
-    "range_norm": {
-      "nunique": 433,
-      "dominance": 0.006564551422319475,
-      "status": "OK",
-      "default_ratio": 0.0,
-      "default_ratio_recent": 0.0
-    },
-    "bb_z": {
-      "nunique": 432,
-      "dominance": 0.006564551422319475,
-      "status": "OK",
-      "default_ratio": 0.0,
-      "default_ratio_recent": 0.0
-    },
-    "body_ratio": {
-      "nunique": 376,
-      "dominance": 0.06564551422319474,
-      "status": "OK",
-      "default_ratio": 0.0,
-      "default_ratio_recent": 0.0
-    },
-    "wick_imbalance": {
-      "nunique": 374,
-      "dominance": 0.0700218818380744,
-      "status": "OK",
-      "default_ratio": 0.0700218818380744,
-      "default_ratio_recent": 0.025
-    },
-    "micro_trend_persist": {
-      "nunique": 22,
-      "dominance": 0.2188183807439825,
-      "status": "OK",
-      "default_ratio": 0.0,
-      "default_ratio_recent": 0.0
-    },
-    "racha_x_rebote": {
-      "nunique": 1,
-      "dominance": 1.0,
-      "status": "ROTA"
-    },
-    "rev_x_breakout": {
-      "nunique": 1,
-      "dominance": 1.0,
-      "status": "ROTA"
-    }
-  },
-  "dropped_features": [
-    {
-      "feature": "racha_x_rebote",
-      "reason": "ROTA:nunique=1"
-    },
-    {
-      "feature": "rev_x_breakout",
-      "reason": "ROTA:nunique=1"
-    }
-  ],
-  "n": 457
+  "model_family": "sklearn_logreg_fallback",
+  "n": 22
 }
