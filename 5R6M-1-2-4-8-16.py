@@ -1398,6 +1398,11 @@ except Exception:
         "ret_1m", "ret_3m", "ret_5m", "slope_5m", "rv_20",
         "range_norm", "bb_z", "body_ratio", "wick_imbalance", "micro_trend_persist",
     ]
+INCREMENTAL_CLOSE_COLS = [f"close_{i}" for i in range(20)]
+INCREMENTAL_META_FLAGS = ["row_has_proxy_features", "row_train_eligible"]
+for _c in INCREMENTAL_CLOSE_COLS:
+    if _c not in INCREMENTAL_FEATURES_V2:
+        INCREMENTAL_FEATURES_V2.append(_c)
 # === LOCK ESTRICTO (solo para escrituras sensibles como incremental.csv) ===
 @contextmanager
 def file_lock_required(path: str, timeout: float = 6.0, stale_after: float = 30.0):
@@ -1452,7 +1457,11 @@ def file_lock_required(path: str, timeout: float = 6.0, stale_after: float = 30.
 
 def _canonical_incremental_cols(feature_names: list | None = None) -> list:
     fn = feature_names if feature_names else INCREMENTAL_FEATURES_V2
-    return list(fn) + ["result_bin"]
+    out = list(fn)
+    for mc in INCREMENTAL_META_FLAGS:
+        if mc not in out:
+            out.append(mc)
+    return out + ["result_bin"]
 
 def _safe_float(x):
     try:
@@ -1592,14 +1601,26 @@ def reparar_dataset_incremental_mutante(ruta: str = "dataset_incremental.csv", c
                     # Validación y saneo defensivo (clip + contrato activo)
                     try:
                         row_map_clean = {cols[i]: new_row[i] for i in range(len(cols))}
-                        row_map_clean = clip_feature_values(row_map_clean, cols[:-1])
-                        ok_row, _reason = validar_fila_incremental(row_map_clean, cols[:-1])
+                        feat_validate = [c for c in cols[:-1] if c not in INCREMENTAL_META_FLAGS and c != "ts_ingest"]
+                        row_map_clean = clip_feature_values(row_map_clean, feat_validate)
+                        for mc in INCREMENTAL_META_FLAGS:
+                            if mc not in row_map_clean or row_map_clean.get(mc, "") in ("", None):
+                                row_map_clean[mc] = 0 if mc == "row_has_proxy_features" else 1
+                        if "ts_ingest" in cols and (row_map_clean.get("ts_ingest", "") in ("", None)):
+                            row_map_clean["ts_ingest"] = float(time.time())
+                        ok_row, _reason = validar_fila_incremental(row_map_clean, feat_validate)
                         if not ok_row:
                             continue
                         lab = _safe_int01(row_map_clean.get("result_bin", new_row[-1]))
                         if lab is None:
                             continue
-                        row_clean = [float(row_map_clean[c]) for c in cols[:-1]] + [lab]
+                        row_clean = []
+                        for c in cols[:-1]:
+                            if c in INCREMENTAL_META_FLAGS:
+                                row_clean.append(int(float(row_map_clean.get(c, 0 if c == "row_has_proxy_features" else 1) or 0)))
+                            else:
+                                row_clean.append(float(row_map_clean.get(c, 0.0) or 0.0))
+                        row_clean = row_clean + [lab]
                         # Deduplicar durante repair para no inflar entrenamiento por filas repetidas.
                         sig = tuple(round(float(v), 10) for v in row_clean[:-1]) + (int(row_clean[-1]),)
                         if sig in seen_rows:
@@ -1788,6 +1809,14 @@ def validar_fila_incremental(fila_dict, feature_names):
     # Asegura numericidad real
     for k in feature_names:
         v = fila_dict.get(k, None)
+        if str(k).startswith("close_"):
+            try:
+                if v is None or (isinstance(v, str) and v.strip() == ""):
+                    fila_dict[k] = 0.0
+                    continue
+            except Exception:
+                fila_dict[k] = 0.0
+                continue
         try:
             v = float(v)
             if not np.isfinite(v):
@@ -1861,8 +1890,18 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
         if label not in (0, 1):
             return False
 
-        # Dict solo con features canónicas
+        # Dict solo con features canónicas + metadatos de elegibilidad
         fila_dict = {k: fila_dict_or_full.get(k, None) for k in feats}
+        try:
+            row_has_proxy = int(float(fila_dict_or_full.get("row_has_proxy_features", 0) or 0))
+        except Exception:
+            row_has_proxy = 0
+        try:
+            row_train_eligible = int(float(fila_dict_or_full.get("row_train_eligible", 1) or 1))
+        except Exception:
+            row_train_eligible = 1
+        if row_has_proxy == 1:
+            row_train_eligible = 0
         ts_ing = fila_dict_or_full.get("ts_ingest", None)
         if ts_ing is None:
             try:
@@ -1882,6 +1921,7 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
             return False
 
         row_vals = [float(fila_dict[k]) for k in feats]
+        row_all = list(row_vals) + [int(row_has_proxy), int(row_train_eligible)]
         sig = _firma_registro(feats, row_vals, label)
 
         # Anti-duplicado persistente (cache local + escaneo incremental reciente)
@@ -1931,7 +1971,7 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
                 try:
                     with open(ruta, "a", newline="", encoding="utf-8") as f:
                         w = csv.writer(f)
-                        w.writerow(row_vals + [ts_ing, label])
+                        w.writerow(row_all + [ts_ing, label])
                         f.flush()
                         os.fsync(f.fileno())
 
@@ -2947,6 +2987,54 @@ def clip_feature_values(fila_dict, feature_names):
             clipped[feat] = float(v)
 
     return clipped
+
+def _close_series_from_row_dict(row_dict: dict, min_points: int = 2) -> list[float]:
+    vals = []
+    for i in range(20):
+        k = f"close_{i}"
+        v = row_dict.get(k, None)
+        try:
+            vf = float(v)
+            if math.isfinite(vf) and vf > 0:
+                vals.append(vf)
+            else:
+                break
+        except Exception:
+            break
+    return vals if len(vals) >= int(min_points) else []
+
+def _calc_scalping_from_close_series(close_vals: list[float]) -> dict:
+    out = {}
+    c = [float(v) for v in list(close_vals or []) if isinstance(v, (int, float)) or (isinstance(v, np.floating))]
+    if len(c) >= 2 and abs(c[1]) > 1e-12:
+        out["ret_1m"] = float(np.clip((c[0] - c[1]) / c[1], -1.0, 1.0))
+    if len(c) >= 5:
+        arr5 = np.asarray([c[4], c[3], c[2], c[1], c[0]], dtype=float)
+        base = float(abs(arr5[0])) if abs(arr5[0]) > 1e-9 else float(max(abs(arr5.mean()), 1e-9))
+        y = arr5 / base
+        x = np.arange(5, dtype=float)
+        slope = float(np.polyfit(x, y, 1)[0])
+        out["slope_5m"] = float(np.clip(slope, -1.0, 1.0))
+    if len(c) >= 3:
+        rets = []
+        for i in range(len(c) - 1):
+            den = c[i + 1]
+            if abs(den) <= 1e-12:
+                continue
+            rets.append((c[i] - den) / den)
+        if rets:
+            rv = float(np.std(np.asarray(rets, dtype=float), ddof=0))
+            out["rv_20"] = float(np.clip(rv, 0.0, 1.0))
+    if len(c) >= 20:
+        arr20 = np.asarray(c[:20], dtype=float)
+        sma20 = float(np.mean(arr20))
+        std20 = float(np.std(arr20, ddof=0))
+        if std20 > 1e-12:
+            bbz = (float(c[0]) - sma20) / (2.0 * std20)
+        else:
+            bbz = 0.0
+        out["bb_z"] = float(np.clip(bbz, -3.0, 3.0))
+    return out
     
 def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
     """Completa CORE13_v2 scalping desde campos legacy cuando falten."""
@@ -2982,10 +3070,19 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
     vol = _f("volatilidad", 0.0)
     reb = _f("es_rebote", 0.0)
     racha = _f("racha_actual", 0.0)
+    close_vals = _close_series_from_row_dict(out, min_points=2)
+    close_calc = _calc_scalping_from_close_series(close_vals) if close_vals else {}
+
+    for k_real in ("ret_1m", "slope_5m", "rv_20", "bb_z"):
+        if k_real in close_calc:
+            out[k_real] = float(close_calc[k_real])
 
     if _missing("ret_1m"):
-        out["ret_1m"] = float(np.clip((rsi9 - 50.0) / 50.0, -1.0, 1.0))
-        proxy_used.add("ret_1m")
+        if "ret_1m" in close_calc:
+            out["ret_1m"] = float(close_calc["ret_1m"])
+        else:
+            out["ret_1m"] = float(np.clip((rsi9 - 50.0) / 50.0, -1.0, 1.0))
+            proxy_used.add("ret_1m")
     if _missing("ret_3m"):
         out["ret_3m"] = float(np.clip((rsi14 - 50.0) / 50.0, -1.0, 1.0))
         proxy_used.add("ret_3m")
@@ -2993,17 +3090,26 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
         out["ret_5m"] = float(np.clip(0.6 * float(out.get("ret_3m", 0.0)) + 0.4 * float(out.get("ret_1m", 0.0)), -1.0, 1.0))
         proxy_used.add("ret_5m")
     if _missing("slope_5m"):
-        out["slope_5m"] = float(np.clip(sma_spread + 0.05 * cruce_sma, -1.0, 1.0))
-        proxy_used.add("slope_5m")
+        if "slope_5m" in close_calc:
+            out["slope_5m"] = float(close_calc["slope_5m"])
+        else:
+            out["slope_5m"] = float(np.clip(sma_spread + 0.05 * cruce_sma, -1.0, 1.0))
+            proxy_used.add("slope_5m")
     if _missing("rv_20"):
-        out["rv_20"] = float(np.clip(vol, 0.0, 1.0))
-        proxy_used.add("rv_20")
+        if "rv_20" in close_calc:
+            out["rv_20"] = float(close_calc["rv_20"])
+        else:
+            out["rv_20"] = float(np.clip(vol, 0.0, 1.0))
+            proxy_used.add("rv_20")
     if _missing("range_norm"):
         out["range_norm"] = float(np.clip(breakout, 0.0, 1.0))
         proxy_used.add("range_norm")
     if _missing("bb_z"):
-        out["bb_z"] = float(np.clip((2.0 * rsi_rev) - 1.0, -3.0, 3.0))
-        proxy_used.add("bb_z")
+        if "bb_z" in close_calc:
+            out["bb_z"] = float(close_calc["bb_z"])
+        else:
+            out["bb_z"] = float(np.clip((2.0 * rsi_rev) - 1.0, -3.0, 3.0))
+            proxy_used.add("bb_z")
     if _missing("body_ratio"):
         out["body_ratio"] = float(np.clip(abs(float(out.get("ret_1m", 0.0))), 0.0, 1.0))
         proxy_used.add("body_ratio")
@@ -8334,6 +8440,12 @@ def _enriquecer_df_con_derivadas(df: pd.DataFrame, feats: list[str]) -> pd.DataF
                 if name in PROXY_FEATURES_BLOCK_TRAIN:
                     row_proxy = row_proxy | pd.Series(True, index=out.index, dtype=bool)
 
+        def _close_col_num(idx: int):
+            cname = f"close_{idx}"
+            if cname in out.columns:
+                return pd.to_numeric(out[cname], errors="coerce")
+            return pd.Series(np.nan, index=out.index, dtype="float64")
+
         if "pay_x_puntaje" in feats:
             out["pay_x_puntaje"] = _col_num("payout", 0.0) * _col_num("puntaje_estrategia", 0.0)
         if "vol_x_breakout" in feats:
@@ -8351,20 +8463,67 @@ def _enriquecer_df_con_derivadas(df: pd.DataFrame, feats: list[str]) -> pd.DataF
             base = sma20.abs().clip(lower=1e-9)
             out["sma_spread"] = ((sma5 - sma20).abs() / base).clip(lower=0.0, upper=5.0)
 
+        c0 = _close_col_num(0)
+        c1 = _close_col_num(1)
+        c2 = _close_col_num(2)
+        c3 = _close_col_num(3)
+        c4 = _close_col_num(4)
+        close_real_2 = c0.notna() & c1.notna() & (c1.abs() > 1e-12)
+        close_real_5 = close_real_2 & c2.notna() & c3.notna() & c4.notna()
+        close_cols_20 = [_close_col_num(i) for i in range(20)]
+        close_real_20 = pd.Series(True, index=out.index, dtype=bool)
+        for cc in close_cols_20:
+            close_real_20 &= cc.notna()
+
         # CORE13_v2 scalping (backfill desde columnas legacy si existen)
         if "ret_1m" in feats:
+            ret_real = ((c0 - c1) / c1).replace([np.inf, -np.inf], np.nan).clip(lower=-1.0, upper=1.0)
+            if bool(close_real_2.any()):
+                out.loc[close_real_2, "ret_1m"] = ret_real.loc[close_real_2]
             _fill_proxy_if_missing("ret_1m", ((_col_num("rsi_9", 50.0) - 50.0) / 50.0).clip(lower=-1.0, upper=1.0))
         if "ret_3m" in feats:
             _fill_proxy_if_missing("ret_3m", ((_col_num("rsi_14", 50.0) - 50.0) / 50.0).clip(lower=-1.0, upper=1.0))
         if "ret_5m" in feats:
             _fill_proxy_if_missing("ret_5m", (0.6 * _col_num("ret_3m", 0.0) + 0.4 * _col_num("ret_1m", 0.0)).clip(lower=-1.0, upper=1.0))
         if "slope_5m" in feats:
+            if bool(close_real_5.any()):
+                arr5 = np.vstack([c4.values, c3.values, c2.values, c1.values, c0.values]).T
+                base5 = np.abs(arr5[:, 0])
+                mean5 = np.abs(np.nanmean(arr5, axis=1))
+                denom = np.where(base5 > 1e-9, base5, np.where(mean5 > 1e-9, mean5, 1.0))
+                y5 = arr5 / denom[:, None]
+                x5 = np.arange(5, dtype=float)
+                xc = x5 - x5.mean()
+                varx = float(np.sum(xc * xc))
+                slopes = np.sum((y5 - np.nanmean(y5, axis=1)[:, None]) * xc[None, :], axis=1) / max(varx, 1e-9)
+                slopes = np.clip(slopes, -1.0, 1.0)
+                out.loc[close_real_5, "slope_5m"] = slopes[close_real_5.values]
             _fill_proxy_if_missing("slope_5m", (_col_num("sma_spread", 0.0) + 0.05 * _col_num("cruce_sma", 0.0)).clip(lower=-1.0, upper=1.0))
         if "rv_20" in feats:
+            if bool(close_real_5.any()):
+                rv_cols = [c0, c1, c2, c3, c4]
+                if bool(close_real_20.any()):
+                    rv_cols = close_cols_20
+                rv_mat = np.vstack([cc.values for cc in rv_cols]).T
+                den = rv_mat[:, 1:]
+                num = rv_mat[:, :-1] - rv_mat[:, 1:]
+                safe_den = np.where(np.abs(den) > 1e-12, den, np.nan)
+                rv_rets = num / safe_den
+                rv_vals = np.nanstd(rv_rets, axis=1, ddof=0)
+                rv_vals = np.clip(np.nan_to_num(rv_vals, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+                out.loc[close_real_5, "rv_20"] = rv_vals[close_real_5.values]
             _fill_proxy_if_missing("rv_20", _col_num("volatilidad", 0.0).clip(lower=0.0, upper=1.0))
         if "range_norm" in feats:
             _fill_proxy_if_missing("range_norm", _col_num("breakout", 0.0).clip(lower=0.0, upper=1.0))
         if "bb_z" in feats:
+            if bool(close_real_20.any()):
+                bb_mat = np.vstack([cc.values for cc in close_cols_20]).T
+                sma20 = np.nanmean(bb_mat, axis=1)
+                std20 = np.nanstd(bb_mat, axis=1, ddof=0)
+                den_bb = 2.0 * np.where(std20 > 1e-12, std20, np.nan)
+                bb = (bb_mat[:, 0] - sma20) / den_bb
+                bb = np.clip(np.nan_to_num(bb, nan=0.0, posinf=3.0, neginf=-3.0), -3.0, 3.0)
+                out.loc[close_real_20, "bb_z"] = bb[close_real_20.values]
             _fill_proxy_if_missing("bb_z", ((2.0 * _col_num("rsi_reversion", 0.0)) - 1.0).clip(lower=-3.0, upper=3.0))
         if "body_ratio" in feats:
             _fill_proxy_if_missing("body_ratio", _col_num("ret_1m", 0.0).abs().clip(lower=0.0, upper=1.0))
@@ -9942,7 +10101,12 @@ def _maybe_retrain_fallback_sklearn(force: bool = False):
         df = _enriquecer_df_con_derivadas(df, feats)
         proxy_mask = pd.to_numeric(df.get("row_has_proxy_features", pd.Series(0, index=df.index)), errors="coerce").fillna(0.0) > 0.0
         train_eligible_mask = pd.to_numeric(df.get("row_train_eligible", pd.Series(1, index=df.index)), errors="coerce").fillna(1.0) > 0.0
+        proxy_excluded = int((mask & proxy_mask).sum())
         mask = mask & (~proxy_mask) & train_eligible_mask
+        try:
+            agregar_evento(f"🧪 IA fallback-clean: proxies excluidos={proxy_excluded} | elegibles={int(mask.sum())}.")
+        except Exception:
+            pass
         if int(mask.sum()) < int(MIN_FIT_ROWS_LOW):
             agregar_evento(f"⚠️ IA fallback: data elegible insuficiente tras filtrar proxies ({int(mask.sum())}).")
             return False
@@ -10132,7 +10296,7 @@ def maybe_retrain(force: bool = False):
             return False
 
         # 4) Construir X/y robusto (usa tus builders)
-        feats_pref = list(dict.fromkeys(list(INCREMENTAL_FEATURES_V2) + list(FEATURE_NAMES_INTERACCIONES)))
+        feats_pref = list(FEATURE_SET_PROD_WARMUP)
 
         X, y, feats_used, label_col = _build_Xy_incremental(df, feature_names=feats_pref)
         if X is None or y is None or feats_used is None:
@@ -10144,6 +10308,8 @@ def maybe_retrain(force: bool = False):
             dup_rm = int(q.get("duplicates_removed", 0) or 0)
             rb = int(q.get("rows_before", len(X)) or len(X))
             ra = int(q.get("rows_after", len(X)) or len(X))
+            proxy_exc = int(q.get("proxy_rows_excluded", 0) or 0)
+            train_elig = int(q.get("rows_train_eligible", len(X)) or len(X))
             if dup_rm > 0:
                 sig_clean = f"{dup_rm}:{rb}->{ra}"
                 last_clean = globals().get("_IA_TRAIN_CLEAN_LOG", {}) or {}
@@ -10155,6 +10321,8 @@ def maybe_retrain(force: bool = False):
                 if should_clean_log:
                     agregar_evento(f"🧹 IA train-clean: dedup {dup_rm} filas ({rb}->{ra}).")
                     globals()["_IA_TRAIN_CLEAN_LOG"] = {"sig": sig_clean, "ts": now_clean}
+            if proxy_exc > 0:
+                agregar_evento(f"🧪 IA train-clean: proxies excluidos={proxy_exc} | elegibles={train_elig}.")
         except Exception:
             pass
 

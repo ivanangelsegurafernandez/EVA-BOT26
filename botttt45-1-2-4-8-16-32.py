@@ -356,6 +356,8 @@ CSV_HEADER = [
     "ia_modo_ack",
     "ia_ready_ack"
 ]
+CLOSE_SNAPSHOT_COLS = [f"close_{i}" for i in range(20)]
+CSV_HEADER = CSV_HEADER + CLOSE_SNAPSHOT_COLS
 # =============================================================================
 # CSV — helpers robustos (evita columnas corridas + asegura puntaje 0..1)
 # =============================================================================
@@ -372,6 +374,29 @@ def _to_float(x, default=0.0):
         return float(x)
     except Exception:
         return default
+
+def _extract_close_snapshot(velas, n: int = 20):
+    closes = []
+    try:
+        seq = list(velas or [])
+        if not seq:
+            return [None] * int(n)
+        seq = seq[-int(n):]
+        seq = list(reversed(seq))  # close_0 = más reciente
+        for v in seq:
+            c = None
+            if isinstance(v, dict):
+                c = v.get("close", v.get("c"))
+            try:
+                cf = float(c)
+                closes.append(cf if math.isfinite(cf) else None)
+            except Exception:
+                closes.append(None)
+        while len(closes) < int(n):
+            closes.append(None)
+    except Exception:
+        closes = [None] * int(n)
+    return closes[:int(n)]
 
 def _norm_puntaje_01(condiciones, total_cond=3):
     """
@@ -595,6 +620,8 @@ def write_pretrade_snapshot(
     trade_uid = str(kwargs.get("trade_uid", "") or "").strip()
     if not trade_uid:
         trade_uid = _build_trade_uid(epoch_val, symbol, direccion, ciclo, kwargs.get("token", "NA"), ts_iso=ts_val)
+    close_snapshot = kwargs.get("close_snapshot", None)
+    closes = _extract_close_snapshot(close_snapshot, n=20)
 
     row_dict = {
         "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -627,6 +654,8 @@ def write_pretrade_snapshot(
         "ia_modo_ack": "",
         "ia_ready_ack": "",
     }
+    for i, c in enumerate(closes):
+        row_dict[f"close_{i}"] = "" if c is None else float(c)
 
     _write_row_dict_atomic(archivo_csv, row_dict)
     return epoch_val
@@ -1444,7 +1473,7 @@ async def buscar_estrategia(ws, ciclo, token):
     print(Fore.MAGENTA + Style.BRIGHT + f"\nBuscando señal válida para Martingala #{ciclo}")
     for intento in range(1, 11):
         if reinicio_forzado.is_set():
-            return "REINTENTAR", None, None, None, None, None, None, None, None, None
+            return "REINTENTAR", None, None, None, None, None, None, None, None, None, None
         if MODO_SILENCIOSO and estado_bot.get("modo_manual"):
             if intento in (1, 5, 10):
                 print(Fore.YELLOW + f"Intento #{intento} (silencioso)...")
@@ -1457,7 +1486,7 @@ async def buscar_estrategia(ws, ciclo, token):
             velas = await obtener_velas(ws, symbol, token, reintentos=4)
             await asyncio.sleep(0.12 + random.uniform(0.0, 0.18))
             if reinicio_forzado.is_set():
-                return "REINTENTAR", None, None, None, None, None, None, None, None, None
+                return "REINTENTAR", None, None, None, None, None, None, None, None, None, None
             try:
                 if len(velas) < VELAS:
                     activos_invalidos.append(symbol)
@@ -1466,7 +1495,8 @@ async def buscar_estrategia(ws, ciclo, token):
                 if condiciones >= 2:
                     score = puntuar_setups(condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion)
                     if setup_pasa_filtro(score, condiciones):
-                        mejores.append((score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion))
+                        close_snapshot = _extract_close_snapshot(velas, n=20)
+                        mejores.append((score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion, close_snapshot))
                     else:
                         activos_invalidos.append(symbol)
                 else:
@@ -1477,10 +1507,10 @@ async def buscar_estrategia(ws, ciclo, token):
         if mejores:
             # Prioridad: mayor score; desempate por más condiciones
             mejores.sort(key=lambda x: (x[0], x[1]), reverse=True)
-            score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion = mejores[0]
+            score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion, close_snapshot = mejores[0]
             estado_bot["score_senal"] = float(score)
             print(Fore.GREEN + Style.BRIGHT + f"Estrategia válida en {symbol} | Dirección: {direccion} | Condiciones: {condiciones}/3 | Score={score:.3f}")
-            return symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion
+            return symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion, close_snapshot
 
         if errores_intento:
             print(Fore.RED + f"Error WS en activos: {', '.join(errores_intento)} | Intento #{intento}")
@@ -1504,9 +1534,9 @@ async def buscar_estrategia(ws, ciclo, token):
     except Exception:
         pass
     await asyncio.sleep(30)
-    return "REINTENTAR", None, None, None, None, None, None, None, None, None
+    return "REINTENTAR", None, None, None, None, None, None, None, None, None, None
 
-async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion, ciclo, payout, condiciones, token_usado_buy, epoch_pretrade=None, trade_uid=None):
+async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion, ciclo, payout, condiciones, token_usado_buy, epoch_pretrade=None, trade_uid=None, close_snapshot=None):
     # ✅ SIEMPRE cerramos/logueamos con el token real del BUY (aunque el maestro cambie token_actual.txt)
     token_antes = token_usado_buy
     print(Fore.CYAN + "=" * 80)
@@ -1521,7 +1551,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                 asyncio.create_task(finalizar_contrato_bg(
                     contract_id, remaining, symbol, direccion, monto,
                     rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
-                    ciclo, payout, condiciones, token_antes, epoch_pretrade=epoch_pretrade, trade_uid=trade_uid
+                    ciclo, payout, condiciones, token_antes, epoch_pretrade=epoch_pretrade, trade_uid=trade_uid, close_snapshot=close_snapshot
                 ))
                 estado_bot["interrumpir_ciclo"] = False
                 estado_bot["ciclo_en_progreso"] = False
@@ -1679,6 +1709,9 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                         "ia_modo_ack": ack_ctx.get("ia_modo_ack", ""),
                         "ia_ready_ack": ia_ready_ack,
                     }
+                    closes = _extract_close_snapshot(close_snapshot, n=20)
+                    for i, c in enumerate(closes):
+                        row_dict[f"close_{i}"] = "" if c is None else float(c)
                     _write_row_dict_atomic(ARCHIVO_CSV, row_dict)
 
             except Exception as csv_e:
@@ -1739,7 +1772,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
 
 async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto,
                                 rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
-                                ciclo, payout, condiciones, token_usado, epoch_pretrade=None, trade_uid=None):
+                                ciclo, payout, condiciones, token_usado, epoch_pretrade=None, trade_uid=None, close_snapshot=None):
     """
     Finaliza un contrato en background cuando hubo cambio de token / reinicio.
     Importante IA:
@@ -1896,6 +1929,9 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
                 "ts": ts_val,
                 "ia_decision_id": trade_uid_final,
             }
+            closes = _extract_close_snapshot(close_snapshot, n=20)
+            for i, c in enumerate(closes):
+                row_dict[f"close_{i}"] = "" if c is None else float(c)
             _write_row_dict_atomic(ARCHIVO_CSV, row_dict)
         # === Logs ===
         msg = Fore.CYAN + f"Contrato #{contract_id} finalizado en background: {resultado} {profit:.2f} USD"
@@ -2134,7 +2170,7 @@ async def ejecutar_panel():
                     await asyncio.sleep(0.6 + random.uniform(0.0, 0.5))
 
                 # ========= BUSCAR SEÑAL =========
-                symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion = await buscar_estrategia(ws, ciclo, current_token)
+                symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion, close_snapshot = await buscar_estrategia(ws, ciclo, current_token)
 
                 if symbol == "REINTENTAR" or symbol is None:
                     continue
@@ -2284,6 +2320,7 @@ async def ejecutar_panel():
                         puntaje_estrategia=float(condiciones),  # tu score
                         token=current_token,
                         trade_uid=trade_uid,
+                        close_snapshot=close_snapshot,
                     )
                 except Exception:
                     epoch_pre = None
@@ -2424,7 +2461,7 @@ async def ejecutar_panel():
                 resultado, profit = await esperar_resultado(
                     ws, contract_id, symbol, direccion, monto,
                     rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
-                    ciclo, payout, condiciones, current_token, epoch_pre, trade_uid=trade_uid
+                    ciclo, payout, condiciones, current_token, epoch_pre, trade_uid=trade_uid, close_snapshot=close_snapshot
                 )
 
                 if resultado == "INDEFINIDO":
