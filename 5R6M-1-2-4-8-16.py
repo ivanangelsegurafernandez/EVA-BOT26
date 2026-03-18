@@ -1463,6 +1463,15 @@ def _canonical_incremental_cols(feature_names: list | None = None) -> list:
             out.append(mc)
     return out + ["result_bin"]
 
+_INCREMENTAL_INGEST_STATS = {
+    "filas_incremental_aceptadas": 0,
+    "filas_incremental_saneadas_close": 0,
+    "filas_incremental_proxy_no_train": 0,
+    "filas_incremental_descartadas_total": 0,
+    "filas_incremental_close_reales_validas": 0,
+    "last_log_ts": 0.0,
+}
+
 def _safe_float(x):
     try:
         if x is None:
@@ -1806,16 +1815,24 @@ def _incremental_signature_exists(ruta: str, sig: str, feats: list) -> bool:
 
 # Nueva: Validar fila para incremental (blindaje contra basura)
 def validar_fila_incremental(fila_dict, feature_names):
+    close_sanitized = False
+    close_valid_count = 0
     # Asegura numericidad real
     for k in feature_names:
         v = fila_dict.get(k, None)
         if str(k).startswith("close_"):
             try:
                 if v is None or (isinstance(v, str) and v.strip() == ""):
-                    fila_dict[k] = 0.0
-                    continue
+                    raise ValueError("close_missing")
+                vf = float(v)
+                if (not np.isfinite(vf)) or vf <= 0.0:
+                    raise ValueError("close_invalid")
+                fila_dict[k] = float(vf)
+                close_valid_count += 1
+                continue
             except Exception:
                 fila_dict[k] = 0.0
+                close_sanitized = True
                 continue
         try:
             v = float(v)
@@ -1851,6 +1868,10 @@ def validar_fila_incremental(fila_dict, feature_names):
     except Exception:
         return False, "fila_sospechosa: parse"
 
+    if close_sanitized or close_valid_count < 20:
+        fila_dict["row_has_proxy_features"] = 1
+        fila_dict["row_train_eligible"] = 0
+
     return True, ""
         
 def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label: int | None = None, feature_names: list | None = None) -> bool:
@@ -1863,6 +1884,31 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
     - Anti-duplicado por firma persistente (_sigcache por bot)
     """
     try:
+        def _ingest_bump(key: str, delta: int = 1):
+            try:
+                stats = globals().get("_INCREMENTAL_INGEST_STATS", {})
+                stats[key] = int(stats.get(key, 0) or 0) + int(delta)
+                now_ts = time.time()
+                if (now_ts - float(stats.get("last_log_ts", 0.0) or 0.0)) >= 15.0:
+                    txt = (
+                        "🧾 incremental-ingest: filas_incremental_aceptadas={a} "
+                        "filas_incremental_saneadas_close={s} filas_incremental_proxy_no_train={p} "
+                        "filas_incremental_descartadas_total={d} filas_incremental_close_reales_validas={r}"
+                    ).format(
+                        a=int(stats.get("filas_incremental_aceptadas", 0) or 0),
+                        s=int(stats.get("filas_incremental_saneadas_close", 0) or 0),
+                        p=int(stats.get("filas_incremental_proxy_no_train", 0) or 0),
+                        d=int(stats.get("filas_incremental_descartadas_total", 0) or 0),
+                        r=int(stats.get("filas_incremental_close_reales_validas", 0) or 0),
+                    )
+                    try:
+                        agregar_evento(txt)
+                    except Exception:
+                        print(txt)
+                    stats["last_log_ts"] = now_ts
+            except Exception:
+                pass
+
         ruta = "dataset_incremental.csv"
         feats = feature_names or INCREMENTAL_FEATURES_V2
         cols = _canonical_incremental_cols(feats)
@@ -1870,6 +1916,7 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
             cols = list(cols[:-1]) + ["ts_ingest", cols[-1]]
 
         if not isinstance(fila_dict_or_full, dict) or not fila_dict_or_full:
+            _ingest_bump("filas_incremental_descartadas_total", 1)
             return False
 
         # Normalizar/enriquecer fila para contrato CORE13_v2 (con fallback legacy).
@@ -1881,13 +1928,16 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
             try:
                 label = int(float(lb))
             except Exception:
+                _ingest_bump("filas_incremental_descartadas_total", 1)
                 return False
 
         try:
             label = int(label)
         except Exception:
+            _ingest_bump("filas_incremental_descartadas_total", 1)
             return False
         if label not in (0, 1):
+            _ingest_bump("filas_incremental_descartadas_total", 1)
             return False
 
         # Dict solo con features canónicas + metadatos de elegibilidad
@@ -1918,7 +1968,18 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
                     fn_evt(f"⚠️ Incremental: fila descartada {bot}: {why}")
             except Exception:
                 pass
+            _ingest_bump("filas_incremental_descartadas_total", 1)
             return False
+        try:
+            row_has_proxy = int(max(row_has_proxy, int(float(fila_dict.get("row_has_proxy_features", 0) or 0))))
+        except Exception:
+            pass
+        try:
+            row_train_eligible = int(min(row_train_eligible, int(float(fila_dict.get("row_train_eligible", 1) or 1))))
+        except Exception:
+            pass
+        if row_has_proxy == 1:
+            row_train_eligible = 0
 
         row_vals = [float(fila_dict[k]) for k in feats]
         row_all = list(row_vals) + [int(row_has_proxy), int(row_train_eligible)]
@@ -1964,6 +2025,7 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
                         f.flush()
                         os.fsync(f.fileno())
                 except Exception:
+                    _ingest_bump("filas_incremental_descartadas_total", 1)
                     return False
 
             # Append con retry
@@ -1981,6 +2043,17 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
                         _INCREMENTAL_SIG_CACHE["mtime"] = float(os.path.getmtime(ruta) or 0.0)
                     except Exception:
                         pass
+                    _ingest_bump("filas_incremental_aceptadas", 1)
+                    if int(row_has_proxy) == 1 or int(row_train_eligible) == 0:
+                        _ingest_bump("filas_incremental_proxy_no_train", 1)
+                    try:
+                        close_real_valid = all(float(fila_dict.get(f"close_{i}", 0.0) or 0.0) > 0.0 for i in range(20))
+                    except Exception:
+                        close_real_valid = False
+                    if close_real_valid:
+                        _ingest_bump("filas_incremental_close_reales_validas", 1)
+                    else:
+                        _ingest_bump("filas_incremental_saneadas_close", 1)
                     return True
 
                 except PermissionError:
@@ -1989,9 +2062,16 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
                 except Exception:
                     break
 
+        _ingest_bump("filas_incremental_descartadas_total", 1)
         return False
 
     except Exception:
+        try:
+            globals().get("_INCREMENTAL_INGEST_STATS", {})["filas_incremental_descartadas_total"] = int(
+                globals().get("_INCREMENTAL_INGEST_STATS", {}).get("filas_incremental_descartadas_total", 0) or 0
+            ) + 1
+        except Exception:
+            pass
         return False
         
 # === Canonización: aunque existan duplicados en el archivo, esta es la versión oficial ===
@@ -2962,9 +3042,21 @@ def clip_feature_values(fila_dict, feature_names):
         # sma_5 / sma_20: no clip, pero sí normalizar a float cuando se pueda
     }
     clipped = dict(fila_dict)
+    close_sanitized = False
 
     for feat in feature_names:
         val = clipped.get(feat, None)
+
+        if str(feat).startswith("close_"):
+            try:
+                v = float(val)
+                if (not np.isfinite(v)) or v <= 0.0:
+                    raise ValueError("close_invalid")
+                clipped[feat] = float(v)
+            except Exception:
+                clipped[feat] = 0.0
+                close_sanitized = True
+            continue
 
         # Normaliza a float si se puede
         try:
@@ -2985,6 +3077,10 @@ def clip_feature_values(fila_dict, feature_names):
             clipped[feat] = float(np.clip(v, lo, hi))
         else:
             clipped[feat] = float(v)
+
+    if close_sanitized:
+        clipped["row_has_proxy_features"] = 1
+        clipped["row_train_eligible"] = 0
 
     return clipped
 
@@ -3119,6 +3215,9 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
     if _missing("micro_trend_persist"):
         out["micro_trend_persist"] = float(np.clip(racha / 10.0, -1.0, 1.0))
         proxy_used.add("micro_trend_persist")
+
+    if len(close_vals) < 20:
+        proxy_used.add("close_snapshot_insuficiente")
 
     out["row_proxy_features"] = ",".join(sorted(proxy_used))
     out["row_has_proxy_features"] = 1 if proxy_used else 0
@@ -8474,6 +8573,8 @@ def _enriquecer_df_con_derivadas(df: pd.DataFrame, feats: list[str]) -> pd.DataF
         close_real_20 = pd.Series(True, index=out.index, dtype=bool)
         for cc in close_cols_20:
             close_real_20 &= cc.notna()
+        if any(f"close_{i}" in out.columns for i in range(20)):
+            row_proxy = row_proxy | (~close_real_20)
 
         # CORE13_v2 scalping (backfill desde columnas legacy si existen)
         if "ret_1m" in feats:
@@ -10110,6 +10211,16 @@ def _maybe_retrain_fallback_sklearn(force: bool = False):
         if int(mask.sum()) < int(MIN_FIT_ROWS_LOW):
             agregar_evento(f"⚠️ IA fallback: data elegible insuficiente tras filtrar proxies ({int(mask.sum())}).")
             return False
+        try:
+            row_has_proxy = int(max(row_has_proxy, int(float(fila_dict.get("row_has_proxy_features", 0) or 0))))
+        except Exception:
+            pass
+        try:
+            row_train_eligible = int(min(row_train_eligible, int(float(fila_dict.get("row_train_eligible", 1) or 1))))
+        except Exception:
+            pass
+        if row_has_proxy == 1:
+            row_train_eligible = 0
 
         X = df.loc[mask, feats].copy()
         yb = y.loc[mask].astype(int).values
@@ -13885,6 +13996,19 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
                 risk_mode = "SHADOW_OK"
                 degrade_from = "unreliable"
                 reason = "unreliable->shadow"
+
+        if (not ia_model_mature) and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
+            decision = EMBUDO_FINAL_SHADOW_OK
+            risk_mode = "SHADOW_OK"
+            if warmup_mode:
+                degrade_from = "ia_immature_warmup"
+                reason = "ia_immature_warmup->shadow"
+            elif model_family == "sklearn_logreg_fallback":
+                degrade_from = "ia_immature_fallback"
+                reason = "ia_fallback->shadow"
+            else:
+                degrade_from = "ia_immature_unreliable"
+                reason = "ia_unreliable->shadow"
 
         if (not ia_model_mature) and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
             decision = EMBUDO_FINAL_SHADOW_OK
