@@ -876,16 +876,12 @@ FEATURE_NAMES_INTERACCIONES = [
 # Gobernanza calidad>cantidad: entrenar solo con features que realmente aporten.
 FEATURE_ALWAYS_KEEP = ["racha_actual"]
 FEATURE_MAX_PROD = 6
-FEATURE_SET_PROD_WARMUP = ["racha_actual", "payout", "ret_3m", "range_norm", "rv_20", "puntaje_estrategia"]
-FEATURE_SET_CORE_EXT = [
-    "racha_actual", "payout", "ret_1m", "ret_3m",
-    "ret_5m", "slope_5m", "range_norm", "bb_z",
-    "rv_20", "body_ratio", "wick_imbalance", "micro_trend_persist",
-]
+FEATURE_SET_PROD_WARMUP = ["racha_actual", "puntaje_estrategia", "ret_1m", "slope_5m", "rv_20", "bb_z"]
+FEATURE_SET_CORE_EXT = ["racha_actual", "puntaje_estrategia", "ret_1m", "slope_5m", "rv_20", "bb_z"]
 FEATURE_SET_CORE_EXT_MIN_ROWS = 500
 FEATURE_MIN_AUC_DELTA = 0.015      # aporte mínimo (|AUC_uni - 0.5|)
 FEATURE_MAX_DOMINANCE_GATE = 0.965 # evita casi-constantes
-FEATURE_DYNAMIC_SELECTION = True
+FEATURE_DYNAMIC_SELECTION = False
 # Durante warmup evitamos selección agresiva para no colapsar a 2-4 features.
 FEATURE_FREEZE_CORE_DURING_WARMUP = True
 FEATURE_FREEZE_CORE_MIN_ROWS = TRAIN_WARMUP_MIN_ROWS
@@ -902,9 +898,13 @@ IA_TARGET_MIN_SIGNALS = 30         # mínimo de señales en zona alta para valid
 TRAIN_PROMOTE_MIN_AUC = 0.50
 TRAIN_PROMOTE_MIN_FEATURES = 5
 
-FEATURE_NAMES_PROD = list(FEATURE_ALWAYS_KEEP)
+FEATURE_NAMES_PROD = list(FEATURE_SET_PROD_WARMUP)
 FEATURE_NAMES_SHADOW = [f for f in FEATURE_NAMES_CORE_13 if f not in FEATURE_NAMES_PROD]
 FEATURE_NAMES_DEFAULT = list(FEATURE_NAMES_CORE_13)
+PROXY_FEATURES_BLOCK_TRAIN = [
+    "ret_1m", "ret_3m", "ret_5m", "slope_5m", "rv_20",
+    "range_norm", "bb_z", "body_ratio", "wick_imbalance", "micro_trend_persist",
+]
 
 class ModeloXGBCalibrado:
     """
@@ -2951,6 +2951,7 @@ def clip_feature_values(fila_dict, feature_names):
 def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
     """Completa CORE13_v2 scalping desde campos legacy cuando falten."""
     out = dict(fila_dict or {})
+    proxy_used = set()
 
     def _missing(name: str) -> bool:
         v = out.get(name, None)
@@ -2984,24 +2985,38 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
 
     if _missing("ret_1m"):
         out["ret_1m"] = float(np.clip((rsi9 - 50.0) / 50.0, -1.0, 1.0))
+        proxy_used.add("ret_1m")
     if _missing("ret_3m"):
         out["ret_3m"] = float(np.clip((rsi14 - 50.0) / 50.0, -1.0, 1.0))
+        proxy_used.add("ret_3m")
     if _missing("ret_5m"):
         out["ret_5m"] = float(np.clip(0.6 * float(out.get("ret_3m", 0.0)) + 0.4 * float(out.get("ret_1m", 0.0)), -1.0, 1.0))
+        proxy_used.add("ret_5m")
     if _missing("slope_5m"):
         out["slope_5m"] = float(np.clip(sma_spread + 0.05 * cruce_sma, -1.0, 1.0))
+        proxy_used.add("slope_5m")
     if _missing("rv_20"):
         out["rv_20"] = float(np.clip(vol, 0.0, 1.0))
+        proxy_used.add("rv_20")
     if _missing("range_norm"):
         out["range_norm"] = float(np.clip(breakout, 0.0, 1.0))
+        proxy_used.add("range_norm")
     if _missing("bb_z"):
         out["bb_z"] = float(np.clip((2.0 * rsi_rev) - 1.0, -3.0, 3.0))
+        proxy_used.add("bb_z")
     if _missing("body_ratio"):
         out["body_ratio"] = float(np.clip(abs(float(out.get("ret_1m", 0.0))), 0.0, 1.0))
+        proxy_used.add("body_ratio")
     if _missing("wick_imbalance"):
         out["wick_imbalance"] = float(np.clip((2.0 * reb) - 1.0, -1.0, 1.0))
+        proxy_used.add("wick_imbalance")
     if _missing("micro_trend_persist"):
         out["micro_trend_persist"] = float(np.clip(racha / 10.0, -1.0, 1.0))
+        proxy_used.add("micro_trend_persist")
+
+    out["row_proxy_features"] = ",".join(sorted(proxy_used))
+    out["row_has_proxy_features"] = 1 if proxy_used else 0
+    out["row_train_eligible"] = 0 if proxy_used else 1
 
     return out
 
@@ -8298,11 +8313,26 @@ def _enriquecer_df_con_derivadas(df: pd.DataFrame, feats: list[str]) -> pd.DataF
     """Genera columnas derivadas solo si el modelo las pide."""
     try:
         out = df.copy()
+        row_proxy = pd.Series(False, index=out.index, dtype=bool)
 
         def _col_num(name, default=0.0):
             if name in out.columns:
                 return pd.to_numeric(out[name], errors="coerce").fillna(default)
             return pd.Series([default] * len(out), index=out.index, dtype="float64")
+
+        def _fill_proxy_if_missing(name: str, values: pd.Series):
+            nonlocal row_proxy
+            if name in out.columns:
+                cur = pd.to_numeric(out[name], errors="coerce")
+                miss = cur.isna()
+                if bool(miss.any()):
+                    out.loc[miss, name] = values.loc[miss]
+                    if name in PROXY_FEATURES_BLOCK_TRAIN:
+                        row_proxy = row_proxy | miss
+            else:
+                out[name] = values
+                if name in PROXY_FEATURES_BLOCK_TRAIN:
+                    row_proxy = row_proxy | pd.Series(True, index=out.index, dtype=bool)
 
         if "pay_x_puntaje" in feats:
             out["pay_x_puntaje"] = _col_num("payout", 0.0) * _col_num("puntaje_estrategia", 0.0)
@@ -8323,25 +8353,28 @@ def _enriquecer_df_con_derivadas(df: pd.DataFrame, feats: list[str]) -> pd.DataF
 
         # CORE13_v2 scalping (backfill desde columnas legacy si existen)
         if "ret_1m" in feats:
-            out["ret_1m"] = ((_col_num("rsi_9", 50.0) - 50.0) / 50.0).clip(lower=-1.0, upper=1.0)
+            _fill_proxy_if_missing("ret_1m", ((_col_num("rsi_9", 50.0) - 50.0) / 50.0).clip(lower=-1.0, upper=1.0))
         if "ret_3m" in feats:
-            out["ret_3m"] = ((_col_num("rsi_14", 50.0) - 50.0) / 50.0).clip(lower=-1.0, upper=1.0)
+            _fill_proxy_if_missing("ret_3m", ((_col_num("rsi_14", 50.0) - 50.0) / 50.0).clip(lower=-1.0, upper=1.0))
         if "ret_5m" in feats:
-            out["ret_5m"] = (0.6 * _col_num("ret_3m", 0.0) + 0.4 * _col_num("ret_1m", 0.0)).clip(lower=-1.0, upper=1.0)
+            _fill_proxy_if_missing("ret_5m", (0.6 * _col_num("ret_3m", 0.0) + 0.4 * _col_num("ret_1m", 0.0)).clip(lower=-1.0, upper=1.0))
         if "slope_5m" in feats:
-            out["slope_5m"] = (_col_num("sma_spread", 0.0) + 0.05 * _col_num("cruce_sma", 0.0)).clip(lower=-1.0, upper=1.0)
+            _fill_proxy_if_missing("slope_5m", (_col_num("sma_spread", 0.0) + 0.05 * _col_num("cruce_sma", 0.0)).clip(lower=-1.0, upper=1.0))
         if "rv_20" in feats:
-            out["rv_20"] = _col_num("volatilidad", 0.0).clip(lower=0.0, upper=1.0)
+            _fill_proxy_if_missing("rv_20", _col_num("volatilidad", 0.0).clip(lower=0.0, upper=1.0))
         if "range_norm" in feats:
-            out["range_norm"] = _col_num("breakout", 0.0).clip(lower=0.0, upper=1.0)
+            _fill_proxy_if_missing("range_norm", _col_num("breakout", 0.0).clip(lower=0.0, upper=1.0))
         if "bb_z" in feats:
-            out["bb_z"] = ((2.0 * _col_num("rsi_reversion", 0.0)) - 1.0).clip(lower=-3.0, upper=3.0)
+            _fill_proxy_if_missing("bb_z", ((2.0 * _col_num("rsi_reversion", 0.0)) - 1.0).clip(lower=-3.0, upper=3.0))
         if "body_ratio" in feats:
-            out["body_ratio"] = _col_num("ret_1m", 0.0).abs().clip(lower=0.0, upper=1.0)
+            _fill_proxy_if_missing("body_ratio", _col_num("ret_1m", 0.0).abs().clip(lower=0.0, upper=1.0))
         if "wick_imbalance" in feats:
-            out["wick_imbalance"] = ((2.0 * _col_num("es_rebote", 0.0)) - 1.0).clip(lower=-1.0, upper=1.0)
+            _fill_proxy_if_missing("wick_imbalance", ((2.0 * _col_num("es_rebote", 0.0)) - 1.0).clip(lower=-1.0, upper=1.0))
         if "micro_trend_persist" in feats:
-            out["micro_trend_persist"] = (_col_num("racha_actual", 0.0) / 10.0).clip(lower=-1.0, upper=1.0)
+            _fill_proxy_if_missing("micro_trend_persist", (_col_num("racha_actual", 0.0) / 10.0).clip(lower=-1.0, upper=1.0))
+
+        out["row_has_proxy_features"] = row_proxy.astype(int)
+        out["row_train_eligible"] = (~row_proxy).astype(int)
 
         return out
     except Exception:
@@ -8373,6 +8406,7 @@ def build_xy_from_incremental(df: pd.DataFrame, feature_names: list | None = Non
         return None, None, label_col
 
     mask = y01.isin([0.0, 1.0])
+    mask_pre_proxy = mask.copy()
     if int(mask.sum()) <= 0:
         return None, None, label_col
 
@@ -8389,6 +8423,12 @@ def build_xy_from_incremental(df: pd.DataFrame, feature_names: list | None = Non
 
     if int(mask.sum()) <= 0:
         return None, None, label_col
+
+    proxy_col = pd.to_numeric(df.get("row_has_proxy_features", pd.Series(0, index=df.index)), errors="coerce").fillna(0.0)
+    train_elig_col = pd.to_numeric(df.get("row_train_eligible", pd.Series(1, index=df.index)), errors="coerce").fillna(1.0)
+    proxy_mask = proxy_col > 0.0
+    train_eligible_mask = train_elig_col > 0.0
+    mask = mask & (~proxy_mask) & train_eligible_mask
 
     # X (reindex = blindaje)
     feats_no_time = [c for c in feats if c != "ts_ingest"]
@@ -8415,6 +8455,9 @@ def build_xy_from_incremental(df: pd.DataFrame, feature_names: list | None = Non
             "rows_after": int(len(X)),
             "duplicates_removed": max(0, before_n - int(len(X))),
             "used_quality_mask": bool(int((quality_mask & y01.isin([0.0, 1.0])).sum()) >= int(max(60, 0.50 * int(y01.isin([0.0, 1.0]).sum())))),
+            "proxy_rows_detected": int((mask_pre_proxy & proxy_mask).sum()),
+            "proxy_rows_excluded": int((mask_pre_proxy & proxy_mask).sum()),
+            "rows_train_eligible": int(mask.sum()),
         }
     except Exception:
         pass
@@ -9874,7 +9917,9 @@ def _maybe_retrain_fallback_sklearn(force: bool = False):
             agregar_evento(f"⚠️ IA fallback: poca data útil ({int(mask.sum())}).")
             return False
 
-        feats = [f for f in FEATURE_NAMES_DEFAULT if f in df.columns]
+        feats = [f for f in FEATURE_SET_PROD_WARMUP if f in df.columns]
+        if len(feats) < int(FEATURE_MAX_PROD):
+            feats = [f for f in FEATURE_NAMES_DEFAULT if f in df.columns]
         if not feats:
             feats = [f for f in INCREMENTAL_FEATURES_V2 if f in df.columns]
         if not feats:
@@ -9892,6 +9937,14 @@ def _maybe_retrain_fallback_sklearn(force: bool = False):
             feats = cand[:20]
         if not feats:
             agregar_evento("⚠️ IA fallback: no hay features numéricas utilizables en incremental.")
+            return False
+
+        df = _enriquecer_df_con_derivadas(df, feats)
+        proxy_mask = pd.to_numeric(df.get("row_has_proxy_features", pd.Series(0, index=df.index)), errors="coerce").fillna(0.0) > 0.0
+        train_eligible_mask = pd.to_numeric(df.get("row_train_eligible", pd.Series(1, index=df.index)), errors="coerce").fillna(1.0) > 0.0
+        mask = mask & (~proxy_mask) & train_eligible_mask
+        if int(mask.sum()) < int(MIN_FIT_ROWS_LOW):
+            agregar_evento(f"⚠️ IA fallback: data elegible insuficiente tras filtrar proxies ({int(mask.sum())}).")
             return False
 
         X = df.loc[mask, feats].copy()
@@ -10150,7 +10203,7 @@ def maybe_retrain(force: bool = False):
                 pass
         elif freeze_core_warmup:
             try:
-                keep_core = [f for f in FEATURE_NAMES_CORE_13 if f in X.columns]
+                keep_core = [f for f in FEATURE_SET_PROD_WARMUP if f in X.columns]
                 if keep_core:
                     X = X[keep_core].copy()
                     feats_used = list(keep_core)
@@ -10373,7 +10426,7 @@ def maybe_retrain(force: bool = False):
                 pass
         elif freeze_core_warmup_train:
             try:
-                keep_core = [f for f in FEATURE_NAMES_CORE_13 if f in X_train.columns]
+                keep_core = [f for f in FEATURE_SET_PROD_WARMUP if f in X_train.columns]
                 if keep_core:
                     X_train = X_train[keep_core].copy()
                     if X_calib is not None and len(X_calib) > 0:
@@ -13552,6 +13605,9 @@ def _registrar_estado_embudo(data: dict | None = None) -> dict:
         "top1_prob": 0.0,
         "top2_prob": 0.0,
         "degrade_from": "none",
+        "ia_real_backed": 0,
+        "real_source": "IA",
+        "ia_model_mature": 0,
     }
     try:
         if isinstance(EMBUDO_DECISION_STATE, dict):
@@ -13579,6 +13635,9 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
         "top1_prob": 0.0,
         "top2_prob": 0.0,
         "degrade_from": "none",
+        "ia_real_backed": 0,
+        "real_source": "IA",
+        "ia_model_mature": 0,
     })
     if not candidatos:
         return out
@@ -13631,6 +13690,9 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
         reliable = bool(meta.get("reliable", False))
         canary = bool(meta.get("canary_mode", False))
         auc = float(meta.get("auc", 0.0) or 0.0)
+        warmup_mode = bool(meta.get("warmup_mode", n_samples < int(TRAIN_WARMUP_MIN_ROWS)))
+        model_family = str(meta.get("model_family", "") or "").strip().lower()
+        ia_model_mature = bool((not warmup_mode) and reliable and (model_family != "sklearn_logreg_fallback"))
         degrade_from = "none"
 
         if canary and decision == EMBUDO_FINAL_REAL_NORMAL:
@@ -13639,7 +13701,7 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
             degrade_from = "canary"
             reason = "canary->micro"
 
-        if bool(AUTO_REAL_BLOCK_WHEN_WARMUP) and bool(meta.get("warmup_mode", n_samples < int(TRAIN_WARMUP_MIN_ROWS))) and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
+        if bool(AUTO_REAL_BLOCK_WHEN_WARMUP) and warmup_mode and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
             decision = EMBUDO_FINAL_SHADOW_OK
             risk_mode = "SHADOW_OK"
             degrade_from = "warmup"
@@ -13655,6 +13717,19 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
                 risk_mode = "SHADOW_OK"
                 degrade_from = "unreliable"
                 reason = "unreliable->shadow"
+
+        if (not ia_model_mature) and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
+            decision = EMBUDO_FINAL_SHADOW_OK
+            risk_mode = "SHADOW_OK"
+            if warmup_mode:
+                degrade_from = "ia_immature_warmup"
+                reason = "ia_immature_warmup->shadow"
+            elif model_family == "sklearn_logreg_fallback":
+                degrade_from = "ia_immature_fallback"
+                reason = "ia_fallback->shadow"
+            else:
+                degrade_from = "ia_immature_unreliable"
+                reason = "ia_unreliable->shadow"
 
         # Prudencia extra en Martingala avanzada C2..C{MAX_CICLOS}: exigir contexto vivo.
         try:
@@ -13725,6 +13800,9 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
             if degrade_from == "none":
                 degrade_from = "micro_mode"
 
+        ia_real_backed = int(decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO) and ia_model_mature)
+        real_source = "IA" if ia_real_backed else "OPERATIVO_NO_IA"
+
         return _registrar_estado_embudo({
             "decision_final": decision,
             "decision_reason": reason,
@@ -13738,6 +13816,9 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
             "top1_prob": top1_prob,
             "top2_prob": top2_prob,
             "degrade_from": degrade_from,
+            "ia_real_backed": int(ia_real_backed),
+            "real_source": str(real_source),
+            "ia_model_mature": int(ia_model_mature),
         })
     except Exception:
         return _registrar_estado_embudo({"decision_final": EMBUDO_FINAL_WAIT_SOFT, "decision_reason": "embudo_err", "soft_wait_reason": "embudo_err"})
