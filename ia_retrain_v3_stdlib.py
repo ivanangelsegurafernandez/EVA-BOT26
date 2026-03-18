@@ -14,7 +14,7 @@ SCALPING10 = [
 CORE13 = ["racha_actual","puntaje_estrategia","payout"] + SCALPING10
 DEFAULTS = {k:0.0 for k in SCALPING10}
 TARGET = "result_bin"
-PRIMARY_DATASET = "dataset_incremental_v3.csv"
+PRIMARY_DATASET_CANDIDATES = ["./dataset_incremental_v3.csv", "/mnt/data/dataset_incremental_v3.csv"]
 CONTRAST_DATASET = "dataset_incremental.csv"
 STRICT_PRIMARY_DATASET = True
 
@@ -60,6 +60,21 @@ def load_rows(path:str)->Tuple[List[Dict[str,float]],Dict[str,Any]]:
             rows.append(row)
     info["rows_loaded"]=len(rows)
     return rows,info
+
+
+def resolve_primary_dataset() -> tuple[str | None, dict]:
+    probe = {"candidates": list(PRIMARY_DATASET_CANDIDATES), "checked": []}
+    for c in PRIMARY_DATASET_CANDIDATES:
+        item = {"path": c, "exists": os.path.exists(c)}
+        if item["exists"]:
+            try:
+                item["size_bytes"] = os.path.getsize(c)
+            except Exception:
+                item["size_bytes"] = None
+            probe["checked"].append(item)
+            return c, probe
+        probe["checked"].append(item)
+    return None, probe
 
 
 def exact_duplicates(rows):
@@ -374,29 +389,42 @@ def try_load_current_model(path):
 
 def main():
     report={"seed":SEED,"generated_at":datetime.utcnow().isoformat()+"Z"}
-    rows_v3,info_v3=load_rows(PRIMARY_DATASET)
+    primary_path,primary_probe=resolve_primary_dataset()
+    report["primary_probe"]=primary_probe
+    rows_v3=[]
+    info_v3={"path":None,"exists":False}
+    if primary_path is not None:
+        rows_v3,info_v3=load_rows(primary_path)
     report["dataset_v3_info"]=info_v3
     report["dataset_policy"]={
         "strict_primary": bool(STRICT_PRIMARY_DATASET),
-        "primary": PRIMARY_DATASET,
+        "primary_candidates": list(PRIMARY_DATASET_CANDIDATES),
         "contrast": CONTRAST_DATASET,
     }
     rows_main=[]
     primary_usable = bool(rows_v3)
     if primary_usable:
         rows_main=rows_v3
-        report["dataset_used"]=PRIMARY_DATASET
+        report["dataset_used"]=info_v3.get("path")
     else:
         report["dataset_used"]=None
-        report["primary_dataset_error"]=(
-            "missing_or_unusable_primary_dataset"
-            if not info_v3.get("exists", False)
-            else "primary_dataset_loaded_zero_rows"
-        )
+        if primary_path is None:
+            report["primary_dataset_error"]="PRIMARY_DATASET_NOT_FOUND"
+        elif info_v3.get("exists", False) and int(info_v3.get("rows_loaded",0))<=0:
+            report["primary_dataset_error"]="PRIMARY_DATASET_FOUND_BUT_UNUSABLE"
+        else:
+            report["primary_dataset_error"]="missing_or_unusable_primary_dataset"
 
     # Carga de contraste secundaria (nunca principal si strict_primary=True)
     rows_c,info_c=load_rows(CONTRAST_DATASET)
     report["contrast_dataset_info"]=info_c
+    report["contrast_secondary_only"]=True
+    if rows_c:
+        report["contrast_secondary_audit"]={
+            "rows":len(rows_c),
+            "duplicates_exact":exact_duplicates(rows_c),
+            "class_balance":class_balance(rows_c),
+        }
     if (not primary_usable) and (not STRICT_PRIMARY_DATASET):
         rows_main=rows_c
         report["dataset_used"]=CONTRAST_DATASET

@@ -1,17 +1,36 @@
 {
   "seed": 20260318,
-  "generated_at": "2026-03-18T02:17:34.075164Z",
+  "generated_at": "2026-03-18T02:41:52.122412Z",
+  "primary_probe": {
+    "candidates": [
+      "./dataset_incremental_v3.csv",
+      "/mnt/data/dataset_incremental_v3.csv"
+    ],
+    "checked": [
+      {
+        "path": "./dataset_incremental_v3.csv",
+        "exists": false
+      },
+      {
+        "path": "/mnt/data/dataset_incremental_v3.csv",
+        "exists": false
+      }
+    ]
+  },
   "dataset_v3_info": {
-    "path": "dataset_incremental_v3.csv",
+    "path": null,
     "exists": false
   },
   "dataset_policy": {
     "strict_primary": true,
-    "primary": "dataset_incremental_v3.csv",
+    "primary_candidates": [
+      "./dataset_incremental_v3.csv",
+      "/mnt/data/dataset_incremental_v3.csv"
+    ],
     "contrast": "dataset_incremental.csv"
   },
   "dataset_used": null,
-  "primary_dataset_error": "missing_or_unusable_primary_dataset",
+  "primary_dataset_error": "PRIMARY_DATASET_NOT_FOUND",
   "contrast_dataset_info": {
     "path": "dataset_incremental.csv",
     "exists": true,
@@ -32,6 +51,17 @@
       "result_bin"
     ],
     "rows_loaded": 8502
+  },
+  "contrast_secondary_only": true,
+  "contrast_secondary_audit": {
+    "rows": 8502,
+    "duplicates_exact": 912,
+    "class_balance": {
+      "n": 8502,
+      "pos": 4211,
+      "neg": 4291,
+      "pos_rate": 0.49529522465302284
+    }
   },
   "audit": {
     "rows": 0,
