@@ -14010,6 +14010,19 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
                 degrade_from = "ia_immature_unreliable"
                 reason = "ia_unreliable->shadow"
 
+        if (not ia_model_mature) and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
+            decision = EMBUDO_FINAL_SHADOW_OK
+            risk_mode = "SHADOW_OK"
+            if warmup_mode:
+                degrade_from = "ia_immature_warmup"
+                reason = "ia_immature_warmup->shadow"
+            elif model_family == "sklearn_logreg_fallback":
+                degrade_from = "ia_immature_fallback"
+                reason = "ia_fallback->shadow"
+            else:
+                degrade_from = "ia_immature_unreliable"
+                reason = "ia_unreliable->shadow"
+
         # Prudencia extra en Martingala avanzada C2..C{MAX_CICLOS}: exigir contexto vivo.
         try:
             ciclo_adv = int(ciclo_martingala_siguiente())

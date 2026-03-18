@@ -398,6 +398,29 @@ def _extract_close_snapshot(velas, n: int = 20):
         closes = [None] * int(n)
     return closes[:int(n)]
 
+def _extract_close_snapshot(velas, n: int = 20):
+    closes = []
+    try:
+        seq = list(velas or [])
+        if not seq:
+            return [None] * int(n)
+        seq = seq[-int(n):]
+        seq = list(reversed(seq))  # close_0 = más reciente
+        for v in seq:
+            c = None
+            if isinstance(v, dict):
+                c = v.get("close", v.get("c"))
+            try:
+                cf = float(c)
+                closes.append(cf if math.isfinite(cf) else None)
+            except Exception:
+                closes.append(None)
+        while len(closes) < int(n):
+            closes.append(None)
+    except Exception:
+        closes = [None] * int(n)
+    return closes[:int(n)]
+
 def _norm_puntaje_01(condiciones, total_cond=3):
     """
     Acepta:
