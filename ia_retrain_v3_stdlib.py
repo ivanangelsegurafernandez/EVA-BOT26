@@ -14,6 +14,9 @@ SCALPING10 = [
 CORE13 = ["racha_actual","puntaje_estrategia","payout"] + SCALPING10
 DEFAULTS = {k:0.0 for k in SCALPING10}
 TARGET = "result_bin"
+PRIMARY_DATASET = "dataset_incremental_v3.csv"
+CONTRAST_DATASET = "dataset_incremental.csv"
+STRICT_PRIMARY_DATASET = True
 
 
 def to_float(v, default=None):
@@ -371,19 +374,51 @@ def try_load_current_model(path):
 
 def main():
     report={"seed":SEED,"generated_at":datetime.utcnow().isoformat()+"Z"}
-    rows_v3,info_v3=load_rows("dataset_incremental_v3.csv")
+    rows_v3,info_v3=load_rows(PRIMARY_DATASET)
     report["dataset_v3_info"]=info_v3
+    report["dataset_policy"]={
+        "strict_primary": bool(STRICT_PRIMARY_DATASET),
+        "primary": PRIMARY_DATASET,
+        "contrast": CONTRAST_DATASET,
+    }
     rows_main=[]
-    if rows_v3:
+    primary_usable = bool(rows_v3)
+    if primary_usable:
         rows_main=rows_v3
-        report["dataset_used"]="dataset_incremental_v3.csv"
+        report["dataset_used"]=PRIMARY_DATASET
     else:
-        rows_c,info_c=load_rows("dataset_incremental.csv")
-        report["contrast_dataset_info"]=info_c
+        report["dataset_used"]=None
+        report["primary_dataset_error"]=(
+            "missing_or_unusable_primary_dataset"
+            if not info_v3.get("exists", False)
+            else "primary_dataset_loaded_zero_rows"
+        )
+
+    # Carga de contraste secundaria (nunca principal si strict_primary=True)
+    rows_c,info_c=load_rows(CONTRAST_DATASET)
+    report["contrast_dataset_info"]=info_c
+    if (not primary_usable) and (not STRICT_PRIMARY_DATASET):
         rows_main=rows_c
-        report["dataset_used"]="dataset_incremental.csv (fallback_por_falta_de_v3)"
+        report["dataset_used"]=CONTRAST_DATASET
 
     n=len(rows_main)
+    if n == 0:
+        report["audit"]={"rows":0,"error":"no_usable_rows_in_primary_dataset"}
+        report["univariate_rank"]=[]
+        report["multicollinearity"]={"threshold":0.70,"kept":[],"dropped":[],"groups_hint":{}}
+        report["models"]={}
+        report["current_model_eval"]={"status":try_load_current_model("modelo_xgb_v2.pkl"),"note":"Modelo actual no evaluado por falta de dataset primario usable"}
+        report["best_model_name"]=None
+        report["best_model_bands"]=[]
+        report["promotion_decision"]={"promote":False,"reason":"Sin dataset primario usable"}
+        report["ia_signals_log"]=audit_signals_log("ia_signals_log.csv")
+        os.makedirs("tmp_validation",exist_ok=True)
+        out_json="tmp_validation/retrain_v3_report.json"
+        report["generated_artifacts"]=[]
+        with open(out_json,'w',encoding='utf-8') as f:
+            json.dump(report,f,ensure_ascii=False,indent=2)
+        print(out_json)
+        return
     report["audit"]={
         "rows":n,
         "columns_expected":len(CORE13)+1,
@@ -421,7 +456,7 @@ def main():
     report["best_model_bands"]=high_bands(best["holdout_y"],best["holdout_probs"])
 
     stable=(best["auc_mean_folds"] is not None and best["auc_mean_folds"]>=0.55 and (best["auc_std_folds"] or 9)<=0.03)
-    report["promotion_decision"]={"promote":False,"reason":"No promoción automática sin dataset_v3 presente en este entorno" if not rows_v3 else ("Aún frágil" if not stable else "Mejora candidata")}
+    report["promotion_decision"]={"promote":False,"reason":"Aún frágil" if not stable else "Mejora candidata"}
 
     report["ia_signals_log"]=audit_signals_log("ia_signals_log.csv")
 
@@ -432,7 +467,7 @@ def main():
 
     # Guardado artefactos solo si hay v3 y mejora estable
     generated=[]
-    if rows_v3 and stable:
+    if primary_usable and stable:
         stamp=datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         model_path=f"modelo_logreg_v3_{stamp}.json"
         meta_path=f"model_meta_v3_{stamp}.json"
