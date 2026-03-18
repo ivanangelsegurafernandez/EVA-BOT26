@@ -1,0 +1,71 @@
+{
+  "seed": 20260318,
+  "generated_at": "2026-03-18T02:17:34.075164Z",
+  "dataset_v3_info": {
+    "path": "dataset_incremental_v3.csv",
+    "exists": false
+  },
+  "dataset_policy": {
+    "strict_primary": true,
+    "primary": "dataset_incremental_v3.csv",
+    "contrast": "dataset_incremental.csv"
+  },
+  "dataset_used": null,
+  "primary_dataset_error": "missing_or_unusable_primary_dataset",
+  "contrast_dataset_info": {
+    "path": "dataset_incremental.csv",
+    "exists": true,
+    "columns": [
+      "racha_actual",
+      "puntaje_estrategia",
+      "payout",
+      "ret_1m",
+      "ret_3m",
+      "ret_5m",
+      "slope_5m",
+      "rv_20",
+      "range_norm",
+      "bb_z",
+      "body_ratio",
+      "wick_imbalance",
+      "micro_trend_persist",
+      "result_bin"
+    ],
+    "rows_loaded": 8502
+  },
+  "audit": {
+    "rows": 0,
+    "error": "no_usable_rows_in_primary_dataset"
+  },
+  "univariate_rank": [],
+  "multicollinearity": {
+    "threshold": 0.7,
+    "kept": [],
+    "dropped": [],
+    "groups_hint": {}
+  },
+  "models": {},
+  "current_model_eval": {
+    "status": {
+      "exists": true,
+      "loadable": false,
+      "error": "ModuleNotFoundError: No module named 'sklearn'"
+    },
+    "note": "Modelo actual no evaluado por falta de dataset primario usable"
+  },
+  "best_model_name": null,
+  "best_model_bands": [],
+  "promotion_decision": {
+    "promote": false,
+    "reason": "Sin dataset primario usable"
+  },
+  "ia_signals_log": {
+    "exists": true,
+    "rows": 0,
+    "columns": 7,
+    "prob_col": null,
+    "result_col": null,
+    "usable": false
+  },
+  "generated_artifacts": []
+}
