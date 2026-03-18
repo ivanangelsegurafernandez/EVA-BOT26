@@ -1,0 +1,573 @@
+{
+  "seed": 20260318,
+  "generated_at": "2026-03-18T02:04:51.916152Z",
+  "dataset_v3_info": {
+    "path": "dataset_incremental_v3.csv",
+    "exists": false
+  },
+  "contrast_dataset_info": {
+    "path": "dataset_incremental.csv",
+    "exists": true,
+    "columns": [
+      "racha_actual",
+      "puntaje_estrategia",
+      "payout",
+      "ret_1m",
+      "ret_3m",
+      "ret_5m",
+      "slope_5m",
+      "rv_20",
+      "range_norm",
+      "bb_z",
+      "body_ratio",
+      "wick_imbalance",
+      "micro_trend_persist",
+      "result_bin"
+    ],
+    "rows_loaded": 8502
+  },
+  "dataset_used": "dataset_incremental.csv (fallback_por_falta_de_v3)",
+  "audit": {
+    "rows": 8502,
+    "columns_expected": 14,
+    "duplicates_exact": 912,
+    "class_balance": {
+      "n": 8502,
+      "pos": 4211,
+      "neg": 4291,
+      "pos_rate": 0.49529522465302284
+    },
+    "nan_or_inf_rows": 0,
+    "scalping_defaults": {
+      "ret_1m": {
+        "default_ratio": 0.0005880969183721477,
+        "var": 0.1095319855184335,
+        "min": -1.0,
+        "max": 1.0
+      },
+      "ret_3m": {
+        "default_ratio": 0.00011761938367442955,
+        "var": 0.06486991182799265,
+        "min": -1.0,
+        "max": 0.7025999999999999
+      },
+      "ret_5m": {
+        "default_ratio": 0.0,
+        "var": 0.07094378216906418,
+        "min": -1.0,
+        "max": 0.82156
+      },
+      "slope_5m": {
+        "default_ratio": 0.0,
+        "var": 0.00012207845877846925,
+        "min": 8.221505002541403e-06,
+        "max": 0.053176899791286945
+      },
+      "rv_20": {
+        "default_ratio": 0.0,
+        "var": 0.002573358348984362,
+        "min": 1.2650953552184596e-05,
+        "max": 0.2974277592459117
+      },
+      "range_norm": {
+        "default_ratio": 0.0,
+        "var": 0.005028795918449276,
+        "min": 0.006949544461110763,
+        "max": 0.3574053842104929
+      },
+      "bb_z": {
+        "default_ratio": 0.00035285815102328866,
+        "var": 0.11577099372224506,
+        "min": -0.9984,
+        "max": 1.0
+      },
+      "body_ratio": {
+        "default_ratio": 0.0005880969183721477,
+        "var": 0.04079123874010094,
+        "min": 0.0,
+        "max": 1.0
+      },
+      "wick_imbalance": {
+        "default_ratio": 0.0,
+        "var": 0.010623552893043727,
+        "min": -0.9696,
+        "max": 0.2338098710251455
+      },
+      "micro_trend_persist": {
+        "default_ratio": 0.0,
+        "var": 0.0602875253008941,
+        "min": -1.0,
+        "max": 1.0
+      }
+    },
+    "scalping_real_counts": {
+      "ge4": 8502,
+      "all10": 8493,
+      "total": 8502
+    },
+    "feature_variance": {
+      "racha_actual": 6.051369498014949,
+      "puntaje_estrategia": 0.008152769989798699,
+      "payout": 4.495660342751204e-06,
+      "ret_1m": 0.1095319855184335,
+      "ret_3m": 0.06486991182799265,
+      "ret_5m": 0.07094378216906418,
+      "slope_5m": 0.00012207845877846925,
+      "rv_20": 0.002573358348984362,
+      "range_norm": 0.005028795918449276,
+      "bb_z": 0.11577099372224506,
+      "body_ratio": 0.04079123874010094,
+      "wick_imbalance": 0.010623552893043727,
+      "micro_trend_persist": 0.0602875253008941
+    }
+  },
+  "univariate_rank": [
+    {
+      "feature": "slope_5m",
+      "auc": 0.5196645146122996,
+      "corr": 0.036760112143563416,
+      "quartile_winrate": [
+        0.45625587958607716,
+        0.5249294449670743,
+        0.4814117647058824,
+        0.5183443085606774
+      ],
+      "fold_auc_std": 0.00469823554926097,
+      "strength": 0.019664514612299566
+    },
+    {
+      "feature": "puntaje_estrategia",
+      "auc": 0.516465709073588,
+      "corr": 0.021467293636604316,
+      "quartile_winrate": [
+        0.45343367826904984,
+        0.5126999059266227,
+        0.5068235294117647,
+        0.5079962370649106
+      ],
+      "fold_auc_std": 0.005935058368595712,
+      "strength": 0.01646570907358802
+    },
+    {
+      "feature": "ret_3m",
+      "auc": 0.5153869793470187,
+      "corr": 0.024263653137020027,
+      "quartile_winrate": [
+        0.48660084626234135,
+        0.4677647058823529,
+        0.5056390977443609,
+        0.522107243650047
+      ],
+      "fold_auc_std": 0.016917691512699007,
+      "strength": 0.015386979347018714
+    },
+    {
+      "feature": "range_norm",
+      "auc": 0.5145570403800325,
+      "corr": 0.019347999263829407,
+      "quartile_winrate": [
+        0.4706158909261871,
+        0.4912941176470588,
+        0.5435294117647059,
+        0.4760112888052681
+      ],
+      "fold_auc_std": 0.0068497141391084745,
+      "strength": 0.014557040380032471
+    },
+    {
+      "feature": "rv_20",
+      "auc": 0.5142105983480028,
+      "corr": 0.008984509275628999,
+      "quartile_winrate": [
+        0.47507055503292567,
+        0.4703668861712135,
+        0.5487058823529412,
+        0.48754113775270336
+      ],
+      "fold_auc_std": 0.005338151726351783,
+      "strength": 0.014210598348002756
+    },
+    {
+      "feature": "ret_5m",
+      "auc": 0.5092716133755624,
+      "corr": 0.014027382603802995,
+      "quartile_winrate": [
+        0.4887111947318909,
+        0.463093559003291,
+        0.5338664158043274,
+        0.49553361542078045
+      ],
+      "fold_auc_std": 0.013332178270575326,
+      "strength": 0.00927161337556237
+    },
+    {
+      "feature": "micro_trend_persist",
+      "auc": 0.5022872091886167,
+      "corr": 0.0032562594244675168,
+      "quartile_winrate": [
+        0.4860982391102873,
+        0.5068043172219615,
+        0.4936708860759494,
+        0.4941846665084263
+      ],
+      "fold_auc_std": 0.00421339121659517,
+      "strength": 0.00228720918861669
+    },
+    {
+      "feature": "racha_actual",
+      "auc": 0.5022866834379291,
+      "corr": 0.003007940199536181,
+      "quartile_winrate": [
+        0.4860982391102873,
+        0.5068043172219615,
+        0.4936708860759494,
+        0.4941846665084263
+      ],
+      "fold_auc_std": 0.004213341022254557,
+      "strength": 0.002286683437929149
+    },
+    {
+      "feature": "wick_imbalance",
+      "auc": 0.4977969109213969,
+      "corr": -0.0075140273889095785,
+      "quartile_winrate": [
+        0.4863593603010348,
+        0.5122295390404515,
+        0.5009398496240601,
+        0.4825964252116651
+      ],
+      "fold_auc_std": 0.005178436396856493,
+      "strength": 0.0022030890786031154
+    },
+    {
+      "feature": "bb_z",
+      "auc": 0.5021496562060912,
+      "corr": -0.0035522157965366275,
+      "quartile_winrate": [
+        0.48661343353687175,
+        0.5134243994347621,
+        0.48447789275634995,
+        0.49741419840150447
+      ],
+      "fold_auc_std": 0.010509406776347052,
+      "strength": 0.0021496562060911995
+    },
+    {
+      "feature": "ret_1m",
+      "auc": 0.5019284811931508,
+      "corr": 0.00021394503431057966,
+      "quartile_winrate": [
+        0.4903620122237894,
+        0.48824082784571965,
+        0.5117702448210922,
+        0.4913023037141514
+      ],
+      "fold_auc_std": 0.008686140611057136,
+      "strength": 0.0019284811931508106
+    },
+    {
+      "feature": "body_ratio",
+      "auc": 0.49955781600065213,
+      "corr": -0.00498218296450754,
+      "quartile_winrate": [
+        0.4781792585640544,
+        0.5179076343072573,
+        0.4896421845574388,
+        0.4964805255748475
+      ],
+      "fold_auc_std": 0.008687897858999268,
+      "strength": 0.0004421839993478671
+    },
+    {
+      "feature": "payout",
+      "auc": 0.5002464110459445,
+      "corr": 0.0006878279072798865,
+      "quartile_winrate": [
+        0.49500416319733553,
+        null,
+        0.49970184853905786,
+        0.4966804979253112
+      ],
+      "fold_auc_std": 0.006697696580839267,
+      "strength": 0.0002464110459444724
+    }
+  ],
+  "multicollinearity": {
+    "threshold": 0.7,
+    "kept": [
+      "slope_5m",
+      "ret_3m",
+      "micro_trend_persist",
+      "wick_imbalance",
+      "payout"
+    ],
+    "dropped": [
+      {
+        "feature": "puntaje_estrategia",
+        "dropped_by": "slope_5m",
+        "corr": 0.7409554307808055
+      },
+      {
+        "feature": "range_norm",
+        "dropped_by": "slope_5m",
+        "corr": 0.7806220598464123
+      },
+      {
+        "feature": "rv_20",
+        "dropped_by": "slope_5m",
+        "corr": 0.7844829745277748
+      },
+      {
+        "feature": "ret_5m",
+        "dropped_by": "ret_3m",
+        "corr": 0.9430654613733547
+      },
+      {
+        "feature": "racha_actual",
+        "dropped_by": "micro_trend_persist",
+        "corr": 0.9998752326794487
+      },
+      {
+        "feature": "bb_z",
+        "dropped_by": "wick_imbalance",
+        "corr": 0.865261079164644
+      },
+      {
+        "feature": "ret_1m",
+        "dropped_by": "ret_3m",
+        "corr": 0.7430790289173624
+      },
+      {
+        "feature": "body_ratio",
+        "dropped_by": "wick_imbalance",
+        "corr": 0.7766423994368126
+      }
+    ],
+    "groups_hint": {
+      "momentum": [
+        "ret_1m",
+        "ret_3m",
+        "ret_5m",
+        "slope_5m",
+        "micro_trend_persist",
+        "bb_z"
+      ]
+    }
+  },
+  "models": {
+    "A_logreg": {
+      "name": "logreg_decorrelated",
+      "features": [
+        "slope_5m",
+        "ret_3m",
+        "micro_trend_persist",
+        "wick_imbalance",
+        "payout"
+      ],
+      "rows_train": 6801,
+      "rows_test": 1701,
+      "holdout": {
+        "auc": 0.48937054139246805,
+        "accuracy": 0.48912404467960025,
+        "brier": 0.2514382208417553,
+        "logloss": 0.6960354796064467
+      },
+      "folds": [
+        {
+          "auc": 0.5251955934808742,
+          "accuracy": 0.5317647058823529,
+          "brier": 0.24969087438769177,
+          "logloss": 0.6925361292949511
+        },
+        {
+          "auc": 0.4759896763750851,
+          "accuracy": 0.46509803921568627,
+          "brier": 0.25327156752955876,
+          "logloss": 0.6997132098161825
+        },
+        {
+          "auc": 0.5027647279438616,
+          "accuracy": 0.4823529411764706,
+          "brier": 0.2502947183606448,
+          "logloss": 0.6937410674987425
+        },
+        {
+          "auc": 0.517945374015748,
+          "accuracy": 0.4988235294117647,
+          "brier": 0.25020579077227867,
+          "logloss": 0.6935693887584675
+        },
+        {
+          "auc": 0.4815090724614839,
+          "accuracy": 0.49254901960784314,
+          "brier": 0.25258807735819455,
+          "logloss": 0.6983510756617836
+        }
+      ],
+      "auc_mean_folds": 0.5006808888554106,
+      "auc_std_folds": 0.019393762366610622
+    },
+    "B_tree": {
+      "name": "stump_tree_decorrelated",
+      "features": [
+        "slope_5m",
+        "ret_3m",
+        "micro_trend_persist",
+        "wick_imbalance",
+        "payout"
+      ],
+      "rows_train": 6801,
+      "rows_test": 1701,
+      "holdout": {
+        "auc": 0.5106232372946967,
+        "accuracy": 0.5126396237507349,
+        "brier": 0.2499942815694209,
+        "logloss": 0.6931386109288291
+      },
+      "folds": [
+        {
+          "auc": 0.5169185897562225,
+          "accuracy": 0.5058823529411764,
+          "brier": 0.24944104700703895,
+          "logloss": 0.6920289463291772
+        },
+        {
+          "auc": 0.4864305030546481,
+          "accuracy": 0.46509803921568627,
+          "brier": 0.2532199396897293,
+          "logloss": 0.6996025215914179
+        },
+        {
+          "auc": 0.5111082598868941,
+          "accuracy": 0.49411764705882355,
+          "brier": 0.24951520122718804,
+          "logloss": 0.6921749843065707
+        },
+        {
+          "auc": 0.5117864173228347,
+          "accuracy": 0.5129411764705882,
+          "brier": 0.2500859123400262,
+          "logloss": 0.69332529274519
+        },
+        {
+          "auc": 0.4882555459237953,
+          "accuracy": 0.4964705882352941,
+          "brier": 0.2519570621724466,
+          "logloss": 0.6970868420616912
+        }
+      ],
+      "auc_mean_folds": 0.5028998631888789,
+      "auc_std_folds": 0.012872988516184403
+    },
+    "C_min": {
+      "name": "logreg_min_interpretable",
+      "features": [
+        "slope_5m",
+        "ret_3m",
+        "micro_trend_persist"
+      ],
+      "rows_train": 6801,
+      "rows_test": 1701,
+      "holdout": {
+        "auc": 0.49153002820328484,
+        "accuracy": 0.5014697236919459,
+        "brier": 0.25139397364709604,
+        "logloss": 0.6959486198125465
+      },
+      "folds": [
+        {
+          "auc": 0.5259346116705752,
+          "accuracy": 0.5309803921568628,
+          "brier": 0.24967011754297755,
+          "logloss": 0.6924948447020037
+        },
+        {
+          "auc": 0.47629069985491657,
+          "accuracy": 0.47058823529411764,
+          "brier": 0.2532341121583835,
+          "logloss": 0.6996386113396468
+        },
+        {
+          "auc": 0.5093502334165672,
+          "accuracy": 0.4956862745098039,
+          "brier": 0.24993090575866303,
+          "logloss": 0.6930110112971879
+        },
+        {
+          "auc": 0.5203174212598425,
+          "accuracy": 0.5137254901960784,
+          "brier": 0.2500449156964891,
+          "logloss": 0.6932467211372143
+        },
+        {
+          "auc": 0.4819006363528902,
+          "accuracy": 0.5027450980392156,
+          "brier": 0.2526198077122047,
+          "logloss": 0.6984162999077977
+        }
+      ],
+      "auc_mean_folds": 0.5027587205109584,
+      "auc_std_folds": 0.02012209600220507
+    }
+  },
+  "current_model_eval": {
+    "status": {
+      "exists": true,
+      "loadable": false,
+      "error": "ModuleNotFoundError: No module named 'sklearn'"
+    },
+    "note": "Sin sklearn/xgboost en entorno, no evaluable de forma justa"
+  },
+  "best_model_name": "stump_tree_decorrelated",
+  "best_model_bands": [
+    {
+      "band": "[0.55,0.60)",
+      "n": 0,
+      "coverage": 0.0,
+      "win_rate": null
+    },
+    {
+      "band": "[0.60,0.65)",
+      "n": 0,
+      "coverage": 0.0,
+      "win_rate": null
+    },
+    {
+      "band": "[0.65,0.70)",
+      "n": 0,
+      "coverage": 0.0,
+      "win_rate": null
+    },
+    {
+      "band": "[0.70,0.75)",
+      "n": 0,
+      "coverage": 0.0,
+      "win_rate": null
+    },
+    {
+      "band": "[0.75,0.80)",
+      "n": 0,
+      "coverage": 0.0,
+      "win_rate": null
+    },
+    {
+      "band": "[0.80,1.01)",
+      "n": 0,
+      "coverage": 0.0,
+      "win_rate": null
+    }
+  ],
+  "promotion_decision": {
+    "promote": false,
+    "reason": "No promoción automática sin dataset_v3 presente en este entorno"
+  },
+  "ia_signals_log": {
+    "exists": true,
+    "rows": 0,
+    "columns": 7,
+    "prob_col": null,
+    "result_col": null,
+    "usable": false
+  },
+  "generated_artifacts": []
+}
