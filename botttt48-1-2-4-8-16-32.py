@@ -13,6 +13,7 @@ import pandas as pd
 import time  # Added for timestamps in orden_real and BLOQUE 5
 import random  # Added for jitter in BLOQUE 1.3
 import itertools  # For req_counter in api_call
+import math
 
 # === BLINDAJE: señales limpias ===
 import signal
@@ -375,6 +376,20 @@ def _to_float(x, default=0.0):
     except Exception:
         return default
 
+def _warn_close_snapshot_insuficiente(closes, total: int = 20, min_valid: int = 10, cooldown_s: float = 120.0):
+    try:
+        valid_closes = sum(1 for c in list(closes or []) if isinstance(c, (int, float)) and math.isfinite(float(c)) and float(c) > 0.0)
+    except Exception:
+        valid_closes = 0
+    if valid_closes >= int(min_valid):
+        return
+    now = time.time()
+    last = float(globals().get("_last_warn_close_snapshot_ts", 0.0) or 0.0)
+    if (now - last) < float(cooldown_s):
+        return
+    globals()["_last_warn_close_snapshot_ts"] = now
+    print(Fore.YELLOW + f"[WARN] close_snapshot insuficiente: {valid_closes}/{int(total)}")
+
 def _extract_close_snapshot(velas, n: int = 20):
     closes = []
     try:
@@ -592,7 +607,6 @@ def write_pretrade_snapshot(
         p = float(payout) if payout not in (None, "", "nan", "NaN") else 0.0
         # si NaN/inf, lo anulamos
         try:
-            import math
             if not math.isfinite(p):
                 p = 0.0
             if not math.isfinite(monto_f):
@@ -626,6 +640,7 @@ def write_pretrade_snapshot(
         trade_uid = _build_trade_uid(epoch_val, symbol, direccion, ciclo, kwargs.get("token", "NA"), ts_iso=ts_val)
     close_snapshot = kwargs.get("close_snapshot", None)
     closes = _extract_close_snapshot(close_snapshot, n=20)
+    _warn_close_snapshot_insuficiente(closes)
 
     row_dict = {
         "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1637,7 +1652,6 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                     p = 0.0
                 # si p es NaN/inf, lo anulamos
                 try:
-                    import math
                     if not math.isfinite(p):
                         p = 0.0
                     if not math.isfinite(monto_f):
@@ -1714,6 +1728,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                         "ia_ready_ack": ia_ready_ack,
                     }
                     closes = _extract_close_snapshot(close_snapshot, n=20)
+                    _warn_close_snapshot_insuficiente(closes)
                     for i, c in enumerate(closes):
                         row_dict[f"close_{i}"] = "" if c is None else float(c)
                     _write_row_dict_atomic(ARCHIVO_CSV, row_dict)
@@ -1863,7 +1878,6 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
 
         # si p es NaN/inf, lo anulamos
         try:
-            import math
             if not math.isfinite(p):
                 p = 0.0
             if not math.isfinite(monto_f):
@@ -1934,6 +1948,7 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
                 "ia_decision_id": trade_uid_final,
             }
             closes = _extract_close_snapshot(close_snapshot, n=20)
+            _warn_close_snapshot_insuficiente(closes)
             for i, c in enumerate(closes):
                 row_dict[f"close_{i}"] = "" if c is None else float(c)
             _write_row_dict_atomic(ARCHIVO_CSV, row_dict)

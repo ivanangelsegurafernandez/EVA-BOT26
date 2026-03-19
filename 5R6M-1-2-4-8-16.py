@@ -1813,6 +1813,21 @@ def _incremental_signature_exists(ruta: str, sig: str, feats: list) -> bool:
     except Exception:
         return False
 
+# Core scalping mínimo válido para no cuarentenar filas útiles por close_* incompleto
+def _core_scalping_ready_from_row(row: dict) -> bool:
+    try:
+        keys = ("ret_1m", "slope_5m", "rv_20", "bb_z")
+        for k in keys:
+            v = row.get(k, None)
+            if v is None or (isinstance(v, str) and v.strip() == ""):
+                return False
+            vf = float(v)
+            if not np.isfinite(vf):
+                return False
+        return True
+    except Exception:
+        return False
+
 # Nueva: Validar fila para incremental (blindaje contra basura)
 def validar_fila_incremental(fila_dict, feature_names):
     close_sanitized = False
@@ -1868,7 +1883,9 @@ def validar_fila_incremental(fila_dict, feature_names):
     except Exception:
         return False, "fila_sospechosa: parse"
 
-    if close_sanitized or close_valid_count < 20:
+    close_snapshot_issue = bool(close_sanitized or close_valid_count < 20)
+    core_scalping_ready = _core_scalping_ready_from_row(fila_dict)
+    if close_snapshot_issue and (not core_scalping_ready):
         fila_dict["row_has_proxy_features"] = 1
         fila_dict["row_train_eligible"] = 0
 
@@ -3078,7 +3095,10 @@ def clip_feature_values(fila_dict, feature_names):
         else:
             clipped[feat] = float(v)
 
-    if close_sanitized:
+    close_valid_count = sum(1 for feat in feature_names if str(feat).startswith("close_") and float(clipped.get(feat, 0.0) or 0.0) > 0.0)
+    close_snapshot_issue = bool(close_sanitized or close_valid_count < 20)
+    core_scalping_ready = _core_scalping_ready_from_row(clipped)
+    if close_snapshot_issue and (not core_scalping_ready):
         clipped["row_has_proxy_features"] = 1
         clipped["row_train_eligible"] = 0
 
@@ -3216,7 +3236,8 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
         out["micro_trend_persist"] = float(np.clip(racha / 10.0, -1.0, 1.0))
         proxy_used.add("micro_trend_persist")
 
-    if len(close_vals) < 20:
+    core_scalping_ready = _core_scalping_ready_from_row(out)
+    if len(close_vals) < 20 and (not core_scalping_ready):
         proxy_used.add("close_snapshot_insuficiente")
 
     out["row_proxy_features"] = ",".join(sorted(proxy_used))
@@ -15301,15 +15322,16 @@ async def main():
                                 p = _prob_ia_operativa_bot(b, default=None)
                                 if not isinstance(p, (int, float)):
                                     continue
-                                # Primer filtro suave: evitar basura por debajo del piso operativo.
-                                piso_operativo = float(_umbral_real_operativo_actual()) if REAL_CLASSIC_GATE else float(IA_ACTIVACION_REAL_THR)
+                                # Primer filtro suave: alinear con el mismo umbral operativo/adaptativo del embudo real.
+                                ctx_pre = _ultimo_contexto_operativo_bot(b)
+                                piso_operativo, _piso_reason = _umbral_real_por_bot_contexto(b, ctx_pre, umbral_ia_real)
                                 if float(p) < float(piso_operativo):
                                     continue
 
                                 # Embudo refactor v1:
                                 # - Fase 1 selecciona campeón provisional por prob operativa.
                                 # - Los candados blandos/moduladores se evalúan después sobre top-1.
-                                regime_score = _score_regimen_contexto(_ultimo_contexto_operativo_bot(b))
+                                regime_score = _score_regimen_contexto(ctx_pre)
                                 p_post = float(p)
                                 p_rank = float(estado_bots.get(b, {}).get("ia_prob_pre_cap", p_post) or p_post)
                                 score_final = float(max(0.0, min(1.0, p_rank)))
