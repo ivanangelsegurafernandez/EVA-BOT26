@@ -9648,7 +9648,7 @@ def anexar_incremental_desde_bot(bot: str):
             return
 
         feature_names = list(INCREMENTAL_FEATURES_V2)
-        cols = feature_names + ["result_bin"]
+        cols = _canonical_incremental_cols(feature_names)
         ruta_inc = "dataset_incremental.csv"
 
         # Construir row completo + features derivadas (volatilidad/hora_bucket)
@@ -9728,6 +9728,16 @@ def anexar_incremental_desde_bot(bot: str):
         if not ok:
             agregar_evento(f"⚠️ Incremental: fila descartada ({bot}) => {reason}")
             return
+        try:
+            row_dict_full["row_has_proxy_features"] = int(float(row_dict_full.get("row_has_proxy_features", 0) or 0))
+        except Exception:
+            row_dict_full["row_has_proxy_features"] = 0
+        try:
+            row_dict_full["row_train_eligible"] = int(float(row_dict_full.get("row_train_eligible", 1) or 1))
+        except Exception:
+            row_dict_full["row_train_eligible"] = 1
+        if int(row_dict_full.get("row_has_proxy_features", 0)) == 1:
+            row_dict_full["row_train_eligible"] = 0
 
         # Firma anti-dup
         row_vals_sig = []
@@ -10211,16 +10221,6 @@ def _maybe_retrain_fallback_sklearn(force: bool = False):
         if int(mask.sum()) < int(MIN_FIT_ROWS_LOW):
             agregar_evento(f"⚠️ IA fallback: data elegible insuficiente tras filtrar proxies ({int(mask.sum())}).")
             return False
-        try:
-            row_has_proxy = int(max(row_has_proxy, int(float(fila_dict.get("row_has_proxy_features", 0) or 0))))
-        except Exception:
-            pass
-        try:
-            row_train_eligible = int(min(row_train_eligible, int(float(fila_dict.get("row_train_eligible", 1) or 1))))
-        except Exception:
-            pass
-        if row_has_proxy == 1:
-            row_train_eligible = 0
 
         X = df.loc[mask, feats].copy()
         yb = y.loc[mask].astype(int).values
@@ -12917,7 +12917,7 @@ def backfill_incremental(ultimas=500):
         except Exception:
             feature_names = list(INCREMENTAL_FEATURES_V2)
         inc = "dataset_incremental.csv"
-        cols = feature_names + ["result_bin"]
+        cols = _canonical_incremental_cols(feature_names)
 
         # 0) Reparar incremental si quedó "mutante" (header corrupto / columnas extra / mezcla de campos)
         with file_lock_required(INCREMENTAL_LOCK_FILE, timeout=6.0, stale_after=30.0) as got:
@@ -13067,6 +13067,16 @@ def backfill_incremental(ultimas=500):
 
                 # Clipping defensivo
                 fila_dict = clip_feature_values(fila_dict, feature_names)
+                try:
+                    fila_dict["row_has_proxy_features"] = int(float(fila_dict.get("row_has_proxy_features", 0) or 0))
+                except Exception:
+                    fila_dict["row_has_proxy_features"] = 0
+                try:
+                    fila_dict["row_train_eligible"] = int(float(fila_dict.get("row_train_eligible", 1) or 1))
+                except Exception:
+                    fila_dict["row_train_eligible"] = 1
+                if int(fila_dict.get("row_has_proxy_features", 0)) == 1:
+                    fila_dict["row_train_eligible"] = 0
 
                 # Evitar duplicados vía firma
                 sig = _make_sig(fila_dict)
