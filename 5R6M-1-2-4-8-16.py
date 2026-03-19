@@ -1813,6 +1813,36 @@ def _incremental_signature_exists(ruta: str, sig: str, feats: list) -> bool:
     except Exception:
         return False
 
+# Core scalping mínimo válido para no cuarentenar filas útiles por close_* incompleto
+def _core_scalping_ready_from_row(row: dict) -> bool:
+    try:
+        keys = ("ret_1m", "slope_5m", "rv_20", "bb_z")
+        for k in keys:
+            v = row.get(k, None)
+            if v is None or (isinstance(v, str) and v.strip() == ""):
+                return False
+            vf = float(v)
+            if not np.isfinite(vf):
+                return False
+        return True
+    except Exception:
+        return False
+
+def _close_snapshot_issue_from_row(row: dict, required_closes: int = 20) -> bool:
+    try:
+        need = int(required_closes)
+        valid = 0
+        for i in range(need):
+            v = row.get(f"close_{i}", None)
+            if v is None or (isinstance(v, str) and v.strip() == ""):
+                continue
+            vf = float(v)
+            if np.isfinite(vf) and vf > 0.0:
+                valid += 1
+        return bool(valid < need)
+    except Exception:
+        return True
+
 # Nueva: Validar fila para incremental (blindaje contra basura)
 def validar_fila_incremental(fila_dict, feature_names):
     close_sanitized = False
@@ -1868,7 +1898,9 @@ def validar_fila_incremental(fila_dict, feature_names):
     except Exception:
         return False, "fila_sospechosa: parse"
 
-    if close_sanitized or close_valid_count < 20:
+    close_snapshot_issue = bool(close_sanitized or close_valid_count < 20)
+    core_scalping_ready = _core_scalping_ready_from_row(fila_dict)
+    if close_snapshot_issue and (not core_scalping_ready):
         fila_dict["row_has_proxy_features"] = 1
         fila_dict["row_train_eligible"] = 0
 
@@ -1950,7 +1982,7 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
             row_train_eligible = int(float(fila_dict_or_full.get("row_train_eligible", 1) or 1))
         except Exception:
             row_train_eligible = 1
-        if row_has_proxy == 1:
+        if row_has_proxy == 1 and (not _core_scalping_ready_from_row(fila_dict_or_full)) and _close_snapshot_issue_from_row(fila_dict_or_full):
             row_train_eligible = 0
         ts_ing = fila_dict_or_full.get("ts_ingest", None)
         if ts_ing is None:
@@ -1978,7 +2010,7 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
             row_train_eligible = int(min(row_train_eligible, int(float(fila_dict.get("row_train_eligible", 1) or 1))))
         except Exception:
             pass
-        if row_has_proxy == 1:
+        if row_has_proxy == 1 and (not _core_scalping_ready_from_row(fila_dict)) and _close_snapshot_issue_from_row(fila_dict):
             row_train_eligible = 0
 
         row_vals = [float(fila_dict[k]) for k in feats]
@@ -3078,7 +3110,10 @@ def clip_feature_values(fila_dict, feature_names):
         else:
             clipped[feat] = float(v)
 
-    if close_sanitized:
+    close_valid_count = sum(1 for feat in feature_names if str(feat).startswith("close_") and float(clipped.get(feat, 0.0) or 0.0) > 0.0)
+    close_snapshot_issue = bool(close_sanitized or close_valid_count < 20)
+    core_scalping_ready = _core_scalping_ready_from_row(clipped)
+    if close_snapshot_issue and (not core_scalping_ready):
         clipped["row_has_proxy_features"] = 1
         clipped["row_train_eligible"] = 0
 
@@ -3102,8 +3137,13 @@ def _close_series_from_row_dict(row_dict: dict, min_points: int = 2) -> list[flo
 def _calc_scalping_from_close_series(close_vals: list[float]) -> dict:
     out = {}
     c = [float(v) for v in list(close_vals or []) if isinstance(v, (int, float)) or (isinstance(v, np.floating))]
+    c = [v for v in c if math.isfinite(v) and abs(v) > 1e-12]
     if len(c) >= 2 and abs(c[1]) > 1e-12:
         out["ret_1m"] = float(np.clip((c[0] - c[1]) / c[1], -1.0, 1.0))
+    if len(c) >= 4 and abs(c[3]) > 1e-12:
+        out["ret_3m"] = float(np.clip((c[0] - c[3]) / c[3], -1.0, 1.0))
+    if len(c) >= 6 and abs(c[5]) > 1e-12:
+        out["ret_5m"] = float(np.clip((c[0] - c[5]) / c[5], -1.0, 1.0))
     if len(c) >= 5:
         arr5 = np.asarray([c[4], c[3], c[2], c[1], c[0]], dtype=float)
         base = float(abs(arr5[0])) if abs(arr5[0]) > 1e-9 else float(max(abs(arr5.mean()), 1e-9))
@@ -3130,6 +3170,27 @@ def _calc_scalping_from_close_series(close_vals: list[float]) -> dict:
         else:
             bbz = 0.0
         out["bb_z"] = float(np.clip(bbz, -3.0, 3.0))
+        rng = float(np.max(arr20) - np.min(arr20))
+        out["range_norm"] = float(np.clip(rng / max(abs(float(c[0])), 1e-9), 0.0, 1.0))
+    if len(c) >= 2:
+        # Derivable con closes: tamaño de vela relativo entre cierres consecutivos (sin OHLC real).
+        out["body_ratio"] = float(np.clip(abs(float(out.get("ret_1m", 0.0))), 0.0, 1.0))
+    if len(c) >= 6:
+        # Persistencia direccional micro: balance de signos en últimos 5 pasos.
+        steps = []
+        for i in range(5):
+            den = c[i + 1]
+            if abs(den) <= 1e-12:
+                continue
+            r = (c[i] - den) / den
+            if r > 0:
+                steps.append(1.0)
+            elif r < 0:
+                steps.append(-1.0)
+            else:
+                steps.append(0.0)
+        if steps:
+            out["micro_trend_persist"] = float(np.clip(float(np.mean(np.asarray(steps, dtype=float))), -1.0, 1.0))
     return out
     
 def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
@@ -3169,7 +3230,7 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
     close_vals = _close_series_from_row_dict(out, min_points=2)
     close_calc = _calc_scalping_from_close_series(close_vals) if close_vals else {}
 
-    for k_real in ("ret_1m", "slope_5m", "rv_20", "bb_z"):
+    for k_real in ("ret_1m", "ret_3m", "ret_5m", "slope_5m", "rv_20", "bb_z", "range_norm", "body_ratio", "micro_trend_persist"):
         if k_real in close_calc:
             out[k_real] = float(close_calc[k_real])
 
@@ -3180,11 +3241,17 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
             out["ret_1m"] = float(np.clip((rsi9 - 50.0) / 50.0, -1.0, 1.0))
             proxy_used.add("ret_1m")
     if _missing("ret_3m"):
-        out["ret_3m"] = float(np.clip((rsi14 - 50.0) / 50.0, -1.0, 1.0))
-        proxy_used.add("ret_3m")
+        if "ret_3m" in close_calc:
+            out["ret_3m"] = float(close_calc["ret_3m"])
+        else:
+            out["ret_3m"] = float(np.clip((rsi14 - 50.0) / 50.0, -1.0, 1.0))
+            proxy_used.add("ret_3m")
     if _missing("ret_5m"):
-        out["ret_5m"] = float(np.clip(0.6 * float(out.get("ret_3m", 0.0)) + 0.4 * float(out.get("ret_1m", 0.0)), -1.0, 1.0))
-        proxy_used.add("ret_5m")
+        if "ret_5m" in close_calc:
+            out["ret_5m"] = float(close_calc["ret_5m"])
+        else:
+            out["ret_5m"] = float(np.clip(0.6 * float(out.get("ret_3m", 0.0)) + 0.4 * float(out.get("ret_1m", 0.0)), -1.0, 1.0))
+            proxy_used.add("ret_5m")
     if _missing("slope_5m"):
         if "slope_5m" in close_calc:
             out["slope_5m"] = float(close_calc["slope_5m"])
@@ -3198,8 +3265,11 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
             out["rv_20"] = float(np.clip(vol, 0.0, 1.0))
             proxy_used.add("rv_20")
     if _missing("range_norm"):
-        out["range_norm"] = float(np.clip(breakout, 0.0, 1.0))
-        proxy_used.add("range_norm")
+        if "range_norm" in close_calc:
+            out["range_norm"] = float(close_calc["range_norm"])
+        else:
+            out["range_norm"] = float(np.clip(breakout, 0.0, 1.0))
+            proxy_used.add("range_norm")
     if _missing("bb_z"):
         if "bb_z" in close_calc:
             out["bb_z"] = float(close_calc["bb_z"])
@@ -3207,21 +3277,30 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
             out["bb_z"] = float(np.clip((2.0 * rsi_rev) - 1.0, -3.0, 3.0))
             proxy_used.add("bb_z")
     if _missing("body_ratio"):
-        out["body_ratio"] = float(np.clip(abs(float(out.get("ret_1m", 0.0))), 0.0, 1.0))
-        proxy_used.add("body_ratio")
+        if "body_ratio" in close_calc:
+            out["body_ratio"] = float(close_calc["body_ratio"])
+        else:
+            out["body_ratio"] = float(np.clip(abs(float(out.get("ret_1m", 0.0))), 0.0, 1.0))
+            proxy_used.add("body_ratio")
     if _missing("wick_imbalance"):
         out["wick_imbalance"] = float(np.clip((2.0 * reb) - 1.0, -1.0, 1.0))
         proxy_used.add("wick_imbalance")
     if _missing("micro_trend_persist"):
-        out["micro_trend_persist"] = float(np.clip(racha / 10.0, -1.0, 1.0))
-        proxy_used.add("micro_trend_persist")
+        if "micro_trend_persist" in close_calc:
+            out["micro_trend_persist"] = float(close_calc["micro_trend_persist"])
+        else:
+            out["micro_trend_persist"] = float(np.clip(racha / 10.0, -1.0, 1.0))
+            proxy_used.add("micro_trend_persist")
 
-    if len(close_vals) < 20:
+    core_scalping_ready = _core_scalping_ready_from_row(out)
+    if len(close_vals) < 20 and (not core_scalping_ready):
         proxy_used.add("close_snapshot_insuficiente")
 
     out["row_proxy_features"] = ",".join(sorted(proxy_used))
     out["row_has_proxy_features"] = 1 if proxy_used else 0
-    out["row_train_eligible"] = 0 if proxy_used else 1
+    core_keys = {"ret_1m", "slope_5m", "rv_20", "bb_z"}
+    critical_proxy = any(k in proxy_used for k in core_keys)
+    out["row_train_eligible"] = 0 if (critical_proxy or ((len(close_vals) < 20) and (not core_scalping_ready))) else 1
 
     return out
 
@@ -5565,7 +5644,11 @@ def _leer_stats_canary_desde_log(ts_inicio: str | None) -> tuple[int, int]:
                     try:
                         dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
                     except Exception:
-                        continue
+                        try:
+                            tsf = float(ts)
+                            dt = datetime.fromtimestamp(tsf)
+                        except Exception:
+                            continue
                     if dt < dt_inicio:
                         continue
                 cerradas += 1
@@ -9737,7 +9820,8 @@ def anexar_incremental_desde_bot(bot: str):
         except Exception:
             row_dict_full["row_train_eligible"] = 1
         if int(row_dict_full.get("row_has_proxy_features", 0)) == 1:
-            row_dict_full["row_train_eligible"] = 0
+            if (not _core_scalping_ready_from_row(row_dict_full)) and _close_snapshot_issue_from_row(row_dict_full):
+                row_dict_full["row_train_eligible"] = 0
 
         # Firma anti-dup
         row_vals_sig = []
@@ -13076,7 +13160,8 @@ def backfill_incremental(ultimas=500):
                 except Exception:
                     fila_dict["row_train_eligible"] = 1
                 if int(fila_dict.get("row_has_proxy_features", 0)) == 1:
-                    fila_dict["row_train_eligible"] = 0
+                    if (not _core_scalping_ready_from_row(fila_dict)) and _close_snapshot_issue_from_row(fila_dict):
+                        fila_dict["row_train_eligible"] = 0
 
                 # Evitar duplicados vía firma
                 sig = _make_sig(fila_dict)
@@ -15301,15 +15386,16 @@ async def main():
                                 p = _prob_ia_operativa_bot(b, default=None)
                                 if not isinstance(p, (int, float)):
                                     continue
-                                # Primer filtro suave: evitar basura por debajo del piso operativo.
-                                piso_operativo = float(_umbral_real_operativo_actual()) if REAL_CLASSIC_GATE else float(IA_ACTIVACION_REAL_THR)
+                                # Primer filtro suave: alinear con el mismo umbral operativo/adaptativo del embudo real.
+                                ctx_pre = _ultimo_contexto_operativo_bot(b)
+                                piso_operativo, _piso_reason = _umbral_real_por_bot_contexto(b, ctx_pre, umbral_ia_real)
                                 if float(p) < float(piso_operativo):
                                     continue
 
                                 # Embudo refactor v1:
                                 # - Fase 1 selecciona campeón provisional por prob operativa.
                                 # - Los candados blandos/moduladores se evalúan después sobre top-1.
-                                regime_score = _score_regimen_contexto(_ultimo_contexto_operativo_bot(b))
+                                regime_score = _score_regimen_contexto(ctx_pre)
                                 p_post = float(p)
                                 p_rank = float(estado_bots.get(b, {}).get("ia_prob_pre_cap", p_post) or p_post)
                                 score_final = float(max(0.0, min(1.0, p_rank)))
