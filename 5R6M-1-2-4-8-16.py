@@ -1828,6 +1828,21 @@ def _core_scalping_ready_from_row(row: dict) -> bool:
     except Exception:
         return False
 
+def _close_snapshot_issue_from_row(row: dict, required_closes: int = 20) -> bool:
+    try:
+        need = int(required_closes)
+        valid = 0
+        for i in range(need):
+            v = row.get(f"close_{i}", None)
+            if v is None or (isinstance(v, str) and v.strip() == ""):
+                continue
+            vf = float(v)
+            if np.isfinite(vf) and vf > 0.0:
+                valid += 1
+        return bool(valid < need)
+    except Exception:
+        return True
+
 # Nueva: Validar fila para incremental (blindaje contra basura)
 def validar_fila_incremental(fila_dict, feature_names):
     close_sanitized = False
@@ -1967,7 +1982,7 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
             row_train_eligible = int(float(fila_dict_or_full.get("row_train_eligible", 1) or 1))
         except Exception:
             row_train_eligible = 1
-        if row_has_proxy == 1:
+        if row_has_proxy == 1 and (not _core_scalping_ready_from_row(fila_dict_or_full)) and _close_snapshot_issue_from_row(fila_dict_or_full):
             row_train_eligible = 0
         ts_ing = fila_dict_or_full.get("ts_ingest", None)
         if ts_ing is None:
@@ -1995,7 +2010,7 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
             row_train_eligible = int(min(row_train_eligible, int(float(fila_dict.get("row_train_eligible", 1) or 1))))
         except Exception:
             pass
-        if row_has_proxy == 1:
+        if row_has_proxy == 1 and (not _core_scalping_ready_from_row(fila_dict)) and _close_snapshot_issue_from_row(fila_dict):
             row_train_eligible = 0
 
         row_vals = [float(fila_dict[k]) for k in feats]
@@ -9805,7 +9820,8 @@ def anexar_incremental_desde_bot(bot: str):
         except Exception:
             row_dict_full["row_train_eligible"] = 1
         if int(row_dict_full.get("row_has_proxy_features", 0)) == 1:
-            row_dict_full["row_train_eligible"] = 0
+            if (not _core_scalping_ready_from_row(row_dict_full)) and _close_snapshot_issue_from_row(row_dict_full):
+                row_dict_full["row_train_eligible"] = 0
 
         # Firma anti-dup
         row_vals_sig = []
@@ -13144,7 +13160,8 @@ def backfill_incremental(ultimas=500):
                 except Exception:
                     fila_dict["row_train_eligible"] = 1
                 if int(fila_dict.get("row_has_proxy_features", 0)) == 1:
-                    fila_dict["row_train_eligible"] = 0
+                    if (not _core_scalping_ready_from_row(fila_dict)) and _close_snapshot_issue_from_row(fila_dict):
+                        fila_dict["row_train_eligible"] = 0
 
                 # Evitar duplicados vía firma
                 sig = _make_sig(fila_dict)
