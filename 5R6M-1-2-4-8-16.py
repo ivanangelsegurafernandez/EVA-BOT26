@@ -9648,7 +9648,7 @@ def anexar_incremental_desde_bot(bot: str):
             return
 
         feature_names = list(INCREMENTAL_FEATURES_V2)
-        cols = feature_names + ["result_bin"]
+        cols = _canonical_incremental_cols(feature_names)
         ruta_inc = "dataset_incremental.csv"
 
         # Construir row completo + features derivadas (volatilidad/hora_bucket)
@@ -9728,6 +9728,16 @@ def anexar_incremental_desde_bot(bot: str):
         if not ok:
             agregar_evento(f"⚠️ Incremental: fila descartada ({bot}) => {reason}")
             return
+        try:
+            row_dict_full["row_has_proxy_features"] = int(float(row_dict_full.get("row_has_proxy_features", 0) or 0))
+        except Exception:
+            row_dict_full["row_has_proxy_features"] = 0
+        try:
+            row_dict_full["row_train_eligible"] = int(float(row_dict_full.get("row_train_eligible", 1) or 1))
+        except Exception:
+            row_dict_full["row_train_eligible"] = 1
+        if int(row_dict_full.get("row_has_proxy_features", 0)) == 1:
+            row_dict_full["row_train_eligible"] = 0
 
         # Firma anti-dup
         row_vals_sig = []
