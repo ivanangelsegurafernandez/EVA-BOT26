@@ -356,6 +356,8 @@ CSV_HEADER = [
     "ia_modo_ack",
     "ia_ready_ack"
 ]
+CLOSE_SNAPSHOT_COLS = [f"close_{i}" for i in range(20)]
+CSV_HEADER = CSV_HEADER + CLOSE_SNAPSHOT_COLS
 # =============================================================================
 # CSV — helpers robustos (evita columnas corridas + asegura puntaje 0..1)
 # =============================================================================
@@ -372,6 +374,33 @@ def _to_float(x, default=0.0):
         return float(x)
     except Exception:
         return default
+
+def _extract_close_snapshot(velas, n: int = 20):
+    closes = []
+    try:
+        seq = list(velas or [])
+        if not seq:
+            return [None] * int(n)
+        seq = seq[-int(n):]
+        seq = list(reversed(seq))  # close_0 = más reciente
+        for v in seq:
+            c = None
+            if isinstance(v, dict):
+                c = v.get("close", v.get("c"))
+            elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                c = v
+            else:
+                c = None
+            try:
+                cf = float(c)
+                closes.append(cf if math.isfinite(cf) else None)
+            except Exception:
+                closes.append(None)
+        while len(closes) < int(n):
+            closes.append(None)
+    except Exception:
+        closes = [None] * int(n)
+    return closes[:int(n)]
 
 def _norm_puntaje_01(condiciones, total_cond=3):
     """
@@ -408,6 +437,66 @@ def _write_row_dict_atomic(archivo_csv: str, row_dict: dict):
     """
     row = [row_dict.get(col, "") for col in CSV_HEADER]
     write_csv_atomic(archivo_csv, row)
+
+def _build_trade_uid(epoch_val, symbol, direccion, ciclo, token, ts_iso=None):
+    try:
+        ep = int(float(epoch_val or 0))
+    except Exception:
+        ep = int(time.time())
+    cyc = int(ciclo) if ciclo is not None else 1
+    sym = str(symbol or "").strip().upper()
+    direc = str(direccion or "").strip().upper()
+    tok = str(token or "NA").strip().upper()
+    ts_part = str(ts_iso or "").strip()
+    return f"{NOMBRE_BOT}|{ep}|C{cyc}|{sym}|{direc}|{tok}|{ts_part}"
+
+def _trade_key_from_row(row: dict) -> str:
+    rid = str((row or {}).get("ia_decision_id", "") or "").strip()
+    if rid:
+        return rid
+    parts = [
+        str((row or {}).get("activo", "") or "").strip().upper(),
+        str((row or {}).get("direction", "") or "").strip().upper(),
+        str((row or {}).get("epoch", "") or "").strip(),
+        str((row or {}).get("ciclo_martingala", "") or "").strip(),
+        str((row or {}).get("ts", "") or "").strip(),
+    ]
+    return "|".join(parts)
+
+def _audit_csv_trade_metrics(archivo_csv: str) -> tuple[int, int, int]:
+    try:
+        rec = {}
+        with open(archivo_csv, "r", encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                status = str(row.get("trade_status", "")).strip().upper()
+                if status not in {"PRE_TRADE", "PENDIENTE", "CERRADO"}:
+                    continue
+                key = _trade_key_from_row(row)
+                if not key:
+                    continue
+                cur = rec.get(key, {"has_pre": False, "has_close": False, "rb": "", "ts": ""})
+                cur["has_pre"] = bool(cur["has_pre"] or status in {"PRE_TRADE", "PENDIENTE"})
+                if status == "CERRADO":
+                    cur["has_close"] = True
+                    cur["rb"] = str(row.get("result_bin", "")).strip()
+                cur["ts"] = str(row.get("ts", cur.get("ts", "")) or cur.get("ts", ""))
+                rec[key] = cur
+
+        total_cerrados = 0
+        ganancias = 0
+        pendientes = 0
+        for v in rec.values():
+            rb = str(v.get("rb", "")).strip()
+            if bool(v.get("has_close", False)) and rb in {"0", "1"}:
+                total_cerrados += 1
+                if rb == "1":
+                    ganancias += 1
+            elif bool(v.get("has_pre", False)):
+                pendientes += 1
+        return int(total_cerrados), int(ganancias), int(pendientes)
+    except Exception:
+        return 0, 0, 0
 
 # === FIN HEADER FINAL ===
 def write_pretrade_snapshot(
@@ -532,6 +621,11 @@ def write_pretrade_snapshot(
     now = datetime.now(timezone.utc)
     epoch_val = int(now.timestamp())
     ts_val = now.isoformat()
+    trade_uid = str(kwargs.get("trade_uid", "") or "").strip()
+    if not trade_uid:
+        trade_uid = _build_trade_uid(epoch_val, symbol, direccion, ciclo, kwargs.get("token", "NA"), ts_iso=ts_val)
+    close_snapshot = kwargs.get("close_snapshot", None)
+    closes = _extract_close_snapshot(close_snapshot, n=20)
 
     row_dict = {
         "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -559,11 +653,13 @@ def write_pretrade_snapshot(
         "ts": ts_val,
         "ia_prob_en_juego": "",
         "ia_prob_source": "",
-        "ia_decision_id": f"{NOMBRE_BOT}|{int(epoch_val)}|C{int(ciclo) if ciclo is not None else 1}|{symbol}|{direccion}|{str(kwargs.get('token', 'NA')).upper()}",
+        "ia_decision_id": trade_uid,
         "ia_gate_real": "",
         "ia_modo_ack": "",
         "ia_ready_ack": "",
     }
+    for i, c in enumerate(closes):
+        row_dict[f"close_{i}"] = "" if c is None else float(c)
 
     _write_row_dict_atomic(archivo_csv, row_dict)
     return epoch_val
@@ -1381,7 +1477,7 @@ async def buscar_estrategia(ws, ciclo, token):
     print(Fore.MAGENTA + Style.BRIGHT + f"\nBuscando señal válida para Martingala #{ciclo}")
     for intento in range(1, 11):
         if reinicio_forzado.is_set():
-            return "REINTENTAR", None, None, None, None, None, None, None, None, None
+            return "REINTENTAR", None, None, None, None, None, None, None, None, None, None
         if MODO_SILENCIOSO and estado_bot.get("modo_manual"):
             if intento in (1, 5, 10):
                 print(Fore.YELLOW + f"Intento #{intento} (silencioso)...")
@@ -1394,7 +1490,7 @@ async def buscar_estrategia(ws, ciclo, token):
             velas = await obtener_velas(ws, symbol, token, reintentos=4)
             await asyncio.sleep(0.12 + random.uniform(0.0, 0.18))
             if reinicio_forzado.is_set():
-                return "REINTENTAR", None, None, None, None, None, None, None, None, None
+                return "REINTENTAR", None, None, None, None, None, None, None, None, None, None
             try:
                 if len(velas) < VELAS:
                     activos_invalidos.append(symbol)
@@ -1403,7 +1499,8 @@ async def buscar_estrategia(ws, ciclo, token):
                 if condiciones >= 2:
                     score = puntuar_setups(condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion)
                     if setup_pasa_filtro(score, condiciones):
-                        mejores.append((score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion))
+                        close_snapshot = _extract_close_snapshot(velas, n=20)
+                        mejores.append((score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion, close_snapshot))
                     else:
                         activos_invalidos.append(symbol)
                 else:
@@ -1414,10 +1511,10 @@ async def buscar_estrategia(ws, ciclo, token):
         if mejores:
             # Prioridad: mayor score; desempate por más condiciones
             mejores.sort(key=lambda x: (x[0], x[1]), reverse=True)
-            score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion = mejores[0]
+            score, condiciones, symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion, close_snapshot = mejores[0]
             estado_bot["score_senal"] = float(score)
             print(Fore.GREEN + Style.BRIGHT + f"Estrategia válida en {symbol} | Dirección: {direccion} | Condiciones: {condiciones}/3 | Score={score:.3f}")
-            return symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion
+            return symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion, close_snapshot
 
         if errores_intento:
             print(Fore.RED + f"Error WS en activos: {', '.join(errores_intento)} | Intento #{intento}")
@@ -1441,9 +1538,9 @@ async def buscar_estrategia(ws, ciclo, token):
     except Exception:
         pass
     await asyncio.sleep(30)
-    return "REINTENTAR", None, None, None, None, None, None, None, None, None
+    return "REINTENTAR", None, None, None, None, None, None, None, None, None, None
 
-async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion, ciclo, payout, condiciones, token_usado_buy, epoch_pretrade=None):
+async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion, ciclo, payout, condiciones, token_usado_buy, epoch_pretrade=None, trade_uid=None, close_snapshot=None):
     # ✅ SIEMPRE cerramos/logueamos con el token real del BUY (aunque el maestro cambie token_actual.txt)
     token_antes = token_usado_buy
     print(Fore.CYAN + "=" * 80)
@@ -1458,7 +1555,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                 asyncio.create_task(finalizar_contrato_bg(
                     contract_id, remaining, symbol, direccion, monto,
                     rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
-                    ciclo, payout, condiciones, token_antes, epoch_pretrade=epoch_pretrade
+                    ciclo, payout, condiciones, token_antes, epoch_pretrade=epoch_pretrade, trade_uid=trade_uid, close_snapshot=close_snapshot
                 ))
                 estado_bot["interrumpir_ciclo"] = False
                 estado_bot["ciclo_en_progreso"] = False
@@ -1582,6 +1679,9 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                     else:
                         ia_prob_source = ia_prob_source or "NO_READY"
 
+                    trade_uid_final = str(trade_uid or "").strip()
+                    if not trade_uid_final:
+                        trade_uid_final = _build_trade_uid(epoch_val, symbol, direccion, ciclo, token_antes, ts_iso=ts_val)
                     row_dict = {
                         "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "activo": symbol,
@@ -1608,31 +1708,21 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                         "ts": ts_val,
                         "ia_prob_en_juego": ia_prob_en_juego,
                         "ia_prob_source": ia_prob_source,
-                        "ia_decision_id": ack_ctx.get("ia_decision_id", f"{NOMBRE_BOT}|{int(epoch_val)}"),
+                        "ia_decision_id": trade_uid_final,
                         "ia_gate_real": ack_ctx.get("ia_gate_real", ""),
                         "ia_modo_ack": ack_ctx.get("ia_modo_ack", ""),
                         "ia_ready_ack": ia_ready_ack,
                     }
+                    closes = _extract_close_snapshot(close_snapshot, n=20)
+                    for i, c in enumerate(closes):
+                        row_dict[f"close_{i}"] = "" if c is None else float(c)
                     _write_row_dict_atomic(ARCHIVO_CSV, row_dict)
 
             except Exception as csv_e:
                 print(Fore.RED + f"[ERROR] al escribir CSV: {csv_e}")
             # Calcular y mostrar % de éxito acumulado (solo cierres auditables)
             try:
-                total_cerrados = 0
-                ganancias = 0
-                pendientes = 0
-                with open(ARCHIVO_CSV, "r", encoding="utf-8", newline="") as fh:
-                    reader = csv.DictReader(fh)
-                    for row in reader:
-                        status = str(row.get("trade_status", "")).strip().upper()
-                        rb = str(row.get("result_bin", "")).strip()
-                        if status == "CERRADO" and rb in {"0", "1"}:
-                            total_cerrados += 1
-                            if rb == "1":
-                                ganancias += 1
-                        elif status in {"PRE_TRADE", "PENDIENTE"}:
-                            pendientes += 1
+                total_cerrados, ganancias, pendientes = _audit_csv_trade_metrics(ARCHIVO_CSV)
 
                 if total_cerrados:
                     porcentaje_exito = (ganancias / total_cerrados) * 100
@@ -1686,7 +1776,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
 
 async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto,
                                 rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
-                                ciclo, payout, condiciones, token_usado, epoch_pretrade=None):
+                                ciclo, payout, condiciones, token_usado, epoch_pretrade=None, trade_uid=None, close_snapshot=None):
     """
     Finaliza un contrato en background cuando hubo cambio de token / reinicio.
     Importante IA:
@@ -1814,6 +1904,9 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
             except Exception:
                 payout_mult_f = 0.0
             puntaje01 = _norm_puntaje_01(condiciones)  # helper REAL del bot
+            trade_uid_final = str(trade_uid or "").strip()
+            if not trade_uid_final:
+                trade_uid_final = _build_trade_uid(epoch_val, symbol, direccion, ciclo, token_usado, ts_iso=ts_val)
             row_dict = {
                 "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "activo": symbol,
@@ -1838,7 +1931,11 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
                 "trade_status": "CERRADO",
                 "epoch": int(epoch_val),
                 "ts": ts_val,
+                "ia_decision_id": trade_uid_final,
             }
+            closes = _extract_close_snapshot(close_snapshot, n=20)
+            for i, c in enumerate(closes):
+                row_dict[f"close_{i}"] = "" if c is None else float(c)
             _write_row_dict_atomic(ARCHIVO_CSV, row_dict)
         # === Logs ===
         msg = Fore.CYAN + f"Contrato #{contract_id} finalizado en background: {resultado} {profit:.2f} USD"
@@ -2077,7 +2174,7 @@ async def ejecutar_panel():
                     await asyncio.sleep(0.6 + random.uniform(0.0, 0.5))
 
                 # ========= BUSCAR SEÑAL =========
-                symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion = await buscar_estrategia(ws, ciclo, current_token)
+                symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion, close_snapshot = await buscar_estrategia(ws, ciclo, current_token)
 
                 if symbol == "REINTENTAR" or symbol is None:
                     continue
@@ -2200,6 +2297,9 @@ async def ejecutar_panel():
                 print(Fore.CYAN + Style.BRIGHT + f"[{symbol}] Martingala #{ciclo} - {direccion} - {monto} USD")
                 # === PRE-TRADE SNAPSHOT (para inferencia real del Maestro) ===
                 epoch_pre = None
+                now_pre = datetime.now(timezone.utc)
+                ts_pre = now_pre.isoformat()
+                trade_uid = _build_trade_uid(int(now_pre.timestamp()), symbol, direccion, ciclo, current_token, ts_iso=ts_pre)
                 try:
                     # es_rebote PRE-TRADE: venías de 4+ pérdidas ANTES de este trade
                     es_rebote_pre = 1.0 if int(racha_actual_bot) <= -4 else 0.0
@@ -2223,6 +2323,8 @@ async def ejecutar_panel():
                         payout=float(payout),
                         puntaje_estrategia=float(condiciones),  # tu score
                         token=current_token,
+                        trade_uid=trade_uid,
+                        close_snapshot=close_snapshot,
                     )
                 except Exception:
                     epoch_pre = None
@@ -2363,7 +2465,7 @@ async def ejecutar_panel():
                 resultado, profit = await esperar_resultado(
                     ws, contract_id, symbol, direccion, monto,
                     rsi9, rsi14, sma5, sma20, cruce, breakout, rsi_reversion,
-                    ciclo, payout, condiciones, current_token, epoch_pre
+                    ciclo, payout, condiciones, current_token, epoch_pre, trade_uid=trade_uid, close_snapshot=close_snapshot
                 )
 
                 if resultado == "INDEFINIDO":
