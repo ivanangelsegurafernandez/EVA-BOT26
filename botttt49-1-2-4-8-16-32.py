@@ -387,7 +387,7 @@ def _extract_close_snapshot(velas, n: int = 20):
             c = None
             if isinstance(v, dict):
                 c = v.get("close", v.get("c"))
-            elif isinstance(v, (int, float)):
+            elif isinstance(v, (int, float)) and not isinstance(v, bool):
                 c = v
             else:
                 c = None
