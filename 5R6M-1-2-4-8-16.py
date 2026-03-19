@@ -467,9 +467,9 @@ REAL_MICRO_ALLOW_SOFT_HIGH_PROB = False
 REAL_MICRO_SOFT_MIN_PROB = 0.66
 REAL_MICRO_SOFT_MIN_SUCESO = 18.0
 REAL_MICRO_SOFT_MIN_WR = 0.47
-REAL_SHADOW_MICRO_ENABLE = False
+REAL_SHADOW_MICRO_ENABLE = True
 REAL_SHADOW_MICRO_MIN_PROB = 0.60
-REAL_SHADOW_MICRO_MAX_ENTRIES = 4
+REAL_SHADOW_MICRO_MAX_ENTRIES = 2
 REAL_SHADOW_MICRO_WINDOW_S = 15 * 60
 REAL_SHADOW_MICRO_TOP_K = 1
 REAL_SHADOW_MICRO_LOG_COOLDOWN_S = 20.0
@@ -14116,6 +14116,16 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
             risk_mode = "WAIT_SOFT"
             soft_wait_reason = "cooldown"
             reason = "cooldown"
+
+        if estado_real == "SHADOW" and decision in (EMBUDO_FINAL_WAIT_SOFT, EMBUDO_FINAL_SHADOW_OK):
+            ok_shadow_micro, why_shadow_micro = _shadow_micro_gate_ok(candidatos, dgate)
+            if ok_shadow_micro:
+                decision = EMBUDO_FINAL_REAL_MICRO
+                risk_mode = "REAL_MICRO"
+                reason = "shadow_micro_gate"
+                soft_wait_reason = ""
+                if degrade_from == "none":
+                    degrade_from = "shadow_micro_gate"
 
         if estado_real == "SHADOW" and decision in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO):
             decision = EMBUDO_FINAL_REAL_MICRO if decision == EMBUDO_FINAL_REAL_NORMAL else decision
