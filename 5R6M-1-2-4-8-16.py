@@ -8654,8 +8654,10 @@ def _enriquecer_df_con_derivadas(df: pd.DataFrame, feats: list[str]) -> pd.DataF
         close_real_5 = close_real_2 & c2.notna() & c3.notna() & c4.notna()
         close_cols_20 = [_close_col_num(i) for i in range(20)]
         close_real_20 = pd.Series(True, index=out.index, dtype=bool)
+        close_valid_20 = pd.Series(True, index=out.index, dtype=bool)
         for cc in close_cols_20:
             close_real_20 &= cc.notna()
+            close_valid_20 &= cc.notna() & np.isfinite(cc) & (cc > 0.0)
         if any(f"close_{i}" in out.columns for i in range(20)):
             row_proxy = row_proxy | (~close_real_20)
 
@@ -8717,7 +8719,20 @@ def _enriquecer_df_con_derivadas(df: pd.DataFrame, feats: list[str]) -> pd.DataF
             _fill_proxy_if_missing("micro_trend_persist", (_col_num("racha_actual", 0.0) / 10.0).clip(lower=-1.0, upper=1.0))
 
         out["row_has_proxy_features"] = row_proxy.astype(int)
-        out["row_train_eligible"] = (~row_proxy).astype(int)
+
+        ret_1m_s = pd.to_numeric(out.get("ret_1m", np.nan), errors="coerce")
+        slope_5m_s = pd.to_numeric(out.get("slope_5m", np.nan), errors="coerce")
+        rv_20_s = pd.to_numeric(out.get("rv_20", np.nan), errors="coerce")
+        bb_z_s = pd.to_numeric(out.get("bb_z", np.nan), errors="coerce")
+        core_scalping_ready = (
+            ret_1m_s.notna() & np.isfinite(ret_1m_s) & (ret_1m_s >= -1.0) & (ret_1m_s <= 1.0)
+            & slope_5m_s.notna() & np.isfinite(slope_5m_s) & (slope_5m_s >= -1.0) & (slope_5m_s <= 1.0)
+            & rv_20_s.notna() & np.isfinite(rv_20_s) & (rv_20_s >= 0.0) & (rv_20_s <= 1.0)
+            & bb_z_s.notna() & np.isfinite(bb_z_s) & (bb_z_s >= -3.0) & (bb_z_s <= 3.0)
+        )
+        close_snapshot_issue = ~close_valid_20
+        force_no_train = row_proxy & close_snapshot_issue & (~core_scalping_ready)
+        out["row_train_eligible"] = (~force_no_train).astype(int)
 
         return out
     except Exception:
@@ -13074,6 +13089,17 @@ def backfill_incremental(ultimas=500):
 
                 # Diccionario completo para helpers enriquecidos
                 row_dict_full = r.to_dict()
+                for i in range(20):
+                    ck = f"close_{i}"
+                    try:
+                        cv = row_dict_full.get(ck, None)
+                        if cv is None or (isinstance(cv, str) and cv.strip() == ""):
+                            continue
+                        cf = float(cv)
+                        if math.isfinite(cf) and cf > 0.0:
+                            fila[ck] = float(cf)
+                    except Exception:
+                        continue
 
                                 # ==========================
                 # payout normalizado (ROI 0–1.5 aprox)
@@ -13141,6 +13167,7 @@ def backfill_incremental(ultimas=500):
                 label = 1 if r["resultado_norm"] == "GANANCIA" else 0
                 fila_dict = fila.copy()
                 fila_dict["result_bin"] = label
+                fila_dict = _enriquecer_scalping_features_row(fila_dict)
 
                 # Validación defensiva
                 valid, reason = validar_fila_incremental(fila_dict, feature_names)
