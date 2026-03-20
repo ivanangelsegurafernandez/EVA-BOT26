@@ -13167,6 +13167,7 @@ def backfill_incremental(ultimas=500):
                 label = 1 if r["resultado_norm"] == "GANANCIA" else 0
                 fila_dict = fila.copy()
                 fila_dict["result_bin"] = label
+                fila_dict = _enriquecer_scalping_features_row(fila_dict)
 
                 # Validación defensiva
                 valid, reason = validar_fila_incremental(fila_dict, feature_names)
