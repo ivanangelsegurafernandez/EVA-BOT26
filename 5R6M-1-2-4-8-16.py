@@ -237,7 +237,7 @@ IA_ACTIVACION_REAL_THR_POST_N15 = 0.58  # post-n15: bajar piso operativo para de
 # En modo unreliable (reliable=false), permitir piso post-n15 más realista para no congelar entradas.
 IA_ACTIVACION_REAL_THR_POST_N15_UNREL = 0.56
 IA_ACTIVACION_REAL_THR_POST_N15_UNREL_MIN_SAMPLES = 300
-IA_ACTIVACION_REAL_MIN_N_POR_BOT = 15   # condición: todos los bots deben tener al menos n=15
+IA_ACTIVACION_REAL_MIN_N_POR_BOT = 5   # condición: todos los bots deben tener al menos n=5
 
 # --- Oráculo visual ---
 ORACULO_THR_MIN   = IA_ACTIVACION_REAL_THR
@@ -328,16 +328,16 @@ IA_WARMUP_LOW_EVIDENCE_CAP_POST_N15 = 0.85
 
 AUTO_REAL_ALLOW_UNRELIABLE_POST_N15 = True
 AUTO_REAL_UNRELIABLE_MIN_N = 0
-AUTO_REAL_UNRELIABLE_MIN_PROB = 0.56  # modo unreliable conservador: exige mejor discriminación antes de REAL
+AUTO_REAL_UNRELIABLE_MIN_PROB = 0.54  # modo unreliable conservador: exige mejor discriminación antes de REAL
 AUTO_REAL_UNRELIABLE_MIN_AUC = 0.52   # unreliable conservador: evita activaciones con AUC marginal débil
-AUTO_REAL_BLOCK_WHEN_WARMUP = True   # bloquear REAL en warmup: solo observación/shadow-micro prudente
+AUTO_REAL_BLOCK_WHEN_WARMUP = False   # no bloquear REAL por warmup (perfil prueba protegida)
 # Ajuste mínimo anti-congelamiento lateral: permite bajar el umbral UNREL
 # solo cuando hay evidencia operativa consistente por bot.
 AUTO_REAL_UNREL_LATERAL_ADAPT_ENABLE = True
 AUTO_REAL_UNREL_LATERAL_MIN_N = 50
 AUTO_REAL_UNREL_LATERAL_MIN_WR = 0.50
 AUTO_REAL_UNREL_LATERAL_MIN_PROB = 0.50
-AUTO_REAL_UNRELIABLE_FLOOR = 0.52      # piso REAL temporal cuando reliable=false y ya hay n mínimo por bot
+AUTO_REAL_UNRELIABLE_FLOOR = 0.51      # piso REAL temporal cuando reliable=false y ya hay n mínimo por bot
 # Micro-relajación gradual del umbral UNREL basada en cierres auditados reales.
 # Solo aplica cuando ya hay muestra suficiente y rendimiento sostenido.
 AUTO_REAL_UNREL_MICRO_RELAX_ENABLE = True
@@ -347,7 +347,7 @@ AUTO_REAL_UNREL_MICRO_RELAX_MAX_DELTA = 0.02
 AUTO_REAL_UNREL_MICRO_RELAX_LOG_COOLDOWN_S = 45.0
 # Bypass controlado: si la compuerta REAL ya está sólida en vivo, permitir AUTO
 # aunque el modelo siga en warmup/reliable=false.
-AUTO_REAL_UNRELIABLE_ALLOW_STRONG_GATE = False
+AUTO_REAL_UNRELIABLE_ALLOW_STRONG_GATE = True
 AUTO_REAL_UNRELIABLE_GATE_MIN_PROB = IA_ACTIVACION_REAL_THR_POST_N15
 
 # Guardas por bot para reducir desalineación Prob IA vs % Éxito observado en HUD.
@@ -369,9 +369,9 @@ GATE_SEGMENTO_LOOKBACK = 240
 # Candados inteligentes: evita bloqueos rígidos en empates/planicies cuando ya
 # hay evidencia real robusta de un bot claramente apto.
 SMART_LOCKS_ENABLE = True
-SMART_CLONE_OVERRIDE_MIN_N = 120
-SMART_CLONE_OVERRIDE_MIN_LB = 0.58
-SMART_CLONE_OVERRIDE_MIN_PROB = 0.78
+SMART_CLONE_OVERRIDE_MIN_N = 20
+SMART_CLONE_OVERRIDE_MIN_LB = 0.53
+SMART_CLONE_OVERRIDE_MIN_PROB = 0.62
 SMART_CLONE_OVERRIDE_MIN_GAP = 0.002
 
 # Embudo IA en 2 capas: A=régimen (tradeable), B=prob fina (modelo)
@@ -456,27 +456,27 @@ PATTERN_V1_Q2_PROXY = {
 PATTERN_V1_LAST_LOG_TS = {}
 # Fase operativa REAL por madurez: SHADOW -> MICRO -> NORMAL
 REAL_PILOT_MODE_ENABLE = True
-REAL_MICRO_REQUIRE_PATTERN = True
+REAL_MICRO_REQUIRE_PATTERN = False
 REAL_MICRO_PATTERN_MIN_TOTAL = 4.0
 REAL_MICRO_REQUIRE_DUAL = False
-REAL_MICRO_REQUIRE_STRUCTURE = True
+REAL_MICRO_REQUIRE_STRUCTURE = False
 REAL_MICRO_MIN_WR = 0.50
 REAL_MICRO_MIN_TRADES = 40
 REAL_MICRO_TOP_K = 1
-REAL_MICRO_ALLOW_SOFT_HIGH_PROB = False
-REAL_MICRO_SOFT_MIN_PROB = 0.66
+REAL_MICRO_ALLOW_SOFT_HIGH_PROB = True
+REAL_MICRO_SOFT_MIN_PROB = 0.58
 REAL_MICRO_SOFT_MIN_SUCESO = 18.0
 REAL_MICRO_SOFT_MIN_WR = 0.47
 REAL_SHADOW_MICRO_ENABLE = True
-REAL_SHADOW_MICRO_MIN_PROB = 0.60
-REAL_SHADOW_MICRO_MAX_ENTRIES = 2
-REAL_SHADOW_MICRO_WINDOW_S = 15 * 60
+REAL_SHADOW_MICRO_MIN_PROB = 0.56
+REAL_SHADOW_MICRO_MAX_ENTRIES = 6
+REAL_SHADOW_MICRO_WINDOW_S = 300
 REAL_SHADOW_MICRO_TOP_K = 1
 REAL_SHADOW_MICRO_LOG_COOLDOWN_S = 20.0
 _REAL_SHADOW_MICRO_OPEN_TS = deque(maxlen=64)
 _REAL_SHADOW_MICRO_LAST_LOG_TS = 0.0
-REAL_MICRO_STRONG_GATE_FALLBACK_ENABLE = False
-REAL_MICRO_STRONG_GATE_MIN_PROB = 0.64
+REAL_MICRO_STRONG_GATE_FALLBACK_ENABLE = True
+REAL_MICRO_STRONG_GATE_MIN_PROB = 0.60
 EMBUDO_FINAL_BLOCK_HARD = "BLOCK_HARD"
 EMBUDO_FINAL_WAIT_SOFT = "WAIT_SOFT"
 EMBUDO_FINAL_REAL_MICRO = "REAL_MICRO"
