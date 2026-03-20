@@ -402,12 +402,12 @@ def _extract_close_snapshot(velas, n: int = 20):
             c = None
             if isinstance(v, dict):
                 c = v.get("close", v.get("c"))
-            elif isinstance(v, (int, float)) and not isinstance(v, bool):
-                c = v
+            elif isinstance(v, bool):
+                c = None
             elif isinstance(v, str):
                 c = v.strip()
             else:
-                c = None
+                c = v
             try:
                 cf = float(c)
                 closes.append(cf if math.isfinite(cf) else None)
