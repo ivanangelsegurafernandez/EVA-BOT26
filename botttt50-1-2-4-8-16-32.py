@@ -138,14 +138,14 @@ ACTIVOS = ["1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
 MARTINGALA_DEMO = [1, 2, 4, 8, 16, 32]
 MARTINGALA_REAL = [1, 2, 4, 8, 16, 32]
 VELAS = 20
-PAUSA_POST_OPERACION_S = 40  # Pausa uniforme tras cada operación con resultado definido (BLOQUE 1)
+PAUSA_POST_OPERACION_S = 8  # Pausa uniforme tras cada operación con resultado definido (BLOQUE 1)
 # ==================== VENTANA DE DECISIÓN IA ====================
 # Objetivo: dar tiempo al MAESTRO + humano para decidir pasar a REAL ANTES del BUY.
 # (0 para desactivar)
-VENTANA_DECISION_IA_S = 60        # segundos
+VENTANA_DECISION_IA_S = 12        # segundos
 VENTANA_DECISION_IA_POLL_S = 0.10 # granularidad de espera
 # === Filtro avanzado (sin cambiar 13 features) ===
-SCORE_MIN = 2.80            # score mínimo para aceptar un setup
+SCORE_MIN = 2.35            # score mínimo para aceptar un setup
 SCORE_DROP_MAX = 0.70       # caída máxima tolerada al revalidar pre-buy
 REVALIDAR_VELAS_N = 8       # velas mínimas para revalidación rápida
 resultado_global = {"demo": 0.0, "real": 0.0}
@@ -174,7 +174,7 @@ saldo_real_last = 0.0
 real_activado_en_bot = 0.0  # BLOQUE 5: Global for activation timestamp
 
 # BLOQUE 2: Commit guard for REAL operations
-REAL_COMMIT_WINDOW_S = 75
+REAL_COMMIT_WINDOW_S = 20
 last_real_contract_id = None
 real_buy_commit_until = 0.0
 
