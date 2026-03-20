@@ -13089,6 +13089,17 @@ def backfill_incremental(ultimas=500):
 
                 # Diccionario completo para helpers enriquecidos
                 row_dict_full = r.to_dict()
+                for i in range(20):
+                    ck = f"close_{i}"
+                    try:
+                        cv = row_dict_full.get(ck, None)
+                        if cv is None or (isinstance(cv, str) and cv.strip() == ""):
+                            continue
+                        cf = float(cv)
+                        if math.isfinite(cf) and cf > 0.0:
+                            fila[ck] = float(cf)
+                    except Exception:
+                        continue
 
                                 # ==========================
                 # payout normalizado (ROI 0–1.5 aprox)
