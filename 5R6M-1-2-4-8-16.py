@@ -366,6 +366,33 @@ GATE_SEGMENTO_MIN_MUESTRA = 35
 GATE_SEGMENTO_MIN_WR = 0.50
 GATE_SEGMENTO_LOOKBACK = 240
 
+# Filtro horario configurable (quirúrgico, sin romper embudo/base strategy).
+# mode: normal | harden | pause
+TIMEZONE_OFFSET_HOURS = 0  # UTC por defecto; ajustar a sesión operativa real si aplica.
+HOURLY_POLICY = [
+    {"start": 0, "end": 5, "mode": "pause", "score_delta": 0.00, "extra_floor_delta": 0.00, "tag": "madrugada_pause"},
+    {"start": 5, "end": 8, "mode": "harden", "score_delta": -0.04, "extra_floor_delta": 0.02, "tag": "preopen_harden"},
+    {"start": 8, "end": 20, "mode": "normal", "score_delta": 0.00, "extra_floor_delta": 0.00, "tag": "core_normal"},
+    {"start": 20, "end": 24, "mode": "harden", "score_delta": -0.03, "extra_floor_delta": 0.01, "tag": "late_harden"},
+]
+
+# Cooldown dinámico por activo (temporal, no expulsión permanente).
+ASSET_COOLDOWN_ENABLE = True
+ASSET_COOLDOWN_BASE_S = 45 * 60
+ASSET_COOLDOWN_MAX_S = 3 * 60 * 60
+ASSET_COOLDOWN_TRIGGER_LOSS_STREAK = 4
+ASSET_COOLDOWN_TRIGGER_ROLL_WR_MIN = 0.42
+ASSET_COOLDOWN_TRIGGER_ROLL_MIN_N = 18
+ASSET_COOLDOWN_TRIGGER_DD_USD = -12.0
+ASSET_COOLDOWN_TRIGGER_DEEP_CYCLE_SHARE = 0.35
+ASSET_COOLDOWN_TRIGGER_DEEP_CYCLE_MIN_N = 20
+
+# Telemetría de degradación en vivo.
+DEGRADE_METRICS_WINDOW = 120
+DEGRADE_METRICS_ALERT_C1_WR_MIN = 0.50
+DEGRADE_METRICS_ALERT_C4P_SHARE_MAX = 0.30
+DEGRADE_METRICS_ALERT_HOURLY_PNL_MIN = -6.0
+
 # Candados inteligentes: evita bloqueos rígidos en empates/planicies cuando ya
 # hay evidencia real robusta de un bot claramente apto.
 SMART_LOCKS_ENABLE = True
@@ -1097,6 +1124,9 @@ last_update_time = {bot: time.time() for bot in BOT_NAMES}
 LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # evita procesar el mismo cierre REAL varias veces
 CTT_CLOSE_EVENTS = deque(maxlen=6000)
 CTT_CLOSE_SEEN = set()
+ASSET_RUNTIME_STATS = {}
+ASSET_COOLDOWN_STATE = {}
+DEGRADE_ALERT_STATE = {"last_ts": 0.0, "last_sig": ""}
 CTT_STATE = {
     "status": "NEUTRAL",
     "regime": "NEUTRAL",
@@ -3297,10 +3327,13 @@ def _enriquecer_scalping_features_row(fila_dict: dict) -> dict:
         proxy_used.add("close_snapshot_insuficiente")
 
     out["row_proxy_features"] = ",".join(sorted(proxy_used))
-    out["row_has_proxy_features"] = 1 if proxy_used else 0
     core_keys = {"ret_1m", "slope_5m", "rv_20", "bb_z"}
     critical_proxy = any(k in proxy_used for k in core_keys)
-    out["row_train_eligible"] = 0 if (critical_proxy or ((len(close_vals) < 20) and (not core_scalping_ready))) else 1
+    close_issue = bool((len(close_vals) < 20) and (not core_scalping_ready))
+    # Importante: marcar proxy solo cuando compromete entrenabilidad real.
+    # Proxies no críticos (ej. wick_imbalance) ya no deben bloquear todo el dataset.
+    out["row_has_proxy_features"] = 1 if (critical_proxy or close_issue) else 0
+    out["row_train_eligible"] = 0 if (critical_proxy or close_issue) else 1
 
     return out
 
@@ -8786,11 +8819,31 @@ def build_xy_from_incremental(df: pd.DataFrame, feature_names: list | None = Non
     train_elig_col = pd.to_numeric(df.get("row_train_eligible", pd.Series(1, index=df.index)), errors="coerce").fillna(1.0)
     proxy_mask = proxy_col > 0.0
     train_eligible_mask = train_elig_col > 0.0
-    mask = mask & (~proxy_mask) & train_eligible_mask
+    mask_before_proxy = mask.copy()
+    # Fuente de verdad para entrenabilidad: row_train_eligible.
+    # row_has_proxy_features queda como telemetría y respaldo defensivo.
+    mask = mask & train_eligible_mask & (~proxy_mask)
 
     # X (reindex = blindaje)
     feats_no_time = [c for c in feats if c != "ts_ingest"]
     X = df.reindex(columns=feats_no_time, fill_value=0.0).loc[mask].copy()
+    invalid_detail = {"nan": 0, "rango_invalido": 0}
+    try:
+        range_rules = {
+            "ret_1m": (-1.0, 1.0), "ret_3m": (-1.0, 1.0), "ret_5m": (-1.0, 1.0), "slope_5m": (-1.0, 1.0),
+            "rv_20": (0.0, 1.0), "range_norm": (0.0, 1.0), "bb_z": (-3.0, 3.0), "body_ratio": (0.0, 1.0),
+            "wick_imbalance": (-1.0, 1.0), "micro_trend_persist": (-1.0, 1.0),
+        }
+        for c in feats_no_time:
+            if c not in X.columns:
+                continue
+            s_raw = pd.to_numeric(X[c], errors="coerce")
+            invalid_detail["nan"] += int(s_raw.isna().sum())
+            if c in range_rules:
+                lo, hi = range_rules[c]
+                invalid_detail["rango_invalido"] += int(((s_raw < lo) | (s_raw > hi)).fillna(False).sum())
+    except Exception:
+        pass
     X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     # y final
@@ -8807,6 +8860,24 @@ def build_xy_from_incremental(df: pd.DataFrame, feature_names: list | None = Non
     except Exception:
         pass
 
+    exclusion = {}
+    try:
+        proxy_reasons = df.get("row_proxy_features", pd.Series("", index=df.index)).astype(str)
+        reason_counts = {}
+        for idx in df.index[mask_before_proxy & proxy_mask]:
+            txt = str(proxy_reasons.loc[idx] or "").strip()
+            if not txt:
+                txt = "proxy_unspecified"
+            for part in [p.strip() for p in txt.split(",") if p.strip()]:
+                reason_counts[part] = int(reason_counts.get(part, 0) + 1)
+        exclusion = {
+            "proxy": int((mask_before_proxy & proxy_mask).sum()),
+            "no_entrenable": int((mask_before_proxy & (~train_eligible_mask)).sum()),
+            "proxy_reasons": reason_counts,
+        }
+    except Exception:
+        exclusion = {}
+
     try:
         globals()["_LAST_XY_QUALITY"] = {
             "rows_before": before_n,
@@ -8816,6 +8887,8 @@ def build_xy_from_incremental(df: pd.DataFrame, feature_names: list | None = Non
             "proxy_rows_detected": int((mask_pre_proxy & proxy_mask).sum()),
             "proxy_rows_excluded": int((mask_pre_proxy & proxy_mask).sum()),
             "rows_train_eligible": int(mask.sum()),
+            "exclusion_breakdown": exclusion,
+            "invalid_feature_values": invalid_detail,
         }
     except Exception:
         pass
@@ -10117,6 +10190,7 @@ def _dataset_quality_gate_for_training(X_df: pd.DataFrame, feats: list[str]):
         n_ok = 0
         n_bad = 0
         dom_hot = 0
+        bad_features = []
         for c in feats:
             rep = health.get(c, {}) if isinstance(health.get(c, {}), dict) else {}
             st = str(rep.get("status", "")).upper()
@@ -10125,6 +10199,7 @@ def _dataset_quality_gate_for_training(X_df: pd.DataFrame, feats: list[str]):
                 n_ok += 1
             else:
                 n_bad += 1
+                bad_features.append((c, st, dom, int(rep.get("nunique", 0) or 0)))
             if dom >= float(FEATURE_MAX_DOMINANCE):
                 dom_hot += 1
 
@@ -10132,6 +10207,9 @@ def _dataset_quality_gate_for_training(X_df: pd.DataFrame, feats: list[str]):
         min_ok = max(3, min(6, len(feats)))
         if n_ok < min_ok:
             reasons.append(f"features_ok_bajas:{n_ok}<{min_ok}")
+            if bad_features:
+                bf_txt = ",".join([f"{c}:{st}:dom={dom:.3f}:nun={nun}" for c, st, dom, nun in bad_features[:4]])
+                reasons.append(f"features_fallidas:{bf_txt}")
 
         # Si casi todo está casi-constante, bloqueamos para evitar entrenos basura.
         if len(feats) > 0 and dom_hot >= max(1, int(len(feats) * 0.8)):
@@ -10312,9 +10390,10 @@ def _maybe_retrain_fallback_sklearn(force: bool = False):
         proxy_mask = pd.to_numeric(df.get("row_has_proxy_features", pd.Series(0, index=df.index)), errors="coerce").fillna(0.0) > 0.0
         train_eligible_mask = pd.to_numeric(df.get("row_train_eligible", pd.Series(1, index=df.index)), errors="coerce").fillna(1.0) > 0.0
         proxy_excluded = int((mask & proxy_mask).sum())
+        inelig_excluded = int((mask & (~train_eligible_mask)).sum())
         mask = mask & (~proxy_mask) & train_eligible_mask
         try:
-            agregar_evento(f"🧪 IA fallback-clean: proxies excluidos={proxy_excluded} | elegibles={int(mask.sum())}.")
+            agregar_evento(f"🧪 IA fallback-clean: proxy={proxy_excluded} no_entrenable={inelig_excluded} | elegibles={int(mask.sum())}.")
         except Exception:
             pass
         if int(mask.sum()) < int(MIN_FIT_ROWS_LOW):
@@ -10520,6 +10599,8 @@ def maybe_retrain(force: bool = False):
             ra = int(q.get("rows_after", len(X)) or len(X))
             proxy_exc = int(q.get("proxy_rows_excluded", 0) or 0)
             train_elig = int(q.get("rows_train_eligible", len(X)) or len(X))
+            excl = q.get("exclusion_breakdown", {}) if isinstance(q.get("exclusion_breakdown", {}), dict) else {}
+            inv = q.get("invalid_feature_values", {}) if isinstance(q.get("invalid_feature_values", {}), dict) else {}
             if dup_rm > 0:
                 sig_clean = f"{dup_rm}:{rb}->{ra}"
                 last_clean = globals().get("_IA_TRAIN_CLEAN_LOG", {}) or {}
@@ -10533,6 +10614,19 @@ def maybe_retrain(force: bool = False):
                     globals()["_IA_TRAIN_CLEAN_LOG"] = {"sig": sig_clean, "ts": now_clean}
             if proxy_exc > 0:
                 agregar_evento(f"🧪 IA train-clean: proxies excluidos={proxy_exc} | elegibles={train_elig}.")
+            if excl:
+                proxy_r = int(excl.get("proxy", 0) or 0)
+                noent_r = int(excl.get("no_entrenable", 0) or 0)
+                det = excl.get("proxy_reasons", {}) if isinstance(excl.get("proxy_reasons", {}), dict) else {}
+                top_det = sorted(det.items(), key=lambda kv: kv[1], reverse=True)[:3]
+                if top_det:
+                    det_txt = ",".join([f"{k}:{v}" for k, v in top_det])
+                    agregar_evento(f"🧾 IA exclusion: proxy={proxy_r} no_entrenable={noent_r} top={det_txt}")
+            if inv:
+                nan_bad = int(inv.get("nan", 0) or 0)
+                rng_bad = int(inv.get("rango_invalido", 0) or 0)
+                if nan_bad > 0 or rng_bad > 0:
+                    agregar_evento(f"🧾 IA exclusion-valores: nan={nan_bad} rango_invalido={rng_bad}")
         except Exception:
             pass
 
@@ -10558,6 +10652,8 @@ def maybe_retrain(force: bool = False):
             try:
                 txt = ", ".join([f"{k}:{r}" for k, r in dropped_feats[:8]])
                 agregar_evento(f"🧪 IA: features filtradas pre-fit ({len(dropped_feats)}): {txt}")
+                if any("nunique" in str(r).lower() or "dom=" in str(r).lower() for _, r in dropped_feats):
+                    agregar_evento("🧾 IA exclusion: varianza_insuficiente/dominancia_alta detectada en filtro de features.")
             except Exception:
                 pass
 
@@ -11645,6 +11741,58 @@ def mostrar_panel():
         n_min_extra = max(0, int(n_min_real) - int(n_req_real))
         n_min_txt = f"{n_min_disp}/{n_req_real}" + (f" (+{n_min_extra} acum)" if n_min_extra > 0 else "")
         print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | OBS≥{umbral_obs*100:.1f}%: {bots_obs} | REAL≥{umbral_real_vigente*100:.1f}%: {bots_real} | Mejor: {mejor_txt} | Suceso↑: {best_suceso:5.1f} | SENSOR_PLANO: {sensores_planos}/{len(BOT_NAMES)} (warmup:{sensores_warmup}) | n_min_real: {n_min_txt} | Token: {owner_txt}")
+        try:
+            pol_h = _get_hourly_policy()
+            hour_now = _operating_hour_now()
+            mode_h = str(pol_h.get("mode", "normal") or "normal").upper()
+            line_h = f"🕒 Franja operativa: H{hour_now:02d} mode={mode_h} tag={pol_h.get('tag', 'na')} scoreΔ={float(pol_h.get('score_delta',0.0) or 0.0):+.3f} floorΔ={float(pol_h.get('extra_floor_delta',0.0) or 0.0):+.3f}"
+            print(padding + Fore.CYAN + line_h)
+            _runtime_audit_append(line_h)
+        except Exception:
+            pass
+        try:
+            cds = []
+            now_cd = time.time()
+            for a, st in list(ASSET_COOLDOWN_STATE.items()):
+                rem = max(0.0, float(st.get("until_ts", 0.0) or 0.0) - now_cd)
+                if rem > 0:
+                    cds.append((a, rem, str(st.get("reason", ""))))
+            cds.sort(key=lambda t: t[1], reverse=True)
+            cd_txt = "none" if not cds else " | ".join([f"{a}:{int(r)}s({why})" for a, r, why in cds[:3]])
+            line_cd = f"🧊 Cooldown activos: {cd_txt}"
+            print(padding + Fore.CYAN + line_cd)
+            _runtime_audit_append(line_cd)
+        except Exception:
+            pass
+        try:
+            dm = _build_live_degradation_metrics()
+            if int(dm.get("sample", 0) or 0) > 0:
+                c1_wr = dm.get("c1_wr", None)
+                c1_txt = "--" if not isinstance(c1_wr, (int, float)) else f"{float(c1_wr)*100:.1f}%"
+                line_deg = (
+                    f"📉 Degradación LIVE(1h): C1_WR={c1_txt} | ciclo_avg={float(dm.get('avg_cycle',0.0) or 0.0):.2f} | "
+                    f"C4+={float(dm.get('c4_share',0.0) or 0.0)*100:.1f}% | PnL_h={float(dm.get('pnl_hour',0.0) or 0.0):+.2f} | n={int(dm.get('sample',0) or 0)}"
+                )
+                print(padding + Fore.CYAN + line_deg)
+                _runtime_audit_append(line_deg)
+                bad = dm.get("asset_rank_bad", []) or []
+                good = dm.get("asset_rank_good", []) or []
+                if bad:
+                    print(padding + Fore.CYAN + "☣️ Activos dañinos: " + " | ".join([f"{a}:{p:+.2f}/wr{w*100:.0f}% n{n}" for a, p, w, n in bad]))
+                if good:
+                    print(padding + Fore.CYAN + "🟢 Activos estables: " + " | ".join([f"{a}:{p:+.2f}/wr{w*100:.0f}% n{n}" for a, p, w, n in good]))
+                alerts = dm.get("alerts", []) or []
+                if alerts:
+                    sig = ",".join(alerts)
+                    now_a = time.time()
+                    last_sig = str(DEGRADE_ALERT_STATE.get("last_sig", "") or "")
+                    last_ts = float(DEGRADE_ALERT_STATE.get("last_ts", 0.0) or 0.0)
+                    if (sig != last_sig) or ((now_a - last_ts) >= 45.0):
+                        DEGRADE_ALERT_STATE["last_sig"] = sig
+                        DEGRADE_ALERT_STATE["last_ts"] = now_a
+                        agregar_evento(f"⚠️ ALERTA degradación: {sig}")
+        except Exception:
+            pass
 
         try:
             meta_live = resolver_canary_estado(leer_model_meta() or {})
@@ -14338,11 +14486,25 @@ def _registrar_cierre_ctt(bot: str, fila_dict: dict, resultado: str):
         result_bin = 1 if str(resultado).upper() == "GANANCIA" else 0
         ts_close = float(_infer_close_ts_ctt(fila_dict))
         asset = str(fila_dict.get("activo", "") or "").strip().upper()
+        try:
+            pnl = float(fila_dict.get("ganancia_perdida", 0.0) or 0.0)
+        except Exception:
+            pnl = 0.0
+        cyc_raw = fila_dict.get("ciclo_actual", fila_dict.get("ciclo", 1))
+        try:
+            cycle = int(float(cyc_raw or 1))
+        except Exception:
+            cycle = 1
+        c1_flag = 1 if int(cycle) <= 1 else 0
         sig = _close_sig_ctt(bot, fila_dict, ts_close, result_bin)
         if sig in CTT_CLOSE_SEEN:
             return
         CTT_CLOSE_SEEN.add(sig)
-        CTT_CLOSE_EVENTS.append({"ts": ts_close, "bot": str(bot), "asset": asset, "result": int(result_bin), "sig": sig})
+        CTT_CLOSE_EVENTS.append({
+            "ts": ts_close, "bot": str(bot), "asset": asset, "result": int(result_bin), "sig": sig,
+            "pnl": float(pnl), "cycle": int(cycle), "c1": int(c1_flag)
+        })
+        _update_asset_runtime_stats(bot, fila_dict, int(result_bin))
         cutoff_seen = float(time.time()) - float(CTT_CIERRE_LOOKBACK_MAX)
         if len(CTT_CLOSE_SEEN) > 12000:
             # rebuild seen desde deque para evitar crecimiento indefinido
@@ -14355,6 +14517,144 @@ def _registrar_cierre_ctt(bot: str, fila_dict: dict, resultado: str):
                     continue
     except Exception:
         return
+
+
+def _operating_hour_now() -> int:
+    try:
+        return int((datetime.utcnow() + timedelta(hours=float(TIMEZONE_OFFSET_HOURS))).hour)
+    except Exception:
+        return int(datetime.utcnow().hour)
+
+
+def _get_hourly_policy(hour: int | None = None) -> dict:
+    h = int(_operating_hour_now() if hour is None else hour) % 24
+    for row in (HOURLY_POLICY or []):
+        try:
+            a = int(row.get("start", 0))
+            b = int(row.get("end", 24))
+            if a <= h < b:
+                return dict(row)
+        except Exception:
+            continue
+    return {"start": 0, "end": 24, "mode": "normal", "score_delta": 0.0, "extra_floor_delta": 0.0, "tag": "default"}
+
+
+def _asset_cooldown_active(asset: str) -> tuple[bool, float]:
+    a = str(asset or "").strip().upper()
+    if not a:
+        return False, 0.0
+    st = ASSET_COOLDOWN_STATE.get(a, {})
+    until = float(st.get("until_ts", 0.0) or 0.0)
+    rem = max(0.0, until - time.time())
+    if rem <= 0.0 and st:
+        if bool(st.get("active", False)):
+            agregar_evento(f"🟢 COOL-DOWN activo liberado: {a}")
+        st["active"] = False
+        st["until_ts"] = 0.0
+        ASSET_COOLDOWN_STATE[a] = st
+        return False, 0.0
+    return rem > 0.0, rem
+
+
+def _update_asset_runtime_stats(bot: str, fila_dict: dict, result_bin: int):
+    asset = str((fila_dict or {}).get("activo", "") or "").strip().upper() or "NA"
+    now = time.time()
+    try:
+        pnl = float((fila_dict or {}).get("ganancia_perdida", 0.0) or 0.0)
+    except Exception:
+        pnl = 0.0
+    cyc_raw = (fila_dict or {}).get("ciclo_actual", (fila_dict or {}).get("ciclo", 1))
+    try:
+        cyc = int(float(cyc_raw or 1))
+    except Exception:
+        cyc = 1
+    c1 = int(cyc <= 1)
+
+    st = ASSET_RUNTIME_STATS.get(asset, {"events": deque(maxlen=500), "loss_streak": 0})
+    ev = {"ts": now, "bot": str(bot), "result": int(result_bin), "pnl": float(pnl), "cycle": int(cyc), "c1": int(c1)}
+    st["events"].append(ev)
+    if int(result_bin) == 0:
+        st["loss_streak"] = int(st.get("loss_streak", 0) or 0) + 1
+    else:
+        st["loss_streak"] = 0
+    ASSET_RUNTIME_STATS[asset] = st
+
+    if not bool(ASSET_COOLDOWN_ENABLE):
+        return
+    if _asset_cooldown_active(asset)[0]:
+        return
+
+    events = list(st["events"])
+    n = len(events)
+    wins = sum(int(e.get("result", 0) or 0) for e in events)
+    wr = (wins / n) if n > 0 else 0.0
+    pnl_sum = sum(float(e.get("pnl", 0.0) or 0.0) for e in events)
+    c4p = sum(1 for e in events if int(e.get("cycle", 1) or 1) >= 4)
+    c4p_share = (c4p / n) if n > 0 else 0.0
+
+    reasons = []
+    if int(st.get("loss_streak", 0) or 0) >= int(ASSET_COOLDOWN_TRIGGER_LOSS_STREAK):
+        reasons.append(f"loss_streak>={int(ASSET_COOLDOWN_TRIGGER_LOSS_STREAK)}")
+    if n >= int(ASSET_COOLDOWN_TRIGGER_ROLL_MIN_N) and wr < float(ASSET_COOLDOWN_TRIGGER_ROLL_WR_MIN):
+        reasons.append(f"wr={wr*100:.1f}%<{float(ASSET_COOLDOWN_TRIGGER_ROLL_WR_MIN)*100:.1f}%")
+    if pnl_sum <= float(ASSET_COOLDOWN_TRIGGER_DD_USD):
+        reasons.append(f"dd={pnl_sum:.2f}<={float(ASSET_COOLDOWN_TRIGGER_DD_USD):.2f}")
+    if n >= int(ASSET_COOLDOWN_TRIGGER_DEEP_CYCLE_MIN_N) and c4p_share >= float(ASSET_COOLDOWN_TRIGGER_DEEP_CYCLE_SHARE):
+        reasons.append(f"c4+={c4p_share*100:.1f}%>={float(ASSET_COOLDOWN_TRIGGER_DEEP_CYCLE_SHARE)*100:.1f}%")
+
+    if reasons:
+        sev = 1.0 + max(0.0, abs(min(0.0, pnl_sum)) / max(1.0, abs(float(ASSET_COOLDOWN_TRIGGER_DD_USD))))
+        cd_s = min(float(ASSET_COOLDOWN_MAX_S), float(ASSET_COOLDOWN_BASE_S) * sev)
+        ASSET_COOLDOWN_STATE[asset] = {"active": True, "until_ts": now + cd_s, "reason": ",".join(reasons[:3]), "since": now}
+        agregar_evento(f"🧊 COOL-DOWN activo ON: {asset} {int(cd_s)}s ({','.join(reasons[:3])})")
+
+
+def _build_live_degradation_metrics() -> dict:
+    now = time.time()
+    events = [ev for ev in list(CTT_CLOSE_EVENTS) if float(ev.get("ts", 0.0) or 0.0) >= (now - 3600.0)]
+    if not events:
+        return {"sample": 0, "asset_rank_bad": [], "asset_rank_good": [], "alerts": []}
+
+    events.sort(key=lambda e: float(e.get("ts", 0.0) or 0.0))
+    c1_events = [e for e in events if int(e.get("c1", 1) or 1) == 1]
+    c1_wr = (sum(int(e.get("result", 0) or 0) for e in c1_events) / len(c1_events)) if c1_events else None
+    avg_cycle = sum(int(e.get("cycle", 1) or 1) for e in events) / max(1, len(events))
+    c4_share = sum(1 for e in events if int(e.get("cycle", 1) or 1) >= 4) / max(1, len(events))
+    pnl_hour = sum(float(e.get("pnl", 0.0) or 0.0) for e in events)
+    pnl_by_asset = {}
+    wr_by_asset = {}
+    for e in events:
+        a = str(e.get("asset", "NA") or "NA")
+        pnl_by_asset[a] = pnl_by_asset.get(a, 0.0) + float(e.get("pnl", 0.0) or 0.0)
+        wr_by_asset.setdefault(a, [0, 0])
+        wr_by_asset[a][0] += int(e.get("result", 0) or 0)
+        wr_by_asset[a][1] += 1
+    rank = []
+    for a, pnl in pnl_by_asset.items():
+        wn, nn = wr_by_asset.get(a, [0, 0])
+        wr = (wn / nn) if nn > 0 else 0.0
+        rank.append((a, float(pnl), float(wr), int(nn)))
+    rank_bad = sorted(rank, key=lambda t: (t[1], t[2]))[:3]
+    rank_good = sorted(rank, key=lambda t: (t[1], t[2]), reverse=True)[:3]
+
+    alerts = []
+    if isinstance(c1_wr, float) and c1_wr < float(DEGRADE_METRICS_ALERT_C1_WR_MIN):
+        alerts.append(f"c1_wr_bajo:{c1_wr*100:.1f}%")
+    if c4_share > float(DEGRADE_METRICS_ALERT_C4P_SHARE_MAX):
+        alerts.append(f"c4+_alto:{c4_share*100:.1f}%")
+    if pnl_hour < float(DEGRADE_METRICS_ALERT_HOURLY_PNL_MIN):
+        alerts.append(f"pnl_h_bajo:{pnl_hour:.2f}")
+    return {
+        "sample": int(len(events)),
+        "c1_wr": c1_wr,
+        "avg_cycle": float(avg_cycle),
+        "c4_share": float(c4_share),
+        "pnl_hour": float(pnl_hour),
+        "pnl_by_asset": pnl_by_asset,
+        "asset_rank_bad": rank_bad,
+        "asset_rank_good": rank_good,
+        "alerts": alerts,
+    }
 
 
 def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
@@ -15413,9 +15713,21 @@ async def main():
                                 p = _prob_ia_operativa_bot(b, default=None)
                                 if not isinstance(p, (int, float)):
                                     continue
-                                # Primer filtro suave: alinear con el mismo umbral operativo/adaptativo del embudo real.
                                 ctx_pre = _ultimo_contexto_operativo_bot(b)
+                                asset_pre = str(ctx_pre.get("activo", "") or "").strip().upper()
+                                pol_h = _get_hourly_policy()
+                                pol_mode = str(pol_h.get("mode", "normal") or "normal").lower()
+                                if pol_mode == "pause":
+                                    estado_bots[b]["ia_hour_policy"] = f"pause:{pol_h.get('tag', 'na')}"
+                                    continue
+                                cd_on, cd_left = _asset_cooldown_active(asset_pre)
+                                if cd_on:
+                                    estado_bots[b]["ia_asset_cooldown_s"] = float(cd_left)
+                                    continue
+                                estado_bots[b]["ia_asset_cooldown_s"] = 0.0
+                                # Primer filtro suave: alinear con el mismo umbral operativo/adaptativo del embudo real.
                                 piso_operativo, _piso_reason = _umbral_real_por_bot_contexto(b, ctx_pre, umbral_ia_real)
+                                piso_operativo = float(piso_operativo) + float(max(0.0, float(pol_h.get("extra_floor_delta", 0.0) or 0.0)))
                                 if float(p) < float(piso_operativo):
                                     continue
 
@@ -15426,6 +15738,8 @@ async def main():
                                 p_post = float(p)
                                 p_rank = float(estado_bots.get(b, {}).get("ia_prob_pre_cap", p_post) or p_post)
                                 score_final = float(max(0.0, min(1.0, p_rank)))
+                                score_final = float(max(0.0, min(1.0, score_final + float(pol_h.get("score_delta", 0.0) or 0.0))))
+                                estado_bots[b]["ia_hour_policy"] = f"{pol_mode}:{pol_h.get('tag', 'na')}"
                                 estado_bots[b]["ia_regime_score"] = float(regime_score)
                                 estado_bots[b]["ia_evidence_n"] = int(estado_bots[b].get("ia_evidence_n", 0) or 0)
                                 estado_bots[b]["ia_evidence_wr"] = float(estado_bots[b].get("ia_evidence_wr", 0.0) or 0.0)
