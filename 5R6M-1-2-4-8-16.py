@@ -2085,8 +2085,10 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
                     except Exception:
                         pass
                     _ingest_bump("filas_incremental_aceptadas", 1)
-                    if int(row_has_proxy) == 1 or int(row_train_eligible) == 0:
-                        _ingest_bump("filas_incremental_proxy_no_train", 1)
+                    if int(row_has_proxy) == 1:
+                        _ingest_bump("filas_incremental_proxy_detectadas", 1)
+                    if int(row_train_eligible) == 0:
+                        _ingest_bump("filas_incremental_no_entrenables", 1)
                     try:
                         close_real_valid = all(float(fila_dict.get(f"close_{i}", 0.0) or 0.0) > 0.0 for i in range(20))
                     except Exception:
@@ -14657,6 +14659,7 @@ def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
     gate = "NEUTRAL"
     status = "NEUTRAL"
     green_mode = "none"
+    # Política de techo basada en evidencia CTT (no reloj fijo/horario duro).
     roof_policy = "normal"
     roof_delta = 0.0
     reason = "muestra_insuficiente"
