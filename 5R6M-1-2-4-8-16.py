@@ -360,6 +360,14 @@ GATE_PERMITE_REBOTE_EN_NEG = True    # permitir excepción si hay rebote confirm
 GATE_ACTIVO_MIN_MUESTRA = 40         # mínimo de cierres por activo para evaluar régimen
 GATE_ACTIVO_MIN_WR = 0.48            # si WR reciente por activo cae debajo, bloquear temporalmente
 GATE_ACTIVO_LOOKBACK = 180           # cierres recientes por bot para estimar régimen
+ASSET_PROTECT_ENABLE = True          # protección dinámica por activo basada en degradación real
+ASSET_PROTECT_LOOKBACK = 80
+ASSET_COOLDOWN_S = 900
+ASSET_MAX_CONSEC_LOSS = 4
+ASSET_MAX_DRAWDOWN = -4.0
+ASSET_MIN_WR = 0.42
+ASSET_MAX_DEEP_CYCLE_RATIO = 0.55
+ASSET_ALERT_COOLDOWN_S = 60.0
 # Gate por segmentos (payout/vol/hora): prioriza zonas con señal estable de racha_actual
 GATE_SEGMENTO_ENABLED = True  # gate segmento operativo para filtrar contexto débil
 GATE_SEGMENTO_MIN_MUESTRA = 35
@@ -830,6 +838,7 @@ CANARY_STRONG_GATE_MIN_CONFIRM = 2
 TRAIN_ROWS_DROP_GUARD_RATIO = 0.35  # no reemplazar modelo si la muestra cae demasiado vs meta anterior
 TRAIN_ROWS_DROP_GUARD_MIN_PREV = 120  # activar guard solo si el modelo previo ya tenía muestra razonable
 FEATURE_MAX_DOMINANCE = 0.90  # Si una feature repite >90%, se considera casi constante
+FEATURE_DQ_MIN_OK = 5         # mínimo de features sanas para no bloquear warmup por 1 columna ruidosa
 TRAIN_WARMUP_MIN_ROWS = 250          # evita declarar modo confiable sin muestra mínima
 INPUT_DUP_DIAG_COOLDOWN_S = 25.0     # anti-spam de diagnóstico por inputs duplicados
 CLONED_PROB_TICKS_ALERT = 3          # ticks consecutivos de probs clonadas para alertar
@@ -2076,8 +2085,10 @@ def _anexar_incremental_desde_bot_CANON(bot: str, fila_dict_or_full: dict, label
                     except Exception:
                         pass
                     _ingest_bump("filas_incremental_aceptadas", 1)
-                    if int(row_has_proxy) == 1 or int(row_train_eligible) == 0:
-                        _ingest_bump("filas_incremental_proxy_no_train", 1)
+                    if int(row_has_proxy) == 1:
+                        _ingest_bump("filas_incremental_proxy_detectadas", 1)
+                    if int(row_train_eligible) == 0:
+                        _ingest_bump("filas_incremental_no_entrenables", 1)
                     try:
                         close_real_valid = all(float(fila_dict.get(f"close_{i}", 0.0) or 0.0) > 0.0 for i in range(20))
                     except Exception:
@@ -4260,6 +4271,8 @@ _IA_HARD_GUARD_LOG_TS = 0.0
 _IA_CHECKPOINT_CACHE = {"last_closed": 0, "last_ts": 0.0}
 _IA_BOT45_TRACE_CACHE = {"ts": 0.0, "msg": ""}
 _GATE_ACTIVO_CACHE = {}
+_ASSET_COOLDOWN_STATE = {}
+_ASSET_RUNTIME_LOG_CACHE = {"ts": 0.0, "sig": ""}
 _GATE_SEGMENTO_CACHE = {}
 
 
@@ -4529,11 +4542,122 @@ def _evidencia_bot_umbral_objetivo(bot: str, force: bool = False) -> dict:
         return {"ts": time.time(), "n": 0, "hits": 0, "wr": 0.0, "lb": 0.0, "brier": None, "ece": None, "ok_hard": True, "goal": float(IA_CALIB_GOAL_THRESHOLD)}
 
 
+def _asset_runtime_snapshot(bot: str, activo: str, lookback: int = 80) -> dict:
+    out = {"n": 0, "wr": 0.5, "wr_c1": 0.5, "avg_cycle": 1.0, "deep_ratio": 0.0, "pnl": 0.0, "consec_loss": 0, "drawdown": 0.0}
+    try:
+        ruta = f"registro_enriquecido_{bot}.csv"
+        if not os.path.exists(ruta):
+            return out
+        df = _safe_read_csv_any_encoding(ruta)
+        if df is None or df.empty or ("result_bin" not in df.columns):
+            return out
+        d = df.copy()
+        if "trade_status" in d.columns:
+            d = d[d["trade_status"].astype(str).str.upper().eq("CERRADO")]
+        d["result_bin"] = pd.to_numeric(d["result_bin"], errors="coerce")
+        d = d[d["result_bin"].isin([0, 1])]
+        if activo and ("activo" in d.columns):
+            d = d[d["activo"].astype(str).str.upper().eq(str(activo).upper())]
+        if d.empty:
+            return out
+        if int(lookback) > 0 and len(d) > int(lookback):
+            d = d.tail(int(lookback))
+
+        ciclo_col = next((c for c in ("ciclo", "ciclo_actual", "marti_ciclo") if c in d.columns), None)
+        if ciclo_col is not None:
+            ciclos = pd.to_numeric(d[ciclo_col], errors="coerce").fillna(1.0)
+        else:
+            ciclos = pd.Series(1.0, index=d.index)
+
+        pnl_col = next((c for c in ("ganancia_perdida", "pnl", "profit") if c in d.columns), None)
+        if pnl_col is not None:
+            pnl = pd.to_numeric(d[pnl_col], errors="coerce").fillna(0.0)
+        else:
+            pnl = pd.Series(np.where(pd.to_numeric(d["result_bin"], errors="coerce").fillna(0.0) > 0.5, 1.0, -1.0), index=d.index)
+
+        y = pd.to_numeric(d["result_bin"], errors="coerce").fillna(0.0).astype(int)
+        n = int(len(d))
+        wr = float(y.mean()) if n > 0 else 0.5
+        mask_c1 = ciclos <= 1.0
+        wr_c1 = float(y[mask_c1].mean()) if int(mask_c1.sum()) > 0 else wr
+        avg_cycle = float(ciclos.mean()) if n > 0 else 1.0
+        deep_ratio = float((ciclos >= 4.0).mean()) if n > 0 else 0.0
+        consec = 0
+        for v in reversed(y.tolist()):
+            if int(v) == 0:
+                consec += 1
+            else:
+                break
+        eq = pnl.cumsum()
+        drawdown = float((eq - eq.cummax()).min()) if len(eq) > 0 else 0.0
+
+        out.update({
+            "n": n, "wr": wr, "wr_c1": wr_c1, "avg_cycle": avg_cycle, "deep_ratio": deep_ratio,
+            "pnl": float(pnl.sum()), "consec_loss": int(consec), "drawdown": drawdown,
+        })
+        return out
+    except Exception:
+        return out
+
+
+def _log_operational_degradation_runtime(ttl_s: float = 60.0):
+    try:
+        now = time.time()
+        cache = globals().get("_ASSET_RUNTIME_LOG_CACHE", {}) or {}
+        if (now - float(cache.get("ts", 0.0))) < float(ttl_s):
+            return
+        rows = []
+        for b in BOT_NAMES:
+            ruta = f"registro_enriquecido_{b}.csv"
+            if not os.path.exists(ruta):
+                continue
+            df = _safe_read_csv_any_encoding(ruta)
+            if df is None or df.empty or ("result_bin" not in df.columns):
+                continue
+            d = df.copy()
+            if "trade_status" in d.columns:
+                d = d[d["trade_status"].astype(str).str.upper().eq("CERRADO")]
+            if d.empty:
+                continue
+            if "activo" in d.columns:
+                activos = [str(x).strip().upper() for x in d["activo"].dropna().unique().tolist() if str(x).strip()]
+            else:
+                activos = [""]
+            for a in activos[:12]:
+                s = _asset_runtime_snapshot(b, a, lookback=int(ASSET_PROTECT_LOOKBACK))
+                if int(s.get("n", 0)) >= 8:
+                    rows.append((a or "NA", b, s))
+        if not rows:
+            globals()["_ASSET_RUNTIME_LOG_CACHE"] = {"ts": now, "sig": "empty"}
+            return
+        rows_sorted = sorted(rows, key=lambda t: float(t[2].get("pnl", 0.0)))
+        worst = rows_sorted[0]
+        best = rows_sorted[-1]
+        wr_vals = [float(r[2].get("wr_c1", 0.5)) for r in rows]
+        cyc_vals = [float(r[2].get("avg_cycle", 1.0)) for r in rows]
+        deep_vals = [float(r[2].get("deep_ratio", 0.0)) for r in rows]
+        pnl_vals = [float(r[2].get("pnl", 0.0)) for r in rows]
+        sig = f"{worst[0]}:{worst[1]}:{worst[2].get('pnl',0):.2f}|{best[0]}:{best[1]}:{best[2].get('pnl',0):.2f}|{sum(pnl_vals):.2f}"
+        if sig != str(cache.get("sig", "")) or (now - float(cache.get("ts", 0.0))) >= float(max(20.0, ttl_s)):
+            agregar_evento(
+                "📊 Degradación vivo: "
+                f"WR_C1={np.mean(wr_vals)*100:.1f}% ciclo={np.mean(cyc_vals):.2f} C4+={np.mean(deep_vals)*100:.1f}% "
+                f"PnL_roll={sum(pnl_vals):+.2f} | peor={worst[0]}/{worst[1]} {worst[2]['pnl']:+.2f} "
+                f"mejor={best[0]}/{best[1]} {best[2]['pnl']:+.2f}"
+            )
+            if (np.mean(wr_vals) < 0.46) or (np.mean(deep_vals) > 0.50) or (sum(pnl_vals) < 0.0):
+                agregar_evento("🚨 Alerta degradación: calidad operativa en caída (WR_C1/PnL/C4+).")
+        globals()["_ASSET_RUNTIME_LOG_CACHE"] = {"ts": now, "sig": sig}
+    except Exception:
+        pass
+
+
 def _gate_regimen_activo_ok(bot: str, activo: str = "", ttl_s: float = 45.0):
     """Valida régimen por activo reciente (HZ10/HZ25/HZ50/HZ75) para no mezclar contextos."""
     try:
         now = time.time()
-        key = f"{bot}|{activo or '*'}"
+        asset_key = str(activo or "*").strip().upper()
+        key = f"{bot}|{asset_key}"
         c = _GATE_ACTIVO_CACHE.get(key)
         if c and (now - float(c.get("ts", 0.0))) <= float(ttl_s):
             return bool(c.get("ok", True)), float(c.get("wr", 0.5)), int(c.get("n", 0))
@@ -4564,7 +4688,7 @@ def _gate_regimen_activo_ok(bot: str, activo: str = "", ttl_s: float = 45.0):
         d = d[d["result_bin"].isin([0, 1])]
 
         if activo and "activo" in d.columns:
-            d = d[d["activo"].astype(str).eq(str(activo))]
+            d = d[d["activo"].astype(str).str.upper().eq(str(activo).upper())]
 
         if int(GATE_ACTIVO_LOOKBACK) > 0 and len(d) > int(GATE_ACTIVO_LOOKBACK):
             d = d.tail(int(GATE_ACTIVO_LOOKBACK))
@@ -4574,6 +4698,36 @@ def _gate_regimen_activo_ok(bot: str, activo: str = "", ttl_s: float = 45.0):
         ok = True
         if n >= int(GATE_ACTIVO_MIN_MUESTRA):
             ok = bool(wr >= float(GATE_ACTIVO_MIN_WR))
+
+        if bool(ASSET_PROTECT_ENABLE):
+            cd = _ASSET_COOLDOWN_STATE.get(key, {}) if isinstance(_ASSET_COOLDOWN_STATE.get(key, {}), dict) else {}
+            until = float(cd.get("until", 0.0) or 0.0)
+            if until > now:
+                ok = False
+            snap = _asset_runtime_snapshot(bot, asset_key if asset_key != "*" else "", lookback=int(ASSET_PROTECT_LOOKBACK))
+            if int(snap.get("n", 0)) >= max(12, int(ASSET_PROTECT_LOOKBACK * 0.4)):
+                reasons = []
+                if int(snap.get("consec_loss", 0)) >= int(ASSET_MAX_CONSEC_LOSS):
+                    reasons.append(f"loss_streak>={int(ASSET_MAX_CONSEC_LOSS)}")
+                if float(snap.get("drawdown", 0.0)) <= float(ASSET_MAX_DRAWDOWN):
+                    reasons.append(f"drawdown<={float(ASSET_MAX_DRAWDOWN):.2f}")
+                if float(snap.get("wr", 0.5)) < float(ASSET_MIN_WR):
+                    reasons.append(f"wr<{float(ASSET_MIN_WR):.2f}")
+                if float(snap.get("deep_ratio", 0.0)) > float(ASSET_MAX_DEEP_CYCLE_RATIO):
+                    reasons.append(f"c4+>{float(ASSET_MAX_DEEP_CYCLE_RATIO):.2f}")
+                if reasons:
+                    until_new = now + float(ASSET_COOLDOWN_S)
+                    prev_until = float(cd.get("until", 0.0) or 0.0)
+                    _ASSET_COOLDOWN_STATE[key] = {"until": until_new, "reasons": reasons, "last_log": now}
+                    ok = False
+                    if (prev_until <= now) or ((now - float(cd.get("last_log", 0.0) or 0.0)) >= float(ASSET_ALERT_COOLDOWN_S)):
+                        agregar_evento(
+                            f"🧯 Asset cooldown ON {bot}/{asset_key}: {','.join(reasons)} "
+                            f"| wr={snap['wr']*100:.1f}% c1={snap['wr_c1']*100:.1f}% deep={snap['deep_ratio']*100:.1f}% dd={snap['drawdown']:.2f}."
+                        )
+                elif until > 0.0 and until <= now:
+                    _ASSET_COOLDOWN_STATE[key] = {"until": 0.0, "reasons": [], "last_log": now}
+                    agregar_evento(f"✅ Asset cooldown OFF {bot}/{asset_key}: métrica recuperada.")
 
         _GATE_ACTIVO_CACHE[key] = {"ts": now, "ok": ok, "wr": wr, "n": n}
         return ok, wr, n
@@ -8763,7 +8917,8 @@ def build_xy_from_incremental(df: pd.DataFrame, feature_names: list | None = Non
     except Exception:
         return None, None, label_col
 
-    mask = y01.isin([0.0, 1.0])
+    label_mask = y01.isin([0.0, 1.0])
+    mask = label_mask.copy()
     mask_pre_proxy = mask.copy()
     if int(mask.sum()) <= 0:
         return None, None, label_col
@@ -8786,12 +8941,35 @@ def build_xy_from_incremental(df: pd.DataFrame, feature_names: list | None = Non
     train_elig_col = pd.to_numeric(df.get("row_train_eligible", pd.Series(1, index=df.index)), errors="coerce").fillna(1.0)
     proxy_mask = proxy_col > 0.0
     train_eligible_mask = train_elig_col > 0.0
-    mask = mask & (~proxy_mask) & train_eligible_mask
+    # Regla canónica: la elegibilidad final manda.
+    # Si una fila trae proxy pero cumple row_train_eligible=1, se permite (proxy no crítico).
+    mask = mask & train_eligible_mask
 
     # X (reindex = blindaje)
     feats_no_time = [c for c in feats if c != "ts_ingest"]
     X = df.reindex(columns=feats_no_time, fill_value=0.0).loc[mask].copy()
-    X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    X_num = X.apply(pd.to_numeric, errors="coerce")
+    non_finite_mask = ~np.isfinite(X_num)
+    nan_rows_excluded = int(non_finite_mask.any(axis=1).sum()) if len(X_num) else 0
+    invalid_range_rows = 0
+    try:
+        invalid_range = pd.Series(False, index=X_num.index)
+        if "ret_1m" in X_num.columns:
+            s = X_num["ret_1m"]
+            invalid_range |= (s < -1.0) | (s > 1.0)
+        if "slope_5m" in X_num.columns:
+            s = X_num["slope_5m"]
+            invalid_range |= (s < -1.0) | (s > 1.0)
+        if "rv_20" in X_num.columns:
+            s = X_num["rv_20"]
+            invalid_range |= (s < 0.0) | (s > 1.0)
+        if "bb_z" in X_num.columns:
+            s = X_num["bb_z"]
+            invalid_range |= (s < -3.0) | (s > 3.0)
+        invalid_range_rows = int(invalid_range.sum())
+    except Exception:
+        invalid_range_rows = 0
+    X = X_num.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     # y final
     y = y01.loc[mask].astype(int)
@@ -8808,13 +8986,35 @@ def build_xy_from_incremental(df: pd.DataFrame, feature_names: list | None = Non
         pass
 
     try:
+        feat_fail = {}
+        low_var = []
+        for c in feats_no_time:
+            try:
+                s = pd.to_numeric(X[c], errors="coerce").fillna(0.0)
+                nun = int(s.nunique(dropna=False))
+                dom = float(s.value_counts(dropna=False).iloc[0] / max(1, len(s))) if len(s) else 1.0
+                if nun <= 1:
+                    feat_fail[c] = "nunique<=1"
+                elif dom >= float(FEATURE_MAX_DOMINANCE):
+                    feat_fail[c] = f"dominance={dom:.3f}"
+                if nun <= 2:
+                    low_var.append(c)
+            except Exception:
+                continue
         globals()["_LAST_XY_QUALITY"] = {
             "rows_before": before_n,
             "rows_after": int(len(X)),
             "duplicates_removed": max(0, before_n - int(len(X))),
             "used_quality_mask": bool(int((quality_mask & y01.isin([0.0, 1.0])).sum()) >= int(max(60, 0.50 * int(y01.isin([0.0, 1.0]).sum())))),
+            "label_invalid_excluded": int((~label_mask).sum()),
             "proxy_rows_detected": int((mask_pre_proxy & proxy_mask).sum()),
-            "proxy_rows_excluded": int((mask_pre_proxy & proxy_mask).sum()),
+            "proxy_rows_excluded": int((mask_pre_proxy & proxy_mask & (~train_eligible_mask)).sum()),
+            "proxy_rows_kept_train_eligible": int((mask_pre_proxy & proxy_mask & train_eligible_mask).sum()),
+            "train_ineligible_excluded": int((mask_pre_proxy & (~train_eligible_mask)).sum()),
+            "nan_rows_detected": int(nan_rows_excluded),
+            "invalid_range_rows_detected": int(invalid_range_rows),
+            "low_variance_features": list(low_var[:12]),
+            "feature_fail_counts": feat_fail,
             "rows_train_eligible": int(mask.sum()),
         }
     except Exception:
@@ -10129,9 +10329,20 @@ def _dataset_quality_gate_for_training(X_df: pd.DataFrame, feats: list[str]):
                 dom_hot += 1
 
         # Exigimos al menos una base de columnas útiles para entrenar sin colapsar.
-        min_ok = max(3, min(6, len(feats)))
+        min_ok_cfg = int(max(3, min(int(globals().get("FEATURE_DQ_MIN_OK", 5)), 6)))
+        min_ok = max(3, min(min_ok_cfg, len(feats)))
         if n_ok < min_ok:
             reasons.append(f"features_ok_bajas:{n_ok}<{min_ok}")
+            bad_feats = []
+            for c in feats:
+                rep = health.get(c, {}) if isinstance(health.get(c, {}), dict) else {}
+                st = str(rep.get("status", "UNKNOWN")).upper()
+                if st != "OK":
+                    nun = int(rep.get("nunique", 0) or 0)
+                    dom = float(rep.get("dominance", 1.0) or 1.0)
+                    bad_feats.append(f"{c}:{st}(nun={nun},dom={dom:.3f})")
+            if bad_feats:
+                reasons.append("features_fallidas=" + ",".join(bad_feats[:8]))
 
         # Si casi todo está casi-constante, bloqueamos para evitar entrenos basura.
         if len(feats) > 0 and dom_hot >= max(1, int(len(feats) * 0.8)):
@@ -10311,10 +10522,13 @@ def _maybe_retrain_fallback_sklearn(force: bool = False):
         df = _enriquecer_df_con_derivadas(df, feats)
         proxy_mask = pd.to_numeric(df.get("row_has_proxy_features", pd.Series(0, index=df.index)), errors="coerce").fillna(0.0) > 0.0
         train_eligible_mask = pd.to_numeric(df.get("row_train_eligible", pd.Series(1, index=df.index)), errors="coerce").fillna(1.0) > 0.0
-        proxy_excluded = int((mask & proxy_mask).sum())
-        mask = mask & (~proxy_mask) & train_eligible_mask
+        proxy_excluded = int((mask & proxy_mask & (~train_eligible_mask)).sum())
+        proxy_kept = int((mask & proxy_mask & train_eligible_mask).sum())
+        mask = mask & train_eligible_mask
         try:
-            agregar_evento(f"🧪 IA fallback-clean: proxies excluidos={proxy_excluded} | elegibles={int(mask.sum())}.")
+            agregar_evento(
+                f"🧪 IA fallback-clean: proxies excluidos={proxy_excluded} | proxies elegibles={proxy_kept} | elegibles={int(mask.sum())}."
+            )
         except Exception:
             pass
         if int(mask.sum()) < int(MIN_FIT_ROWS_LOW):
@@ -10519,7 +10733,13 @@ def maybe_retrain(force: bool = False):
             rb = int(q.get("rows_before", len(X)) or len(X))
             ra = int(q.get("rows_after", len(X)) or len(X))
             proxy_exc = int(q.get("proxy_rows_excluded", 0) or 0)
+            proxy_kept = int(q.get("proxy_rows_kept_train_eligible", 0) or 0)
             train_elig = int(q.get("rows_train_eligible", len(X)) or len(X))
+            inelig_exc = int(q.get("train_ineligible_excluded", 0) or 0)
+            nan_rows = int(q.get("nan_rows_detected", 0) or 0)
+            range_rows = int(q.get("invalid_range_rows_detected", 0) or 0)
+            feat_fail = q.get("feature_fail_counts", {}) if isinstance(q.get("feature_fail_counts", {}), dict) else {}
+            low_var = q.get("low_variance_features", []) if isinstance(q.get("low_variance_features", []), list) else []
             if dup_rm > 0:
                 sig_clean = f"{dup_rm}:{rb}->{ra}"
                 last_clean = globals().get("_IA_TRAIN_CLEAN_LOG", {}) or {}
@@ -10531,8 +10751,17 @@ def maybe_retrain(force: bool = False):
                 if should_clean_log:
                     agregar_evento(f"🧹 IA train-clean: dedup {dup_rm} filas ({rb}->{ra}).")
                     globals()["_IA_TRAIN_CLEAN_LOG"] = {"sig": sig_clean, "ts": now_clean}
-            if proxy_exc > 0:
-                agregar_evento(f"🧪 IA train-clean: proxies excluidos={proxy_exc} | elegibles={train_elig}.")
+            if (proxy_exc > 0) or (proxy_kept > 0) or (inelig_exc > 0) or (nan_rows > 0) or (range_rows > 0):
+                agregar_evento(
+                    "🧪 IA embudo filas: "
+                    f"proxy_excl={proxy_exc} proxy_ok={proxy_kept} no_entrenable={inelig_exc} "
+                    f"nan={nan_rows} rango_invalido={range_rows} elegibles={train_elig}."
+                )
+            if feat_fail:
+                det = ", ".join([f"{k}:{v}" for k, v in list(feat_fail.items())[:8]])
+                agregar_evento(f"🧪 IA embudo features: fallidas={len(feat_fail)} [{det}]")
+            if low_var:
+                agregar_evento(f"🧪 IA embudo features: baja_var={','.join([str(x) for x in low_var[:8]])}")
         except Exception:
             pass
 
@@ -14430,6 +14659,7 @@ def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
     gate = "NEUTRAL"
     status = "NEUTRAL"
     green_mode = "none"
+    # Política de techo basada en evidencia CTT (no reloj fijo/horario duro).
     roof_policy = "normal"
     roof_delta = 0.0
     reason = "muestra_insuficiente"
@@ -15399,6 +15629,7 @@ async def main():
                             agregar_evento(
                                 f"🟫 CTT modo prudente ({ctt_status_pre}): embudo pasa a evaluación blanda ({ctt_reason_pre})."
                             )
+                        _log_operational_degradation_runtime(ttl_s=60.0)
 
                         for b in BOT_NAMES:
                             try:
