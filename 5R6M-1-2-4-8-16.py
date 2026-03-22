@@ -13928,8 +13928,8 @@ DYN_ROOF_GATE_REARM_HYST = 0.02
 DYN_ROOF_GATE_REARM_TICKS = 2
 DYN_ROOF_LOW_BAL_WARN_COOLDOWN_S = 60
 DYN_ROOF_STALL_TO_MODE_C_S = 2 * 60 * 60
-DYN_ROOF_MODE_C_FLOOR = 0.70
-DYN_ROOF_MODE_C_CONFIRM_TICKS = 3
+DYN_ROOF_MODE_C_FLOOR = 0.60
+DYN_ROOF_MODE_C_CONFIRM_TICKS = 2
 DYN_ROOF_MODE_C_MIN_EVIDENCE_N = 20
 DYN_ROOF_MODE_C_MIN_EVIDENCE_LB = 0.60
 # Techo vivo del mercado (ticks HUD): evita perseguir picos históricos irreales.
@@ -14890,6 +14890,38 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
             reason = "oper_override_micro_early_confirm"
             soft_wait_reason = ""
             degrade_from = "oper_override_micro_early_confirm"
+
+        pat_state_top = str(estado_bots.get(top1_bot, {}).get("ia_pattern_col_state", "BLOQUEADO")) if top1_bot else "BLOQUEADO"
+        try:
+            pat_ratio_top = float(estado_bots.get(top1_bot, {}).get("ia_pattern_col_ratio", 0.0) or 0.0) if top1_bot else 0.0
+        except Exception:
+            pat_ratio_top = 0.0
+        try:
+            suceso_idx_best = float(estado_bots.get(top1_bot, {}).get("ia_suceso_idx", 0.0) or 0.0) if top1_bot else 0.0
+        except Exception:
+            suceso_idx_best = 0.0
+        trigger_ok_micro_soft = bool(
+            (decision in (EMBUDO_FINAL_WAIT_SOFT, EMBUDO_FINAL_SHADOW_OK))
+            and bool(top1_bot)
+            and reliable
+            and (n_samples >= 300)
+            and (estado_real in ("MICRO", "SHADOW"))
+            and (pat_state_top == "CONTINUIDAD")
+            and (pat_ratio_top >= 0.80)
+            and (suceso_idx_best >= 30.0)
+            and (top1_prob >= (float(floor_eff) - 0.02))
+            and gap_ok
+            and (not cooldown_active)
+            and (not hard_guard_hard_block)
+            and (soft_wait_reason not in ("marti_contexto_degradado", "best_bot_mismatch", "cooldown"))
+        )
+        if trigger_ok_micro_soft:
+            decision = EMBUDO_FINAL_REAL_MICRO
+            risk_mode = "REAL_MICRO"
+            reason = "micro_soft_context_ok"
+            soft_wait_reason = ""
+            if degrade_from == "none":
+                degrade_from = "micro_soft_context_ok"
 
         if estado_real == "SHADOW" and decision in (EMBUDO_FINAL_WAIT_SOFT, EMBUDO_FINAL_SHADOW_OK):
             ok_shadow_micro, why_shadow_micro = _shadow_micro_gate_ok(candidatos, dgate)
