@@ -14864,36 +14864,6 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
             soft_wait_reason = "cooldown"
             reason = "cooldown"
 
-        denied_by_maturity_only = bool(
-            degrade_from in {"unreliable", "ia_immature_warmup", "ia_immature_fallback", "ia_immature_unreliable"}
-            and reason in {
-                "unreliable->shadow",
-                "ia_immature_warmup->shadow",
-                "ia_fallback->shadow",
-                "ia_unreliable->shadow",
-            }
-        )
-        if (
-            bool(AUTO_REAL_UNRELIABLE_ALLOW_STRONG_GATE)
-            and (estado_real in ("SHADOW", "MICRO"))
-            and decision in (EMBUDO_FINAL_WAIT_SOFT, EMBUDO_FINAL_SHADOW_OK)
-            and denied_by_maturity_only
-            and bool(top1_bot)
-            and (top1_prob >= float(AUTO_REAL_UNRELIABLE_GATE_MIN_PROB))
-            and (n_samples >= int(AUTO_REAL_UNRELIABLE_MIN_N))
-            and allow_real
-            and trigger_ok
-            and confirm_ok
-            and (not cooldown_active)
-            and (not hard_guard_hard_block)
-            and (soft_wait_reason not in ("marti_contexto_degradado", "best_bot_mismatch"))
-        ):
-            decision = EMBUDO_FINAL_REAL_MICRO
-            risk_mode = "REAL_MICRO"
-            reason = "oper_override_micro"
-            soft_wait_reason = ""
-            degrade_from = "oper_override_micro"
-
         confirm_deficit = int(max(0, int(confirm_need) - int(confirm_streak)))
         near_prob_floor = float(max(float(floor_eff), float(AUTO_REAL_UNRELIABLE_GATE_MIN_PROB) - float(AUTO_REAL_MICRO_EARLY_CONFIRM_MARGIN)))
         denied_by_early_confirm_only = bool(
