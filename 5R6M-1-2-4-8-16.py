@@ -350,7 +350,7 @@ AUTO_REAL_UNREL_MICRO_RELAX_LOG_COOLDOWN_S = 45.0
 AUTO_REAL_UNRELIABLE_ALLOW_STRONG_GATE = True
 AUTO_REAL_UNRELIABLE_GATE_MIN_PROB = IA_ACTIVACION_REAL_THR_POST_N15
 AUTO_REAL_MICRO_EARLY_CONFIRM_ENABLE = True
-AUTO_REAL_MICRO_EARLY_CONFIRM_MARGIN = 0.01
+AUTO_REAL_MICRO_EARLY_CONFIRM_MARGIN = 0.02
 AUTO_REAL_MICRO_EARLY_CONFIRM_DEFICIT_MAX = 1
 
 # Guardas por bot para reducir desalineación Prob IA vs % Éxito observado en HUD.
@@ -13935,14 +13935,18 @@ DYN_ROOF_MODE_C_MIN_EVIDENCE_LB = 0.60
 # Techo vivo del mercado (ticks HUD): evita perseguir picos históricos irreales.
 DYN_ROOF_LIVE_PEAK_WINDOW = 120
 DYN_ROOF_LIVE_PEAK_MIN_SAMPLES = 20
-DYN_ROOF_LIVE_PEAK_MARGIN = 0.01
-DYN_ROOF_LIVE_PEAK_MARGIN_UNRELIABLE = 0.05
+DYN_ROOF_LIVE_PEAK_MARGIN = 0.05
+DYN_ROOF_LIVE_PEAK_MARGIN_UNRELIABLE = 0.07
 DYN_ROOF_LIVE_PEAK_ONLY_RELIABLE = True
 # Trigger suave en modo unreliable para no perder entradas de alta calidad por 1 tick de latencia.
 DYN_ROOF_UNRELIABLE_TRIGGER_SOFT_ENABLE = True
 DYN_ROOF_UNRELIABLE_TRIGGER_SOFT_MARGIN = 0.05
 DYN_ROOF_UNRELIABLE_TRIGGER_SOFT_MIN_SUCESO = 20.0
 DYN_ROOF_UNRELIABLE_TRIGGER_SOFT_MIN_PATTERN = 3.0
+DYN_ROOF_RELIABLE_TRIGGER_SOFT_ENABLE = True
+DYN_ROOF_RELIABLE_TRIGGER_SOFT_MARGIN = 0.02
+DYN_ROOF_RELIABLE_TRIGGER_SOFT_MIN_SUCESO = 22.0
+DYN_ROOF_RELIABLE_TRIGGER_SOFT_MIN_PATTERN = 3.0
 DYN_ROOF_UNRELIABLE_ROOF_OFFSET = 0.03
 # Cap superior dinámico del techo: mantiene límites altos pero evita quedarse en 85-99% sin ejecuciones.
 DYN_ROOF_MAX_CAP = 0.82
@@ -14292,6 +14296,7 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         "new_open": False,
         "gate_mode": "A",
         "stall_s": float(stall_s),
+        "trigger_ok_micro_soft": False,
     }
     try:
         DYN_ROOF_STATE["tick"] = int(DYN_ROOF_STATE.get("tick", 0) or 0) + 1
@@ -14524,6 +14529,7 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
 
         trigger_pattern = False
         trigger_soft = False
+        trigger_ok_micro_soft = False
         if modo_relajado_n15 and (not reliable_mode):
             try:
                 ctx_best = _ultimo_contexto_operativo_bot(str(best_bot))
@@ -14544,6 +14550,31 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             except Exception:
                 trigger_pattern = False
                 trigger_soft = False
+        if modo_relajado_n15 and reliable_mode and bool(DYN_ROOF_RELIABLE_TRIGGER_SOFT_ENABLE):
+            try:
+                ctx_best_rel = _ultimo_contexto_operativo_bot(str(best_bot))
+                q3p_rel, q2p_rel = _pattern_v1_thresholds_proxy()
+                _ps_rel, _pb_rel, _pp_rel, _pt_rel = pattern_score_operativo_v1(ctx_best_rel or {}, q3p_rel, q2p_rel)
+                suceso_idx_best_rel = float(estado_bots.get(str(best_bot), {}).get("ia_suceso_idx", 0.0) or 0.0)
+                pat_state_rel = str(estado_bots.get(str(best_bot), {}).get("ia_pattern_col_state", "BLOQUEADO") or "BLOQUEADO")
+                near_roof_soft_rel = bool(
+                    float(p_best) >= float(max(float(floor_eff), float(roof_eff - DYN_ROOF_RELIABLE_TRIGGER_SOFT_MARGIN)))
+                )
+                confirm_soft_rel = bool(int(confirm_streak) >= max(1, int(confirm_need) - 1))
+                context_soft_rel = bool(
+                    (suceso_idx_best_rel >= float(DYN_ROOF_RELIABLE_TRIGGER_SOFT_MIN_SUCESO))
+                    or (float(_pt_rel) >= float(DYN_ROOF_RELIABLE_TRIGGER_SOFT_MIN_PATTERN))
+                    or (pat_state_rel == "CONTINUIDAD")
+                )
+                trigger_ok_micro_soft = bool(
+                    (n_samples_meta >= 300)
+                    and near_roof_soft_rel
+                    and confirm_soft_rel
+                    and bool(gap_ok)
+                    and context_soft_rel
+                )
+            except Exception:
+                trigger_ok_micro_soft = False
 
         if mode_c_active:
             trigger_ok = bool(suceso_ok)
@@ -14582,6 +14613,7 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         DYN_ROOF_STATE["last_floor_eff"] = float(floor_eff)
         DYN_ROOF_STATE["last_confirm_need"] = int(confirm_need)
         DYN_ROOF_STATE["last_trigger_ok"] = bool(trigger_ok)
+        DYN_ROOF_STATE["last_trigger_ok_micro_soft"] = bool(trigger_ok_micro_soft)
         DYN_ROOF_STATE["last_trigger_force"] = bool(trigger_force)
         for b_live, p_live, _n_live in live:
             prev_probs[str(b_live)] = float(p_live)
@@ -14603,6 +14635,7 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             "crossed_up": bool(crossed_up),
             "suceso_ok": bool(suceso_ok),
             "trigger_ok": bool(trigger_ok),
+            "trigger_ok_micro_soft": bool(trigger_ok_micro_soft),
             "trigger_force": bool(trigger_force),
             "gate_mode": str(gate_mode),
             "stall_s": float(stall_s),
@@ -14891,26 +14924,10 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
             soft_wait_reason = ""
             degrade_from = "oper_override_micro_early_confirm"
 
-        pat_state_top = str(estado_bots.get(top1_bot, {}).get("ia_pattern_col_state", "BLOQUEADO")) if top1_bot else "BLOQUEADO"
-        try:
-            pat_ratio_top = float(estado_bots.get(top1_bot, {}).get("ia_pattern_col_ratio", 0.0) or 0.0) if top1_bot else 0.0
-        except Exception:
-            pat_ratio_top = 0.0
-        try:
-            suceso_idx_best = float(estado_bots.get(top1_bot, {}).get("ia_suceso_idx", 0.0) or 0.0) if top1_bot else 0.0
-        except Exception:
-            suceso_idx_best = 0.0
         trigger_ok_micro_soft = bool(
-            (decision in (EMBUDO_FINAL_WAIT_SOFT, EMBUDO_FINAL_SHADOW_OK))
-            and bool(top1_bot)
-            and reliable
-            and (n_samples >= 300)
+            bool(dgate.get("trigger_ok_micro_soft", False))
+            and (decision in (EMBUDO_FINAL_WAIT_SOFT, EMBUDO_FINAL_SHADOW_OK))
             and (estado_real in ("MICRO", "SHADOW"))
-            and (pat_state_top == "CONTINUIDAD")
-            and (pat_ratio_top >= 0.80)
-            and (suceso_idx_best >= 30.0)
-            and (top1_prob >= (float(floor_eff) - 0.02))
-            and gap_ok
             and (not cooldown_active)
             and (not hard_guard_hard_block)
             and (soft_wait_reason not in ("marti_contexto_degradado", "best_bot_mismatch", "cooldown"))
