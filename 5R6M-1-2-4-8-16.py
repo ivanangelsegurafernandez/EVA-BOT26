@@ -349,6 +349,9 @@ AUTO_REAL_UNREL_MICRO_RELAX_LOG_COOLDOWN_S = 45.0
 # aunque el modelo siga en warmup/reliable=false.
 AUTO_REAL_UNRELIABLE_ALLOW_STRONG_GATE = True
 AUTO_REAL_UNRELIABLE_GATE_MIN_PROB = IA_ACTIVACION_REAL_THR_POST_N15
+AUTO_REAL_MICRO_EARLY_CONFIRM_ENABLE = True
+AUTO_REAL_MICRO_EARLY_CONFIRM_MARGIN = 0.01
+AUTO_REAL_MICRO_EARLY_CONFIRM_DEFICIT_MAX = 1
 
 # Guardas por bot para reducir desalineación Prob IA vs % Éxito observado en HUD.
 IA_PROMO_MIN_WR_POR_BOT = 0.45         # no promover bots con WR rolling claramente negativo
@@ -14682,6 +14685,8 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
         dgate = dyn_gate if isinstance(dyn_gate, dict) else {}
         allow_real = bool(dgate.get("allow_real", False))
         trigger_ok = bool(dgate.get("trigger_ok", False))
+        gap_ok = bool(dgate.get("gap_ok", False))
+        floor_eff = float(dgate.get("floor_eff", 0.0) or 0.0)
         confirm_need = int(dgate.get("confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
         confirm_streak = int(dgate.get("confirm_streak", 0) or 0)
         confirm_ok = bool(confirm_streak >= confirm_need)
@@ -14888,6 +14893,33 @@ def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real:
             reason = "oper_override_micro"
             soft_wait_reason = ""
             degrade_from = "oper_override_micro"
+
+        confirm_deficit = int(max(0, int(confirm_need) - int(confirm_streak)))
+        near_prob_floor = float(max(float(floor_eff), float(AUTO_REAL_UNRELIABLE_GATE_MIN_PROB) - float(AUTO_REAL_MICRO_EARLY_CONFIRM_MARGIN)))
+        denied_by_early_confirm_only = bool(
+            decision in (EMBUDO_FINAL_WAIT_SOFT, EMBUDO_FINAL_SHADOW_OK)
+            and (not allow_real)
+            and trigger_ok
+            and gap_ok
+            and (confirm_streak < confirm_need)
+            and (soft_wait_reason not in ("marti_contexto_degradado", "best_bot_mismatch", "cooldown"))
+        )
+        if (
+            bool(AUTO_REAL_MICRO_EARLY_CONFIRM_ENABLE)
+            and (estado_real in ("SHADOW", "MICRO"))
+            and bool(top1_bot)
+            and denied_by_early_confirm_only
+            and (confirm_deficit <= int(AUTO_REAL_MICRO_EARLY_CONFIRM_DEFICIT_MAX))
+            and (int(confirm_streak) >= max(0, int(confirm_need) - 1))
+            and (top1_prob >= near_prob_floor)
+            and (not cooldown_active)
+            and (not hard_guard_hard_block)
+        ):
+            decision = EMBUDO_FINAL_REAL_MICRO
+            risk_mode = "REAL_MICRO"
+            reason = "oper_override_micro_early_confirm"
+            soft_wait_reason = ""
+            degrade_from = "oper_override_micro_early_confirm"
 
         if estado_real == "SHADOW" and decision in (EMBUDO_FINAL_WAIT_SOFT, EMBUDO_FINAL_SHADOW_OK):
             ok_shadow_micro, why_shadow_micro = _shadow_micro_gate_ok(candidatos, dgate)
