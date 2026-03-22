@@ -1221,7 +1221,15 @@ estado_bots = {
         "ia_prob_senal": None,        # prob IA en el momento de la señal
         "ia_regime_score": 0.0,       # capa A (régimen)
         "ia_evidence_n": 0,           # soporte histórico en umbral objetivo
-        "ia_evidence_wr": 0.0         # win-rate real en umbral objetivo
+        "ia_evidence_wr": 0.0,        # win-rate real en umbral objetivo
+        # Telemetría Pattern V1 (existente)
+        "ia_pattern_bonus": 0.0,
+        "ia_pattern_penal": 0.0,
+        # Telemetría patrón por columnas (separada, evita colisión con Pattern V1)
+        "ia_pattern_col_state": "BLOQUEADO",
+        "ia_pattern_col_bonus": 0.0,
+        "ia_pattern_col_penal": 0.0,
+        "ia_pattern_col_delta": 0.0,
     }
     for bot in BOT_NAMES
 }
@@ -11864,6 +11872,172 @@ def aplicar_ajuste_patron_score(pattern_eval: dict) -> tuple[float, float, float
         penal += float(PATTERN_COL_PENAL_LATE_CHASE)
     return float(bonus), float(penal), float(bonus - penal)
 
+def _resultado_to_mark(x):
+    raw = str(x or "").strip().upper()
+    if raw in {"GANANCIA", "G", "WIN", "W", "✓", "✔", "✅", "🟢"}:
+        return "G"
+    if raw in {"PÉRDIDA", "PERDIDA", "P", "LOSS", "L", "X", "✗", "❌", "🔴"}:
+        return "R"
+    return None
+
+def _construir_matriz_resultados_columnas(estado: dict, bots: list[str], window: int = 40) -> list[dict]:
+    """
+    Construye matriz por columnas cerradas:
+      - filas: bots
+      - columnas: de más reciente [0] a más antigua [window-1]
+    Cada columna incluye `cells` (bot->G/R/None) y métricas base.
+    """
+    cols = []
+    w = max(1, int(window))
+    for off in range(w):
+        cells = {}
+        validos = verdes = rojos = 0
+        for b in list(bots or []):
+            rr = list((estado.get(b, {}) or {}).get("resultados", []) or [])
+            val = rr[-1 - off] if off < len(rr) else None
+            mark = _resultado_to_mark(val)
+            cells[b] = mark
+            if mark == "G":
+                validos += 1
+                verdes += 1
+            elif mark == "R":
+                validos += 1
+                rojos += 1
+        ratio = (float(verdes) / float(validos)) if validos > 0 else None
+        cols.append({
+            "offset": int(off),
+            "cells": cells,
+            "total_validos": int(validos),
+            "total_verdes": int(verdes),
+            "total_rojos": int(rojos),
+            "green_ratio": ratio,
+        })
+    return cols
+
+def evaluar_patron_columna_verde(col_data: dict, thr80: float = 0.80, thr90: float = 0.90) -> dict:
+    validos = int((col_data or {}).get("total_validos", 0) or 0)
+    verdes = int((col_data or {}).get("total_verdes", 0) or 0)
+    rojos = int((col_data or {}).get("total_rojos", 0) or 0)
+    ratio = (float(verdes) / float(validos)) if validos > 0 else None
+    es80 = bool((ratio is not None) and (float(ratio) >= float(thr80)))
+    es90 = bool((ratio is not None) and (float(ratio) >= float(thr90)))
+    return {
+        "total_validos": validos,
+        "total_verdes": verdes,
+        "total_rojos": rojos,
+        "green_ratio": ratio,
+        "es_col80": es80,
+        "es_col90": es90,
+    }
+
+def calcular_rebote_x_to_check_historico(columnas: list[dict], lookback: int = 12) -> dict:
+    """
+    Convención temporal de matriz:
+      - offset 0 = columna operativa actual (más reciente cerrada)
+      - offset creciente = columnas más antiguas
+    Antifuga estricta:
+      - NO se usa ningún par que toque offset 0
+      - SOLO se usan pares históricos completos j -> j-1 con j >= 2
+    """
+    hist = []
+    cols = list(columnas or [])
+    max_j = min(len(cols) - 1, max(2, int(lookback)))
+    for j in range(2, max_j + 1):
+        col_j = cols[j] if j < len(cols) else {}
+        col_next = cols[j - 1] if (j - 1) < len(cols) else {}
+        cells_j = dict((col_j or {}).get("cells", {}) or {})
+        cells_next = dict((col_next or {}).get("cells", {}) or {})
+        x_total = 0
+        x_rebota = 0
+        for bot, mark in cells_j.items():
+            if mark != "R":
+                continue
+            mark_next = cells_next.get(bot, None)
+            if mark_next is None:
+                continue
+            x_total += 1
+            if mark_next == "G":
+                x_rebota += 1
+        rate = (float(x_rebota) / float(x_total)) if x_total > 0 else None
+        hist.append({"j": int(j), "x_totales": int(x_total), "x_rebotan": int(x_rebota), "rebote_rate_j": rate})
+    total_x_hist = sum(int(h.get("x_totales", 0) or 0) for h in hist)
+    total_x_rebote_hist = sum(int(h.get("x_rebotan", 0) or 0) for h in hist)
+    rate_hist = (float(total_x_rebote_hist) / float(total_x_hist)) if total_x_hist > 0 else None
+    rates_simple = [float(h["rebote_rate_j"]) for h in hist if h.get("rebote_rate_j") is not None]
+    rate_simple = (sum(rates_simple) / float(len(rates_simple))) if rates_simple else None
+    return {
+        "pairs": hist,
+        "rebote_rate_hist": rate_hist,
+        "rebote_rate_hist_simple": rate_simple,  # solo debug
+        "rebote_samples_hist": int(total_x_hist),
+        "total_x_hist": int(total_x_hist),
+        "total_x_rebote_hist": int(total_x_rebote_hist),
+    }
+
+def calcular_strong_streak(columnas_stats: list[dict], thr: float = 0.80) -> int:
+    streak = 0
+    for c in list(columnas_stats or []):
+        ratio = c.get("green_ratio", None)
+        if (ratio is None) or (float(ratio) < float(thr)):
+            break
+        streak += 1
+    return int(streak)
+
+def clasificar_estado_patron(col_actual: dict, col_anterior: dict, rebote_rate_hist: float | None, rebote_samples_hist: int) -> dict:
+    ratio = col_actual.get("green_ratio", None)
+    col80 = bool(col_actual.get("es_col80", False))
+    col90 = bool(col_actual.get("es_col90", False))
+    prev90 = bool((col_anterior or {}).get("es_col90", False))
+    strong_streak_80 = int(col_actual.get("strong_streak_80", 0) or 0)
+    strong_streak_90 = int(col_actual.get("strong_streak_90", 0) or 0)
+    late_chase = bool(
+        (strong_streak_80 >= int(PATTERN_STRONG_STREAK_BLOCK))
+        or (strong_streak_90 >= 1)
+    )
+    sat_activa = bool(col90 or late_chase)
+    rebote_ok = bool(
+        col80
+        and (not sat_activa)
+        and (rebote_rate_hist is not None)
+        and (float(rebote_rate_hist) >= float(PATTERN_REBOTE_MIN))
+        and (int(rebote_samples_hist) >= int(PATTERN_REBOTE_MIN_SAMPLES))
+    )
+    continuidad_ok = bool(col80 and (not col90) and (not prev90) and (not late_chase))
+
+    if sat_activa:
+        state = "SATURACION"
+    elif rebote_ok:
+        state = "REBOTE"
+    elif continuidad_ok:
+        state = "CONTINUIDAD"
+    else:
+        state = "BLOQUEADO"
+    return {
+        "pattern_state": state,
+        "late_chase": late_chase,
+        "saturacion_activa": sat_activa,
+        "continuidad_ok": continuidad_ok,
+        "rebote_ok": rebote_ok,
+        "green_ratio_col_actual": ratio,
+        "strong_streak_80": strong_streak_80,
+        "strong_streak_90": strong_streak_90,
+    }
+
+def aplicar_ajuste_patron_score(pattern_eval: dict) -> tuple[float, float, float]:
+    state = str((pattern_eval or {}).get("pattern_state", "BLOQUEADO"))
+    late_chase = bool((pattern_eval or {}).get("late_chase", False))
+    bonus = 0.0
+    penal = 0.0
+    if state == "CONTINUIDAD":
+        bonus += float(PATTERN_COL_BONUS_CONTINUIDAD)
+    elif state == "REBOTE":
+        bonus += float(PATTERN_COL_BONUS_REBOTE)
+    elif state == "SATURACION":
+        penal += float(PATTERN_COL_PENAL_SATURACION)
+    if late_chase:
+        penal += float(PATTERN_COL_PENAL_LATE_CHASE)
+    return float(bonus), float(penal), float(bonus - penal)
+
 def _racha_actual_color(resultados):
     r = list(resultados or [])
     largo = 0
@@ -16009,15 +16183,15 @@ async def main():
                                         thr_post_ctx = min(0.99, float(thr_post_ctx) + abs(float(pat_delta_col)) * k_pts_pat)
                                     elif float(pat_delta_col) > 0.0:
                                         thr_post_ctx = max(0.0, float(thr_post_ctx) - min(0.02, float(pat_delta_col) * k_pts_pat))
-                                estado_bots[b]["ia_pattern_state"] = str(pat_state.get("pattern_state", "BLOQUEADO"))
+                                estado_bots[b]["ia_pattern_col_state"] = str(pat_state.get("pattern_state", "BLOQUEADO"))
                                 estado_bots[b]["ia_pattern_col_ratio"] = pat_state.get("green_ratio_col_actual", None)
                                 estado_bots[b]["ia_pattern_rebote_hist"] = pat_state.get("rebote_rate_hist", None)
                                 estado_bots[b]["ia_pattern_strong80"] = int(pat_state.get("strong_streak_80", 0) or 0)
                                 estado_bots[b]["ia_pattern_strong90"] = int(pat_state.get("strong_streak_90", 0) or 0)
                                 estado_bots[b]["ia_pattern_late_chase"] = bool(pat_state.get("late_chase", False))
-                                estado_bots[b]["ia_pattern_bonus"] = float(pat_bonus_col)
-                                estado_bots[b]["ia_pattern_penal"] = float(pat_penal_col)
-                                estado_bots[b]["ia_pattern_delta_col"] = float(pat_delta_col)
+                                estado_bots[b]["ia_pattern_col_bonus"] = float(pat_bonus_col)
+                                estado_bots[b]["ia_pattern_col_penal"] = float(pat_penal_col)
+                                estado_bots[b]["ia_pattern_col_delta"] = float(pat_delta_col)
                                 estado_bots[b]["ia_pattern_thr_ctx"] = float(thr_post_ctx)
                                 if float(p_post) < float(thr_post_ctx):
                                     continue
