@@ -448,6 +448,33 @@ PATTERN_V1_REQUIRE_TRIGGER_OK = True     # trigger_ok=sí
 PATTERN_V1_USE_HYBRID_RANKING = True    # ranking híbrido operativo (prob + pattern + evidencia)
 PATTERN_V1_LOG_COOLDOWN_S = 25.0
 PATTERN_V1_HYBRID_PTS_TO_PROB = 0.03  # 1 punto pattern = 3pp sobre score probabilístico
+PATTERN_COL_WINDOW = 40
+PATTERN_COL80_THRESHOLD = 0.80
+PATTERN_COL90_THRESHOLD = 0.90
+PATTERN_REBOTE_LOOKBACK = 12
+PATTERN_REBOTE_MIN = 0.65
+PATTERN_REBOTE_MIN_SAMPLES = 3
+PATTERN_STRONG_STREAK_BLOCK = 2
+PATTERN_ENABLE = True
+PATTERN_COL_BONUS_CONTINUIDAD = 0.60
+PATTERN_COL_BONUS_REBOTE = 0.80
+PATTERN_COL_PENAL_SATURACION = 1.20
+PATTERN_COL_PENAL_LATE_CHASE = 1.00
+PATTERN_COL_LAST_STATE = {
+    "green_ratio_col_actual": None,
+    "total_verdes_col_actual": 0,
+    "total_rojos_col_actual": 0,
+    "rebote_rate_hist": None,
+    "rebote_samples_hist": 0,
+    "total_x_hist": 0,
+    "total_x_rebote_hist": 0,
+    "pattern_state": "BLOQUEADO",
+    "strong_streak_80": 0,
+    "strong_streak_90": 0,
+    "late_chase": False,
+    "pattern_delta": 0.0,
+    "pattern_bonus_penalty": 0.0,
+}
 PATTERN_V1_Q3_PROXY = {
     "rsi_9": 64.0,
     "rsi_reversion": 0.060,
@@ -499,11 +526,20 @@ IA_PROB_POLARIZE_CENTER = 0.50
 def _validar_pattern_v1_config() -> None:
     """Sanitiza parámetros para evitar valores inválidos en runtime."""
     global PATTERN_V1_SCORE_THR, PATTERN_V1_BONUS_DUAL, PATTERN_V1_PENAL_TARDIA, PATTERN_V1_LOG_COOLDOWN_S, PATTERN_V1_HYBRID_PTS_TO_PROB
+    global PATTERN_COL_WINDOW, PATTERN_COL80_THRESHOLD, PATTERN_COL90_THRESHOLD, PATTERN_REBOTE_LOOKBACK
+    global PATTERN_REBOTE_MIN, PATTERN_REBOTE_MIN_SAMPLES, PATTERN_STRONG_STREAK_BLOCK
     PATTERN_V1_SCORE_THR = max(0.0, float(PATTERN_V1_SCORE_THR))
     PATTERN_V1_BONUS_DUAL = max(0.0, float(PATTERN_V1_BONUS_DUAL))
     PATTERN_V1_PENAL_TARDIA = max(0.0, float(PATTERN_V1_PENAL_TARDIA))
     PATTERN_V1_LOG_COOLDOWN_S = max(5.0, float(PATTERN_V1_LOG_COOLDOWN_S))
     PATTERN_V1_HYBRID_PTS_TO_PROB = min(0.10, max(0.0, float(PATTERN_V1_HYBRID_PTS_TO_PROB)))
+    PATTERN_COL_WINDOW = max(5, int(PATTERN_COL_WINDOW))
+    PATTERN_COL80_THRESHOLD = min(0.99, max(0.50, float(PATTERN_COL80_THRESHOLD)))
+    PATTERN_COL90_THRESHOLD = min(1.0, max(float(PATTERN_COL80_THRESHOLD), float(PATTERN_COL90_THRESHOLD)))
+    PATTERN_REBOTE_LOOKBACK = max(2, int(PATTERN_REBOTE_LOOKBACK))
+    PATTERN_REBOTE_MIN = min(1.0, max(0.0, float(PATTERN_REBOTE_MIN)))
+    PATTERN_REBOTE_MIN_SAMPLES = max(1, int(PATTERN_REBOTE_MIN_SAMPLES))
+    PATTERN_STRONG_STREAK_BLOCK = max(1, int(PATTERN_STRONG_STREAK_BLOCK))
 
 
 def resumen_plan_cambios_5r6m() -> list[str]:
@@ -11662,6 +11698,172 @@ def _es_verde_resultado(x):
 def _es_rojo_resultado(x):
     return str(x or "").strip().upper() == "PÉRDIDA"
 
+def _resultado_to_mark(x):
+    raw = str(x or "").strip().upper()
+    if raw in {"GANANCIA", "G", "WIN", "W", "✓", "✔", "✅", "🟢"}:
+        return "G"
+    if raw in {"PÉRDIDA", "PERDIDA", "P", "LOSS", "L", "X", "✗", "❌", "🔴"}:
+        return "R"
+    return None
+
+def _construir_matriz_resultados_columnas(estado: dict, bots: list[str], window: int = 40) -> list[dict]:
+    """
+    Construye matriz por columnas cerradas:
+      - filas: bots
+      - columnas: de más reciente [0] a más antigua [window-1]
+    Cada columna incluye `cells` (bot->G/R/None) y métricas base.
+    """
+    cols = []
+    w = max(1, int(window))
+    for off in range(w):
+        cells = {}
+        validos = verdes = rojos = 0
+        for b in list(bots or []):
+            rr = list((estado.get(b, {}) or {}).get("resultados", []) or [])
+            val = rr[-1 - off] if off < len(rr) else None
+            mark = _resultado_to_mark(val)
+            cells[b] = mark
+            if mark == "G":
+                validos += 1
+                verdes += 1
+            elif mark == "R":
+                validos += 1
+                rojos += 1
+        ratio = (float(verdes) / float(validos)) if validos > 0 else None
+        cols.append({
+            "offset": int(off),
+            "cells": cells,
+            "total_validos": int(validos),
+            "total_verdes": int(verdes),
+            "total_rojos": int(rojos),
+            "green_ratio": ratio,
+        })
+    return cols
+
+def evaluar_patron_columna_verde(col_data: dict, thr80: float = 0.80, thr90: float = 0.90) -> dict:
+    validos = int((col_data or {}).get("total_validos", 0) or 0)
+    verdes = int((col_data or {}).get("total_verdes", 0) or 0)
+    rojos = int((col_data or {}).get("total_rojos", 0) or 0)
+    ratio = (float(verdes) / float(validos)) if validos > 0 else None
+    es80 = bool((ratio is not None) and (float(ratio) >= float(thr80)))
+    es90 = bool((ratio is not None) and (float(ratio) >= float(thr90)))
+    return {
+        "total_validos": validos,
+        "total_verdes": verdes,
+        "total_rojos": rojos,
+        "green_ratio": ratio,
+        "es_col80": es80,
+        "es_col90": es90,
+    }
+
+def calcular_rebote_x_to_check_historico(columnas: list[dict], lookback: int = 12) -> dict:
+    """
+    Convención temporal de matriz:
+      - offset 0 = columna operativa actual (más reciente cerrada)
+      - offset creciente = columnas más antiguas
+    Antifuga estricta:
+      - NO se usa ningún par que toque offset 0
+      - SOLO se usan pares históricos completos j -> j-1 con j >= 2
+    """
+    hist = []
+    cols = list(columnas or [])
+    max_j = min(len(cols) - 1, max(2, int(lookback)))
+    for j in range(2, max_j + 1):
+        col_j = cols[j] if j < len(cols) else {}
+        col_next = cols[j - 1] if (j - 1) < len(cols) else {}
+        cells_j = dict((col_j or {}).get("cells", {}) or {})
+        cells_next = dict((col_next or {}).get("cells", {}) or {})
+        x_total = 0
+        x_rebota = 0
+        for bot, mark in cells_j.items():
+            if mark != "R":
+                continue
+            mark_next = cells_next.get(bot, None)
+            if mark_next is None:
+                continue
+            x_total += 1
+            if mark_next == "G":
+                x_rebota += 1
+        rate = (float(x_rebota) / float(x_total)) if x_total > 0 else None
+        hist.append({"j": int(j), "x_totales": int(x_total), "x_rebotan": int(x_rebota), "rebote_rate_j": rate})
+    total_x_hist = sum(int(h.get("x_totales", 0) or 0) for h in hist)
+    total_x_rebote_hist = sum(int(h.get("x_rebotan", 0) or 0) for h in hist)
+    rate_hist = (float(total_x_rebote_hist) / float(total_x_hist)) if total_x_hist > 0 else None
+    rates_simple = [float(h["rebote_rate_j"]) for h in hist if h.get("rebote_rate_j") is not None]
+    rate_simple = (sum(rates_simple) / float(len(rates_simple))) if rates_simple else None
+    return {
+        "pairs": hist,
+        "rebote_rate_hist": rate_hist,
+        "rebote_rate_hist_simple": rate_simple,  # solo debug
+        "rebote_samples_hist": int(total_x_hist),
+        "total_x_hist": int(total_x_hist),
+        "total_x_rebote_hist": int(total_x_rebote_hist),
+    }
+
+def calcular_strong_streak(columnas_stats: list[dict], thr: float = 0.80) -> int:
+    streak = 0
+    for c in list(columnas_stats or []):
+        ratio = c.get("green_ratio", None)
+        if (ratio is None) or (float(ratio) < float(thr)):
+            break
+        streak += 1
+    return int(streak)
+
+def clasificar_estado_patron(col_actual: dict, col_anterior: dict, rebote_rate_hist: float | None, rebote_samples_hist: int) -> dict:
+    ratio = col_actual.get("green_ratio", None)
+    col80 = bool(col_actual.get("es_col80", False))
+    col90 = bool(col_actual.get("es_col90", False))
+    prev90 = bool((col_anterior or {}).get("es_col90", False))
+    strong_streak_80 = int(col_actual.get("strong_streak_80", 0) or 0)
+    strong_streak_90 = int(col_actual.get("strong_streak_90", 0) or 0)
+    late_chase = bool(
+        (strong_streak_80 >= int(PATTERN_STRONG_STREAK_BLOCK))
+        or (strong_streak_90 >= 1)
+    )
+    sat_activa = bool(col90 or late_chase)
+    rebote_ok = bool(
+        col80
+        and (not sat_activa)
+        and (rebote_rate_hist is not None)
+        and (float(rebote_rate_hist) >= float(PATTERN_REBOTE_MIN))
+        and (int(rebote_samples_hist) >= int(PATTERN_REBOTE_MIN_SAMPLES))
+    )
+    continuidad_ok = bool(col80 and (not col90) and (not prev90) and (not late_chase))
+
+    if sat_activa:
+        state = "SATURACION"
+    elif rebote_ok:
+        state = "REBOTE"
+    elif continuidad_ok:
+        state = "CONTINUIDAD"
+    else:
+        state = "BLOQUEADO"
+    return {
+        "pattern_state": state,
+        "late_chase": late_chase,
+        "saturacion_activa": sat_activa,
+        "continuidad_ok": continuidad_ok,
+        "rebote_ok": rebote_ok,
+        "green_ratio_col_actual": ratio,
+        "strong_streak_80": strong_streak_80,
+        "strong_streak_90": strong_streak_90,
+    }
+
+def aplicar_ajuste_patron_score(pattern_eval: dict) -> tuple[float, float, float]:
+    state = str((pattern_eval or {}).get("pattern_state", "BLOQUEADO"))
+    late_chase = bool((pattern_eval or {}).get("late_chase", False))
+    bonus = 0.0
+    penal = 0.0
+    if state == "CONTINUIDAD":
+        bonus += float(PATTERN_COL_BONUS_CONTINUIDAD)
+    elif state == "REBOTE":
+        bonus += float(PATTERN_COL_BONUS_REBOTE)
+    elif state == "SATURACION":
+        penal += float(PATTERN_COL_PENAL_SATURACION)
+    if late_chase:
+        penal += float(PATTERN_COL_PENAL_LATE_CHASE)
+    return float(bonus), float(penal), float(bonus - penal)
+
 def _racha_actual_color(resultados):
     r = list(resultados or [])
     largo = 0
@@ -12218,6 +12420,30 @@ def mostrar_panel():
 
         if owner not in (None, "none") and mejor is not None and owner != mejor[0]:
             print(padding + Fore.YELLOW + f"⛓️ Token bloqueado en {owner}; mejor IA actual es {mejor[0]} ({mejor[1]*100:.1f}%).")
+    except Exception:
+        pass
+    try:
+        pat = dict(globals().get("PATTERN_COL_LAST_STATE", {}) or {})
+        ratio = pat.get("green_ratio_col_actual", None)
+        ratio_txt = "--" if ratio is None else f"{float(ratio)*100:.1f}%"
+        reb_txt = "--"
+        if pat.get("rebote_rate_hist", None) is not None:
+            reb_txt = f"{float(pat.get('rebote_rate_hist', 0.0))*100:.1f}%"
+        print(
+            padding
+            + Fore.CYAN
+            + "🧠 PatternCol: "
+            + f"ratio={ratio_txt} V={int(pat.get('total_verdes_col_actual', 0) or 0)} "
+            + f"R={int(pat.get('total_rojos_col_actual', 0) or 0)} "
+            + f"reb_hist={reb_txt} "
+            + f"X={int(pat.get('total_x_hist', 0) or 0)} "
+            + f"X→✓={int(pat.get('total_x_rebote_hist', 0) or 0)} "
+            + f"state={str(pat.get('pattern_state', 'BLOQUEADO'))} "
+            + f"st80={int(pat.get('strong_streak_80', 0) or 0)} "
+            + f"st90={int(pat.get('strong_streak_90', 0) or 0)} "
+            + f"late={'sí' if bool(pat.get('late_chase', False)) else 'no'} "
+            + f"Δ={float(pat.get('pattern_delta', 0.0) or 0.0):+.2f}"
+        )
     except Exception:
         pass
 
@@ -15611,6 +15837,41 @@ async def main():
                         # Candidatos: prob válida, reciente, IA activa (no OFF)
                         candidatos = []
                         raw_rank_scores = []
+                        pattern_col_eval = dict(PATTERN_COL_LAST_STATE)
+                        if bool(PATTERN_ENABLE):
+                            try:
+                                cols = _construir_matriz_resultados_columnas(estado_bots, BOT_NAMES, window=int(PATTERN_COL_WINDOW))
+                                cols_stats = [
+                                    evaluar_patron_columna_verde(c, thr80=float(PATTERN_COL80_THRESHOLD), thr90=float(PATTERN_COL90_THRESHOLD))
+                                    for c in cols
+                                ]
+                                col_actual = dict(cols_stats[0]) if cols_stats else {}
+                                col_anterior = dict(cols_stats[1]) if len(cols_stats) > 1 else {}
+                                streak80 = calcular_strong_streak(cols_stats, thr=float(PATTERN_COL80_THRESHOLD))
+                                streak90 = calcular_strong_streak(cols_stats, thr=float(PATTERN_COL90_THRESHOLD))
+                                col_actual["strong_streak_80"] = int(streak80)
+                                col_actual["strong_streak_90"] = int(streak90)
+                                rebote_hist = calcular_rebote_x_to_check_historico(cols, lookback=int(PATTERN_REBOTE_LOOKBACK))
+                                pattern_col_eval = clasificar_estado_patron(
+                                    col_actual=col_actual,
+                                    col_anterior=col_anterior,
+                                    rebote_rate_hist=rebote_hist.get("rebote_rate_hist", None),
+                                    rebote_samples_hist=int(rebote_hist.get("rebote_samples_hist", 0) or 0),
+                                )
+                                _b_pat, _p_pat, _d_pat = aplicar_ajuste_patron_score(pattern_col_eval)
+                                pattern_col_eval.update({
+                                    "total_verdes_col_actual": int(col_actual.get("total_verdes", 0) or 0),
+                                    "total_rojos_col_actual": int(col_actual.get("total_rojos", 0) or 0),
+                                    "rebote_rate_hist": rebote_hist.get("rebote_rate_hist", None),
+                                    "rebote_samples_hist": int(rebote_hist.get("rebote_samples_hist", 0) or 0),
+                                    "total_x_hist": int(rebote_hist.get("total_x_hist", 0) or 0),
+                                    "total_x_rebote_hist": int(rebote_hist.get("total_x_rebote_hist", 0) or 0),
+                                    "pattern_delta": float(_d_pat),
+                                    "pattern_bonus_penalty": float(_d_pat),
+                                })
+                            except Exception:
+                                pattern_col_eval = dict(PATTERN_COL_LAST_STATE)
+                        globals()["PATTERN_COL_LAST_STATE"] = dict(pattern_col_eval)
                         diag_gate = _leer_gate_desde_diagnostico(ttl_s=60.0)
                         # CTT como autoridad contextual superior: si hay veto duro,
                         # no se evalúan señales individuales/techo en este tick.
@@ -15651,14 +15912,7 @@ async def main():
                                 # - Fase 1 selecciona campeón provisional por prob operativa.
                                 # - Los candados blandos/moduladores se evalúan después sobre top-1.
                                 regime_score = _score_regimen_contexto(ctx_pre)
-                                p_post = float(p)
-                                p_rank = float(estado_bots.get(b, {}).get("ia_prob_pre_cap", p_post) or p_post)
-                                score_final = float(max(0.0, min(1.0, p_rank)))
-                                estado_bots[b]["ia_regime_score"] = float(regime_score)
-                                estado_bots[b]["ia_evidence_n"] = int(estado_bots[b].get("ia_evidence_n", 0) or 0)
-                                estado_bots[b]["ia_evidence_wr"] = float(estado_bots[b].get("ia_evidence_wr", 0.0) or 0.0)
-                                candidatos.append((float(score_final), b, float(p), float(p_post), float(regime_score), 0, 0.0, 0.0))
-                                continue
+                                ctx = ctx_pre
 
                                 # 1) Gate de calidad por racha/rebote (priorizar precisión real)
                                 ctx = _ultimo_contexto_operativo_bot(b)
@@ -15744,7 +15998,28 @@ async def main():
                                 estado_bots[b]["ia_thr_real_reason"] = str(thr_reason)
                                 if ev_n < int(EVIDENCE_MIN_N_SOFT):
                                     thr_post = min(0.99, thr_post + float(EVIDENCE_LOW_N_EXTRA_MARGIN))
-                                if float(p_post) < float(thr_post):
+                                # Pattern por columnas = CONTEXTO GLOBAL (no score diferencial por bot).
+                                # Se usa como modulador de elegibilidad común, sin reordenar bots por sí solo.
+                                pat_state = dict(pattern_col_eval if isinstance(pattern_col_eval, dict) else {})
+                                pat_bonus_col, pat_penal_col, pat_delta_col = aplicar_ajuste_patron_score(pat_state)
+                                k_pts_pat = float(PATTERN_V1_HYBRID_PTS_TO_PROB)
+                                thr_post_ctx = float(thr_post)
+                                if bool(PATTERN_ENABLE):
+                                    if float(pat_delta_col) < 0.0:
+                                        thr_post_ctx = min(0.99, float(thr_post_ctx) + abs(float(pat_delta_col)) * k_pts_pat)
+                                    elif float(pat_delta_col) > 0.0:
+                                        thr_post_ctx = max(0.0, float(thr_post_ctx) - min(0.02, float(pat_delta_col) * k_pts_pat))
+                                estado_bots[b]["ia_pattern_state"] = str(pat_state.get("pattern_state", "BLOQUEADO"))
+                                estado_bots[b]["ia_pattern_col_ratio"] = pat_state.get("green_ratio_col_actual", None)
+                                estado_bots[b]["ia_pattern_rebote_hist"] = pat_state.get("rebote_rate_hist", None)
+                                estado_bots[b]["ia_pattern_strong80"] = int(pat_state.get("strong_streak_80", 0) or 0)
+                                estado_bots[b]["ia_pattern_strong90"] = int(pat_state.get("strong_streak_90", 0) or 0)
+                                estado_bots[b]["ia_pattern_late_chase"] = bool(pat_state.get("late_chase", False))
+                                estado_bots[b]["ia_pattern_bonus"] = float(pat_bonus_col)
+                                estado_bots[b]["ia_pattern_penal"] = float(pat_penal_col)
+                                estado_bots[b]["ia_pattern_delta_col"] = float(pat_delta_col)
+                                estado_bots[b]["ia_pattern_thr_ctx"] = float(thr_post_ctx)
+                                if float(p_post) < float(thr_post_ctx):
                                     continue
 
                                 # Candado anti-overconfidence global: si el diagnóstico reporta gap alto,
