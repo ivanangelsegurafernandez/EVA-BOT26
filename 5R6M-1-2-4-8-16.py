@@ -1070,6 +1070,7 @@ IA53_LAST_TS = {bot: 0.0 for bot in BOT_NAMES}
 TOKEN_FILE = "token_actual.txt"
 DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 saldo_real = "--"
+saldo_demo = "--"
 SALDO_INICIAL = None
 META = None
 meta_mostrada = False
@@ -1085,33 +1086,61 @@ def _marca_lxv_desde_resultado(resultado) -> str | None:
     """Normaliza resultado de bot a marca LXV: V (verde) / X (fallo)."""
     try:
         txt = str(resultado or "").strip().upper()
-        if txt in {"GANADA", "GANADOR", "WIN", "W", "V", "VERDE", "1"}:
+        if txt in {"GANANCIA", "GANADA", "GANADOR", "WIN", "W", "V", "VERDE", "1"}:
             return "V"
-        if txt in {"PERDIDA", "PERDIDO", "LOSS", "L", "X", "ROJO", "0"}:
+        if txt in {"PÉRDIDA", "PERDIDA", "PERDIDO", "LOSS", "L", "X", "ROJO", "0"}:
             return "X"
         return None
     except Exception:
         return None
 
 
-def construir_columnas_lxv(estado: dict) -> list[dict]:
+def construir_matriz_lxv_visible(estado: dict, width: int = 40) -> dict[str, list[str | None]]:
     """
-    Construye columnas alineadas LXV usando el último resultado confirmado por bot.
-    Si algún bot no tiene marca válida, no hay columna operable en ese tick.
+    Construye exactamente la matriz visible del HUD (últimos 40 resultados):
+    - fuente: estado_bots[bot]["resultados"]
+    - padding a la izquierda con vacíos
+    - mapeo GANANCIA->V, PÉRDIDA->X, resto->None
     """
+    out: dict[str, list[str | None]] = {}
     try:
         estado = estado if isinstance(estado, dict) else {}
-        marcas = {}
+        width = max(1, int(width))
         for bot in BOT_NAMES:
             st = estado.get(bot, {}) if isinstance(estado.get(bot, {}), dict) else {}
-            mk = _marca_lxv_desde_resultado(st.get("ultimo_resultado"))
-            if mk not in ("V", "X"):
-                return []
-            marcas[bot] = mk
-        return [{
-            "columna_id": f"lxv:{int(time.time())}",
-            "marcas": marcas,
-        }]
+            raw = st.get("resultados", [])
+            raw_list = list(raw) if isinstance(raw, (list, tuple, deque)) else []
+            tail = raw_list[-width:]
+            marcas = [_marca_lxv_desde_resultado(x) for x in tail]
+            if len(marcas) < width:
+                marcas = ([None] * (width - len(marcas))) + marcas
+            out[bot] = marcas
+    except Exception:
+        for bot in BOT_NAMES:
+            out[bot] = [None] * int(max(1, width))
+    return out
+
+
+def construir_columnas_lxv(estado: dict) -> list[dict]:
+    """
+    Construye columnas LXV desde la misma matriz visible del HUD.
+    Columna operable: los 6 bots tienen marca V/X (sin vacíos).
+    """
+    try:
+        matriz = construir_matriz_lxv_visible(estado, width=40)
+        width = 40
+        columnas: list[dict] = []
+        for col_idx in range(width):
+            marcas = {bot: (matriz.get(bot, [None] * width)[col_idx]) for bot in BOT_NAMES}
+            operable = all(marcas.get(bot) in ("V", "X") for bot in BOT_NAMES)
+            if not operable:
+                continue
+            columnas.append({
+                "columna_id": f"col_visible:{col_idx}",
+                "col_visible": int(col_idx),
+                "marcas": marcas,
+            })
+        return columnas
     except Exception:
         return []
 
@@ -1158,21 +1187,26 @@ def elegir_x_mayor_peso(candidatas_x: list[str], estado: dict, columnas: list[di
 
 
 def detectar_lxv(columnas: list[dict], estado: dict, contexto: dict | None = None) -> dict | None:
-    """Detecta patrón LXV válido (5V1X o 4V2X) y resuelve bot objetivo."""
+    """Detecta patrón LXV válido (5V1X o 4V2X), priorizando columna visible más reciente."""
     try:
-        for col in list(columnas or []):
+        cols = sorted(list(columnas or []), key=lambda c: int((c or {}).get("col_visible", -1)), reverse=True)
+        for col in cols:
             marcas = col.get("marcas", {}) if isinstance(col, dict) else {}
             if not isinstance(marcas, dict):
                 continue
+            if not all(marcas.get(b) in ("V", "X") for b in BOT_NAMES):
+                continue
             verdes = [b for b in BOT_NAMES if marcas.get(b) == "V"]
             xs = [b for b in BOT_NAMES if marcas.get(b) == "X"]
+            col_visible = int(col.get("col_visible", -1))
             if len(verdes) == 5 and len(xs) == 1:
                 x = str(xs[0])
                 return {
                     "pattern": "5V1X",
                     "bot_objetivo": x,
                     "motivo": "x_unica_en_columna",
-                    "columna_id": str(col.get("columna_id", "lxv:na")),
+                    "columna_id": str(col.get("columna_id", f"col_visible:{col_visible}")),
+                    "col_visible": col_visible,
                     "xs_consideradas": list(xs),
                     "x_ganadora": x,
                 }
@@ -1183,7 +1217,8 @@ def detectar_lxv(columnas: list[dict], estado: dict, contexto: dict | None = Non
                         "pattern": "4V2X",
                         "bot_objetivo": xg,
                         "motivo": str(detalle.get("motivo", "desempate_4V2X")),
-                        "columna_id": str(col.get("columna_id", "lxv:na")),
+                        "columna_id": str(col.get("columna_id", f"col_visible:{col_visible}")),
+                        "col_visible": col_visible,
                         "xs_consideradas": list(xs),
                         "x_ganadora": xg,
                         "detalle_peso": detalle,
@@ -1194,257 +1229,7 @@ def detectar_lxv(columnas: list[dict], estado: dict, contexto: dict | None = Non
 
 
 def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> dict | None:
-    """Ruta única de selección REAL: solo LXV."""
-    cols = construir_columnas_lxv(estado)
-    out = detectar_lxv(cols, estado, contexto=contexto)
-    if isinstance(out, dict) and str(out.get("bot_objetivo")) in BOT_NAMES:
-        return out
-    return None
-
-# ==================== LXV: ruta única de decisión REAL ====================
-# Mayor valor = mayor prioridad histórica en desempate 4V2X.
-LXV_PRIORIDAD_HISTORICA = {bot: int(len(BOT_NAMES) - i) for i, bot in enumerate(BOT_NAMES)}
-
-
-def _marca_lxv_desde_resultado(resultado) -> str | None:
-    """Normaliza resultado de bot a marca LXV: V (verde) / X (fallo)."""
-    try:
-        txt = str(resultado or "").strip().upper()
-        if txt in {"GANADA", "GANADOR", "WIN", "W", "V", "VERDE", "1"}:
-            return "V"
-        if txt in {"PERDIDA", "PERDIDO", "LOSS", "L", "X", "ROJO", "0"}:
-            return "X"
-        return None
-    except Exception:
-        return None
-
-
-def construir_columnas_lxv(estado: dict) -> list[dict]:
-    """
-    Construye columnas alineadas LXV usando el último resultado confirmado por bot.
-    Si algún bot no tiene marca válida, no hay columna operable en ese tick.
-    """
-    try:
-        estado = estado if isinstance(estado, dict) else {}
-        marcas = {}
-        for bot in BOT_NAMES:
-            st = estado.get(bot, {}) if isinstance(estado.get(bot, {}), dict) else {}
-            mk = _marca_lxv_desde_resultado(st.get("ultimo_resultado"))
-            if mk not in ("V", "X"):
-                return []
-            marcas[bot] = mk
-        return [{
-            "columna_id": f"lxv:{int(time.time())}",
-            "marcas": marcas,
-        }]
-    except Exception:
-        return []
-
-
-def elegir_x_mayor_peso(candidatas_x: list[str], estado: dict, columnas: list[dict], contexto: dict | None = None) -> tuple[str | None, dict]:
-    """
-    Desempate estable para 4V2X:
-    a) mayor prioridad histórica configurable
-    b) peor racha reciente válida
-    c) menor % de acierto reciente
-    d) orden determinista BOT_NAMES
-    """
-    try:
-        estado = estado if isinstance(estado, dict) else {}
-        contexto = contexto if isinstance(contexto, dict) else {}
-        prioridad = dict(LXV_PRIORIDAD_HISTORICA)
-        prioridad.update(contexto.get("prioridad_historica", {}) if isinstance(contexto.get("prioridad_historica"), dict) else {})
-        index_bot = {b: i for i, b in enumerate(BOT_NAMES)}
-        filas = []
-        for bot in [str(x) for x in (candidatas_x or []) if str(x) in BOT_NAMES]:
-            st = estado.get(bot, {}) if isinstance(estado.get(bot, {}), dict) else {}
-            racha = float(st.get("racha_actual", 0.0) or 0.0)
-            acierto = float(st.get("porcentaje_exito", 0.0) or 0.0)
-            filas.append({
-                "bot": bot,
-                "prio": float(prioridad.get(bot, 0.0) or 0.0),
-                "racha": float(racha),
-                "acierto": float(acierto),
-                "idx": int(index_bot.get(bot, 999)),
-            })
-        if not filas:
-            return None, {"motivo": "sin_x_validas"}
-        filas.sort(key=lambda r: (-r["prio"], r["racha"], r["acierto"], r["idx"]))
-        win = filas[0]
-        return str(win["bot"]), {
-            "motivo": "desempate_4V2X_peso",
-            "prioridad_historica": {f["bot"]: f["prio"] for f in filas},
-            "racha_reciente": {f["bot"]: f["racha"] for f in filas},
-            "acierto_reciente": {f["bot"]: f["acierto"] for f in filas},
-            "orden": [f["bot"] for f in filas],
-        }
-    except Exception:
-        return None, {"motivo": "error_elegir_x"}
-
-
-def detectar_lxv(columnas: list[dict], estado: dict, contexto: dict | None = None) -> dict | None:
-    """Detecta patrón LXV válido (5V1X o 4V2X) y resuelve bot objetivo."""
-    try:
-        for col in list(columnas or []):
-            marcas = col.get("marcas", {}) if isinstance(col, dict) else {}
-            if not isinstance(marcas, dict):
-                continue
-            verdes = [b for b in BOT_NAMES if marcas.get(b) == "V"]
-            xs = [b for b in BOT_NAMES if marcas.get(b) == "X"]
-            if len(verdes) == 5 and len(xs) == 1:
-                x = str(xs[0])
-                return {
-                    "pattern": "5V1X",
-                    "bot_objetivo": x,
-                    "motivo": "x_unica_en_columna",
-                    "columna_id": str(col.get("columna_id", "lxv:na")),
-                    "xs_consideradas": list(xs),
-                    "x_ganadora": x,
-                }
-            if len(verdes) == 4 and len(xs) == 2:
-                xg, detalle = elegir_x_mayor_peso(xs, estado, columnas, contexto=contexto)
-                if xg in BOT_NAMES:
-                    return {
-                        "pattern": "4V2X",
-                        "bot_objetivo": xg,
-                        "motivo": str(detalle.get("motivo", "desempate_4V2X")),
-                        "columna_id": str(col.get("columna_id", "lxv:na")),
-                        "xs_consideradas": list(xs),
-                        "x_ganadora": xg,
-                        "detalle_peso": detalle,
-                    }
-        return None
-    except Exception:
-        return None
-
-
-def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> dict | None:
-    """Ruta única de selección REAL: solo LXV."""
-    cols = construir_columnas_lxv(estado)
-    out = detectar_lxv(cols, estado, contexto=contexto)
-    if isinstance(out, dict) and str(out.get("bot_objetivo")) in BOT_NAMES:
-        return out
-    return None
-
-# ==================== LXV: ruta única de decisión REAL ====================
-# Mayor valor = mayor prioridad histórica en desempate 4V2X.
-LXV_PRIORIDAD_HISTORICA = {bot: int(len(BOT_NAMES) - i) for i, bot in enumerate(BOT_NAMES)}
-
-
-def _marca_lxv_desde_resultado(resultado) -> str | None:
-    """Normaliza resultado de bot a marca LXV: V (verde) / X (fallo)."""
-    try:
-        txt = str(resultado or "").strip().upper()
-        if txt in {"GANADA", "GANADOR", "WIN", "W", "V", "VERDE", "1"}:
-            return "V"
-        if txt in {"PERDIDA", "PERDIDO", "LOSS", "L", "X", "ROJO", "0"}:
-            return "X"
-        return None
-    except Exception:
-        return None
-
-
-def construir_columnas_lxv(estado: dict) -> list[dict]:
-    """
-    Construye columnas alineadas LXV usando el último resultado confirmado por bot.
-    Si algún bot no tiene marca válida, no hay columna operable en ese tick.
-    """
-    try:
-        estado = estado if isinstance(estado, dict) else {}
-        marcas = {}
-        for bot in BOT_NAMES:
-            st = estado.get(bot, {}) if isinstance(estado.get(bot, {}), dict) else {}
-            mk = _marca_lxv_desde_resultado(st.get("ultimo_resultado"))
-            if mk not in ("V", "X"):
-                return []
-            marcas[bot] = mk
-        return [{
-            "columna_id": f"lxv:{int(time.time())}",
-            "marcas": marcas,
-        }]
-    except Exception:
-        return []
-
-
-def elegir_x_mayor_peso(candidatas_x: list[str], estado: dict, columnas: list[dict], contexto: dict | None = None) -> tuple[str | None, dict]:
-    """
-    Desempate estable para 4V2X:
-    a) mayor prioridad histórica configurable
-    b) peor racha reciente válida
-    c) menor % de acierto reciente
-    d) orden determinista BOT_NAMES
-    """
-    try:
-        estado = estado if isinstance(estado, dict) else {}
-        contexto = contexto if isinstance(contexto, dict) else {}
-        prioridad = dict(LXV_PRIORIDAD_HISTORICA)
-        prioridad.update(contexto.get("prioridad_historica", {}) if isinstance(contexto.get("prioridad_historica"), dict) else {})
-        index_bot = {b: i for i, b in enumerate(BOT_NAMES)}
-        filas = []
-        for bot in [str(x) for x in (candidatas_x or []) if str(x) in BOT_NAMES]:
-            st = estado.get(bot, {}) if isinstance(estado.get(bot, {}), dict) else {}
-            racha = float(st.get("racha_actual", 0.0) or 0.0)
-            acierto = float(st.get("porcentaje_exito", 0.0) or 0.0)
-            filas.append({
-                "bot": bot,
-                "prio": float(prioridad.get(bot, 0.0) or 0.0),
-                "racha": float(racha),
-                "acierto": float(acierto),
-                "idx": int(index_bot.get(bot, 999)),
-            })
-        if not filas:
-            return None, {"motivo": "sin_x_validas"}
-        filas.sort(key=lambda r: (-r["prio"], r["racha"], r["acierto"], r["idx"]))
-        win = filas[0]
-        return str(win["bot"]), {
-            "motivo": "desempate_4V2X_peso",
-            "prioridad_historica": {f["bot"]: f["prio"] for f in filas},
-            "racha_reciente": {f["bot"]: f["racha"] for f in filas},
-            "acierto_reciente": {f["bot"]: f["acierto"] for f in filas},
-            "orden": [f["bot"] for f in filas],
-        }
-    except Exception:
-        return None, {"motivo": "error_elegir_x"}
-
-
-def detectar_lxv(columnas: list[dict], estado: dict, contexto: dict | None = None) -> dict | None:
-    """Detecta patrón LXV válido (5V1X o 4V2X) y resuelve bot objetivo."""
-    try:
-        for col in list(columnas or []):
-            marcas = col.get("marcas", {}) if isinstance(col, dict) else {}
-            if not isinstance(marcas, dict):
-                continue
-            verdes = [b for b in BOT_NAMES if marcas.get(b) == "V"]
-            xs = [b for b in BOT_NAMES if marcas.get(b) == "X"]
-            if len(verdes) == 5 and len(xs) == 1:
-                x = str(xs[0])
-                return {
-                    "pattern": "5V1X",
-                    "bot_objetivo": x,
-                    "motivo": "x_unica_en_columna",
-                    "columna_id": str(col.get("columna_id", "lxv:na")),
-                    "xs_consideradas": list(xs),
-                    "x_ganadora": x,
-                }
-            if len(verdes) == 4 and len(xs) == 2:
-                xg, detalle = elegir_x_mayor_peso(xs, estado, columnas, contexto=contexto)
-                if xg in BOT_NAMES:
-                    return {
-                        "pattern": "4V2X",
-                        "bot_objetivo": xg,
-                        "motivo": str(detalle.get("motivo", "desempate_4V2X")),
-                        "columna_id": str(col.get("columna_id", "lxv:na")),
-                        "xs_consideradas": list(xs),
-                        "x_ganadora": xg,
-                        "detalle_peso": detalle,
-                    }
-        return None
-    except Exception:
-        return None
-
-
-def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> dict | None:
-    """Ruta única de selección REAL: solo LXV."""
+    """Ruta única de selección REAL: solo LXV desde columna visible HUD."""
     cols = construir_columnas_lxv(estado)
     out = detectar_lxv(cols, estado, contexto=contexto)
     if isinstance(out, dict) and str(out.get("bot_objetivo")) in BOT_NAMES:
@@ -1457,7 +1242,12 @@ reinicio_manual = False
 
 LIMPIEZA_PANEL_HASTA = 0
 ULTIMA_ACT_SALDO = 0
+ULTIMA_ACT_SALDO_DEMO = 0
 REFRESCO_SALDO = 12
+SALDO_FEED_HEARTBEAT_S = 25.0
+SALDO_FEED_MIN_INTERVAL_S = 1.0
+SALDO_FEED_FORCE_INTERVAL_S = 8.0
+SALDO_FEED_HISTORY_KEEPALIVE_S = 30.0
 MAX_CICLOS = len(MARTI_ESCALADO)
 huellas_usadas = {bot: set() for bot in BOT_NAMES}
 SNAPSHOT_FILAS = {bot: 0 for bot in BOT_NAMES}
@@ -7863,6 +7653,16 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
         f"🔁 Martingala{bot_msg}: resultado={res} | pérdidas seguidas={marti_ciclos_perdidos}/{MAX_CICLOS} | próximo ciclo={ciclo_sig}"
     )
     agregar_evento(f"🧾 MARTI-AUDIT: {marti_audit_resumen_linea()}")
+    try:
+        owner_now = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_archivo_raw()
+        publicar_feed_saldo("real", obtener_valor_saldo(), owner=owner_now, motivo=f"resultado_{res.lower()}", forzar=True)
+        try:
+            demo_v = float(saldo_demo)
+        except Exception:
+            demo_v = None
+        publicar_feed_saldo("demo", demo_v, owner=owner_now, motivo=f"resultado_{res.lower()}", forzar=True)
+    except Exception:
+        pass
 
 def ciclo_martingala_siguiente() -> int:
     """
@@ -13637,38 +13437,158 @@ async def cargar_datos_bot(bot, token_actual):
     except Exception as e:
         print(f"⚠️ Error cargando datos para {bot}: {e}")
 
-# Obtener saldo real
-async def obtener_saldo_real():
-    global saldo_real, ULTIMA_ACT_SALDO
-    token_demo, token_real = leer_tokens_usuario()
-    if not token_real:
+# === Feed canónico de saldo (canal lateral, no toca lógica operativa) ===
+SALDO_FEED_STATE = {
+    "real": {"last_payload": None, "last_publish_ts": 0.0, "last_history_ts": 0.0},
+    "demo": {"last_payload": None, "last_publish_ts": 0.0, "last_history_ts": 0.0},
+}
+SALDO_FEED_LOCK = threading.Lock()
+LAST_TOKEN_OWNER_PUBLISHED = None
+
+
+def _saldo_feed_paths(modo: str) -> tuple[str, str, str]:
+    base_dir = script_dir if "script_dir" in globals() else os.getcwd()
+    if modo == "real":
+        live_path = os.path.expanduser(os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(base_dir, "saldo_real_live.json")))
+        hist_path = os.path.expanduser(os.getenv("SALDO_LIVE_HISTORY_SHARED_PATH", os.path.join(base_dir, "saldo_real_live_history.jsonl")))
+        csv_path = os.path.expanduser(os.getenv("SALDO_SERIES_CSV_PATH", os.path.join(base_dir, "saldo_real_series.csv")))
+    else:
+        live_path = os.path.expanduser(os.getenv("SALDO_DEMO_LIVE_SHARED_PATH", os.path.join(base_dir, "saldo_demo_live.json")))
+        hist_path = os.path.expanduser(os.getenv("SALDO_DEMO_HISTORY_SHARED_PATH", os.path.join(base_dir, "saldo_demo_live_history.jsonl")))
+        csv_path = os.path.expanduser(os.getenv("SALDO_DEMO_SERIES_CSV_PATH", os.path.join(base_dir, "saldo_demo_series.csv")))
+    return live_path, hist_path, csv_path
+
+
+def _atomic_write_json(path: str, payload: dict) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _append_line_atomic(path: str, line: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        f.write(line + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _ensure_csv_header(path: str) -> None:
+    if os.path.exists(path) and os.path.getsize(path) > 0:
         return
-    if not WEBSOCKETS_OK:
-        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write("timestamp,equity,source\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _build_saldo_payload(modo: str, saldo: float | None, owner: str | None = None) -> dict | None:
+    if saldo is None:
+        return None
+    now = time.time()
+    token_owner = owner if owner in BOT_NAMES else "none"
+    return {
+        "ts": float(now),
+        "timestamp": datetime.now().isoformat(),
+        "saldo_real": float(saldo) if modo == "real" else None,
+        "saldo_demo": float(saldo) if modo == "demo" else None,
+        "equity": float(saldo),
+        "balance": float(saldo),
+        "fuente": "maestro_5R6M",
+        "maestro_activo": 1,
+        "token_owner": token_owner,
+        "modo_real": bool(modo == "real"),
+    }
+
+
+def publicar_feed_saldo(modo: str, saldo: float | None, owner: str | None = None, motivo: str = "tick", forzar: bool = False) -> bool:
+    try:
+        payload = _build_saldo_payload(modo, saldo, owner=owner)
+        if not isinstance(payload, dict):
+            return False
+        now = time.time()
+        st = SALDO_FEED_STATE.get(modo, {})
+        prev = st.get("last_payload")
+        last_pub = float(st.get("last_publish_ts", 0.0) or 0.0)
+        last_hist = float(st.get("last_history_ts", 0.0) or 0.0)
+        changed_balance = not isinstance(prev, dict) or (float(prev.get("equity", -999999)) != float(payload.get("equity", 0.0)))
+        changed_owner = not isinstance(prev, dict) or (str(prev.get("token_owner", "none")) != str(payload.get("token_owner", "none")))
+        should_publish = bool(forzar or changed_balance or changed_owner or (now - last_pub) >= float(SALDO_FEED_FORCE_INTERVAL_S))
+        if (not should_publish) and (now - last_pub) < float(SALDO_FEED_MIN_INTERVAL_S):
+            return False
+        if not should_publish:
+            return False
+
+        live_path, hist_path, csv_path = _saldo_feed_paths(modo)
+        with SALDO_FEED_LOCK:
+            _atomic_write_json(live_path, payload)
+            _ensure_csv_header(csv_path)
+            _append_line_atomic(csv_path, f"{payload['timestamp']},{payload['equity']:.8f},{payload['fuente']}")
+            if changed_balance or changed_owner or (now - last_hist) >= float(SALDO_FEED_HISTORY_KEEPALIVE_S):
+                _append_line_atomic(hist_path, json.dumps(payload, ensure_ascii=False))
+                st["last_history_ts"] = now
+            st["last_payload"] = payload
+            st["last_publish_ts"] = now
+            SALDO_FEED_STATE[modo] = st
+        return True
+    except Exception:
+        return False
+
+
+async def _fetch_balance_from_token(token: str) -> float | None:
+    if not token or (not WEBSOCKETS_OK):
+        return None
     try:
         async with websockets.connect(DERIV_WS_URL) as ws:
-            auth_msg = json.dumps({"authorize": token_real})
-            await ws.send(auth_msg)
+            await ws.send(json.dumps({"authorize": token}))
+            auth = json.loads(await ws.recv())
+            if "error" in auth:
+                return None
+            await ws.send(json.dumps({"balance": 1}))
             resp = json.loads(await ws.recv())
             if "error" in resp:
-                print(f"⚠️ Error en auth: {resp['error']['message']}")
-                return
-            bal_msg = json.dumps({"balance": 1, "subscribe": 1})
-            await ws.send(bal_msg)
-            resp = json.loads(await ws.recv())
-            if "error" in resp:
-                print(f"⚠️ Error en balance: {resp['error']['message']}")
-                return
-            if "balance" in resp:
-                saldo_real = f"{resp['balance']['balance']:.2f}"
-                ULTIMA_ACT_SALDO = time.time()
-    except Exception as e:
-        print(f"⚠️ Error obteniendo saldo: {e}")
+                return None
+            bal = ((resp or {}).get("balance") or {}).get("balance")
+            return float(bal) if bal is not None else None
+    except Exception:
+        return None
+
+
+# Obtener saldo real/demo
+async def obtener_saldo_real():
+    global saldo_real, saldo_demo, ULTIMA_ACT_SALDO, ULTIMA_ACT_SALDO_DEMO
+    token_demo, token_real = leer_tokens_usuario()
+    owner_now = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_archivo_raw()
+    if token_real:
+        bal_real = await _fetch_balance_from_token(token_real)
+        if isinstance(bal_real, (int, float)):
+            saldo_real = f"{float(bal_real):.2f}"
+            ULTIMA_ACT_SALDO = time.time()
+            publicar_feed_saldo("real", float(bal_real), owner=owner_now, motivo="refresh_real")
+    if token_demo:
+        bal_demo = await _fetch_balance_from_token(token_demo)
+        if isinstance(bal_demo, (int, float)):
+            saldo_demo = f"{float(bal_demo):.2f}"
+            ULTIMA_ACT_SALDO_DEMO = time.time()
+            publicar_feed_saldo("demo", float(bal_demo), owner=owner_now, motivo="refresh_demo")
 
 async def refresh_saldo_real(forzado=False):
     global ULTIMA_ACT_SALDO
     if forzado or time.time() - ULTIMA_ACT_SALDO > REFRESCO_SALDO:
         await obtener_saldo_real()
+    else:
+        owner_now = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_archivo_raw()
+        publicar_feed_saldo("real", obtener_valor_saldo(), owner=owner_now, motivo="heartbeat_real")
+        try:
+            demo_val = float(saldo_demo)
+        except Exception:
+            demo_val = None
+        publicar_feed_saldo("demo", demo_val, owner=owner_now, motivo="heartbeat_demo")
 
 def obtener_valor_saldo():
     global saldo_real
@@ -13955,7 +13875,7 @@ def _boot_health_check():
 async def main():
     global salir, pausado, reinicio_manual, SALDO_INICIAL
     global PENDIENTE_FORZAR_BOT, PENDIENTE_FORZAR_INICIO, PENDIENTE_FORZAR_EXPIRA, REAL_OWNER_LOCK
-    global REAL_LOCK_MISMATCH_SINCE
+    global REAL_LOCK_MISMATCH_SINCE, LAST_TOKEN_OWNER_PUBLISHED
 
     try:
         set_etapa("BOOT_01", "Inicializando main()", anunciar=True)
@@ -13996,6 +13916,13 @@ async def main():
         valor = obtener_valor_saldo()
         if valor is not None:
             inicializar_saldo_real(valor)
+        owner_boot = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_archivo_raw()
+        publicar_feed_saldo("real", obtener_valor_saldo(), owner=owner_boot, motivo="arranque", forzar=True)
+        try:
+            demo_boot = float(saldo_demo)
+        except Exception:
+            demo_boot = None
+        publicar_feed_saldo("demo", demo_boot, owner=owner_boot, motivo="arranque", forzar=True)
 
         set_etapa("BOOT_03", "Backfill y primer entrenamiento")
         # Backfill IA desde los logs enriquecidos
@@ -14031,6 +13958,15 @@ async def main():
             try:  
                 set_etapa("TICK_01")
                 token_actual_loop = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else (leer_token_actual() or next((b for b in BOT_NAMES if estado_bots.get(b, {}).get("token") == "REAL"), None))
+                owner_pub = token_actual_loop if token_actual_loop in BOT_NAMES else None
+                if owner_pub != LAST_TOKEN_OWNER_PUBLISHED:
+                    LAST_TOKEN_OWNER_PUBLISHED = owner_pub
+                    publicar_feed_saldo("real", obtener_valor_saldo(), owner=owner_pub, motivo="owner_change", forzar=True)
+                    try:
+                        demo_v = float(saldo_demo)
+                    except Exception:
+                        demo_v = None
+                    publicar_feed_saldo("demo", demo_v, owner=owner_pub, motivo="owner_change", forzar=True)
 
                 # Reconciliación anti-desincronía maestro↔bots:
                 # si memoria dice REAL pero token_actual.txt ya está en none por varios segundos,
@@ -14179,7 +14115,7 @@ async def main():
                                 candidatos = [(1.0, bot_lxv, 0.0, 0.0, 0.0, 0, 0.0, 0.0)]
                                 agregar_evento(
                                     f"🧭 LXV {lxv_decision.get('pattern','--')} → {bot_lxv} "
-                                    f"(col={lxv_decision.get('columna_id','--')}, xs={lxv_decision.get('xs_consideradas',[])})"
+                                    f"(col_visible={lxv_decision.get('col_visible','--')}, col={lxv_decision.get('columna_id','--')}, xs={lxv_decision.get('xs_consideradas',[])}, xg={lxv_decision.get('x_ganadora','--')})"
                                 )
 
                         # Si hay señal y el saldo no cubre el plan completo, solo avisar (no bloquear).
