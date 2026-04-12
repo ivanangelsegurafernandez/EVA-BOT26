@@ -1073,6 +1073,131 @@ meta_mostrada = False
 eventos_recentes = deque(maxlen=8)
 reinicio_forzado = asyncio.Event()
 
+# ==================== LXV: ruta única de decisión REAL ====================
+# Mayor valor = mayor prioridad histórica en desempate 4V2X.
+LXV_PRIORIDAD_HISTORICA = {bot: int(len(BOT_NAMES) - i) for i, bot in enumerate(BOT_NAMES)}
+
+
+def _marca_lxv_desde_resultado(resultado) -> str | None:
+    """Normaliza resultado de bot a marca LXV: V (verde) / X (fallo)."""
+    try:
+        txt = str(resultado or "").strip().upper()
+        if txt in {"GANADA", "GANADOR", "WIN", "W", "V", "VERDE", "1"}:
+            return "V"
+        if txt in {"PERDIDA", "PERDIDO", "LOSS", "L", "X", "ROJO", "0"}:
+            return "X"
+        return None
+    except Exception:
+        return None
+
+
+def construir_columnas_lxv(estado: dict) -> list[dict]:
+    """
+    Construye columnas alineadas LXV usando el último resultado confirmado por bot.
+    Si algún bot no tiene marca válida, no hay columna operable en ese tick.
+    """
+    try:
+        estado = estado if isinstance(estado, dict) else {}
+        marcas = {}
+        for bot in BOT_NAMES:
+            st = estado.get(bot, {}) if isinstance(estado.get(bot, {}), dict) else {}
+            mk = _marca_lxv_desde_resultado(st.get("ultimo_resultado"))
+            if mk not in ("V", "X"):
+                return []
+            marcas[bot] = mk
+        return [{
+            "columna_id": f"lxv:{int(time.time())}",
+            "marcas": marcas,
+        }]
+    except Exception:
+        return []
+
+
+def elegir_x_mayor_peso(candidatas_x: list[str], estado: dict, columnas: list[dict], contexto: dict | None = None) -> tuple[str | None, dict]:
+    """
+    Desempate estable para 4V2X:
+    a) mayor prioridad histórica configurable
+    b) peor racha reciente válida
+    c) menor % de acierto reciente
+    d) orden determinista BOT_NAMES
+    """
+    try:
+        estado = estado if isinstance(estado, dict) else {}
+        contexto = contexto if isinstance(contexto, dict) else {}
+        prioridad = dict(LXV_PRIORIDAD_HISTORICA)
+        prioridad.update(contexto.get("prioridad_historica", {}) if isinstance(contexto.get("prioridad_historica"), dict) else {})
+        index_bot = {b: i for i, b in enumerate(BOT_NAMES)}
+        filas = []
+        for bot in [str(x) for x in (candidatas_x or []) if str(x) in BOT_NAMES]:
+            st = estado.get(bot, {}) if isinstance(estado.get(bot, {}), dict) else {}
+            racha = float(st.get("racha_actual", 0.0) or 0.0)
+            acierto = float(st.get("porcentaje_exito", 0.0) or 0.0)
+            filas.append({
+                "bot": bot,
+                "prio": float(prioridad.get(bot, 0.0) or 0.0),
+                "racha": float(racha),
+                "acierto": float(acierto),
+                "idx": int(index_bot.get(bot, 999)),
+            })
+        if not filas:
+            return None, {"motivo": "sin_x_validas"}
+        filas.sort(key=lambda r: (-r["prio"], r["racha"], r["acierto"], r["idx"]))
+        win = filas[0]
+        return str(win["bot"]), {
+            "motivo": "desempate_4V2X_peso",
+            "prioridad_historica": {f["bot"]: f["prio"] for f in filas},
+            "racha_reciente": {f["bot"]: f["racha"] for f in filas},
+            "acierto_reciente": {f["bot"]: f["acierto"] for f in filas},
+            "orden": [f["bot"] for f in filas],
+        }
+    except Exception:
+        return None, {"motivo": "error_elegir_x"}
+
+
+def detectar_lxv(columnas: list[dict], estado: dict, contexto: dict | None = None) -> dict | None:
+    """Detecta patrón LXV válido (5V1X o 4V2X) y resuelve bot objetivo."""
+    try:
+        for col in list(columnas or []):
+            marcas = col.get("marcas", {}) if isinstance(col, dict) else {}
+            if not isinstance(marcas, dict):
+                continue
+            verdes = [b for b in BOT_NAMES if marcas.get(b) == "V"]
+            xs = [b for b in BOT_NAMES if marcas.get(b) == "X"]
+            if len(verdes) == 5 and len(xs) == 1:
+                x = str(xs[0])
+                return {
+                    "pattern": "5V1X",
+                    "bot_objetivo": x,
+                    "motivo": "x_unica_en_columna",
+                    "columna_id": str(col.get("columna_id", "lxv:na")),
+                    "xs_consideradas": list(xs),
+                    "x_ganadora": x,
+                }
+            if len(verdes) == 4 and len(xs) == 2:
+                xg, detalle = elegir_x_mayor_peso(xs, estado, columnas, contexto=contexto)
+                if xg in BOT_NAMES:
+                    return {
+                        "pattern": "4V2X",
+                        "bot_objetivo": xg,
+                        "motivo": str(detalle.get("motivo", "desempate_4V2X")),
+                        "columna_id": str(col.get("columna_id", "lxv:na")),
+                        "xs_consideradas": list(xs),
+                        "x_ganadora": xg,
+                        "detalle_peso": detalle,
+                    }
+        return None
+    except Exception:
+        return None
+
+
+def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> dict | None:
+    """Ruta única de selección REAL: solo LXV."""
+    cols = construir_columnas_lxv(estado)
+    out = detectar_lxv(cols, estado, contexto=contexto)
+    if isinstance(out, dict) and str(out.get("bot_objetivo")) in BOT_NAMES:
+        return out
+    return None
+
 salir = False
 pausado = False
 reinicio_manual = False
@@ -14125,197 +14250,20 @@ async def main():
                         costo_ciclo1 = float(MARTI_ESCALADO[0])
                         costo_plan = float(sum(MARTI_ESCALADO[:max(1, int(MAX_CICLOS))]))
 
-                        # Candidatos: prob válida, reciente, IA activa (no OFF)
+                        # Candidatos REAL definidos exclusivamente por LXV.
+                        lxv_decision = resolver_candidato_real_lxv(
+                            estado_bots,
+                            contexto={"prioridad_historica": LXV_PRIORIDAD_HISTORICA},
+                        )
                         candidatos = []
-                        diag_gate = _leer_gate_desde_diagnostico(ttl_s=60.0)
-                        # CTT maestro se evalúa luego sobre candidatos base (antes del embudo).
-                        ctt_eval = dict(CTT_STATE) if isinstance(CTT_STATE, dict) else {}
-
-                        for b in BOT_NAMES:
-                            try:
-                                modo_b = str(estado_bots.get(b, {}).get("modo_ia", "off")).lower()
-                                if modo_b == "off":
-                                    continue
-                                if not ia_prob_valida(b, max_age_s=12.0):
-                                    continue
-                                # Redundancia: no bloquear en seco; aplicar penalización de score y desempate posterior.
-                                redundante_tick = bool(estado_bots.get(b, {}).get("ia_input_redundante", False))
-
-                                p = _prob_ia_operativa_bot(b, default=None)
-                                if not isinstance(p, (int, float)):
-                                    continue
-                                # Primer filtro suave: evitar basura por debajo del piso operativo.
-                                piso_operativo = float(_umbral_real_operativo_actual()) if REAL_CLASSIC_GATE else float(IA_ACTIVACION_REAL_THR)
-                                if float(p) < float(piso_operativo):
-                                    continue
-
-                                # Embudo refactor v1:
-                                # - Fase 1 selecciona campeón provisional por prob operativa.
-                                # - Los candados blandos/moduladores se evalúan después sobre top-1.
-                                regime_score = _score_regimen_contexto(_ultimo_contexto_operativo_bot(b))
-                                p_post = float(p)
-                                p_rank = float(estado_bots.get(b, {}).get("ia_prob_pre_cap", p_post) or p_post)
-                                score_final = float(max(0.0, min(1.0, p_rank)))
-                                estado_bots[b]["ia_regime_score"] = float(regime_score)
-                                estado_bots[b]["ia_evidence_n"] = int(estado_bots[b].get("ia_evidence_n", 0) or 0)
-                                estado_bots[b]["ia_evidence_wr"] = float(estado_bots[b].get("ia_evidence_wr", 0.0) or 0.0)
-                                candidatos.append((float(score_final), b, float(p), float(p_post), float(regime_score), 0, 0.0, 0.0))
-                                continue
-
-                                # 1) Gate de calidad por racha/rebote (priorizar precisión real)
-                                ctx = _ultimo_contexto_operativo_bot(b)
-                                racha_now = float(ctx.get("racha_actual", 0.0) or 0.0)
-                                rebote_now = float(ctx.get("es_rebote", 0.0) or 0.0)
-                                if racha_now <= float(GATE_RACHA_NEG_BLOQUEO):
-                                    if not (bool(GATE_PERMITE_REBOTE_EN_NEG) and rebote_now >= 0.5):
-                                        continue
-
-                                # 2) Validación por régimen/activo (evita mezclar HZ con mal tramo reciente)
-                                activo_now = str(ctx.get("activo", "") or "").strip()
-                                ok_reg, wr_reg, n_reg = _gate_regimen_activo_ok(b, activo=activo_now)
-                                if not ok_reg:
-                                    agregar_evento(
-                                        f"🧯 Gate régimen: {b}/{activo_now or 'NA'} bloqueado "
-                                        f"(WR{n_reg}={wr_reg*100:.1f}% < {GATE_ACTIVO_MIN_WR*100:.1f}%)."
-                                    )
-                                    continue
-
-                                # 3) Gate por segmento (payout/vol/hora) para ejecutar donde hay más señal estable
-                                ok_seg, wr_seg, n_seg, seg_key = _gate_segmento_ok(b, ctx)
-                                if not ok_seg:
-                                    agregar_evento(
-                                        f"🧱 Gate segmento: {b}/{seg_key} bloqueado "
-                                        f"(WR{n_seg}={wr_seg*100:.1f}% < {GATE_SEGMENTO_MIN_WR*100:.1f}%)."
-                                    )
-                                    continue
-
-                                # 4) Capa A del embudo: score de régimen
-                                regime_score = _score_regimen_contexto(ctx)
-                                if regime_score < float(REGIME_GATE_MIN_SCORE):
-                                    continue
-
-                                # 5) Índice de evidencia por bot en umbral objetivo (evita inflar 0.70+ sin soporte)
-                                ev = _evidencia_bot_umbral_objetivo(b)
-                                ev_n = int(ev.get("n", 0) or 0)
-                                ev_wr = float(ev.get("wr", 0.0) or 0.0)
-                                ev_lb = float(ev.get("lb", 0.0) or 0.0)
-                                if (ev_n >= int(EVIDENCE_MIN_N_HARD)) and (not bool(ev.get("ok_hard", True))):
-                                    agregar_evento(
-                                        f"🧪 Evidencia: {b} bloqueado (n={ev_n}, WR={ev_wr*100:.1f}%, LB={ev_lb*100:.1f}% < LB_min {EVIDENCE_MIN_LB_HARD*100:.1f}%)."
-                                    )
-                                    continue
-
-                                # Candado blando: con muestra intermedia exigimos LB mínimo intermedio.
-                                if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (ev_lb < float(EVIDENCE_MIN_LB_SOFT)):
-                                    continue
-
-                                # 6) Prob REAL posterior (modelo + régimen + evidencia + bound)
-                                p_post = _prob_real_posterior(float(p), float(regime_score), int(ev_n), float(ev_wr), float(ev_lb))
-
-                                # Guardas por bot (alineadas al HUD): evitar promoción cuando hay
-                                # desalineación severa entre probabilidad y performance real reciente.
-                                if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (ev_wr < float(IA_PROMO_MIN_WR_POR_BOT)):
-                                    agregar_evento(
-                                        f"🧱 Guarda WR bot: {b} bloqueado (WR={ev_wr*100:.1f}% < {IA_PROMO_MIN_WR_POR_BOT*100:.1f}%, n={ev_n})."
-                                    )
-                                    continue
-                                overconf_gap = float(p_post) - float(ev_wr)
-                                if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (overconf_gap > float(IA_PROMO_MAX_OVERCONF_GAP)):
-                                    agregar_evento(
-                                        f"🧯 Guarda calibración: {b} bloqueado (p_real-WR={overconf_gap*100:.1f}pp > {IA_PROMO_MAX_OVERCONF_GAP*100:.1f}pp)."
-                                    )
-                                    continue
-
-                                # Guardas por bot (alineadas al HUD): evitar promoción cuando hay
-                                # desalineación severa entre probabilidad y performance real reciente.
-                                if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (ev_wr < float(IA_PROMO_MIN_WR_POR_BOT)):
-                                    agregar_evento(
-                                        f"🧱 Guarda WR bot: {b} bloqueado (WR={ev_wr*100:.1f}% < {IA_PROMO_MIN_WR_POR_BOT*100:.1f}%, n={ev_n})."
-                                    )
-                                    continue
-                                overconf_gap = float(p_post) - float(ev_wr)
-                                if (ev_n >= int(EVIDENCE_MIN_N_SOFT)) and (overconf_gap > float(IA_PROMO_MAX_OVERCONF_GAP)):
-                                    agregar_evento(
-                                        f"🧯 Guarda calibración: {b} bloqueado (p_real-WR={overconf_gap*100:.1f}pp > {IA_PROMO_MAX_OVERCONF_GAP*100:.1f}pp)."
-                                    )
-                                    continue
-
-                                # Candado final: el umbral REAL se valida sobre la probabilidad posterior (no p_model)
-                                thr_post = float(umbral_ia_real)
-                                if ev_n < int(EVIDENCE_MIN_N_SOFT):
-                                    thr_post = min(0.99, thr_post + float(EVIDENCE_LOW_N_EXTRA_MARGIN))
-                                if float(p_post) < float(thr_post):
-                                    continue
-
-                                # Candado anti-overconfidence global: si el diagnóstico reporta gap alto,
-                                # solo promover con evidencia fuerte (LB + N) aunque p_post supere umbral.
-                                if bool(diag_gate.get("force_evidence", False)):
-                                    if not ((ev_n >= int(EVIDENCE_MIN_N_HARD)) and (ev_lb >= float(EVIDENCE_MIN_LB_HARD))):
-                                        continue
-
-                                # 7) Ranking final (Capa B + régimen + evidencia)
-                                evidence_score = min(1.0, p_post + min(0.15, ev_n / 400.0))
-                                suceso_idx_b = float(estado_bots.get(b, {}).get("ia_suceso_idx", 0.0) or 0.0) / 100.0
-                                sensor_plano_b = bool(estado_bots.get(b, {}).get("ia_sensor_plano", False))
-                                score_final = (
-                                    float(REGIME_GATE_WEIGHT_PROB) * float(p_post)
-                                    + float(REGIME_GATE_WEIGHT_REGIME) * float(regime_score)
-                                    + float(REGIME_GATE_WEIGHT_EVIDENCE) * float(evidence_score)
-                                    + float(IA_SUCESO_SCORE_WEIGHT) * float(max(0.0, min(1.0, suceso_idx_b)))
+                        if isinstance(lxv_decision, dict):
+                            bot_lxv = str(lxv_decision.get("bot_objetivo", "") or "").strip()
+                            if bot_lxv in BOT_NAMES:
+                                candidatos = [(1.0, bot_lxv, 0.0, 0.0, 0.0, 0, 0.0, 0.0)]
+                                agregar_evento(
+                                    f"🧭 LXV {lxv_decision.get('pattern','--')} → {bot_lxv} "
+                                    f"(col={lxv_decision.get('columna_id','--')}, xs={lxv_decision.get('xs_consideradas',[])})"
                                 )
-                                if redundante_tick:
-                                    score_final = float(score_final) - float(IA_REDUNDANCY_SCORE_PENALTY)
-                                if sensor_plano_b:
-                                    score_final = float(score_final) - float(IA_SENSOR_PLANO_SCORE_PENALTY)
-
-                                # Pattern V1 (gradual): score híbrido detrás de flag.
-                                pattern_score_b = 0.0
-                                pattern_bonus_b = 0.0
-                                pattern_penal_b = 0.0
-                                score_hibrido = float(score_final)
-                                if bool(PATTERN_V1_ENABLE) and bool(PATTERN_V1_USE_HYBRID_RANKING):
-                                    q3_proxy, q2_proxy = _pattern_v1_thresholds_proxy()
-                                    pattern_score_b, pattern_bonus_b, pattern_penal_b, pattern_total_b = pattern_score_operativo_v1(ctx, q3_proxy, q2_proxy)
-                                    # Ajuste en escala probabilística (evita mezclar puntos de pattern con prob 0..1)
-                                    k_pts = float(PATTERN_V1_HYBRID_PTS_TO_PROB)
-                                    delta_hibrido = 0.0
-                                    if float(pattern_total_b) >= float(PATTERN_V1_SCORE_THR):
-                                        delta_hibrido = k_pts * (float(pattern_bonus_b) - float(pattern_penal_b))
-                                    else:
-                                        delta_hibrido = -k_pts * float(pattern_penal_b)
-                                    score_hibrido = float(score_final) + float(delta_hibrido)
-                                    score_hibrido = float(max(0.0, min(1.0, score_hibrido)))
-                                    _pattern_v1_log_bot(
-                                        b,
-                                        pattern_score=float(pattern_score_b),
-                                        bonus_dual=float(pattern_bonus_b),
-                                        penal_tardia=float(pattern_penal_b),
-                                        score_hibrido=float(score_hibrido),
-                                    )
-
-                                estado_bots[b]["ia_pattern_score"] = float(pattern_score_b)
-                                estado_bots[b]["ia_pattern_bonus"] = float(pattern_bonus_b)
-                                estado_bots[b]["ia_pattern_penal"] = float(pattern_penal_b)
-                                estado_bots[b]["ia_score_hibrido"] = float(score_hibrido)
-                                estado_bots[b]["ia_score_hibrido_delta"] = float(score_hibrido - float(score_final))
-                                estado_bots[b]["ia_regime_score"] = float(regime_score)
-                                estado_bots[b]["ia_evidence_n"] = int(ev_n)
-                                estado_bots[b]["ia_evidence_wr"] = float(ev_wr)
-
-                                candidatos.append((float(score_hibrido), b, float(p), float(p_post), float(regime_score), int(ev_n), float(ev_wr), float(ev_lb)))
-                            except Exception:
-                                continue
-
-                            candidatos.sort(key=lambda x: x[0], reverse=True)
-
-                            candidatos_ctt, ctt_eval = evaluar_ctt_fase(candidatos)
-                            ctt_state_now = str(ctt_eval.get("state", "CTT_NEUTRO") or "CTT_NEUTRO")
-                            if ctt_state_now == "CTT_VIVO":
-                                candidatos = list(candidatos_ctt)
-                            else:
-                                candidatos = []
-
-                            # Selección automática: tomar la mejor señal elegible >= umbral REAL vigente.
 
                         # Si hay señal y el saldo no cubre el plan completo, solo avisar (no bloquear).
                         if candidatos and saldo_val < costo_plan:
@@ -14333,36 +14281,8 @@ async def main():
                                     )
                                 DYN_ROOF_STATE["last_low_balance_warn_ts"] = float(ahora_warn)
 
-                        # Estado operativo REAL (SOMBRA -> MICRO -> NORMAL)
-                        try:
-                            estado_real = _resolver_estado_real(None)
-                        except Exception:
-                            estado_real = "SHADOW"
-
-                        if candidatos and estado_real == "SHADOW":
-                            candidatos.sort(key=lambda x: float(x[2]), reverse=True)
-                            candidatos = candidatos[:max(1, int(REAL_SHADOW_MICRO_TOP_K))]
-                        elif candidatos and estado_real == "MICRO":
-                            candidatos.sort(key=lambda x: float(x[2]), reverse=True)
-                            candidatos = candidatos[:max(1, int(REAL_MICRO_TOP_K))]
-
-                        embudo = _resolver_embudo_final(candidatos, dyn_gate, estado_real, resolver_canary_estado(leer_model_meta() or {}), ctt_eval=ctt_eval)
-                        decision_final = str(embudo.get("decision_final", EMBUDO_FINAL_WAIT_SOFT))
-                        if decision_final == EMBUDO_FINAL_BLOCK_HARD:
-                            agregar_evento(f"🛑 EMBUDO {decision_final}: {embudo.get('hard_block_reason') or embudo.get('decision_reason')}")
-                            candidatos = []
-                        elif decision_final == EMBUDO_FINAL_WAIT_SOFT:
-                            agregar_evento(f"⏳ EMBUDO WAIT: {embudo.get('soft_wait_reason') or embudo.get('decision_reason')}")
-                            candidatos = []
-                        elif decision_final == EMBUDO_FINAL_SHADOW_OK:
-                            agregar_evento(f"🕶️ EMBUDO SHADOW_OK: {embudo.get('decision_reason')}")
-                            candidatos = []
-                        elif decision_final == EMBUDO_FINAL_REAL_MICRO:
-                            candidatos = candidatos[:1]
-
                         # ==================== AUTO-PRESELECCIÓN (MODO MANUAL) ====================
-                        # Si la IA detecta señal y tú estás en manual, preselecciona el mejor bot y abre la ventana
-                        # para que solo elijas el ciclo (1..MAX_CICLOS) dentro del tiempo.
+                        # Si LXV detecta señal y estás en manual, preselecciona bot LXV.
                         if MODO_REAL_MANUAL:
                             ahora = time.time()
 
@@ -14378,56 +14298,47 @@ async def main():
                                 ciclo_auto = ciclo_martingala_siguiente()
                                 if reset_martingala_por_saldo(ciclo_auto, saldo_val):
                                     ciclo_auto = 1
-                                emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
-                                mejor_bot = str(emb.get("top1_bot") or "").strip()
-                                mejor = next((c for c in candidatos if str(c[1]) == mejor_bot), None)
+                                mejor = candidatos[0] if candidatos else None
                                 if mejor is not None:
-                                    score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
-                                    agregar_evento(f"🧠 Embudo IA (manual): ganador único={mejor_bot} | p_oper={prob*100:.1f}% | risk={emb.get('risk_mode','--')}")
+                                    _, mejor_bot, *_ = mejor
+                                    info_lxv = lxv_decision if isinstance(lxv_decision, dict) else {}
+                                    agregar_evento(
+                                        f"🧠 LXV (manual): ganador={mejor_bot} | pattern={info_lxv.get('pattern','--')} "
+                                        f"| motivo={info_lxv.get('motivo','--')}"
+                                    )
                                     PENDIENTE_FORZAR_BOT = mejor_bot
                                     PENDIENTE_FORZAR_INICIO = ahora
                                     PENDIENTE_FORZAR_EXPIRA = ahora + VENTANA_DECISION_IA_S
 
                                     # marcamos señal pendiente (sirve para contabilidad IA luego)
                                     estado_bots[mejor_bot]["ia_senal_pendiente"] = True
-                                    estado_bots[mejor_bot]["ia_prob_senal"] = prob
+                                    estado_bots[mejor_bot]["ia_prob_senal"] = None
 
                                     agregar_evento(
-                                        f"🟢 Señal IA en {mejor_bot} ({prob*100:.1f}%). "
+                                        f"🟢 Señal LXV en {mejor_bot}. "
                                         f"Tienes {VENTANA_DECISION_IA_S}s para elegir ciclo [1..{MAX_CICLOS}] o ESC."
                                     )
                         # ==================== /AUTO-PRESELECCIÓN ====================
 
                         if candidatos and not MODO_REAL_MANUAL:
-                            meta_live = resolver_canary_estado(leer_model_meta() or {})
-                            embudo_live = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
-                            dec_live = str(embudo_live.get("decision_final", EMBUDO_FINAL_WAIT_SOFT))
-                            risk_live = str(embudo_live.get("risk_mode", "WAIT_SOFT"))
-                            if dec_live in (EMBUDO_FINAL_REAL_MICRO, EMBUDO_FINAL_REAL_NORMAL):
-                                agregar_evento(
-                                    f"🧭 EMBUDO listo: {dec_live} | risk={risk_live} | gate={embudo_live.get('gate_quality','--')} "
-                                    f"| top1={embudo_live.get('top1_bot') or '--'}"
-                                )
-                            else:
-                                candidatos = []
-
-                        if candidatos and not MODO_REAL_MANUAL:
                             ciclo_auto = ciclo_martingala_siguiente()
                             if reset_martingala_por_saldo(ciclo_auto, saldo_val):
                                 ciclo_auto = 1
-                            emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
-                            mejor_bot = str(emb.get("top1_bot") or "").strip()
-                            mejor = next((c for c in candidatos if str(c[1]) == mejor_bot), None)
+                            mejor = candidatos[0] if candidatos else None
                             if mejor is not None:
-                                score_top, mejor_bot, prob, p_post, reg_score, ev_n, ev_wr, ev_lb = mejor
-                                agregar_evento(f"⚙️ IA AUTO (embudo único): {mejor_bot} p_oper={prob*100:.1f}% risk={emb.get('risk_mode','--')} gate={emb.get('gate_quality','--')}")
+                                _, mejor_bot, *_ = mejor
+                                info_lxv = lxv_decision if isinstance(lxv_decision, dict) else {}
+                                agregar_evento(
+                                    f"⚙️ LXV AUTO: {mejor_bot} "
+                                    f"pattern={info_lxv.get('pattern','--')} motivo={info_lxv.get('motivo','--')}"
+                                )
                                 monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_auto - 1))]
                                 val = obtener_valor_saldo()
                                 if val is None or val < monto:
                                     pass
                                 else:
                                     estado_bots[mejor_bot]["ia_senal_pendiente"] = True
-                                    estado_bots[mejor_bot]["ia_prob_senal"] = prob
+                                    estado_bots[mejor_bot]["ia_prob_senal"] = None
 
                                     # Handoff entre ciclos REAL: si quedó lock residual de otro bot,
                                     # liberarlo antes de emitir la nueva orden para no bloquear rotación.
@@ -14437,11 +14348,6 @@ async def main():
 
                                     ok_real = escribir_orden_real(mejor_bot, ciclo_auto)
                                     if ok_real:
-                                        if estado_real == "SHADOW":
-                                            try:
-                                                _REAL_SHADOW_MICRO_OPEN_TS.append(float(time.time()))
-                                            except Exception:
-                                                pass
                                         estado_bots[mejor_bot]["fuente"] = "IA_AUTO"
                                         estado_bots[mejor_bot]["ciclo_actual"] = ciclo_auto
                                         activo_real = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else mejor_bot
@@ -14449,10 +14355,6 @@ async def main():
                                     else:
                                         estado_bots[mejor_bot]["ia_senal_pendiente"] = False
                                         estado_bots[mejor_bot]["ia_prob_senal"] = None
-                        else:
-                            max_prob = max((_prob_ia_operativa_bot(bot, default=0.0) for bot in BOT_NAMES if estado_bots[bot]["ia_ready"]), default=0)
-                            if max_prob < umbral_ia_real:
-                                pass
 
                     set_etapa("TICK_04")
                     await refresh_saldo_real()
