@@ -1086,33 +1086,61 @@ def _marca_lxv_desde_resultado(resultado) -> str | None:
     """Normaliza resultado de bot a marca LXV: V (verde) / X (fallo)."""
     try:
         txt = str(resultado or "").strip().upper()
-        if txt in {"GANADA", "GANADOR", "WIN", "W", "V", "VERDE", "1"}:
+        if txt in {"GANANCIA", "GANADA", "GANADOR", "WIN", "W", "V", "VERDE", "1"}:
             return "V"
-        if txt in {"PERDIDA", "PERDIDO", "LOSS", "L", "X", "ROJO", "0"}:
+        if txt in {"PÉRDIDA", "PERDIDA", "PERDIDO", "LOSS", "L", "X", "ROJO", "0"}:
             return "X"
         return None
     except Exception:
         return None
 
 
-def construir_columnas_lxv(estado: dict) -> list[dict]:
+def construir_matriz_lxv_visible(estado: dict, width: int = 40) -> dict[str, list[str | None]]:
     """
-    Construye columnas alineadas LXV usando el último resultado confirmado por bot.
-    Si algún bot no tiene marca válida, no hay columna operable en ese tick.
+    Construye exactamente la matriz visible del HUD (últimos 40 resultados):
+    - fuente: estado_bots[bot]["resultados"]
+    - padding a la izquierda con vacíos
+    - mapeo GANANCIA->V, PÉRDIDA->X, resto->None
     """
+    out: dict[str, list[str | None]] = {}
     try:
         estado = estado if isinstance(estado, dict) else {}
-        marcas = {}
+        width = max(1, int(width))
         for bot in BOT_NAMES:
             st = estado.get(bot, {}) if isinstance(estado.get(bot, {}), dict) else {}
-            mk = _marca_lxv_desde_resultado(st.get("ultimo_resultado"))
-            if mk not in ("V", "X"):
-                return []
-            marcas[bot] = mk
-        return [{
-            "columna_id": f"lxv:{int(time.time())}",
-            "marcas": marcas,
-        }]
+            raw = st.get("resultados", [])
+            raw_list = list(raw) if isinstance(raw, (list, tuple, deque)) else []
+            tail = raw_list[-width:]
+            marcas = [_marca_lxv_desde_resultado(x) for x in tail]
+            if len(marcas) < width:
+                marcas = ([None] * (width - len(marcas))) + marcas
+            out[bot] = marcas
+    except Exception:
+        for bot in BOT_NAMES:
+            out[bot] = [None] * int(max(1, width))
+    return out
+
+
+def construir_columnas_lxv(estado: dict) -> list[dict]:
+    """
+    Construye columnas LXV desde la misma matriz visible del HUD.
+    Columna operable: los 6 bots tienen marca V/X (sin vacíos).
+    """
+    try:
+        matriz = construir_matriz_lxv_visible(estado, width=40)
+        width = 40
+        columnas: list[dict] = []
+        for col_idx in range(width):
+            marcas = {bot: (matriz.get(bot, [None] * width)[col_idx]) for bot in BOT_NAMES}
+            operable = all(marcas.get(bot) in ("V", "X") for bot in BOT_NAMES)
+            if not operable:
+                continue
+            columnas.append({
+                "columna_id": f"col_visible:{col_idx}",
+                "col_visible": int(col_idx),
+                "marcas": marcas,
+            })
+        return columnas
     except Exception:
         return []
 
@@ -1159,21 +1187,26 @@ def elegir_x_mayor_peso(candidatas_x: list[str], estado: dict, columnas: list[di
 
 
 def detectar_lxv(columnas: list[dict], estado: dict, contexto: dict | None = None) -> dict | None:
-    """Detecta patrón LXV válido (5V1X o 4V2X) y resuelve bot objetivo."""
+    """Detecta patrón LXV válido (5V1X o 4V2X), priorizando columna visible más reciente."""
     try:
-        for col in list(columnas or []):
+        cols = sorted(list(columnas or []), key=lambda c: int((c or {}).get("col_visible", -1)), reverse=True)
+        for col in cols:
             marcas = col.get("marcas", {}) if isinstance(col, dict) else {}
             if not isinstance(marcas, dict):
                 continue
+            if not all(marcas.get(b) in ("V", "X") for b in BOT_NAMES):
+                continue
             verdes = [b for b in BOT_NAMES if marcas.get(b) == "V"]
             xs = [b for b in BOT_NAMES if marcas.get(b) == "X"]
+            col_visible = int(col.get("col_visible", -1))
             if len(verdes) == 5 and len(xs) == 1:
                 x = str(xs[0])
                 return {
                     "pattern": "5V1X",
                     "bot_objetivo": x,
                     "motivo": "x_unica_en_columna",
-                    "columna_id": str(col.get("columna_id", "lxv:na")),
+                    "columna_id": str(col.get("columna_id", f"col_visible:{col_visible}")),
+                    "col_visible": col_visible,
                     "xs_consideradas": list(xs),
                     "x_ganadora": x,
                 }
@@ -1184,7 +1217,8 @@ def detectar_lxv(columnas: list[dict], estado: dict, contexto: dict | None = Non
                         "pattern": "4V2X",
                         "bot_objetivo": xg,
                         "motivo": str(detalle.get("motivo", "desempate_4V2X")),
-                        "columna_id": str(col.get("columna_id", "lxv:na")),
+                        "columna_id": str(col.get("columna_id", f"col_visible:{col_visible}")),
+                        "col_visible": col_visible,
                         "xs_consideradas": list(xs),
                         "x_ganadora": xg,
                         "detalle_peso": detalle,
@@ -1195,257 +1229,7 @@ def detectar_lxv(columnas: list[dict], estado: dict, contexto: dict | None = Non
 
 
 def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> dict | None:
-    """Ruta única de selección REAL: solo LXV."""
-    cols = construir_columnas_lxv(estado)
-    out = detectar_lxv(cols, estado, contexto=contexto)
-    if isinstance(out, dict) and str(out.get("bot_objetivo")) in BOT_NAMES:
-        return out
-    return None
-
-# ==================== LXV: ruta única de decisión REAL ====================
-# Mayor valor = mayor prioridad histórica en desempate 4V2X.
-LXV_PRIORIDAD_HISTORICA = {bot: int(len(BOT_NAMES) - i) for i, bot in enumerate(BOT_NAMES)}
-
-
-def _marca_lxv_desde_resultado(resultado) -> str | None:
-    """Normaliza resultado de bot a marca LXV: V (verde) / X (fallo)."""
-    try:
-        txt = str(resultado or "").strip().upper()
-        if txt in {"GANADA", "GANADOR", "WIN", "W", "V", "VERDE", "1"}:
-            return "V"
-        if txt in {"PERDIDA", "PERDIDO", "LOSS", "L", "X", "ROJO", "0"}:
-            return "X"
-        return None
-    except Exception:
-        return None
-
-
-def construir_columnas_lxv(estado: dict) -> list[dict]:
-    """
-    Construye columnas alineadas LXV usando el último resultado confirmado por bot.
-    Si algún bot no tiene marca válida, no hay columna operable en ese tick.
-    """
-    try:
-        estado = estado if isinstance(estado, dict) else {}
-        marcas = {}
-        for bot in BOT_NAMES:
-            st = estado.get(bot, {}) if isinstance(estado.get(bot, {}), dict) else {}
-            mk = _marca_lxv_desde_resultado(st.get("ultimo_resultado"))
-            if mk not in ("V", "X"):
-                return []
-            marcas[bot] = mk
-        return [{
-            "columna_id": f"lxv:{int(time.time())}",
-            "marcas": marcas,
-        }]
-    except Exception:
-        return []
-
-
-def elegir_x_mayor_peso(candidatas_x: list[str], estado: dict, columnas: list[dict], contexto: dict | None = None) -> tuple[str | None, dict]:
-    """
-    Desempate estable para 4V2X:
-    a) mayor prioridad histórica configurable
-    b) peor racha reciente válida
-    c) menor % de acierto reciente
-    d) orden determinista BOT_NAMES
-    """
-    try:
-        estado = estado if isinstance(estado, dict) else {}
-        contexto = contexto if isinstance(contexto, dict) else {}
-        prioridad = dict(LXV_PRIORIDAD_HISTORICA)
-        prioridad.update(contexto.get("prioridad_historica", {}) if isinstance(contexto.get("prioridad_historica"), dict) else {})
-        index_bot = {b: i for i, b in enumerate(BOT_NAMES)}
-        filas = []
-        for bot in [str(x) for x in (candidatas_x or []) if str(x) in BOT_NAMES]:
-            st = estado.get(bot, {}) if isinstance(estado.get(bot, {}), dict) else {}
-            racha = float(st.get("racha_actual", 0.0) or 0.0)
-            acierto = float(st.get("porcentaje_exito", 0.0) or 0.0)
-            filas.append({
-                "bot": bot,
-                "prio": float(prioridad.get(bot, 0.0) or 0.0),
-                "racha": float(racha),
-                "acierto": float(acierto),
-                "idx": int(index_bot.get(bot, 999)),
-            })
-        if not filas:
-            return None, {"motivo": "sin_x_validas"}
-        filas.sort(key=lambda r: (-r["prio"], r["racha"], r["acierto"], r["idx"]))
-        win = filas[0]
-        return str(win["bot"]), {
-            "motivo": "desempate_4V2X_peso",
-            "prioridad_historica": {f["bot"]: f["prio"] for f in filas},
-            "racha_reciente": {f["bot"]: f["racha"] for f in filas},
-            "acierto_reciente": {f["bot"]: f["acierto"] for f in filas},
-            "orden": [f["bot"] for f in filas],
-        }
-    except Exception:
-        return None, {"motivo": "error_elegir_x"}
-
-
-def detectar_lxv(columnas: list[dict], estado: dict, contexto: dict | None = None) -> dict | None:
-    """Detecta patrón LXV válido (5V1X o 4V2X) y resuelve bot objetivo."""
-    try:
-        for col in list(columnas or []):
-            marcas = col.get("marcas", {}) if isinstance(col, dict) else {}
-            if not isinstance(marcas, dict):
-                continue
-            verdes = [b for b in BOT_NAMES if marcas.get(b) == "V"]
-            xs = [b for b in BOT_NAMES if marcas.get(b) == "X"]
-            if len(verdes) == 5 and len(xs) == 1:
-                x = str(xs[0])
-                return {
-                    "pattern": "5V1X",
-                    "bot_objetivo": x,
-                    "motivo": "x_unica_en_columna",
-                    "columna_id": str(col.get("columna_id", "lxv:na")),
-                    "xs_consideradas": list(xs),
-                    "x_ganadora": x,
-                }
-            if len(verdes) == 4 and len(xs) == 2:
-                xg, detalle = elegir_x_mayor_peso(xs, estado, columnas, contexto=contexto)
-                if xg in BOT_NAMES:
-                    return {
-                        "pattern": "4V2X",
-                        "bot_objetivo": xg,
-                        "motivo": str(detalle.get("motivo", "desempate_4V2X")),
-                        "columna_id": str(col.get("columna_id", "lxv:na")),
-                        "xs_consideradas": list(xs),
-                        "x_ganadora": xg,
-                        "detalle_peso": detalle,
-                    }
-        return None
-    except Exception:
-        return None
-
-
-def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> dict | None:
-    """Ruta única de selección REAL: solo LXV."""
-    cols = construir_columnas_lxv(estado)
-    out = detectar_lxv(cols, estado, contexto=contexto)
-    if isinstance(out, dict) and str(out.get("bot_objetivo")) in BOT_NAMES:
-        return out
-    return None
-
-# ==================== LXV: ruta única de decisión REAL ====================
-# Mayor valor = mayor prioridad histórica en desempate 4V2X.
-LXV_PRIORIDAD_HISTORICA = {bot: int(len(BOT_NAMES) - i) for i, bot in enumerate(BOT_NAMES)}
-
-
-def _marca_lxv_desde_resultado(resultado) -> str | None:
-    """Normaliza resultado de bot a marca LXV: V (verde) / X (fallo)."""
-    try:
-        txt = str(resultado or "").strip().upper()
-        if txt in {"GANADA", "GANADOR", "WIN", "W", "V", "VERDE", "1"}:
-            return "V"
-        if txt in {"PERDIDA", "PERDIDO", "LOSS", "L", "X", "ROJO", "0"}:
-            return "X"
-        return None
-    except Exception:
-        return None
-
-
-def construir_columnas_lxv(estado: dict) -> list[dict]:
-    """
-    Construye columnas alineadas LXV usando el último resultado confirmado por bot.
-    Si algún bot no tiene marca válida, no hay columna operable en ese tick.
-    """
-    try:
-        estado = estado if isinstance(estado, dict) else {}
-        marcas = {}
-        for bot in BOT_NAMES:
-            st = estado.get(bot, {}) if isinstance(estado.get(bot, {}), dict) else {}
-            mk = _marca_lxv_desde_resultado(st.get("ultimo_resultado"))
-            if mk not in ("V", "X"):
-                return []
-            marcas[bot] = mk
-        return [{
-            "columna_id": f"lxv:{int(time.time())}",
-            "marcas": marcas,
-        }]
-    except Exception:
-        return []
-
-
-def elegir_x_mayor_peso(candidatas_x: list[str], estado: dict, columnas: list[dict], contexto: dict | None = None) -> tuple[str | None, dict]:
-    """
-    Desempate estable para 4V2X:
-    a) mayor prioridad histórica configurable
-    b) peor racha reciente válida
-    c) menor % de acierto reciente
-    d) orden determinista BOT_NAMES
-    """
-    try:
-        estado = estado if isinstance(estado, dict) else {}
-        contexto = contexto if isinstance(contexto, dict) else {}
-        prioridad = dict(LXV_PRIORIDAD_HISTORICA)
-        prioridad.update(contexto.get("prioridad_historica", {}) if isinstance(contexto.get("prioridad_historica"), dict) else {})
-        index_bot = {b: i for i, b in enumerate(BOT_NAMES)}
-        filas = []
-        for bot in [str(x) for x in (candidatas_x or []) if str(x) in BOT_NAMES]:
-            st = estado.get(bot, {}) if isinstance(estado.get(bot, {}), dict) else {}
-            racha = float(st.get("racha_actual", 0.0) or 0.0)
-            acierto = float(st.get("porcentaje_exito", 0.0) or 0.0)
-            filas.append({
-                "bot": bot,
-                "prio": float(prioridad.get(bot, 0.0) or 0.0),
-                "racha": float(racha),
-                "acierto": float(acierto),
-                "idx": int(index_bot.get(bot, 999)),
-            })
-        if not filas:
-            return None, {"motivo": "sin_x_validas"}
-        filas.sort(key=lambda r: (-r["prio"], r["racha"], r["acierto"], r["idx"]))
-        win = filas[0]
-        return str(win["bot"]), {
-            "motivo": "desempate_4V2X_peso",
-            "prioridad_historica": {f["bot"]: f["prio"] for f in filas},
-            "racha_reciente": {f["bot"]: f["racha"] for f in filas},
-            "acierto_reciente": {f["bot"]: f["acierto"] for f in filas},
-            "orden": [f["bot"] for f in filas],
-        }
-    except Exception:
-        return None, {"motivo": "error_elegir_x"}
-
-
-def detectar_lxv(columnas: list[dict], estado: dict, contexto: dict | None = None) -> dict | None:
-    """Detecta patrón LXV válido (5V1X o 4V2X) y resuelve bot objetivo."""
-    try:
-        for col in list(columnas or []):
-            marcas = col.get("marcas", {}) if isinstance(col, dict) else {}
-            if not isinstance(marcas, dict):
-                continue
-            verdes = [b for b in BOT_NAMES if marcas.get(b) == "V"]
-            xs = [b for b in BOT_NAMES if marcas.get(b) == "X"]
-            if len(verdes) == 5 and len(xs) == 1:
-                x = str(xs[0])
-                return {
-                    "pattern": "5V1X",
-                    "bot_objetivo": x,
-                    "motivo": "x_unica_en_columna",
-                    "columna_id": str(col.get("columna_id", "lxv:na")),
-                    "xs_consideradas": list(xs),
-                    "x_ganadora": x,
-                }
-            if len(verdes) == 4 and len(xs) == 2:
-                xg, detalle = elegir_x_mayor_peso(xs, estado, columnas, contexto=contexto)
-                if xg in BOT_NAMES:
-                    return {
-                        "pattern": "4V2X",
-                        "bot_objetivo": xg,
-                        "motivo": str(detalle.get("motivo", "desempate_4V2X")),
-                        "columna_id": str(col.get("columna_id", "lxv:na")),
-                        "xs_consideradas": list(xs),
-                        "x_ganadora": xg,
-                        "detalle_peso": detalle,
-                    }
-        return None
-    except Exception:
-        return None
-
-
-def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> dict | None:
-    """Ruta única de selección REAL: solo LXV."""
+    """Ruta única de selección REAL: solo LXV desde columna visible HUD."""
     cols = construir_columnas_lxv(estado)
     out = detectar_lxv(cols, estado, contexto=contexto)
     if isinstance(out, dict) and str(out.get("bot_objetivo")) in BOT_NAMES:
@@ -14331,7 +14115,7 @@ async def main():
                                 candidatos = [(1.0, bot_lxv, 0.0, 0.0, 0.0, 0, 0.0, 0.0)]
                                 agregar_evento(
                                     f"🧭 LXV {lxv_decision.get('pattern','--')} → {bot_lxv} "
-                                    f"(col={lxv_decision.get('columna_id','--')}, xs={lxv_decision.get('xs_consideradas',[])})"
+                                    f"(col_visible={lxv_decision.get('col_visible','--')}, col={lxv_decision.get('columna_id','--')}, xs={lxv_decision.get('xs_consideradas',[])}, xg={lxv_decision.get('x_ganadora','--')})"
                                 )
 
                         # Si hay señal y el saldo no cubre el plan completo, solo avisar (no bloquear).

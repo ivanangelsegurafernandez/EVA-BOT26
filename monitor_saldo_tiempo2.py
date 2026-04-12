@@ -222,22 +222,21 @@ def detector_fuente_saldo(db_path: Optional[Path] = None) -> List[Tuple[str, Pat
     env_history = Path(os.path.expanduser(os.getenv("SALDO_LIVE_HISTORY_SHARED_PATH", str(env_live.parent / SALDO_HISTORY_FILE))))
     env_series = Path(os.path.expanduser(os.getenv("SALDO_SERIES_CSV_PATH", str(SCRIPT_DIR / SOURCE_SERIES_FILE))))
 
+    local = [
+        ("local_live", SCRIPT_DIR / SALDO_LIVE_FILE),
+        ("local_history", SCRIPT_DIR / SALDO_HISTORY_FILE),
+        ("local_series", SCRIPT_DIR / SOURCE_SERIES_FILE),
+    ]
     shared = [
         ("shared_live", env_live),
         ("shared_history", env_history),
         ("shared_series", env_series),
     ]
 
-    local = [
-        ("local_live", SCRIPT_DIR / SALDO_LIVE_FILE),
-        ("local_history", SCRIPT_DIR / SALDO_HISTORY_FILE),
-        ("local_series", SCRIPT_DIR / SOURCE_SERIES_FILE),
-    ]
-
     excluded = {str(db_path.resolve())} if db_path is not None else set()
     dedup: List[Tuple[str, Path]] = []
     seen = set()
-    for src, p in (shared + local):
+    for src, p in (local + shared):
         key = str(p.resolve()) if p.exists() else str(p)
         if key in seen or key in excluded:
             continue
