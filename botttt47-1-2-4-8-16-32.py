@@ -138,15 +138,8 @@ MARTINGALA_DEMO = [1, 2, 4, 8, 16, 32]
 MARTINGALA_REAL = [1, 2, 4, 8, 16, 32]
 VELAS = 20
 PAUSA_POST_OPERACION_S = 40  # Pausa uniforme tras cada operación con resultado definido (BLOQUE 1)
-# ==================== VENTANA DE DECISIÓN IA ====================
-# Objetivo: dar tiempo al MAESTRO + humano para decidir pasar a REAL ANTES del BUY.
-# (0 para desactivar)
-VENTANA_DECISION_IA_S = 0         # LXV: sin espera previa por IA
-VENTANA_DECISION_IA_POLL_S = 0.10 # granularidad de espera
-# === Filtro avanzado (sin cambiar 13 features) ===
-SCORE_MIN = 0.0             # LXV: sin candado por score
-SCORE_DROP_MAX = 999.0      # LXV: sin veto por caida de score
-REVALIDAR_VELAS_N = 999999  # LXV: revalidacion tecnica fuera del flujo
+# ==================== LEGACY IA/REVALIDACIÓN (INACTIVO) ====================
+# LXV gobierna runtime: no se espera IA ACK ni se bloquea compra por score/revalidación técnica.
 resultado_global = {"demo": 0.0, "real": 0.0}
 ultimo_token = None
 reinicio_forzado = asyncio.Event()
@@ -195,22 +188,8 @@ def commit_guard_clear():
 
 # >>> PATCH 1 — Helpers de orden de ciclo
 ORDEN_DIR = "orden_real"  # misma carpeta usada por el maestro
-# === IA ACK (handshake maestro→bot) ===
-IA_ACK_DIR = "ia_ack"
-try:
-    os.makedirs(IA_ACK_DIR, exist_ok=True)
-except Exception:
-    pass
-
-def leer_ia_ack(bot: str):
-    path = os.path.join(IA_ACK_DIR, f"{bot}.json")
-    try:
-        if not os.path.exists(path):
-            return None
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+# === LEGACY IA ACK (INACTIVO) ===
+# Se retiró el handshake maestro→bot del flujo caliente LXV.
 
 MAX_CICLOS = len(MARTINGALA_REAL)
 # ✅ Asegura carpeta de órdenes (evita rarezas si el maestro aún no la creó)
@@ -2099,28 +2078,7 @@ async def ejecutar_panel():
                             print(Fore.RED + Style.BRIGHT + f"Saldo REAL insuficiente: {saldo:.2f} < {monto:.2f}. Espero y reintento MISMO ciclo ({estado_bot['intentos_saldo']}/3).")
                             await asyncio.sleep(15 + random.uniform(0.0, 0.5))
                         continue
-
-                # ========= REVALIDACIÓN PRE-BUY =========
-                try:
-                    score_sel = estado_bot.get("score_senal")
-                    velas_rv = await obtener_velas(ws, symbol, current_token, reintentos=2)
-                    if False and velas_rv and len(velas_rv) >= int(REVALIDAR_VELAS_N):  # LXV
-                        cond2, dir2, rsi9_2, rsi14_2, sma5_2, sma20_2, br2, cr2, rev2 = evaluar_estrategia(velas_rv)
-                        score2 = puntuar_setups(cond2, dir2, rsi9_2, rsi14_2, sma5_2, sma20_2, br2, cr2, rev2)
-                        piso = float(SCORE_MIN)
-                        if isinstance(score_sel, (int, float)):
-                            piso = max(piso, float(score_sel) - float(SCORE_DROP_MAX))
-
-                        if (dir2 != direccion) or (int(cond2) < 2) or (float(score2) < piso):
-                            print(Fore.YELLOW + Style.BRIGHT + f"Revalidación falló en {symbol}: dir {direccion}->{dir2}, cond={cond2}, score={score2:.3f}<piso {piso:.3f}. Reintentando ciclo...")
-                            await asyncio.sleep(2.0 + random.uniform(0.0, 0.5))
-                            continue
-
-                        # refresca snapshot para compra/log consistentes
-                        direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, rsi_reversion, condiciones = dir2, rsi9_2, rsi14_2, sma5_2, sma20_2, br2, cr2, rev2, cond2
-                        estado_bot["score_senal"] = float(score2)
-                except Exception:
-                    pass
+                # ========= REVALIDACIÓN PRE-BUY LEGACY (INACTIVO EN LXV) =========
 
                 # ========= PROPOSAL =========
                 try:
@@ -2204,94 +2162,7 @@ async def ejecutar_panel():
                     epoch_pre = None
 
                 # === /PRE-TRADE SNAPSHOT ===
-                # ==================== VENTANA DE DECISIÓN IA (GATEWIN) ====================
-                # Ya escribimos el PRE-TRADE snapshot. Ahora damos tiempo para que:
-                # 1) el MAESTRO calcule/muestre la prob IA
-                # 2) tú elijas bot/ciclo
-                # 3) si el MAESTRO asigna REAL (token), el watcher lo detecte y dispare reinicio_forzado
-                # Resultado: evitamos comprar en DEMO cuando justo tocaba REAL.
-                if False and VENTANA_DECISION_IA_S > 0:  # LXV
-                    t0 = time.time()
-                    ack_visto = False
-
-                    while (time.time() - t0) < VENTANA_DECISION_IA_S:
-                        if reinicio_forzado.is_set():
-                            break
-                        # Doble seguro: si el token cambió durante GateWin, corta ya
-                        try:
-                            tok_now = leer_token_desde_archivo()
-                            if tok_now != current_token:
-                                reinicio_forzado.set()
-                                break
-                        except Exception:
-                            pass
-                        # ✅ Leer ACK del maestro (si llega, lo mostramos una sola vez)
-                        if (not ack_visto) and epoch_pre:
-                            ack = leer_ia_ack(NOMBRE_BOT)
-                            try:
-                                ep_ack = int(float(ack.get("epoch", 0) or 0)) if ack else 0
-                                ep_pre = int(float(epoch_pre or 0))
-                                # tolera pequeños desfases de epoch para no dejar telemetría en NO_READY
-                                epoch_ok = bool(ep_ack >= max(0, ep_pre - 2))
-                                if ack and epoch_ok:
-                                    p = ack.get("prob", None)
-                                    p_hud = ack.get("prob_hud", None)
-                                    p_play = ack.get("prob_en_juego", None)
-                                    has_prob_hud = ack.get("has_prob_hud", None)
-                                    has_prob_play = ack.get("has_prob_en_juego", None)
-                                    if isinstance(has_prob_play, bool):
-                                        p_show = p_play if has_prob_play else None
-                                    elif isinstance(has_prob_hud, bool):
-                                        p_show = p_hud if has_prob_hud else p
-                                    else:
-                                        p_show = p_hud if isinstance(p_hud, (int, float)) else p
-
-                                    auc = float(ack.get("auc", 0.0) or 0.0)
-                                    modo = ack.get("modo", "OFF")
-                                    thr_real = ack.get("real_thr", None)
-                                    reliable_ack = bool(ack.get("reliable", False))
-                                    ready_ack = bool(ack.get("ia_ready", False))
-                                    modo_norm = str(modo or "OFF").strip().upper()
-                                    # Si hay prob visible, no forzar vacío solo por modo OFF transitorio.
-                                    if modo_norm == "OFF" and (not isinstance(p_show, (int, float))):
-                                        p_show = None
-                                    auc_txt = f"{auc:.3f}" if (reliable_ack and 0.0 < auc < 1.0 and modo_norm != "OFF") else "N/A"
-
-                                    estado_bot["ack_ctx"] = {
-                                        "ia_prob_en_juego": p_show if isinstance(p_show, (int, float)) else "",
-                                        "ia_prob_source": str(ack.get("prob_source", "")) or ("HUD" if isinstance(p_show, (int, float)) else "NO_READY"),
-                                        "ia_decision_id": str(ack.get("decision_id", "")),
-                                        "ia_gate_real": float(thr_real) if isinstance(thr_real, (int, float)) else "",
-                                        "ia_modo_ack": str(modo),
-                                        "ia_ready_ack": bool(ready_ack or isinstance(p_show, (int, float))),
-                                    }
-
-                                    if isinstance(p_show, (int, float)):
-                                        if isinstance(thr_real, (int, float)):
-                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | Gate REAL={float(thr_real)*100:.1f}% | AUC={auc_txt} | modo={modo}")
-                                        else:
-                                            print(f"🤖 IA ACK ({NOMBRE_BOT}) → {p_show*100:.1f}% | AUC={auc_txt} | modo={modo}")
-                                    else:
-                                        print(f"🤖 IA ACK ({NOMBRE_BOT}) → (sin prob) | AUC={auc_txt} | modo={modo}")
-
-                                    ack_visto = True
-                            except Exception:
-                                pass
-
-                        await asyncio.sleep(VENTANA_DECISION_IA_POLL_S)
-
-                    # Si el token cambió durante la ventana, NO compramos con estado viejo.
-                    if reinicio_forzado.is_set():
-                        estado_bot["ciclo_forzado"] = ciclo
-                        print(
-                            Fore.YELLOW + Style.BRIGHT +
-                            f"[VENTANA IA] Token cambió durante la decisión. Reintentando ciclo #{ciclo} (sin comprar)."
-                        )
-                        reinicio_forzado.clear()
-                        await asyncio.sleep(0.8)
-                        continue
-
-# ==================== /VENTANA DE DECISIÓN IA ====================
+                # ==================== VENTANA IA LEGACY (INACTIVA EN LXV) ====================
 
                 try:
                     data_buy = await api_call(ws, {

@@ -261,8 +261,10 @@ AUTO_REAL_LIVE_MIN_BOTS = 3   # mínimos bots con prob viva para calibración po
 
 # Umbral "operativo/UI" (señales actuales, semáforo, etc.)
 IA_METRIC_THRESHOLD = AUTO_REAL_THR_MIN
-# Modo clásico: activación REAL con umbral operativo vigente (hoy 65%, con techo dinámico base 70%).
-# Mantiene lock de un solo bot en REAL y ciclo martingala global en HUD.
+# Modo clásico IA (LEGACY_NO_USADO para promoción REAL automática).
+# La promoción REAL automática en runtime depende EXCLUSIVAMENTE de LXV:
+# construir_columnas_lxv -> detectar_lxv -> elegir_x_mayor_peso -> resolver_candidato_real_lxv.
+# Se conserva este flag solo por compatibilidad de HUD/telemetría histórica.
 REAL_CLASSIC_GATE = True
 
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
@@ -470,6 +472,7 @@ _REAL_SHADOW_MICRO_OPEN_TS = deque(maxlen=64)
 _REAL_SHADOW_MICRO_LAST_LOG_TS = 0.0
 REAL_MICRO_STRONG_GATE_FALLBACK_ENABLE = False
 REAL_MICRO_STRONG_GATE_MIN_PROB = 0.64
+# LEGACY INACTIVO (compatibilidad HUD): estados históricos del embudo IA/CTT.
 EMBUDO_FINAL_BLOCK_HARD = "BLOCK_HARD"
 EMBUDO_FINAL_WAIT_SOFT = "WAIT_SOFT"
 EMBUDO_FINAL_REAL_MICRO = "REAL_MICRO"
@@ -13265,58 +13268,21 @@ def _registrar_estado_embudo(data: dict | None = None) -> dict:
 
 
 def _resolver_embudo_final(candidatos: list, dyn_gate: dict | None, estado_real: str, meta_live: dict | None, ctt_eval: dict | None = None) -> dict:
-    """Embudo operativo simplificado: top1 + probabilidad + bot permitido."""
-    out = _registrar_estado_embudo({
+    """LEGACY INACTIVO: embudo IA/CTT fuera del flujo REAL LXV."""
+    return _registrar_estado_embudo({
         "decision_final": EMBUDO_FINAL_WAIT_SOFT,
-        "decision_reason": "sin_candidatos",
-        "gate_quality": "weak",
+        "decision_reason": "legacy_inactivo_lxv",
+        "gate_quality": "legacy",
         "risk_mode": "WAIT_SOFT",
-        "soft_wait_reason": "sin_candidatos",
+        "soft_wait_reason": "lxv_only_runtime",
         "hard_block_reason": "",
         "top1_bot": None,
         "top2_bot": None,
         "gap_value": 0.0,
         "top1_prob": 0.0,
         "top2_prob": 0.0,
-        "degrade_from": "none",
+        "degrade_from": "legacy_inactivo",
     })
-    if not candidatos:
-        return out
-    try:
-        ordered = sorted(candidatos, key=lambda x: float(x[2] if len(x) > 2 else 0.0), reverse=True)
-        top1 = ordered[0]
-        top2 = ordered[1] if len(ordered) > 1 else None
-        top1_bot = str(top1[1])
-        top1_prob = float(top1[2] or 0.0)
-        top2_bot = str(top2[1]) if top2 else None
-        top2_prob = float(top2[2] or 0.0) if top2 else 0.0
-        gap_value = float(top1_prob - top2_prob)
-
-        top1_allowed = top1_bot in BOT_NAMES
-        decision = EMBUDO_FINAL_REAL_NORMAL if top1_allowed else EMBUDO_FINAL_WAIT_SOFT
-        reason = "top1_prob_ok" if top1_allowed else "top1_not_allowed"
-        risk_mode = "REAL_NORMAL" if top1_allowed else "WAIT_SOFT"
-        quality = "strong" if top1_allowed else "wait"
-        soft_wait_reason = "" if top1_allowed else "top1_not_allowed"
-        out_hard = ""
-        degrade_from = "none"
-
-        return _registrar_estado_embudo({
-            "decision_final": decision,
-            "decision_reason": reason,
-            "gate_quality": quality,
-            "risk_mode": risk_mode,
-            "hard_block_reason": out_hard,
-            "soft_wait_reason": soft_wait_reason,
-            "top1_bot": top1_bot,
-            "top2_bot": top2_bot,
-            "gap_value": gap_value,
-            "top1_prob": top1_prob,
-            "top2_prob": top2_prob,
-            "degrade_from": degrade_from,
-        })
-    except Exception:
-        return _registrar_estado_embudo({"decision_final": EMBUDO_FINAL_WAIT_SOFT, "decision_reason": "embudo_err", "soft_wait_reason": "embudo_err"})
 
 
 def _umbral_senal_actual_hud() -> float:
@@ -13403,267 +13369,26 @@ def _registrar_cierre_ctt(bot: str, fila_dict: dict, resultado: str):
 
 
 def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
-    """CTT maestro por franja viva: frente verde real + rezago útil."""
-    global CTT_LAST_STATE, CTT_LAST_LOG_TS
-    now = float(time.time())
-    w = float(max(5.0, CTT_MICRO_WINDOW_S))
-    cutoff = now - max(float(CTT_CIERRE_LOOKBACK_MAX), 4.0 * w + 5.0)
-
-    eventos = []
-    for ev in list(CTT_CLOSE_EVENTS):
-        try:
-            ts = float(ev.get("ts", 0.0) or 0.0)
-            if ts >= cutoff:
-                eventos.append(ev)
-        except Exception:
-            continue
-
-    def _is_green(ev: dict) -> bool:
-        try:
-            return int(ev.get("result", 0) or 0) == 1
-        except Exception:
-            return False
-
-    def _ratio_green(seg):
-        if not seg:
-            return 0.0
-        g = sum(1 for x in seg if _is_green(x))
-        return float(g / max(1, len(seg)))
-
-    def _emit_state_log(st: dict):
-        nonlocal now
-        try:
-            state_now = str(st.get("state", "CTT_NEUTRO"))
-            changed = state_now != str(CTT_LAST_STATE)
-            cooldown = (now - float(CTT_LAST_LOG_TS or 0.0)) >= float(CTT_STATE_LOG_COOLDOWN_S)
-            if changed or cooldown:
-                CTT_LAST_STATE = state_now
-                CTT_LAST_LOG_TS = float(now)
-                agregar_evento(
-                    f"🧭 CTT {state_now}: g2→g1→g0={st.get('g2',0.0):.2f}/{st.get('g1',0.0):.2f}/{st.get('g0',0.0):.2f} "
-                    f"frontG={float(st.get('front_green_age_s') or 0.0):.1f}s confV={int(st.get('confirmadores_verdes',0))} "
-                    f"res={float(st.get('resueltos_ratio',0.0))*100:.0f}% rez={len(st.get('rezagados_validos',[]) or [])} "
-                    f"why={st.get('reason','na')}"
-                )
-        except Exception:
-            pass
-
-    st_base = {
+    """LEGACY INACTIVO: CTT no participa en la promoción REAL automática LXV."""
+    st = {
         "state": "CTT_NEUTRO",
         "status": "CTT_NEUTRO",
         "regime": "NEUTRAL",
         "gate": "BLOCK",
-        "reason": "sin_eventos",
+        "reason": "legacy_inactivo_lxv",
         "g0": 0.0,
         "g1": 0.0,
         "g2": 0.0,
-        "pendiente_verde": 0.0,
-        "front_ts": 0.0,
-        "front_age_s": None,
-        "front_green_ts": 0.0,
         "front_green_age_s": None,
-        "front_event_color": "NONE",
-        "participantes_ola": 0,
-        "confirmadores": 0,
         "confirmadores_verdes": 0,
-        "resueltos_ola": 0,
         "resueltos_ratio": 0.0,
-        "green_confirm_ratio": 0.0,
         "rezagados_validos": [],
-        "asset": str(CTT_ACTIVO_UNICO or "") or None,
-        "no_participantes": list(BOT_NAMES),
-        "sample": 0,
-        "wave_alive": False,
-        "red_counter": 0,
-        "deterioro_rojo": 0.0,
-        "debug_summary": "sin_eventos",
-        # compat legacy
-        "t_front": 0.0,
-        "wave_start": 0.0,
-        "wave_age_s": None,
-        "wave_ttl_ok": False,
-        "wave_ratio": 0.0,
-        "wave_total": 0,
-        "density_cpm": 0.0,
-        "diversity_ratio": 0.0,
-        "redundancy_high": False,
-        "green_mode": "none",
-        "roof_policy": "normal",
-        "roof_delta": 0.0,
     }
-
-    if not eventos:
-        CTT_STATE.update(st_base)
-        _emit_state_log(st_base)
-        return [], st_base
-
-    eventos.sort(key=lambda x: float(x.get("ts", 0.0) or 0.0), reverse=True)
-    asset_target = str(CTT_ACTIVO_UNICO or "").strip().upper()
-    asset_ref = asset_target if asset_target else str(eventos[0].get("asset", "") or "").strip().upper()
-
-    ev_asset = []
-    for ev in eventos:
-        try:
-            a = str(ev.get("asset", "") or "").strip().upper()
-            if bool(CTT_REQUIRE_SAME_ASSET) and asset_ref and (a != asset_ref):
-                continue
-            ev_asset.append(ev)
-        except Exception:
-            continue
-
-    if not ev_asset:
-        CTT_STATE.update(st_base)
-        _emit_state_log(st_base)
-        return [], st_base
-
-    # microventanas por frescura
-    w0_cut = now - w
-    w1_cut = now - 2.0 * w
-    w2_cut = now - 3.0 * w
-    wave_cut = now - 3.0 * w
-
-    w0 = [e for e in ev_asset if float(e.get("ts", 0.0) or 0.0) >= w0_cut]
-    w1 = [e for e in ev_asset if w1_cut <= float(e.get("ts", 0.0) or 0.0) < w0_cut]
-    w2 = [e for e in ev_asset if w2_cut <= float(e.get("ts", 0.0) or 0.0) < w1_cut]
-
-    g0 = _ratio_green(w0)
-    g1 = _ratio_green(w1)
-    g2 = _ratio_green(w2)
-    pendiente_verde = float(g0 - g1)
-
-    ola = [e for e in ev_asset if float(e.get("ts", 0.0) or 0.0) >= wave_cut]
-    sample = int(len(ola))
-
-    # frente verde real: último verde útil de la ola (no último cierre cualquiera)
-    verdes_ola = [e for e in ola if _is_green(e)]
-    front_green_event = verdes_ola[0] if verdes_ola else None
-    front_green_ts = float(front_green_event.get("ts", 0.0) or 0.0) if front_green_event else 0.0
-    front_green_age_s = max(0.0, now - front_green_ts) if front_green_ts > 0 else None
-    front_event_color = "GREEN" if front_green_event else "NONE"
-
-    # participación vs confirmación verde
-    bots_participantes = {str(e.get("bot")) for e in ola}
-    bots_confirmadores_verdes = {str(e.get("bot")) for e in verdes_ola}
-    participantes_ola = int(len(bots_participantes))
-    confirmadores_verdes = int(len(bots_confirmadores_verdes))
-    confirmadores = int(confirmadores_verdes)  # compat: confirmación verde real
-
-    resueltos_ola = int(participantes_ola)
-    resueltos_ratio = float(resueltos_ola / max(1, len(BOT_NAMES)))
-    green_confirm_ratio = float(confirmadores_verdes / max(1, participantes_ola))
-
-    # deterioro rojo reciente
-    rojos_w0 = sum(1 for e in w0 if (not _is_green(e)))
-    deterioro_rojo = float(rojos_w0 / max(1, len(w0))) if w0 else 0.0
-    red_counter = int((g0 <= float(CTT_RED_STRONG_MAX_G0)) + (g1 <= float(CTT_RED_STRONG_MAX_G1)) + (deterioro_rojo >= 0.70))
-
-    # rezagados válidos contra frente verde real
-    last_ts_bot = {}
-    for e in ev_asset:
-        b = str(e.get("bot"))
-        if b not in last_ts_bot:
-            last_ts_bot[b] = float(e.get("ts", 0.0) or 0.0)
-
-    rezagados_validos = []
-    if front_green_ts > 0:
-        for b in BOT_NAMES:
-            tsb = float(last_ts_bot.get(str(b), 0.0) or 0.0)
-            if tsb <= 0:
-                continue
-            lag = float(front_green_ts - tsb)
-            if float(CTT_LAG_MIN_S) <= lag <= float(CTT_LAG_MAX_S):
-                rezagados_validos.append(str(b))
-
-    no_participantes = [str(b) for b in BOT_NAMES if str(b) not in bots_participantes and str(b) not in set(rezagados_validos)]
-    drop = float(g1 - g0)
-    wave_alive = bool((front_green_age_s is not None) and (front_green_age_s <= float(CTT_VIVO_MAX_FRONT_AGE_S)))
-
-    state = "CTT_NEUTRO"
-    reason = "ctt_neutro"
-    if red_counter >= 2:
-        state = "CTT_RED_STRONG"
-        reason = "ctt_red_strong"
-    elif (
-        (front_green_ts <= 0)
-        or ((front_green_age_s or 9999.0) > float(CTT_TARDIO_MAX_FRONT_AGE_S))
-        or (drop >= float(CTT_TARDIO_DROP_DELTA))
-        or (resueltos_ratio > float(CTT_TARDIO_RESUELTOS_MAX_RATIO))
-        or (len(rezagados_validos) <= 0)
-    ):
-        state = "CTT_TARDIO"
-        reason = "ctt_tardio" if front_green_ts > 0 else "sin_front_green"
-    elif (
-        front_green_ts > 0
-        and g0 >= float(CTT_VIVO_MIN_G0)
-        and g1 >= float(CTT_VIVO_MIN_G1)
-        and confirmadores_verdes >= int(CTT_VIVO_MIN_CONFIRMADORES)
-        and (front_green_age_s or 9999.0) <= float(CTT_VIVO_MAX_FRONT_AGE_S)
-        and len(rezagados_validos) > 0
-        and resueltos_ratio <= float(CTT_TARDIO_RESUELTOS_MAX_RATIO)
-    ):
-        state = "CTT_VIVO"
-        reason = "ctt_vivo"
-    elif (
-        g0 >= float(CTT_ARM_MIN_GREEN)
-        and (g0 - g1) >= float(CTT_ARM_MIN_DELTA)
-        and confirmadores_verdes >= int(CTT_ARM_MIN_CONFIRMADORES)
-    ):
-        state = "CTT_ARMADO"
-        reason = "ctt_armado"
-
-    rez_set = set(rezagados_validos)
-    cands = list(candidatos or [])
-    filtrados = [c for c in cands if len(c) > 1 and str(c[1]) in rez_set] if state == "CTT_VIVO" else []
-
-    density_cpm = float(len(w0) * 60.0 / max(1.0, w))
-    diversity_ratio = float(participantes_ola / max(1, sample))
-
-    st = {
-        "state": state,
-        "status": state,
-        "regime": "GREEN" if state in ("CTT_ARMADO", "CTT_VIVO") else "RED" if state == "CTT_RED_STRONG" else "NEUTRAL",
-        "gate": "ALLOW" if state == "CTT_VIVO" else "BLOCK",
-        "reason": reason,
-        "g0": float(g0),
-        "g1": float(g1),
-        "g2": float(g2),
-        "pendiente_verde": float(pendiente_verde),
-        "front_ts": float(front_green_ts),
-        "front_age_s": float(front_green_age_s) if front_green_age_s is not None else None,
-        "front_green_ts": float(front_green_ts),
-        "front_green_age_s": float(front_green_age_s) if front_green_age_s is not None else None,
-        "front_event_color": front_event_color,
-        "participantes_ola": int(participantes_ola),
-        "confirmadores": int(confirmadores),
-        "confirmadores_verdes": int(confirmadores_verdes),
-        "resueltos_ola": int(resueltos_ola),
-        "resueltos_ratio": float(resueltos_ratio),
-        "green_confirm_ratio": float(green_confirm_ratio),
-        "rezagados_validos": list(rezagados_validos),
-        "asset": asset_ref or None,
-        "no_participantes": list(no_participantes),
-        "sample": int(sample),
-        "wave_alive": bool(wave_alive),
-        "red_counter": int(red_counter),
-        "deterioro_rojo": float(deterioro_rojo),
-        "debug_summary": f"{state}|g={g2:.2f}/{g1:.2f}/{g0:.2f}|frontG={float(front_green_age_s or 0.0):.1f}|cv={confirmadores_verdes}|rez={len(rezagados_validos)}",
-        # compat legacy
-        "t_front": float(front_green_ts),
-        "wave_start": float(max(0.0, wave_cut)),
-        "wave_age_s": float(front_green_age_s) if front_green_age_s is not None else None,
-        "wave_ttl_ok": bool(wave_alive),
-        "wave_ratio": float(g0),
-        "wave_total": int(len(w0)),
-        "density_cpm": float(density_cpm),
-        "diversity_ratio": float(diversity_ratio),
-        "redundancy_high": bool(confirmadores_verdes < max(1, int(_ctt_min_confirmadores()))),
-        "green_mode": "vivo" if state == "CTT_VIVO" else "armado" if state == "CTT_ARMADO" else "none",
-        "roof_policy": "normal",
-        "roof_delta": 0.0,
-    }
-    CTT_STATE.update(st)
-    _emit_state_log(st)
-    return filtrados, st
+    try:
+        CTT_STATE.update(st)
+    except Exception:
+        pass
+    return [], st
 
 
 # Cargar datos bot
@@ -14428,7 +14153,9 @@ async def main():
                             activo_real = owner_lock if owner_lock in BOT_NAMES else holder_memoria
                             _enforce_single_real_standby(activo_real)
 
-                        # LXV gobierna REAL: evitamos evaluación de compuertas/umbrales IA en el flujo caliente.
+                        # LXV gobierna REAL en runtime (ruta única oficial):
+                        # construir_columnas_lxv -> detectar_lxv -> elegir_x_mayor_peso -> resolver_candidato_real_lxv.
+                        # IA/embudo/CTT quedan fuera del flujo caliente de promoción REAL.
                         umbral_ia_real = 0.0
                         dyn_gate = None
 
