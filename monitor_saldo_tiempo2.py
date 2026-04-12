@@ -253,13 +253,13 @@ def detector_fuente_saldo_demo() -> List[Tuple[str, Path]]:
     local_history_alt = SCRIPT_DIR / SALDO_DEMO_HISTORY_FILE_ALT
 
     candidates = [
+        ("shared_demo_live", env_live),
+        ("shared_demo_history", env_history),
+        ("shared_demo_series", env_series),
         ("local_demo_live", SCRIPT_DIR / SALDO_DEMO_LIVE_FILE),
         ("local_demo_history", local_history),
         ("local_demo_history_alt", local_history_alt),
         ("local_demo_series", SCRIPT_DIR / SALDO_DEMO_SERIES_FILE),
-        ("shared_demo_live", env_live),
-        ("shared_demo_history", env_history),
-        ("shared_demo_series", env_series),
     ]
     dedup: List[Tuple[str, Path]] = []
     seen = set()
@@ -1139,10 +1139,6 @@ class MonitorSaldoApp:
                         print(f"[DB SALDO][SOURCE] leyendo desde {sample.fuente}: {source_path}")
                         if "series" in sample.fuente:
                             print("[DB SALDO][WARN] source_series es solo lectura")
-                    elif sample.fuente.startswith("fallback"):
-                        print("[DB SALDO][WARN] maestro feed no encontrado, usando fallback websocket")
-                    else:
-                        print("[DB SALDO][WARN] maestro feed no encontrado")
                 if source_demo_path != self.active_demo_source_path:
                     self.active_demo_source_path = source_demo_path
                     if source_demo_path is not None:
