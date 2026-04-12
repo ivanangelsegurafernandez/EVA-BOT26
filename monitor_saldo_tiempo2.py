@@ -54,6 +54,10 @@ DB_HEADERS = ["ts_epoch", "ts_iso", "saldo", "fuente", "maestro_activo", "observ
 
 SALDO_LIVE_FILE = "saldo_real_live.json"
 SALDO_HISTORY_FILE = "saldo_real_live_history.jsonl"
+SALDO_DEMO_LIVE_FILE = "saldo_demo_live.json"
+SALDO_DEMO_HISTORY_FILE = "saldo_demo_live_history.jsonl"
+SALDO_DEMO_HISTORY_FILE_ALT = "saldo_demo_history.jsonl"
+SALDO_DEMO_SERIES_FILE = "saldo_demo_series.csv"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 HOME_DIR = Path.home()
@@ -242,6 +246,33 @@ def detector_fuente_saldo(db_path: Optional[Path] = None) -> List[Tuple[str, Pat
     return dedup
 
 
+def detector_fuente_saldo_demo() -> List[Tuple[str, Path]]:
+    env_live = Path(os.path.expanduser(os.getenv("SALDO_DEMO_LIVE_SHARED_PATH", str(HOME_DIR / SALDO_DEMO_LIVE_FILE))))
+    env_history = Path(os.path.expanduser(os.getenv("SALDO_DEMO_HISTORY_SHARED_PATH", str(env_live.parent / SALDO_DEMO_HISTORY_FILE))))
+    env_series = Path(os.path.expanduser(os.getenv("SALDO_DEMO_SERIES_CSV_PATH", str(SCRIPT_DIR / SALDO_DEMO_SERIES_FILE))))
+    local_history = SCRIPT_DIR / SALDO_DEMO_HISTORY_FILE
+    local_history_alt = SCRIPT_DIR / SALDO_DEMO_HISTORY_FILE_ALT
+
+    candidates = [
+        ("shared_demo_live", env_live),
+        ("shared_demo_history", env_history),
+        ("shared_demo_series", env_series),
+        ("local_demo_live", SCRIPT_DIR / SALDO_DEMO_LIVE_FILE),
+        ("local_demo_history", local_history),
+        ("local_demo_history_alt", local_history_alt),
+        ("local_demo_series", SCRIPT_DIR / SALDO_DEMO_SERIES_FILE),
+    ]
+    dedup: List[Tuple[str, Path]] = []
+    seen = set()
+    for src, p in candidates:
+        key = str(p.resolve()) if p.exists() else str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append((src, p))
+    return dedup
+
+
 async def _leer_saldo_deriv_ws() -> Optional[SaldoSample]:
     token = _choose_deriv_token()
     if not token:
@@ -335,6 +366,57 @@ def leer_saldo_desde_fuente(db_path: Path) -> Tuple[SaldoSample, Optional[Path]]
         return ws_sample, None
 
     return SaldoSample(now, _now_iso(), None, "sin_fuente", 0, "sin_datos", None, None), None
+
+
+def leer_saldo_demo_desde_fuente() -> Tuple[SaldoSample, Optional[Path]]:
+    now = time.time()
+    for fuente, path in detector_fuente_saldo_demo():
+        try:
+            if "live" in fuente:
+                if not path.exists():
+                    continue
+                payload = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+                saldo = _to_float(payload.get("saldo_demo"))
+                if saldo is None:
+                    saldo = _extract_saldo(payload)
+                if saldo is None:
+                    continue
+                source_ts = _extract_ts_epoch(payload)
+                obs = "ok" if (source_ts is None or now - source_ts <= SOURCE_STALE_SECONDS) else "stale"
+                source_ts_iso = datetime.fromtimestamp(source_ts, tz=LIMA_TZ).isoformat() if isinstance(source_ts, (int, float)) else None
+                return SaldoSample(now, _now_iso(), saldo, fuente, 1, obs, source_ts, source_ts_iso), path
+            if "history" in fuente:
+                line = _read_last_nonempty_line(path)
+                if not line:
+                    continue
+                payload = json.loads(line)
+                saldo = _to_float(payload.get("saldo_demo"))
+                if saldo is None:
+                    saldo = _extract_saldo(payload)
+                if saldo is None:
+                    continue
+                source_ts = _extract_ts_epoch(payload)
+                obs = "ok" if (source_ts is None or now - source_ts <= SOURCE_STALE_SECONDS) else "stale"
+                source_ts_iso = datetime.fromtimestamp(source_ts, tz=LIMA_TZ).isoformat() if isinstance(source_ts, (int, float)) else None
+                return SaldoSample(now, _now_iso(), saldo, fuente, 1, obs, source_ts, source_ts_iso), path
+            if "series" in fuente:
+                if not path.exists() or path.stat().st_size <= 0:
+                    continue
+                line = _read_last_nonempty_line(path)
+                if not line or "timestamp" in line.lower() or "ts_epoch" in line.lower():
+                    continue
+                cols = [c.strip() for c in line.split(",")]
+                saldo = None
+                if len(cols) >= 2:
+                    saldo = _to_float(cols[1])
+                if saldo is None and len(cols) >= 3:
+                    saldo = _to_float(cols[2])
+                if saldo is None:
+                    continue
+                return SaldoSample(now, _now_iso(), saldo, fuente, 1, "ok", None, None), path
+        except Exception:
+            continue
+    return SaldoSample(now, _now_iso(), None, "sin_demo_fuente", 0, "sin_datos_demo", None, None), None
 
 
 # =========================
@@ -616,6 +698,7 @@ class MonitorSaldoApp:
         self.lock_path = SCRIPT_DIR / f"{DB_FILENAME}.lock"
         self.legacy_db_path = SCRIPT_DIR / LEGACY_DB_FILENAME
         self.active_source_path: Optional[Path] = None
+        self.active_demo_source_path: Optional[Path] = None
 
         repair = ensure_db_header_or_repair(self.db_path, legacy_candidates=[self.legacy_db_path])
         print(f"[DB SALDO][OK] usando db propia: {self.db_path.name}")
@@ -753,6 +836,14 @@ class MonitorSaldoApp:
         self.lbl_saldo.pack(fill="x", padx=10, pady=(2, 2))
         self.lbl_delta = ttk.Label(saldo_band, text="Δ -- (--%)", style="Muted.TLabel", anchor="center", font=("Segoe UI", 18, "bold"))
         self.lbl_delta.pack(fill="x", padx=10, pady=(0, 8))
+        self.lbl_demo = ttk.Label(
+            saldo_band,
+            text="DEMO: --",
+            style="Muted.TLabel",
+            anchor="center",
+            font=("Segoe UI", 18, "bold"),
+        )
+        self.lbl_demo.pack(fill="x", padx=10, pady=(0, 8))
 
         controls = ttk.Frame(header, style="DarkPanel.TFrame")
         controls.pack(fill="x", padx=0, pady=(0, 2))
@@ -1042,12 +1133,17 @@ class MonitorSaldoApp:
             started = time.time()
             try:
                 sample, source_path = leer_saldo_desde_fuente(self.db_path)
+                sample_demo, source_demo_path = leer_saldo_demo_desde_fuente()
                 if source_path != self.active_source_path:
                     self.active_source_path = source_path
                     if source_path is not None:
                         print(f"[DB SALDO][SOURCE] leyendo desde {sample.fuente}: {source_path}")
                         if "series" in sample.fuente:
                             print("[DB SALDO][WARN] source_series es solo lectura")
+                if source_demo_path != self.active_demo_source_path:
+                    self.active_demo_source_path = source_demo_path
+                    if source_demo_path is not None:
+                        print(f"[DB SALDO][SOURCE-DEMO] leyendo desde {sample_demo.fuente}: {source_demo_path}")
 
                 if sample.saldo is not None:
                     self.last_valid = sample
@@ -1070,7 +1166,7 @@ class MonitorSaldoApp:
                     status = "STALE"
                 if sample.fuente.startswith("fallback"):
                     status = "FALLBACK"
-                self._update_status_ui(sample, status)
+                self._update_status_ui(sample, sample_demo, status)
             except Exception as exc:
                 now = time.time()
                 if now - last_log_err >= 5:
@@ -1079,20 +1175,29 @@ class MonitorSaldoApp:
             elapsed = time.time() - started
             time.sleep(max(0.05, SAMPLE_INTERVAL_SECONDS - elapsed))
 
-    def _update_status_ui(self, sample: SaldoSample, status: str):
+    def _update_status_ui(self, sample: SaldoSample, sample_demo: SaldoSample, status: str):
         saldo_txt = "--" if sample.saldo is None else f"{sample.saldo:,.2f}"
+        demo_txt = "--" if sample_demo.saldo is None else f"{sample_demo.saldo:,.2f}"
         ts = _fmt_lima(sample.ts_epoch)
         source_txt = str(self.active_source_path) if self.active_source_path else "n/a"
+        source_demo_txt = str(self.active_demo_source_path) if self.active_demo_source_path else "n/a"
         text = (
             f"Estado: {status} | Fuente: {sample.fuente} | "
-            f"Último saldo válido: {saldo_txt} | Actualización: {ts} | "
-            f"DB: {self.db_path.name} | Source: {source_txt}"
+            f"REAL: {saldo_txt} | DEMO: {demo_txt} | Actualización: {ts} | "
+            f"DB: {self.db_path.name} | Source REAL: {source_txt} | Source DEMO: {source_demo_txt}"
         )
 
         def apply_text():
             self.last_status = status
             self.lbl_saldo.config(text=saldo_txt)
             self._update_delta_label(sample.saldo)
+            self.lbl_demo.config(text=f"DEMO: {demo_txt}")
+            if sample_demo.observacion == "stale":
+                self.lbl_demo.config(foreground="#ffe14d")
+            elif sample_demo.saldo is None:
+                self.lbl_demo.config(foreground="#cfcfcf")
+            else:
+                self.lbl_demo.config(foreground="#9ad1ff")
             if status == "OK":
                 self.lbl_saldo.config(foreground="#35f2ff")
             elif status == "STALE":

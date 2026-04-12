@@ -1070,6 +1070,7 @@ IA53_LAST_TS = {bot: 0.0 for bot in BOT_NAMES}
 TOKEN_FILE = "token_actual.txt"
 DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 saldo_real = "--"
+saldo_demo = "--"
 SALDO_INICIAL = None
 META = None
 meta_mostrada = False
@@ -1457,7 +1458,12 @@ reinicio_manual = False
 
 LIMPIEZA_PANEL_HASTA = 0
 ULTIMA_ACT_SALDO = 0
+ULTIMA_ACT_SALDO_DEMO = 0
 REFRESCO_SALDO = 12
+SALDO_FEED_HEARTBEAT_S = 25.0
+SALDO_FEED_MIN_INTERVAL_S = 1.0
+SALDO_FEED_FORCE_INTERVAL_S = 8.0
+SALDO_FEED_HISTORY_KEEPALIVE_S = 30.0
 MAX_CICLOS = len(MARTI_ESCALADO)
 huellas_usadas = {bot: set() for bot in BOT_NAMES}
 SNAPSHOT_FILAS = {bot: 0 for bot in BOT_NAMES}
@@ -7863,6 +7869,16 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
         f"🔁 Martingala{bot_msg}: resultado={res} | pérdidas seguidas={marti_ciclos_perdidos}/{MAX_CICLOS} | próximo ciclo={ciclo_sig}"
     )
     agregar_evento(f"🧾 MARTI-AUDIT: {marti_audit_resumen_linea()}")
+    try:
+        owner_now = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_archivo_raw()
+        publicar_feed_saldo("real", obtener_valor_saldo(), owner=owner_now, motivo=f"resultado_{res.lower()}", forzar=True)
+        try:
+            demo_v = float(saldo_demo)
+        except Exception:
+            demo_v = None
+        publicar_feed_saldo("demo", demo_v, owner=owner_now, motivo=f"resultado_{res.lower()}", forzar=True)
+    except Exception:
+        pass
 
 def ciclo_martingala_siguiente() -> int:
     """
@@ -13637,38 +13653,158 @@ async def cargar_datos_bot(bot, token_actual):
     except Exception as e:
         print(f"⚠️ Error cargando datos para {bot}: {e}")
 
-# Obtener saldo real
-async def obtener_saldo_real():
-    global saldo_real, ULTIMA_ACT_SALDO
-    token_demo, token_real = leer_tokens_usuario()
-    if not token_real:
+# === Feed canónico de saldo (canal lateral, no toca lógica operativa) ===
+SALDO_FEED_STATE = {
+    "real": {"last_payload": None, "last_publish_ts": 0.0, "last_history_ts": 0.0},
+    "demo": {"last_payload": None, "last_publish_ts": 0.0, "last_history_ts": 0.0},
+}
+SALDO_FEED_LOCK = threading.Lock()
+LAST_TOKEN_OWNER_PUBLISHED = None
+
+
+def _saldo_feed_paths(modo: str) -> tuple[str, str, str]:
+    base_dir = script_dir if "script_dir" in globals() else os.getcwd()
+    if modo == "real":
+        live_path = os.path.expanduser(os.getenv("SALDO_LIVE_SHARED_PATH", os.path.join(base_dir, "saldo_real_live.json")))
+        hist_path = os.path.expanduser(os.getenv("SALDO_LIVE_HISTORY_SHARED_PATH", os.path.join(base_dir, "saldo_real_live_history.jsonl")))
+        csv_path = os.path.expanduser(os.getenv("SALDO_SERIES_CSV_PATH", os.path.join(base_dir, "saldo_real_series.csv")))
+    else:
+        live_path = os.path.expanduser(os.getenv("SALDO_DEMO_LIVE_SHARED_PATH", os.path.join(base_dir, "saldo_demo_live.json")))
+        hist_path = os.path.expanduser(os.getenv("SALDO_DEMO_HISTORY_SHARED_PATH", os.path.join(base_dir, "saldo_demo_live_history.jsonl")))
+        csv_path = os.path.expanduser(os.getenv("SALDO_DEMO_SERIES_CSV_PATH", os.path.join(base_dir, "saldo_demo_series.csv")))
+    return live_path, hist_path, csv_path
+
+
+def _atomic_write_json(path: str, payload: dict) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _append_line_atomic(path: str, line: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        f.write(line + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _ensure_csv_header(path: str) -> None:
+    if os.path.exists(path) and os.path.getsize(path) > 0:
         return
-    if not WEBSOCKETS_OK:
-        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write("timestamp,equity,source\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _build_saldo_payload(modo: str, saldo: float | None, owner: str | None = None) -> dict | None:
+    if saldo is None:
+        return None
+    now = time.time()
+    token_owner = owner if owner in BOT_NAMES else "none"
+    return {
+        "ts": float(now),
+        "timestamp": datetime.now().isoformat(),
+        "saldo_real": float(saldo) if modo == "real" else None,
+        "saldo_demo": float(saldo) if modo == "demo" else None,
+        "equity": float(saldo),
+        "balance": float(saldo),
+        "fuente": "maestro_5R6M",
+        "maestro_activo": 1,
+        "token_owner": token_owner,
+        "modo_real": bool(modo == "real"),
+    }
+
+
+def publicar_feed_saldo(modo: str, saldo: float | None, owner: str | None = None, motivo: str = "tick", forzar: bool = False) -> bool:
+    try:
+        payload = _build_saldo_payload(modo, saldo, owner=owner)
+        if not isinstance(payload, dict):
+            return False
+        now = time.time()
+        st = SALDO_FEED_STATE.get(modo, {})
+        prev = st.get("last_payload")
+        last_pub = float(st.get("last_publish_ts", 0.0) or 0.0)
+        last_hist = float(st.get("last_history_ts", 0.0) or 0.0)
+        changed_balance = not isinstance(prev, dict) or (float(prev.get("equity", -999999)) != float(payload.get("equity", 0.0)))
+        changed_owner = not isinstance(prev, dict) or (str(prev.get("token_owner", "none")) != str(payload.get("token_owner", "none")))
+        should_publish = bool(forzar or changed_balance or changed_owner or (now - last_pub) >= float(SALDO_FEED_FORCE_INTERVAL_S))
+        if (not should_publish) and (now - last_pub) < float(SALDO_FEED_MIN_INTERVAL_S):
+            return False
+        if not should_publish:
+            return False
+
+        live_path, hist_path, csv_path = _saldo_feed_paths(modo)
+        with SALDO_FEED_LOCK:
+            _atomic_write_json(live_path, payload)
+            _ensure_csv_header(csv_path)
+            _append_line_atomic(csv_path, f"{payload['timestamp']},{payload['equity']:.8f},{payload['fuente']}")
+            if changed_balance or changed_owner or (now - last_hist) >= float(SALDO_FEED_HISTORY_KEEPALIVE_S):
+                _append_line_atomic(hist_path, json.dumps(payload, ensure_ascii=False))
+                st["last_history_ts"] = now
+            st["last_payload"] = payload
+            st["last_publish_ts"] = now
+            SALDO_FEED_STATE[modo] = st
+        return True
+    except Exception:
+        return False
+
+
+async def _fetch_balance_from_token(token: str) -> float | None:
+    if not token or (not WEBSOCKETS_OK):
+        return None
     try:
         async with websockets.connect(DERIV_WS_URL) as ws:
-            auth_msg = json.dumps({"authorize": token_real})
-            await ws.send(auth_msg)
+            await ws.send(json.dumps({"authorize": token}))
+            auth = json.loads(await ws.recv())
+            if "error" in auth:
+                return None
+            await ws.send(json.dumps({"balance": 1}))
             resp = json.loads(await ws.recv())
             if "error" in resp:
-                print(f"⚠️ Error en auth: {resp['error']['message']}")
-                return
-            bal_msg = json.dumps({"balance": 1, "subscribe": 1})
-            await ws.send(bal_msg)
-            resp = json.loads(await ws.recv())
-            if "error" in resp:
-                print(f"⚠️ Error en balance: {resp['error']['message']}")
-                return
-            if "balance" in resp:
-                saldo_real = f"{resp['balance']['balance']:.2f}"
-                ULTIMA_ACT_SALDO = time.time()
-    except Exception as e:
-        print(f"⚠️ Error obteniendo saldo: {e}")
+                return None
+            bal = ((resp or {}).get("balance") or {}).get("balance")
+            return float(bal) if bal is not None else None
+    except Exception:
+        return None
+
+
+# Obtener saldo real/demo
+async def obtener_saldo_real():
+    global saldo_real, saldo_demo, ULTIMA_ACT_SALDO, ULTIMA_ACT_SALDO_DEMO
+    token_demo, token_real = leer_tokens_usuario()
+    owner_now = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_archivo_raw()
+    if token_real:
+        bal_real = await _fetch_balance_from_token(token_real)
+        if isinstance(bal_real, (int, float)):
+            saldo_real = f"{float(bal_real):.2f}"
+            ULTIMA_ACT_SALDO = time.time()
+            publicar_feed_saldo("real", float(bal_real), owner=owner_now, motivo="refresh_real")
+    if token_demo:
+        bal_demo = await _fetch_balance_from_token(token_demo)
+        if isinstance(bal_demo, (int, float)):
+            saldo_demo = f"{float(bal_demo):.2f}"
+            ULTIMA_ACT_SALDO_DEMO = time.time()
+            publicar_feed_saldo("demo", float(bal_demo), owner=owner_now, motivo="refresh_demo")
 
 async def refresh_saldo_real(forzado=False):
     global ULTIMA_ACT_SALDO
     if forzado or time.time() - ULTIMA_ACT_SALDO > REFRESCO_SALDO:
         await obtener_saldo_real()
+    else:
+        owner_now = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_archivo_raw()
+        publicar_feed_saldo("real", obtener_valor_saldo(), owner=owner_now, motivo="heartbeat_real")
+        try:
+            demo_val = float(saldo_demo)
+        except Exception:
+            demo_val = None
+        publicar_feed_saldo("demo", demo_val, owner=owner_now, motivo="heartbeat_demo")
 
 def obtener_valor_saldo():
     global saldo_real
@@ -13955,7 +14091,7 @@ def _boot_health_check():
 async def main():
     global salir, pausado, reinicio_manual, SALDO_INICIAL
     global PENDIENTE_FORZAR_BOT, PENDIENTE_FORZAR_INICIO, PENDIENTE_FORZAR_EXPIRA, REAL_OWNER_LOCK
-    global REAL_LOCK_MISMATCH_SINCE
+    global REAL_LOCK_MISMATCH_SINCE, LAST_TOKEN_OWNER_PUBLISHED
 
     try:
         set_etapa("BOOT_01", "Inicializando main()", anunciar=True)
@@ -13996,6 +14132,13 @@ async def main():
         valor = obtener_valor_saldo()
         if valor is not None:
             inicializar_saldo_real(valor)
+        owner_boot = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_archivo_raw()
+        publicar_feed_saldo("real", obtener_valor_saldo(), owner=owner_boot, motivo="arranque", forzar=True)
+        try:
+            demo_boot = float(saldo_demo)
+        except Exception:
+            demo_boot = None
+        publicar_feed_saldo("demo", demo_boot, owner=owner_boot, motivo="arranque", forzar=True)
 
         set_etapa("BOOT_03", "Backfill y primer entrenamiento")
         # Backfill IA desde los logs enriquecidos
@@ -14031,6 +14174,15 @@ async def main():
             try:  
                 set_etapa("TICK_01")
                 token_actual_loop = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else (leer_token_actual() or next((b for b in BOT_NAMES if estado_bots.get(b, {}).get("token") == "REAL"), None))
+                owner_pub = token_actual_loop if token_actual_loop in BOT_NAMES else None
+                if owner_pub != LAST_TOKEN_OWNER_PUBLISHED:
+                    LAST_TOKEN_OWNER_PUBLISHED = owner_pub
+                    publicar_feed_saldo("real", obtener_valor_saldo(), owner=owner_pub, motivo="owner_change", forzar=True)
+                    try:
+                        demo_v = float(saldo_demo)
+                    except Exception:
+                        demo_v = None
+                    publicar_feed_saldo("demo", demo_v, owner=owner_pub, motivo="owner_change", forzar=True)
 
                 # Reconciliación anti-desincronía maestro↔bots:
                 # si memoria dice REAL pero token_actual.txt ya está en none por varios segundos,
