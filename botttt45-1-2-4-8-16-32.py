@@ -1008,45 +1008,21 @@ def evaluar_estrategia(velas):
 
 def puntuar_setups(condiciones, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce_sma, rsi_reversion):
     """
-    Score interno para elegir MEJOR activo entre candidatos válidos (sin cambiar 13 features).
-    Mantiene la regla base (>=2/3), pero evita tomar el primer símbolo "aceptable".
+    Compatibilidad LXV: el bot no decide selección REAL por setup/score.
+    Se mantiene firma para no romper llamadas legacy.
     """
     try:
-        score = float(condiciones)
-
-        # Alineación de tendencia con la dirección sugerida
-        tendencia_call = (sma5 > sma20)
-        tendencia_put = (sma5 < sma20)
-        alineado = (direccion == "CALL" and tendencia_call) or (direccion == "PUT" and tendencia_put)
-        if alineado:
-            score += 0.75
-
-        # Fortaleza del cruce (distancia relativa entre medias)
-        den = max(abs(float(sma20)), 1e-9)
-        gap = abs(float(sma5) - float(sma20)) / den
-        score += min(0.50, gap * 25.0)
-
-        # Confirmaciones de setup
-        if breakout:
-            score += 0.35
-        if rsi_reversion:
-            score += 0.25
-
-        # Penalización suave si RSI está en zona "gris" (menos edge)
-        if 45.0 <= float(rsi14) <= 55.0:
-            score -= 0.15
-
-        return float(score)
+        return 0.0
     except Exception:
-        return float(condiciones or 0)
+        return 0.0
 
 
 def setup_pasa_filtro(score: float, condiciones: int) -> bool:
-    """Gate de calidad: mantiene >=2/3 y exige score mínimo."""
+    """Compatibilidad LXV: no gatea decisiones de pase a REAL en el bot."""
     try:
-        return (int(condiciones) >= 2) and (float(score) >= float(SCORE_MIN))
+        return True
     except Exception:
-        return False
+        return True
 # ==================== WS HELPERS ====================
 # BLOQUE 1: api_call wrapper
 _req_counter = itertools.count(1)
