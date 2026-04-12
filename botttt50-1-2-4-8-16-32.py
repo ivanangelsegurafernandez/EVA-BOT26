@@ -141,12 +141,12 @@ PAUSA_POST_OPERACION_S = 40  # Pausa uniforme tras cada operación con resultado
 # ==================== VENTANA DE DECISIÓN IA ====================
 # Objetivo: dar tiempo al MAESTRO + humano para decidir pasar a REAL ANTES del BUY.
 # (0 para desactivar)
-VENTANA_DECISION_IA_S = 60        # segundos
+VENTANA_DECISION_IA_S = 0         # LXV: sin espera previa por IA
 VENTANA_DECISION_IA_POLL_S = 0.10 # granularidad de espera
 # === Filtro avanzado (sin cambiar 13 features) ===
-SCORE_MIN = 2.80            # score mínimo para aceptar un setup
-SCORE_DROP_MAX = 0.70       # caída máxima tolerada al revalidar pre-buy
-REVALIDAR_VELAS_N = 8       # velas mínimas para revalidación rápida
+SCORE_MIN = 0.0             # LXV: sin candado por score
+SCORE_DROP_MAX = 999.0      # LXV: sin veto por caida de score
+REVALIDAR_VELAS_N = 999999  # LXV: revalidacion tecnica fuera del flujo
 resultado_global = {"demo": 0.0, "real": 0.0}
 ultimo_token = None
 reinicio_forzado = asyncio.Event()
@@ -2104,7 +2104,7 @@ async def ejecutar_panel():
                 try:
                     score_sel = estado_bot.get("score_senal")
                     velas_rv = await obtener_velas(ws, symbol, current_token, reintentos=2)
-                    if velas_rv and len(velas_rv) >= int(REVALIDAR_VELAS_N):
+                    if False and velas_rv and len(velas_rv) >= int(REVALIDAR_VELAS_N):  # LXV
                         cond2, dir2, rsi9_2, rsi14_2, sma5_2, sma20_2, br2, cr2, rev2 = evaluar_estrategia(velas_rv)
                         score2 = puntuar_setups(cond2, dir2, rsi9_2, rsi14_2, sma5_2, sma20_2, br2, cr2, rev2)
                         piso = float(SCORE_MIN)
@@ -2210,7 +2210,7 @@ async def ejecutar_panel():
                 # 2) tú elijas bot/ciclo
                 # 3) si el MAESTRO asigna REAL (token), el watcher lo detecte y dispare reinicio_forzado
                 # Resultado: evitamos comprar en DEMO cuando justo tocaba REAL.
-                if VENTANA_DECISION_IA_S > 0:
+                if False and VENTANA_DECISION_IA_S > 0:  # LXV
                     t0 = time.time()
                     ack_visto = False
 

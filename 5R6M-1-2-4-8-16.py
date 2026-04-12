@@ -1323,6 +1323,131 @@ def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> d
         return out
     return None
 
+# ==================== LXV: ruta única de decisión REAL ====================
+# Mayor valor = mayor prioridad histórica en desempate 4V2X.
+LXV_PRIORIDAD_HISTORICA = {bot: int(len(BOT_NAMES) - i) for i, bot in enumerate(BOT_NAMES)}
+
+
+def _marca_lxv_desde_resultado(resultado) -> str | None:
+    """Normaliza resultado de bot a marca LXV: V (verde) / X (fallo)."""
+    try:
+        txt = str(resultado or "").strip().upper()
+        if txt in {"GANADA", "GANADOR", "WIN", "W", "V", "VERDE", "1"}:
+            return "V"
+        if txt in {"PERDIDA", "PERDIDO", "LOSS", "L", "X", "ROJO", "0"}:
+            return "X"
+        return None
+    except Exception:
+        return None
+
+
+def construir_columnas_lxv(estado: dict) -> list[dict]:
+    """
+    Construye columnas alineadas LXV usando el último resultado confirmado por bot.
+    Si algún bot no tiene marca válida, no hay columna operable en ese tick.
+    """
+    try:
+        estado = estado if isinstance(estado, dict) else {}
+        marcas = {}
+        for bot in BOT_NAMES:
+            st = estado.get(bot, {}) if isinstance(estado.get(bot, {}), dict) else {}
+            mk = _marca_lxv_desde_resultado(st.get("ultimo_resultado"))
+            if mk not in ("V", "X"):
+                return []
+            marcas[bot] = mk
+        return [{
+            "columna_id": f"lxv:{int(time.time())}",
+            "marcas": marcas,
+        }]
+    except Exception:
+        return []
+
+
+def elegir_x_mayor_peso(candidatas_x: list[str], estado: dict, columnas: list[dict], contexto: dict | None = None) -> tuple[str | None, dict]:
+    """
+    Desempate estable para 4V2X:
+    a) mayor prioridad histórica configurable
+    b) peor racha reciente válida
+    c) menor % de acierto reciente
+    d) orden determinista BOT_NAMES
+    """
+    try:
+        estado = estado if isinstance(estado, dict) else {}
+        contexto = contexto if isinstance(contexto, dict) else {}
+        prioridad = dict(LXV_PRIORIDAD_HISTORICA)
+        prioridad.update(contexto.get("prioridad_historica", {}) if isinstance(contexto.get("prioridad_historica"), dict) else {})
+        index_bot = {b: i for i, b in enumerate(BOT_NAMES)}
+        filas = []
+        for bot in [str(x) for x in (candidatas_x or []) if str(x) in BOT_NAMES]:
+            st = estado.get(bot, {}) if isinstance(estado.get(bot, {}), dict) else {}
+            racha = float(st.get("racha_actual", 0.0) or 0.0)
+            acierto = float(st.get("porcentaje_exito", 0.0) or 0.0)
+            filas.append({
+                "bot": bot,
+                "prio": float(prioridad.get(bot, 0.0) or 0.0),
+                "racha": float(racha),
+                "acierto": float(acierto),
+                "idx": int(index_bot.get(bot, 999)),
+            })
+        if not filas:
+            return None, {"motivo": "sin_x_validas"}
+        filas.sort(key=lambda r: (-r["prio"], r["racha"], r["acierto"], r["idx"]))
+        win = filas[0]
+        return str(win["bot"]), {
+            "motivo": "desempate_4V2X_peso",
+            "prioridad_historica": {f["bot"]: f["prio"] for f in filas},
+            "racha_reciente": {f["bot"]: f["racha"] for f in filas},
+            "acierto_reciente": {f["bot"]: f["acierto"] for f in filas},
+            "orden": [f["bot"] for f in filas],
+        }
+    except Exception:
+        return None, {"motivo": "error_elegir_x"}
+
+
+def detectar_lxv(columnas: list[dict], estado: dict, contexto: dict | None = None) -> dict | None:
+    """Detecta patrón LXV válido (5V1X o 4V2X) y resuelve bot objetivo."""
+    try:
+        for col in list(columnas or []):
+            marcas = col.get("marcas", {}) if isinstance(col, dict) else {}
+            if not isinstance(marcas, dict):
+                continue
+            verdes = [b for b in BOT_NAMES if marcas.get(b) == "V"]
+            xs = [b for b in BOT_NAMES if marcas.get(b) == "X"]
+            if len(verdes) == 5 and len(xs) == 1:
+                x = str(xs[0])
+                return {
+                    "pattern": "5V1X",
+                    "bot_objetivo": x,
+                    "motivo": "x_unica_en_columna",
+                    "columna_id": str(col.get("columna_id", "lxv:na")),
+                    "xs_consideradas": list(xs),
+                    "x_ganadora": x,
+                }
+            if len(verdes) == 4 and len(xs) == 2:
+                xg, detalle = elegir_x_mayor_peso(xs, estado, columnas, contexto=contexto)
+                if xg in BOT_NAMES:
+                    return {
+                        "pattern": "4V2X",
+                        "bot_objetivo": xg,
+                        "motivo": str(detalle.get("motivo", "desempate_4V2X")),
+                        "columna_id": str(col.get("columna_id", "lxv:na")),
+                        "xs_consideradas": list(xs),
+                        "x_ganadora": xg,
+                        "detalle_peso": detalle,
+                    }
+        return None
+    except Exception:
+        return None
+
+
+def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> dict | None:
+    """Ruta única de selección REAL: solo LXV."""
+    cols = construir_columnas_lxv(estado)
+    out = detectar_lxv(cols, estado, contexto=contexto)
+    if isinstance(out, dict) and str(out.get("bot_objetivo")) in BOT_NAMES:
+        return out
+    return None
+
 salir = False
 pausado = False
 reinicio_manual = False
@@ -11965,8 +12090,8 @@ def set_main_loop(loop):
     MAIN_LOOP = loop
 
 # ==================== VENTANA DE DECISIÓN IA ====================
-# Debe empatar con el BOT (VENTANA_DECISION_IA_S) para que el humano alcance a elegir ciclo.
-VENTANA_DECISION_IA_S = 30
+# LXV: no usar espera IA para decidir promoción.
+VENTANA_DECISION_IA_S = 0
 
 PENDIENTE_FORZAR_BOT = None
 PENDIENTE_FORZAR_INICIO = 0.0
@@ -11975,16 +12100,13 @@ PENDIENTE_FORZAR_EXPIRA = 0.0
 FORZAR_LOCK = threading.Lock()
 
 def condiciones_seguras_para(bot: str) -> bool:
-    # Fuente operativa única: prob_ia_oper + estado final del embudo
-    thr = float(get_umbral_operativo())
-    prob = float(_prob_ia_operativa_bot(bot, default=0.0) or 0.0)
-    n = int(estado_bots.get(bot, {}).get("tamano_muestra", 0) or 0)
-    emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
-    dec = str(emb.get("decision_final", EMBUDO_FINAL_WAIT_SOFT))
-    top1 = str(emb.get("top1_bot") or "")
-    if top1 and bot != top1:
+    # LXV: seguridad basada en el candidato LXV vigente, sin prob_ia ni embudo.
+    dec = resolver_candidato_real_lxv(estado_bots, contexto={"prioridad_historica": LXV_PRIORIDAD_HISTORICA})
+    top = str(dec.get("bot_objetivo", "") if isinstance(dec, dict) else "")
+    if top != str(bot):
         return False
-    return (n >= ORACULO_N_MIN) and (prob >= thr) and (dec in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO))
+    owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+    return owner in (None, "none")
 
 # forzar_real_manual
 def forzar_real_manual(bot: str, ciclo: int):
@@ -12014,33 +12136,10 @@ def forzar_real_manual(bot: str, ciclo: int):
             finally:
                 MODAL_ACTIVO = False
 
-        # Nueva lógica: Marcar como señal IA si prob >= thr_ia
-        prob = float(_prob_ia_operativa_bot(bot, default=0.0) or 0.0)
-        thr_ia = float(get_umbral_operativo())
-
-        if prob >= thr_ia and not estado_bots[bot]["ia_senal_pendiente"]:
+        # LXV: marca operativa neutra, sin handshake IA/probabilidad.
+        if not estado_bots[bot]["ia_senal_pendiente"]:
             estado_bots[bot]["ia_senal_pendiente"] = True
-            estado_bots[bot]["ia_prob_senal"] = prob
-
-            # ✅ FIX REAL: registrar APERTURA de señal con epoch PRE real (para contabilidad correcta)
-            # Esto sí “lo consume” el cierre automático posterior (log_ia_close vía ia_audit_scan_close).
-            try:
-                epoch_sig = None
-                try:
-                    epoch_sig = ia_audit_get_last_pre_epoch(bot)
-                except Exception:
-                    epoch_sig = None
-
-                if epoch_sig is not None:
-                    log_ia_open(
-                        bot,
-                        int(epoch_sig),
-                        float(prob),
-                        float(thr_ia),
-                        "MANUAL"
-                    )
-            except Exception:
-                pass
+            estado_bots[bot]["ia_prob_senal"] = None
 
 
         if not escribir_orden_real(bot, ciclo):
@@ -12068,13 +12167,9 @@ def forzar_real_manual(bot: str, ciclo: int):
         FORZAR_LOCK.release()
 
 def evaluar_semaforo():
-    thr = float(get_umbral_operativo())
-    emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
-    dec = str(emb.get("decision_final", EMBUDO_FINAL_WAIT_SOFT))
-    reason = str(emb.get("decision_reason", "--"))
-    top1 = str(emb.get("top1_bot") or "")
-    prob = float(emb.get("top1_prob", 0.0) or 0.0)
-    n = int(estado_bots.get(top1, {}).get("tamano_muestra", 0) or 0) if top1 else 0
+    dec_lxv = resolver_candidato_real_lxv(estado_bots, contexto={"prioridad_historica": LXV_PRIORIDAD_HISTORICA})
+    top1 = str(dec_lxv.get("bot_objetivo", "") if isinstance(dec_lxv, dict) else "")
+    pattern = str(dec_lxv.get("pattern", "--") if isinstance(dec_lxv, dict) else "--")
 
     owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
     try:
@@ -12092,19 +12187,9 @@ def evaluar_semaforo():
     if saldo_val < costo:
         return "🟡", "AVISO", f"Saldo parcial: cubre C1 pero no C1..C{int(MAX_CICLOS)} ({costo:.2f})."
 
-    if dec == EMBUDO_FINAL_BLOCK_HARD:
-        return "🔴", "BLOQUEO", f"{emb.get('hard_block_reason') or reason}"
-    if dec == EMBUDO_FINAL_WAIT_SOFT:
-        return "🟡", "EN ESPERA", f"{emb.get('soft_wait_reason') or reason}"
-    if dec == EMBUDO_FINAL_SHADOW_OK:
-        return "🔵", "SHADOW", f"{reason} (no ejecuta REAL)"
-    if dec in (EMBUDO_FINAL_REAL_MICRO, EMBUDO_FINAL_REAL_NORMAL):
-        if (not top1) or (prob < thr):
-            return "🟡", "EN ESPERA", f"Top1 no operativo ({top1 or '--'} p={prob:.0%}<{int(thr*100)}%)."
-        modo = "MICRO" if dec == EMBUDO_FINAL_REAL_MICRO else "NORMAL"
-        return "🟢", "SEÑAL LISTA", f"{top1} • ProbOper={prob:.0%} • n={n} • modo={modo}"
-
-    return "🟡", "EN ESPERA", f"Sin decisión embudo ({reason})."
+    if top1:
+        return "🟢", "SEÑAL LXV", f"{top1} • patrón={pattern}"
+    return "🟡", "EN ESPERA", "Sin patrón LXV (5V1X/4V2X)."
 
 # NUEVAS FUNCIONES PARA RESET
 RESET_ON_START = False  # Cambiado a False para mantener historial entre sesiones
