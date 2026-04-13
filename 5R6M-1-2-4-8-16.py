@@ -1190,7 +1190,7 @@ def elegir_x_mayor_peso(candidatas_x: list[str], estado: dict, columnas: list[di
 
 
 def detectar_lxv(columnas: list[dict], estado: dict, contexto: dict | None = None) -> dict | None:
-    """Detecta patrón LXV válido (SOLO 5V1X) en la última columna visible."""
+    """Detecta patrón LXV válido (5V1X o 4V2X) SOLO en la última columna visible."""
     try:
         cols = list(columnas or [])
         if not cols:
@@ -1223,6 +1223,19 @@ def detectar_lxv(columnas: list[dict], estado: dict, contexto: dict | None = Non
                 "xs_consideradas": list(xs),
                 "x_ganadora": x,
             }
+        if len(verdes) == 4 and len(xs) == 2:
+            xg, detalle = elegir_x_mayor_peso(xs, estado, columnas, contexto=contexto)
+            if xg in BOT_NAMES:
+                return {
+                    "pattern": "4V2X",
+                    "bot_objetivo": xg,
+                    "motivo": str(detalle.get("motivo", "desempate_4V2X")),
+                    "columna_id": columna_id,
+                    "col_visible": col_visible,
+                    "xs_consideradas": list(xs),
+                    "x_ganadora": xg,
+                    "detalle_peso": detalle,
+                }
         return {
             "motivo": "lastcol_no_pattern",
             "col_visible": col_visible,
@@ -1237,7 +1250,7 @@ def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> d
     """Ruta única de selección REAL: solo LXV desde columna visible HUD."""
     cols = construir_columnas_lxv(estado)
     out = detectar_lxv(cols, estado, contexto=contexto)
-    if isinstance(out, dict) and str(out.get("bot_objetivo")) in BOT_NAMES and str(out.get("pattern")) == "5V1X":
+    if isinstance(out, dict) and str(out.get("bot_objetivo")) in BOT_NAMES and str(out.get("pattern")) in {"5V1X", "4V2X"}:
         return out
     return None
 
@@ -14115,7 +14128,7 @@ async def main():
                             estado_bots,
                             contexto={"prioridad_historica": LXV_PRIORIDAD_HISTORICA},
                         )
-                        lxv_decision = lxv_eval if isinstance(lxv_eval, dict) and str(lxv_eval.get("pattern")) == "5V1X" and str(lxv_eval.get("bot_objetivo", "")) in BOT_NAMES else None
+                        lxv_decision = lxv_eval if isinstance(lxv_eval, dict) and str(lxv_eval.get("pattern")) in {"5V1X", "4V2X"} and str(lxv_eval.get("bot_objetivo", "")) in BOT_NAMES else None
                         candidatos = []
                         if isinstance(lxv_decision, dict):
                             bot_lxv = str(lxv_decision.get("bot_objetivo", "") or "").strip()
@@ -14132,7 +14145,7 @@ async def main():
                                 if diag_reason == "lastcol_incompleta":
                                     diag_msg = "🧭 LXV sin señal en lastcol: lastcol incompleta."
                                 elif diag_reason == "lastcol_no_pattern":
-                                    diag_msg = "🧭 LXV sin señal en lastcol: lastcol no es 5V1X."
+                                    diag_msg = "🧭 LXV sin señal en lastcol: lastcol no es 5V1X/4V2X."
                                 else:
                                     diag_msg = "🧭 LXV sin señal en lastcol."
                                 if (diag_msg != _LXV_LASTCOL_DIAG_MSG) or ((now_lxv - float(_LXV_LASTCOL_DIAG_TS or 0.0)) >= 12.0):
