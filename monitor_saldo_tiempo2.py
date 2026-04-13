@@ -64,7 +64,7 @@ HOME_DIR = Path.home()
 LIMA_TZ = ZoneInfo("America/Lima")
 MASTER_PAUSE_STATE_PATH = Path(os.path.expanduser(os.getenv("MAESTRO_PAUSE_STATE_PATH", str(SCRIPT_DIR / "maestro_pause_state.json"))))
 PROTECTION_DRAWDOWN_PCT = float(os.getenv("SALDO_MONITOR_PROTECTION_DRAWDOWN", "0.20"))
-PROTECTION_PAUSE_SECONDS = int(float(os.getenv("SALDO_MONITOR_PROTECTION_PAUSE_SECONDS", "2400")))
+PROTECTION_PAUSE_SECONDS = int(float(os.getenv("SALDO_MONITOR_PROTECTION_PAUSE_SECONDS", "1800")))
 
 
 @dataclass
@@ -804,7 +804,7 @@ class MonitorSaldoApp:
         )
         self.pause_timer = ttk.Label(
             self.pause_banner,
-            text="40:00",
+            text="30:00",
             style="PauseTimer.TLabel",
             font=("Consolas", 34, "bold"),
             anchor="center",
