@@ -2199,7 +2199,7 @@ def _emitir_evento_pausa_real_si_toca(st: dict | None = None, cooldown_s: float 
         mm = rem // 60
         ss = rem % 60
         reason = str(st.get("reason", "") or "drawdown_20_monitor")
-        agregar_evento(f"⏸ REAL en pausa por protección saldo ({mm:02d}:{ss:02d} restantes) | motivo={reason}")
+        agregar_evento(f"⏸ PAUSA REAL {mm:02d}:{ss:02d} | motivo={reason}")
         _MAESTRO_PAUSE_LAST_EVENT_TS = now
     except Exception:
         pass
