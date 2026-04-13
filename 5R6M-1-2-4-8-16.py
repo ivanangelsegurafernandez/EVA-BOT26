@@ -1080,6 +1080,7 @@ reinicio_forzado = asyncio.Event()
 # ==================== LXV: ruta única de decisión REAL ====================
 # Mayor valor = mayor prioridad histórica (legado de compatibilidad).
 LXV_PRIORIDAD_HISTORICA = {bot: int(len(BOT_NAMES) - i) for i, bot in enumerate(BOT_NAMES)}
+LXV_RUNTIME_PATTERN = "5V1X"  # patrón único válido para promoción REAL automática
 
 
 def _marca_lxv_desde_resultado(resultado) -> str | None:
