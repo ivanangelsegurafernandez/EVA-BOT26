@@ -263,7 +263,7 @@ AUTO_REAL_LIVE_MIN_BOTS = 3   # mínimos bots con prob viva para calibración po
 IA_METRIC_THRESHOLD = AUTO_REAL_THR_MIN
 # Modo clásico IA (LEGACY_NO_USADO para promoción REAL automática).
 # La promoción REAL automática en runtime depende EXCLUSIVAMENTE de LXV:
-# construir_columnas_lxv -> detectar_lxv -> elegir_x_mayor_peso -> resolver_candidato_real_lxv.
+# construir_columnas_lxv -> detectar_lxv -> resolver_candidato_real_lxv.
 # Se conserva este flag solo por compatibilidad de HUD/telemetría histórica.
 REAL_CLASSIC_GATE = True
 
@@ -12010,7 +12010,7 @@ def evaluar_semaforo():
 
     if top1:
         return "🟢", "SEÑAL LXV", f"{top1} • patrón={pattern}"
-    return "🟡", "EN ESPERA", "Sin patrón LXV (5V1X/4V2X)."
+    return "🟡", "EN ESPERA", "Sin patrón LXV (5V1X)."
 
 # NUEVAS FUNCIONES PARA RESET
 RESET_ON_START = False  # Cambiado a False para mantener historial entre sesiones
@@ -14108,7 +14108,7 @@ async def main():
                             _enforce_single_real_standby(activo_real)
 
                         # LXV gobierna REAL en runtime (ruta única oficial):
-                        # construir_columnas_lxv -> detectar_lxv -> elegir_x_mayor_peso -> resolver_candidato_real_lxv.
+                        # construir_columnas_lxv -> detectar_lxv -> resolver_candidato_real_lxv.
                         # IA/embudo/CTT quedan fuera del flujo caliente de promoción REAL.
                         umbral_ia_real = 0.0
                         dyn_gate = None
