@@ -1150,6 +1150,7 @@ def construir_columnas_lxv(estado: dict) -> list[dict]:
 
 def elegir_x_mayor_peso(candidatas_x: list[str], estado: dict, columnas: list[dict], contexto: dict | None = None) -> tuple[str | None, dict]:
     """
+    LEGACY INACTIVO: no participa en runtime LXV (solo 5V1X).
     Desempate estable para 4V2X:
     a) mayor prioridad histórica configurable
     b) peor racha reciente válida
