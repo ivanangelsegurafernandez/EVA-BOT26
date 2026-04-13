@@ -4,7 +4,7 @@
 #
 # Este script coordina:
 # - Lectura de CSV enriquecidos de los bots fulll45–fulll50
-# - Control de Martingala 1-2-4-8-16
+# - Control de Martingala 1-2-4-8
 # - Gestión de tokens DEMO/REAL
 # - IA (XGBoost) para probabilidades de éxito
 # - HUD visual con Prob IA, % éxito, saldo, meta y eventos
@@ -155,7 +155,7 @@ init(autoreset=True)
 
 # === BLOQUE 2 — CONFIGURACIÓN GLOBAL (MARTINGALA, HUD, AUDIO, IA) ===
 # === CONFIGURACIÓN DE MARTINGALA ===
-MARTI_ESCALADO = [1, 2, 4, 8, 16, 32]  # Escalado ajustado a 6 pasos
+MARTI_ESCALADO = [1, 2, 4, 8]  # Escalado ajustado a 4 pasos
 MONTO_TOL = 0.01  # Tolerancia para redondeos
 SONAR_TAMBIEN_EN_DEMO = False  # Activar sonidos para victorias en DEMO
 SONAR_SOLO_EN_GATEWIN = True   # Solo sonar dentro de la ventana GateWIN
@@ -263,7 +263,7 @@ AUTO_REAL_LIVE_MIN_BOTS = 3   # mínimos bots con prob viva para calibración po
 IA_METRIC_THRESHOLD = AUTO_REAL_THR_MIN
 # Modo clásico IA (LEGACY_NO_USADO para promoción REAL automática).
 # La promoción REAL automática en runtime depende EXCLUSIVAMENTE de LXV:
-# construir_columnas_lxv -> detectar_lxv -> elegir_x_mayor_peso -> resolver_candidato_real_lxv.
+# construir_columnas_lxv -> detectar_lxv -> resolver_candidato_real_lxv.
 # Se conserva este flag solo por compatibilidad de HUD/telemetría histórica.
 REAL_CLASSIC_GATE = True
 
@@ -1078,8 +1078,9 @@ eventos_recentes = deque(maxlen=8)
 reinicio_forzado = asyncio.Event()
 
 # ==================== LXV: ruta única de decisión REAL ====================
-# Mayor valor = mayor prioridad histórica en desempate 4V2X.
+# Mayor valor = mayor prioridad histórica (legado de compatibilidad).
 LXV_PRIORIDAD_HISTORICA = {bot: int(len(BOT_NAMES) - i) for i, bot in enumerate(BOT_NAMES)}
+LXV_RUNTIME_PATTERN = "5V1X"  # patrón único válido para promoción REAL automática
 
 
 def _marca_lxv_desde_resultado(resultado) -> str | None:
@@ -1095,7 +1096,7 @@ def _marca_lxv_desde_resultado(resultado) -> str | None:
         return None
 
 
-def construir_matriz_lxv_visible(estado: dict, width: int = 40) -> dict[str, list[str | None]]:
+def construir_matriz_visible_hud(estado: dict, width: int = 40) -> dict[str, list[str | None]]:
     """
     Construye exactamente la matriz visible del HUD (últimos 40 resultados):
     - fuente: estado_bots[bot]["resultados"]
@@ -1121,24 +1122,27 @@ def construir_matriz_lxv_visible(estado: dict, width: int = 40) -> dict[str, lis
     return out
 
 
+def construir_matriz_lxv_visible(estado: dict, width: int = 40) -> dict[str, list[str | None]]:
+    """Alias de compatibilidad: LXV/HUD comparten una sola fuente de verdad."""
+    return construir_matriz_visible_hud(estado, width=width)
+
+
 def construir_columnas_lxv(estado: dict) -> list[dict]:
     """
     Construye columnas LXV desde la misma matriz visible del HUD.
-    Columna operable: los 6 bots tienen marca V/X (sin vacíos).
+    No usa ultimo_resultado ni snapshots alternos.
     """
     try:
-        matriz = construir_matriz_lxv_visible(estado, width=40)
+        matriz = construir_matriz_visible_hud(estado, width=40)
         width = 40
         columnas: list[dict] = []
         for col_idx in range(width):
             marcas = {bot: (matriz.get(bot, [None] * width)[col_idx]) for bot in BOT_NAMES}
-            operable = all(marcas.get(bot) in ("V", "X") for bot in BOT_NAMES)
-            if not operable:
-                continue
             columnas.append({
                 "columna_id": f"col_visible:{col_idx}",
                 "col_visible": int(col_idx),
                 "marcas": marcas,
+                "operable": bool(all(marcas.get(bot) in ("V", "X") for bot in BOT_NAMES)),
             })
         return columnas
     except Exception:
@@ -1147,7 +1151,8 @@ def construir_columnas_lxv(estado: dict) -> list[dict]:
 
 def elegir_x_mayor_peso(candidatas_x: list[str], estado: dict, columnas: list[dict], contexto: dict | None = None) -> tuple[str | None, dict]:
     """
-    Desempate estable para 4V2X:
+    LEGACY INACTIVO: no participa en runtime LXV (solo 5V1X).
+    Desempate estable legado para dos candidatas X:
     a) mayor prioridad histórica configurable
     b) peor racha reciente válida
     c) menor % de acierto reciente
@@ -1176,7 +1181,7 @@ def elegir_x_mayor_peso(candidatas_x: list[str], estado: dict, columnas: list[di
         filas.sort(key=lambda r: (-r["prio"], r["racha"], r["acierto"], r["idx"]))
         win = filas[0]
         return str(win["bot"]), {
-            "motivo": "desempate_4V2X_peso",
+            "motivo": "desempate_x_legacy",
             "prioridad_historica": {f["bot"]: f["prio"] for f in filas},
             "racha_reciente": {f["bot"]: f["racha"] for f in filas},
             "acierto_reciente": {f["bot"]: f["acierto"] for f in filas},
@@ -1187,43 +1192,44 @@ def elegir_x_mayor_peso(candidatas_x: list[str], estado: dict, columnas: list[di
 
 
 def detectar_lxv(columnas: list[dict], estado: dict, contexto: dict | None = None) -> dict | None:
-    """Detecta patrón LXV válido (5V1X o 4V2X), priorizando columna visible más reciente."""
+    """Detecta patrón LXV válido (SOLO 5V1X) en la última columna visible."""
     try:
-        cols = sorted(list(columnas or []), key=lambda c: int((c or {}).get("col_visible", -1)), reverse=True)
-        for col in cols:
-            marcas = col.get("marcas", {}) if isinstance(col, dict) else {}
-            if not isinstance(marcas, dict):
-                continue
-            if not all(marcas.get(b) in ("V", "X") for b in BOT_NAMES):
-                continue
-            verdes = [b for b in BOT_NAMES if marcas.get(b) == "V"]
-            xs = [b for b in BOT_NAMES if marcas.get(b) == "X"]
-            col_visible = int(col.get("col_visible", -1))
-            if len(verdes) == 5 and len(xs) == 1:
-                x = str(xs[0])
-                return {
-                    "pattern": "5V1X",
-                    "bot_objetivo": x,
-                    "motivo": "x_unica_en_columna",
-                    "columna_id": str(col.get("columna_id", f"col_visible:{col_visible}")),
-                    "col_visible": col_visible,
-                    "xs_consideradas": list(xs),
-                    "x_ganadora": x,
-                }
-            if len(verdes) == 4 and len(xs) == 2:
-                xg, detalle = elegir_x_mayor_peso(xs, estado, columnas, contexto=contexto)
-                if xg in BOT_NAMES:
-                    return {
-                        "pattern": "4V2X",
-                        "bot_objetivo": xg,
-                        "motivo": str(detalle.get("motivo", "desempate_4V2X")),
-                        "columna_id": str(col.get("columna_id", f"col_visible:{col_visible}")),
-                        "col_visible": col_visible,
-                        "xs_consideradas": list(xs),
-                        "x_ganadora": xg,
-                        "detalle_peso": detalle,
-                    }
-        return None
+        cols = list(columnas or [])
+        if not cols:
+            return {"motivo": "sin_columnas"}
+
+        last_col = max(cols, key=lambda c: int((c or {}).get("col_visible", -1)))
+        marcas = last_col.get("marcas", {}) if isinstance(last_col, dict) else {}
+        if not isinstance(marcas, dict):
+            return {"motivo": "lastcol_invalida"}
+
+        col_visible = int(last_col.get("col_visible", -1))
+        columna_id = str(last_col.get("columna_id", f"col_visible:{col_visible}"))
+        if not all(marcas.get(b) in ("V", "X") for b in BOT_NAMES):
+            return {
+                "motivo": "lastcol_incompleta",
+                "col_visible": col_visible,
+                "columna_id": columna_id,
+            }
+
+        verdes = [b for b in BOT_NAMES if marcas.get(b) == "V"]
+        xs = [b for b in BOT_NAMES if marcas.get(b) == "X"]
+        if len(verdes) == 5 and len(xs) == 1:
+            x = str(xs[0])
+            return {
+                "pattern": "5V1X",
+                "bot_objetivo": x,
+                "motivo": "x_unica_en_lastcol",
+                "columna_id": columna_id,
+                "col_visible": col_visible,
+                "xs_consideradas": list(xs),
+                "x_ganadora": x,
+            }
+        return {
+            "motivo": "lastcol_no_pattern",
+            "col_visible": col_visible,
+            "columna_id": columna_id,
+        }
     except Exception:
         return None
 
@@ -1232,7 +1238,7 @@ def resolver_candidato_real_lxv(estado: dict, contexto: dict | None = None) -> d
     """Ruta única de selección REAL: solo LXV desde columna visible HUD."""
     cols = construir_columnas_lxv(estado)
     out = detectar_lxv(cols, estado, contexto=contexto)
-    if isinstance(out, dict) and str(out.get("bot_objetivo")) in BOT_NAMES:
+    if isinstance(out, dict) and str(out.get("bot_objetivo")) in BOT_NAMES and str(out.get("pattern")) == LXV_RUNTIME_PATTERN:
         return out
     return None
 
@@ -7011,6 +7017,8 @@ def ia_prob_valida(bot: str, max_age_s: float = 10.0) -> bool:
         return False
                                               
 _AUTO_REAL_CACHE = {"ts": 0.0, "thr": float(IA_ACTIVACION_REAL_THR), "n": 0, "max": 0.0}
+_LXV_LASTCOL_DIAG_TS = 0.0
+_LXV_LASTCOL_DIAG_MSG = ""
 
 
 def _leer_probs_historicas_ia(max_rows: int = AUTO_REAL_LOG_MAX_ROWS) -> list[float]:
@@ -7549,7 +7557,7 @@ def _marti_audit_record(kind: str, ciclo: int | None = None, bot: str | None = N
 
 def _marti_audit_log_orden(ciclo: int, bot: str | None = None, origen: str = ""):
     """
-    Verifica orden esperado C1->C6 por corrida y deja eventos explícitos.
+    Verifica orden esperado C1->C{MAX_CICLOS} por corrida y deja eventos explícitos.
     No bloquea operación; solo audita y alerta desviaciones.
     """
     global marti_audit_run_id, marti_audit_desviaciones, marti_audit_ultimo_ciclo_ordenado
@@ -11171,6 +11179,8 @@ def mostrar_panel():
     # Sincronía visual dura: si hay owner REAL en memoria, la tabla SIEMPRE lo refleja.
     owner_visual = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
 
+    matriz_hud = construir_matriz_visible_hud(estado_bots, width=40)
+
     for bot in BOT_NAMES:
         r = estado_bots[bot]["resultados"]
         token = "REAL" if owner_visual == bot else "DEMO"
@@ -11186,17 +11196,13 @@ def mostrar_panel():
 
         # Últimos 40 resultados visuales
         visual = []
-        for x in r[-40:]:
-            if x == "GANANCIA":
+        for marca in list(matriz_hud.get(bot, [None] * 40))[-40:]:
+            if marca == "V":
                 visual.append(Fore.GREEN + "✓")
-            elif x == "PÉRDIDA":
+            elif marca == "X":
                 visual.append(Fore.RED + "✗")
-            elif x == "INDEFINIDO":
-                visual.append(Fore.YELLOW + "·")
             else:
                 visual.append(Fore.LIGHTBLACK_EX + "─")
-        while len(visual) < 40:
-            visual.insert(0, Fore.LIGHTBLACK_EX + "─")
         col_resultados = " ".join(visual)
 
         # Ganancias / Pérdidas / % éxito
@@ -11992,7 +11998,7 @@ def evaluar_semaforo():
 
     if top1:
         return "🟢", "SEÑAL LXV", f"{top1} • patrón={pattern}"
-    return "🟡", "EN ESPERA", "Sin patrón LXV (5V1X/4V2X)."
+    return "🟡", "EN ESPERA", "Sin patrón LXV (5V1X)."
 
 # NUEVAS FUNCIONES PARA RESET
 RESET_ON_START = False  # Cambiado a False para mantener historial entre sesiones
@@ -14090,7 +14096,7 @@ async def main():
                             _enforce_single_real_standby(activo_real)
 
                         # LXV gobierna REAL en runtime (ruta única oficial):
-                        # construir_columnas_lxv -> detectar_lxv -> elegir_x_mayor_peso -> resolver_candidato_real_lxv.
+                        # construir_columnas_lxv -> detectar_lxv -> resolver_candidato_real_lxv.
                         # IA/embudo/CTT quedan fuera del flujo caliente de promoción REAL.
                         umbral_ia_real = 0.0
                         dyn_gate = None
@@ -14104,19 +14110,38 @@ async def main():
                         costo_plan = float(sum(MARTI_ESCALADO[:max(1, int(MAX_CICLOS))]))
 
                         # Candidatos REAL definidos exclusivamente por LXV.
-                        lxv_decision = resolver_candidato_real_lxv(
+                        lxv_columnas = construir_columnas_lxv(estado_bots)
+                        lxv_eval = detectar_lxv(
+                            lxv_columnas,
                             estado_bots,
                             contexto={"prioridad_historica": LXV_PRIORIDAD_HISTORICA},
                         )
+                        lxv_decision = lxv_eval if isinstance(lxv_eval, dict) and str(lxv_eval.get("pattern")) == LXV_RUNTIME_PATTERN and str(lxv_eval.get("bot_objetivo", "")) in BOT_NAMES else None
                         candidatos = []
                         if isinstance(lxv_decision, dict):
                             bot_lxv = str(lxv_decision.get("bot_objetivo", "") or "").strip()
                             if bot_lxv in BOT_NAMES:
                                 candidatos = [(1.0, bot_lxv, 0.0, 0.0, 0.0, 0, 0.0, 0.0)]
                                 agregar_evento(
-                                    f"🧭 LXV {lxv_decision.get('pattern','--')} → {bot_lxv} "
-                                    f"(col_visible={lxv_decision.get('col_visible','--')}, col={lxv_decision.get('columna_id','--')}, xs={lxv_decision.get('xs_consideradas',[])}, xg={lxv_decision.get('x_ganadora','--')})"
+                                    f"🧭 LXV LASTCOL {lxv_decision.get('pattern','--')} → {bot_lxv} "
+                                    f"(col_visible={lxv_decision.get('col_visible','--')}, xs={lxv_decision.get('xs_consideradas',[])}, xg={lxv_decision.get('x_ganadora','--')})"
                                 )
+                        else:
+                            try:
+                                now_lxv = time.time()
+                                diag_reason = str((lxv_eval or {}).get("motivo", "sin_senal")) if isinstance(lxv_eval, dict) else "sin_senal"
+                                if diag_reason == "lastcol_incompleta":
+                                    diag_msg = "🧭 LXV sin señal en lastcol: lastcol incompleta."
+                                elif diag_reason == "lastcol_no_pattern":
+                                    diag_msg = "🧭 LXV sin señal en lastcol: lastcol no es 5V1X."
+                                else:
+                                    diag_msg = "🧭 LXV sin señal en lastcol."
+                                if (diag_msg != _LXV_LASTCOL_DIAG_MSG) or ((now_lxv - float(_LXV_LASTCOL_DIAG_TS or 0.0)) >= 12.0):
+                                    agregar_evento(diag_msg)
+                                    globals()["_LXV_LASTCOL_DIAG_MSG"] = diag_msg
+                                    globals()["_LXV_LASTCOL_DIAG_TS"] = float(now_lxv)
+                            except Exception:
+                                pass
 
                         # Si hay señal y el saldo no cubre el plan completo, solo avisar (no bloquear).
                         if candidatos and saldo_val < costo_plan:
@@ -14273,7 +14298,7 @@ if __name__ == "__main__":
 # === BLOQUE 99 — RESUMEN FINAL DE LO QUE SE LOGRA ===
 #
 # - Bot maestro 5R6M-1-2-4-8-16 con:
-#   * Martingala 1-2-4-8-16 intacta.
+#   * Martingala 1-2-4-8 intacta.
 #   * Tokens DEMO/REAL y handshake maestro→bots intactos.
 #   * CSV enriquecidos, dataset_incremental.csv, IA XGBoost, reentrenos intactos.
 #   * HUD visual con Prob IA, % éxito, saldo, meta, eventos
