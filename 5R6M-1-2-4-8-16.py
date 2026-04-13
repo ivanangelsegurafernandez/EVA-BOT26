@@ -1068,6 +1068,9 @@ BOT_NAMES = ["fulll45", "fulll46", "fulll47", "fulll48", "fulll49", "fulll50"]
 IA53_TRIGGERED = {bot: False for bot in BOT_NAMES}
 IA53_LAST_TS = {bot: 0.0 for bot in BOT_NAMES}
 TOKEN_FILE = "token_actual.txt"
+MAESTRO_PAUSE_STATE_PATH = os.path.join(script_dir, "maestro_pause_state.json")
+MAESTRO_PAUSE_LOG_COOLDOWN_S = 10.0
+_MAESTRO_PAUSE_LAST_EVENT_TS = 0.0
 DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 saldo_real = "--"
 saldo_demo = "--"
@@ -2132,6 +2135,75 @@ anexar_incremental_desde_bot = _anexar_incremental_desde_bot_CANON
 # === ORDEN DE REAL (handshake maestro→bot) ===
 ORDEN_DIR = "orden_real"
 
+def leer_pause_state_maestro() -> dict:
+    """
+    Lee maestro_pause_state.json de forma robusta.
+    Retorna siempre:
+      paused: bool
+      resume_ts: float
+      reason: str
+      remaining_s: int
+    """
+    now = time.time()
+    out = {
+        "paused": False,
+        "resume_ts": 0.0,
+        "reason": "",
+        "remaining_s": 0,
+    }
+    try:
+        if not os.path.exists(MAESTRO_PAUSE_STATE_PATH):
+            return out
+        with open(MAESTRO_PAUSE_STATE_PATH, "r", encoding="utf-8", errors="replace") as f:
+            data = json.load(f) or {}
+    except Exception:
+        return out
+
+    try:
+        paused_raw = bool(data.get("paused", False))
+    except Exception:
+        paused_raw = False
+    try:
+        resume_ts = float(data.get("resume_ts", 0.0) or 0.0)
+    except Exception:
+        resume_ts = 0.0
+    try:
+        reason = str(data.get("reason", "") or "")
+    except Exception:
+        reason = ""
+
+    remaining = max(0, int(round(resume_ts - now))) if resume_ts > 0 else 0
+    paused = bool(paused_raw and resume_ts > now)
+    out.update({
+        "paused": paused,
+        "resume_ts": float(resume_ts),
+        "reason": reason,
+        "remaining_s": int(remaining if paused else 0),
+    })
+    return out
+
+def maestro_real_paused(st: dict | None = None) -> bool:
+    st = st if isinstance(st, dict) else leer_pause_state_maestro()
+    return bool(st.get("paused", False))
+
+def _emitir_evento_pausa_real_si_toca(st: dict | None = None, cooldown_s: float = MAESTRO_PAUSE_LOG_COOLDOWN_S):
+    global _MAESTRO_PAUSE_LAST_EVENT_TS
+    try:
+        st = st if isinstance(st, dict) else leer_pause_state_maestro()
+        if not bool(st.get("paused", False)):
+            return
+        now = time.time()
+        if (now - float(_MAESTRO_PAUSE_LAST_EVENT_TS or 0.0)) < float(cooldown_s):
+            return
+        rem = max(0, int(st.get("remaining_s", 0) or 0))
+        mm = rem // 60
+        ss = rem % 60
+        reason = str(st.get("reason", "") or "drawdown_20_monitor")
+        agregar_evento(f"⏸ REAL en pausa por protección saldo ({mm:02d}:{ss:02d} restantes) | motivo={reason}")
+        _MAESTRO_PAUSE_LAST_EVENT_TS = now
+    except Exception:
+        pass
+
 def _ensure_dir(p):
     try:
         os.makedirs(p, exist_ok=True)
@@ -2264,6 +2336,10 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real"):
 
     try:
         if bot not in BOT_NAMES:
+            return
+        pause_state = leer_pause_state_maestro()
+        if maestro_real_paused(pause_state):
+            _emitir_evento_pausa_real_si_toca(pause_state)
             return
 
         now = time.time()
@@ -2426,6 +2502,10 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
     - Activa REAL inmediato en HUD + token file
     """
     ciclo = max(1, min(int(ciclo), MAX_CICLOS))
+    pause_state = leer_pause_state_maestro()
+    if maestro_real_paused(pause_state):
+        _emitir_evento_pausa_real_si_toca(pause_state)
+        return False
 
     # 🔒 No crear orden si ya hay otro owner REAL activo.
     try:
@@ -14095,6 +14175,11 @@ async def main():
                             activo_real = owner_lock if owner_lock in BOT_NAMES else holder_memoria
                             _enforce_single_real_standby(activo_real)
 
+                        pausa_real_state = leer_pause_state_maestro()
+                        pausa_real_activa = maestro_real_paused(pausa_real_state)
+                        if pausa_real_activa:
+                            _emitir_evento_pausa_real_si_toca(pausa_real_state)
+
                         # LXV gobierna REAL en runtime (ruta única oficial):
                         # construir_columnas_lxv -> detectar_lxv -> resolver_candidato_real_lxv.
                         # IA/embudo/CTT quedan fuera del flujo caliente de promoción REAL.
@@ -14161,7 +14246,7 @@ async def main():
 
                         # ==================== AUTO-PRESELECCIÓN (MODO MANUAL) ====================
                         # Si LXV detecta señal y estás en manual, preselecciona bot LXV.
-                        if MODO_REAL_MANUAL:
+                        if MODO_REAL_MANUAL and not pausa_real_activa:
                             ahora = time.time()
 
                             # Si expiró, limpiamos
@@ -14198,7 +14283,7 @@ async def main():
                                     )
                         # ==================== /AUTO-PRESELECCIÓN ====================
 
-                        if candidatos and not MODO_REAL_MANUAL:
+                        if candidatos and (not MODO_REAL_MANUAL) and (not pausa_real_activa):
                             ciclo_auto = ciclo_martingala_siguiente()
                             if reset_martingala_por_saldo(ciclo_auto, saldo_val):
                                 ciclo_auto = 1
