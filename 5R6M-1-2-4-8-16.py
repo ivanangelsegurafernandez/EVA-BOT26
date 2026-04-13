@@ -1078,7 +1078,7 @@ eventos_recentes = deque(maxlen=8)
 reinicio_forzado = asyncio.Event()
 
 # ==================== LXV: ruta única de decisión REAL ====================
-# Mayor valor = mayor prioridad histórica en desempate 4V2X.
+# Mayor valor = mayor prioridad histórica (legado de compatibilidad).
 LXV_PRIORIDAD_HISTORICA = {bot: int(len(BOT_NAMES) - i) for i, bot in enumerate(BOT_NAMES)}
 
 
@@ -1180,7 +1180,7 @@ def elegir_x_mayor_peso(candidatas_x: list[str], estado: dict, columnas: list[di
         filas.sort(key=lambda r: (-r["prio"], r["racha"], r["acierto"], r["idx"]))
         win = filas[0]
         return str(win["bot"]), {
-            "motivo": "desempate_4V2X_peso",
+            "motivo": "desempate_x_legacy",
             "prioridad_historica": {f["bot"]: f["prio"] for f in filas},
             "racha_reciente": {f["bot"]: f["racha"] for f in filas},
             "acierto_reciente": {f["bot"]: f["acierto"] for f in filas},
