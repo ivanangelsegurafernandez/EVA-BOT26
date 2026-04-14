@@ -132,6 +132,9 @@ _sfx_load_all()
 NOMBRE_BOT = "fulll46"
 ARCHIVO_CSV = f"registro_enriquecido_{NOMBRE_BOT}.csv"
 ARCHIVO_TOKEN = "token_actual.txt"  # Fuente única de verdad (coincide con 5R6M)
+MAESTRO_PAUSE_STATE_PATH = "maestro_pause_state.json"
+PAUSE_MONITOR_LOG_COOLDOWN_S = 12.0
+_pause_monitor_last_log_ts = 0.0
 DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 ACTIVOS = ["1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
 MARTINGALA_DEMO = [1, 2, 4, 8]
@@ -192,6 +195,55 @@ ORDEN_DIR = "orden_real"  # misma carpeta usada por el maestro
 # Se retiró el handshake maestro→bot del flujo caliente LXV.
 
 MAX_CICLOS = len(MARTINGALA_REAL)
+
+def leer_pause_state_monitor() -> dict:
+    now = time.time()
+    out = {"paused": False, "resume_ts": 0.0, "reason": "", "remaining_s": 0}
+    try:
+        if not os.path.exists(MAESTRO_PAUSE_STATE_PATH):
+            return out
+        with open(MAESTRO_PAUSE_STATE_PATH, "r", encoding="utf-8", errors="replace") as f:
+            data = json.load(f) or {}
+    except Exception:
+        return out
+
+    try:
+        paused_raw = bool(data.get("paused", False))
+    except Exception:
+        paused_raw = False
+    try:
+        resume_ts = float(data.get("resume_ts", 0.0) or 0.0)
+    except Exception:
+        resume_ts = 0.0
+    try:
+        reason = str(data.get("reason", "") or "")
+    except Exception:
+        reason = ""
+
+    paused = bool(paused_raw and resume_ts > now)
+    remaining_s = max(0, int(round(resume_ts - now))) if paused else 0
+    out.update({"paused": paused, "resume_ts": resume_ts, "reason": reason, "remaining_s": remaining_s})
+    return out
+
+def trading_pausado_por_monitor(st: dict | None = None) -> bool:
+    st = st if isinstance(st, dict) else leer_pause_state_monitor()
+    return bool(st.get("paused", False))
+
+def _log_pausa_monitor_si_toca(st: dict | None = None, cooldown_s: float = PAUSE_MONITOR_LOG_COOLDOWN_S):
+    global _pause_monitor_last_log_ts
+    try:
+        st = st if isinstance(st, dict) else leer_pause_state_monitor()
+        if not bool(st.get("paused", False)):
+            return
+        now = time.time()
+        if (now - float(_pause_monitor_last_log_ts or 0.0)) < float(cooldown_s):
+            return
+        rem = max(0, int(st.get("remaining_s", 0) or 0))
+        mm, ss = rem // 60, rem % 60
+        print(Fore.LIGHTYELLOW_EX + Style.BRIGHT + f"⏸ PAUSA MONITOR ACTIVA | no se opera | quedan {mm:02d}:{ss:02d}")
+        _pause_monitor_last_log_ts = now
+    except Exception:
+        pass
 # ✅ Asegura carpeta de órdenes (evita rarezas si el maestro aún no la creó)
 try:
     os.makedirs(ORDEN_DIR, exist_ok=True)
@@ -1970,6 +2022,12 @@ async def ejecutar_panel():
                 continue
 
             # ========= ARRANQUE DE MARTINGALA =========
+            pause_state = leer_pause_state_monitor()
+            if trading_pausado_por_monitor(pause_state):
+                _log_pausa_monitor_si_toca(pause_state)
+                await asyncio.sleep(1.0)
+                continue
+
             modo_real = (current_token == TOKEN_REAL)
             if modo_real:
                 if not estado_bot.get("barra_activa", False) and _print_once("real-start-msg", ttl=120):
@@ -2030,6 +2088,12 @@ async def ejecutar_panel():
                     if _print_once("ws-reopened", ttl=20):
                         print(Fore.CYAN + Style.BRIGHT + "WS reabierto por salud. Retomando MISMO ciclo.")
                     await asyncio.sleep(0.6 + random.uniform(0.0, 0.5))
+
+                pause_state = leer_pause_state_monitor()
+                if trading_pausado_por_monitor(pause_state):
+                    _log_pausa_monitor_si_toca(pause_state)
+                    await asyncio.sleep(1.0)
+                    continue
 
                 # ========= BUSCAR SEÑAL =========
                 symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion = await buscar_estrategia(ws, ciclo, current_token)
@@ -2163,6 +2227,12 @@ async def ejecutar_panel():
 
                 # === /PRE-TRADE SNAPSHOT ===
                 # ==================== VENTANA IA LEGACY (INACTIVA EN LXV) ====================
+
+                pause_state = leer_pause_state_monitor()
+                if trading_pausado_por_monitor(pause_state):
+                    _log_pausa_monitor_si_toca(pause_state)
+                    estado_bot["ciclo_forzado"] = ciclo
+                    continue
 
                 try:
                     data_buy = await api_call(ws, {
