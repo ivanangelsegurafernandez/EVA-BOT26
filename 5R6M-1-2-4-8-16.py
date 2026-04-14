@@ -2186,6 +2186,12 @@ def maestro_real_paused(st: dict | None = None) -> bool:
     st = st if isinstance(st, dict) else leer_pause_state_maestro()
     return bool(st.get("paused", False))
 
+def maestro_trading_paused(st: dict | None = None) -> bool:
+    """
+    Pausa TOTAL de trading (REAL + DEMO subordinado), basada en maestro_pause_state.json.
+    """
+    return maestro_real_paused(st)
+
 def _emitir_evento_pausa_real_si_toca(st: dict | None = None, cooldown_s: float = MAESTRO_PAUSE_LOG_COOLDOWN_S):
     global _MAESTRO_PAUSE_LAST_EVENT_TS
     try:
@@ -2199,7 +2205,7 @@ def _emitir_evento_pausa_real_si_toca(st: dict | None = None, cooldown_s: float 
         mm = rem // 60
         ss = rem % 60
         reason = str(st.get("reason", "") or "drawdown_20_monitor")
-        agregar_evento(f"⏸ PAUSA REAL {mm:02d}:{ss:02d} | motivo={reason}")
+        agregar_evento(f"⏸ TRADING EN PAUSA {mm:02d}:{ss:02d} | motivo={reason}")
         _MAESTRO_PAUSE_LAST_EVENT_TS = now
     except Exception:
         pass
@@ -12003,6 +12009,11 @@ def forzar_real_manual(bot: str, ciclo: int):
         agregar_evento("🔒 Forzar REAL: ya en progreso; espera.")
         return
     try:
+        pause_state = leer_pause_state_maestro()
+        if maestro_trading_paused(pause_state):
+            _emitir_evento_pausa_real_si_toca(pause_state)
+            agregar_evento("⏸ Forzar REAL bloqueado: trading en pausa por protección.")
+            return
         ciclo = max(1, min(int(ciclo), MAX_CICLOS))
 
         # Añadido: Confirmación en rojo si no es seguro (para evitar cierres forzados por malas decisiones)
