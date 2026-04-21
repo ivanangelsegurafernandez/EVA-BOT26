@@ -470,6 +470,13 @@ PATTERN_COL_BONUS_CONTINUIDAD = 0.60
 PATTERN_COL_BONUS_REBOTE = 0.80
 PATTERN_COL_PENAL_SATURACION = 1.20
 PATTERN_COL_PENAL_LATE_CHASE = 1.00
+MRV_5V1X_ENABLE = True
+MRV_5V1X_MIN_HISTORY_COLUMNS = 6
+MRV_5V1X_REQUIRE_REBOTE_OR_CONTINUIDAD = True
+MRV_5V1X_BLOCK_LATE_CHASE = True
+MRV_5V1X_BLOCK_SATURACION = True
+MRV_5V1X_PREV90_BLOCK = True
+MRV_5V1X_LOG_COOLDOWN_S = 20.0
 PATTERN_COL_LAST_STATE = {
     "green_ratio_col_actual": None,
     "total_verdes_col_actual": 0,
@@ -3168,6 +3175,304 @@ def _lxv_5v1x_pick_real_bot(candidate: dict | None) -> str | None:
     bot = str((candidate or {}).get("bot_x_fuerte", "") or "").strip()
     return bot if bot in BOT_NAMES else None
 
+def _mrv_5v1x_to_float(value, default=0.0):
+    try:
+        if value is None:
+            return float(default)
+        sval = str(value).strip()
+        if sval == "":
+            return float(default)
+        return float(sval)
+    except Exception:
+        return float(default)
+
+def _mrv_5v1x_to_int(value, default=0):
+    try:
+        if value is None:
+            return int(default)
+        sval = str(value).strip()
+        if sval == "":
+            return int(default)
+        return int(float(sval))
+    except Exception:
+        return int(default)
+
+def _mrv_5v1x_to_bool(value, default=False):
+    try:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return bool(default)
+        sval = str(value).strip().lower()
+        if sval in ("1", "true", "yes", "si", "sí", "y", "on"):
+            return True
+        if sval in ("0", "false", "no", "n", "off", ""):
+            return False
+        return bool(default)
+    except Exception:
+        return bool(default)
+
+def _mrv_5v1x_row_symbol(row, bot):
+    r = row if isinstance(row, dict) else {}
+    b = str(bot or "").strip()
+    if not b:
+        return ""
+    keys = [
+        b,
+        f"{b}_symbol",
+        f"{b}_resultado",
+        f"resultado_{b}",
+        f"{b}_res",
+        f"res_{b}",
+    ]
+    for k in keys:
+        if k in r:
+            val = r.get(k)
+            if val is None:
+                continue
+            return str(val).strip()
+    return ""
+
+def _mrv_5v1x_green_ratio_from_row(row):
+    r = row if isinstance(row, dict) else {}
+    n_verdes = _mrv_5v1x_to_int(r.get("n_verdes", None), default=-1)
+    n_rojos = _mrv_5v1x_to_int(r.get("n_rojos", None), default=-1)
+    if n_verdes >= 0 and n_rojos >= 0:
+        total = int(n_verdes + n_rojos)
+        if total > 0:
+            return float(n_verdes) / float(total)
+    verdes_tokens = {"✓", "GANANCIA", "WIN", "CHECK"}
+    rojos_tokens = {"X", "✗", "PÉRDIDA", "PERDIDA", "LOSS"}
+    ignore_tokens = {"", "-", "·", "INDEFINIDO", "PENDING", "NONE"}
+    verdes = 0
+    rojos = 0
+    for bot in list(BOT_NAMES or []):
+        sym = str(_mrv_5v1x_row_symbol(r, bot) or "").strip()
+        token = sym.upper()
+        if token in ignore_tokens:
+            continue
+        if token in verdes_tokens:
+            verdes += 1
+        elif token in rojos_tokens:
+            rojos += 1
+    total = int(verdes + rojos)
+    if total <= 0:
+        return None
+    return float(verdes) / float(total)
+
+def _lxv_5v1x_load_recent_matrix_rows(max_rows=None):
+    try:
+        paths = _lxv_matrix_paths()
+        matrix_path = paths.get("matrix")
+        if not matrix_path or not os.path.exists(matrix_path):
+            return []
+        rows = _lxv_csv_read_rows(matrix_path, max_lines=50000)
+        if not isinstance(rows, list):
+            return []
+        if max_rows is None:
+            return list(rows)
+        lim = max(1, int(max_rows))
+        return list(rows[-lim:])
+    except Exception:
+        return []
+
+def _lxv_5v1x_calc_rebote_hist(rows, bot_x, current_round_id):
+    bot_obj = str(bot_x or "").strip()
+    rid_now = _mrv_5v1x_to_int(current_round_id, 0)
+    if not bot_obj or bot_obj not in BOT_NAMES or rid_now <= 0:
+        return None, 0, 0, 0
+    norm_rows = []
+    for r in list(rows or []):
+        rr = r if isinstance(r, dict) else {}
+        rid = _mrv_5v1x_to_int(rr.get("round_id", 0), 0)
+        if rid <= 0 or rid >= rid_now:
+            continue
+        norm_rows.append((rid, rr))
+    if not norm_rows:
+        return None, 0, 0, 0
+    norm_rows.sort(key=lambda t: t[0])
+    by_round = {rid: rr for rid, rr in norm_rows}
+    case_rounds = []
+    for rid, rr in norm_rows:
+        if str(rr.get("patron_lxv", "") or "").upper() != "5V1X":
+            continue
+        bot_f = str(rr.get("bot_x_fuerte", "") or "").strip()
+        bot_1 = str(rr.get("bot_x1", "") or "").strip()
+        match = (bot_f == bot_obj) or (bot_1 == bot_obj)
+        if not match:
+            sym_case = str(_mrv_5v1x_row_symbol(rr, bot_obj) or "").strip().upper()
+            match = sym_case in ("X", "✗", "PÉRDIDA", "PERDIDA", "LOSS")
+        if match:
+            case_rounds.append(rid)
+    if not case_rounds:
+        return None, 0, 0, 0
+    case_rounds = case_rounds[-max(1, int(PATTERN_REBOTE_LOOKBACK)):]
+    total_x_hist = 0
+    total_x_rebote_hist = 0
+    rebote_samples_hist = 0
+    available_round_ids = [rid for rid, _ in norm_rows]
+    for case_rid in case_rounds:
+        total_x_hist += 1
+        next_row = by_round.get(case_rid + 1)
+        if not isinstance(next_row, dict):
+            next_candidates = [rid for rid in available_round_ids if rid > case_rid]
+            if not next_candidates:
+                continue
+            next_row = by_round.get(next_candidates[0], {})
+        sym_next = str(_mrv_5v1x_row_symbol(next_row, bot_obj) or "").strip().upper()
+        if sym_next in ("✓", "GANANCIA", "WIN", "CHECK"):
+            total_x_rebote_hist += 1
+            rebote_samples_hist += 1
+        elif sym_next in ("X", "✗", "PÉRDIDA", "PERDIDA", "LOSS"):
+            rebote_samples_hist += 1
+        else:
+            continue
+    if rebote_samples_hist <= 0:
+        return None, 0, total_x_rebote_hist, total_x_hist
+    rebote_rate_hist = float(total_x_rebote_hist) / float(rebote_samples_hist)
+    return rebote_rate_hist, int(rebote_samples_hist), int(total_x_rebote_hist), int(total_x_hist)
+
+def _lxv_5v1x_mrv_gate_ok(candidate):
+    info = {
+        "estado": "BLOQUEADO",
+        "green_ratio_col_actual": None,
+        "total_verdes_col_actual": 0,
+        "total_rojos_col_actual": 0,
+        "rebote_rate_hist": None,
+        "rebote_samples_hist": 0,
+        "total_x_hist": 0,
+        "total_x_rebote_hist": 0,
+        "strong_streak_80": 0,
+        "strong_streak_90": 0,
+        "late_chase": False,
+        "prev90": False,
+    }
+    try:
+        ok_base, reason_base = _lxv_5v1x_gate_ok(candidate)
+        if not ok_base:
+            info["estado"] = "BLOQUEADO"
+            PATTERN_COL_LAST_STATE.update(info)
+            PATTERN_COL_LAST_STATE["pattern_state"] = info["estado"]
+            return False, f"mrv_base_gate_off_{reason_base}", info
+
+        round_id = _mrv_5v1x_to_int((candidate or {}).get("round_id", 0), 0)
+        bot_x = str((candidate or {}).get("bot_x_fuerte", "") or "").strip()
+        rows = _lxv_5v1x_load_recent_matrix_rows(PATTERN_COL_WINDOW)
+        hist_rows = []
+        for r in list(rows or []):
+            rr = r if isinstance(r, dict) else {}
+            rr_id = _mrv_5v1x_to_int(rr.get("round_id", 0), 0)
+            if rr_id < round_id:
+                hist_rows.append(rr)
+        if len(hist_rows) < int(MRV_5V1X_MIN_HISTORY_COLUMNS):
+            info["estado"] = "SIN_MUESTRA"
+            PATTERN_COL_LAST_STATE.update(info)
+            PATTERN_COL_LAST_STATE["pattern_state"] = info["estado"]
+            return False, "mrv_5v1x_sin_muestra", info
+
+        round_row, feat_row = _lxv_5v1x_get_exported_rows(round_id)
+        current_row = round_row if isinstance(round_row, dict) and round_row else (feat_row if isinstance(feat_row, dict) else {})
+        green_ratio_actual = _mrv_5v1x_green_ratio_from_row(current_row)
+        n_verdes = _mrv_5v1x_to_int((current_row or {}).get("n_verdes", 0), 0)
+        n_rojos = _mrv_5v1x_to_int((current_row or {}).get("n_rojos", 0), 0)
+        info["green_ratio_col_actual"] = green_ratio_actual
+        info["total_verdes_col_actual"] = n_verdes
+        info["total_rojos_col_actual"] = n_rojos
+
+        prev_rows = list(hist_rows[-max(1, int(PATTERN_REBOTE_LOOKBACK)):])
+        prev_ratios = []
+        for rr in prev_rows:
+            dq = str(rr.get("data_quality", "") or "").strip().lower()
+            if dq and dq != "ok":
+                continue
+            gr = _mrv_5v1x_green_ratio_from_row(rr)
+            if gr is None:
+                continue
+            prev_ratios.append(float(gr))
+        strong_streak_80 = 0
+        strong_streak_90 = 0
+        for gr in reversed(prev_ratios):
+            if float(gr) >= float(PATTERN_COL80_THRESHOLD):
+                strong_streak_80 += 1
+            else:
+                break
+        for gr in reversed(prev_ratios):
+            if float(gr) >= float(PATTERN_COL90_THRESHOLD):
+                strong_streak_90 += 1
+            else:
+                break
+        prev90 = bool(prev_ratios and (float(prev_ratios[-1]) >= float(PATTERN_COL90_THRESHOLD)))
+        if not bool(globals().get("MRV_5V1X_PREV90_BLOCK", True)):
+            prev90 = False
+        late_chase = bool(
+            (strong_streak_80 >= int(PATTERN_STRONG_STREAK_BLOCK))
+            or (strong_streak_90 >= 1)
+            or prev90
+        )
+        info["strong_streak_80"] = int(strong_streak_80)
+        info["strong_streak_90"] = int(strong_streak_90)
+        info["prev90"] = bool(prev90)
+        info["late_chase"] = bool(late_chase)
+
+        saturacion = bool((green_ratio_actual is not None) and (float(green_ratio_actual) >= float(PATTERN_COL90_THRESHOLD)))
+        if bool(globals().get("MRV_5V1X_BLOCK_SATURACION", True)) and saturacion:
+            info["estado"] = "SATURACION_VERDE"
+            PATTERN_COL_LAST_STATE.update(info)
+            PATTERN_COL_LAST_STATE["pattern_state"] = info["estado"]
+            return False, "mrv_5v1x_saturacion_verde", info
+
+        if bool(globals().get("MRV_5V1X_BLOCK_LATE_CHASE", True)) and late_chase:
+            info["estado"] = "TARDIA"
+            PATTERN_COL_LAST_STATE.update(info)
+            PATTERN_COL_LAST_STATE["pattern_state"] = info["estado"]
+            return False, "mrv_5v1x_tardia", info
+
+        rebote_rate_hist, rebote_samples_hist, total_x_rebote_hist, total_x_hist = _lxv_5v1x_calc_rebote_hist(hist_rows, bot_x, round_id)
+        info["rebote_rate_hist"] = rebote_rate_hist
+        info["rebote_samples_hist"] = int(rebote_samples_hist)
+        info["total_x_hist"] = int(total_x_hist)
+        info["total_x_rebote_hist"] = int(total_x_rebote_hist)
+
+        rebote_valido = bool(
+            (rebote_rate_hist is not None)
+            and (int(rebote_samples_hist) >= int(PATTERN_REBOTE_MIN_SAMPLES))
+            and (float(rebote_rate_hist) >= float(PATTERN_REBOTE_MIN))
+            and (not late_chase)
+            and (not saturacion)
+        )
+        continuidad_verde = bool(
+            (green_ratio_actual is not None)
+            and (float(green_ratio_actual) >= float(PATTERN_COL80_THRESHOLD))
+            and (float(green_ratio_actual) < float(PATTERN_COL90_THRESHOLD))
+            and (not late_chase)
+            and (not prev90)
+            and (int(strong_streak_80) < int(PATTERN_STRONG_STREAK_BLOCK))
+        )
+
+        if rebote_valido:
+            info["estado"] = "REBOTE_VALIDO"
+        elif continuidad_verde:
+            info["estado"] = "CONTINUIDAD_VERDE"
+        elif rebote_valido or continuidad_verde:
+            info["estado"] = "RESCATABLE"
+        else:
+            info["estado"] = "BLOQUEADO"
+
+        if bool(globals().get("MRV_5V1X_REQUIRE_REBOTE_OR_CONTINUIDAD", True)) and not (rebote_valido or continuidad_verde):
+            PATTERN_COL_LAST_STATE.update(info)
+            PATTERN_COL_LAST_STATE["pattern_state"] = info["estado"]
+            return False, "mrv_5v1x_bloqueado", info
+
+        PATTERN_COL_LAST_STATE.update(info)
+        PATTERN_COL_LAST_STATE["pattern_state"] = info["estado"]
+        return True, "mrv_5v1x_rescatable", info
+    except Exception as e:
+        info["estado"] = "ERROR_SEGURO"
+        info["error"] = str(e)
+        PATTERN_COL_LAST_STATE.update(info)
+        PATTERN_COL_LAST_STATE["pattern_state"] = info["estado"]
+        return False, "mrv_5v1x_error_seguro", info
+
 def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     bot_pick = _lxv_5v1x_pick_real_bot(candidate)
     if not bot_pick:
@@ -3179,6 +3484,48 @@ def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         )
         return False
     rid = int((candidate or {}).get("round_id", 0) or 0)
+    if bool(globals().get("MRV_5V1X_ENABLE", True)):
+        ok_mrv, reason_mrv, info_mrv = _lxv_5v1x_mrv_gate_ok(candidate)
+        estado_mrv = str((info_mrv or {}).get("estado", "BLOQUEADO"))
+        green_mrv = (info_mrv or {}).get("green_ratio_col_actual", None)
+        rebote_mrv = (info_mrv or {}).get("rebote_rate_hist", None)
+        samples_mrv = _mrv_5v1x_to_int((info_mrv or {}).get("rebote_samples_hist", 0), 0)
+        streak80_mrv = _mrv_5v1x_to_int((info_mrv or {}).get("strong_streak_80", 0), 0)
+        streak90_mrv = _mrv_5v1x_to_int((info_mrv or {}).get("strong_streak_90", 0), 0)
+        prev90_mrv = _mrv_5v1x_to_bool((info_mrv or {}).get("prev90", False), False)
+        green_txt = f"{float(green_mrv):.4f}" if green_mrv is not None else "None"
+        rebote_txt = f"{float(rebote_mrv):.4f}" if rebote_mrv is not None else "None"
+        if not ok_mrv:
+            if estado_mrv == "ERROR_SEGURO":
+                _lxv_5v1x_event_cooldown(
+                    key=f"mrv_error:{rid}:{estado_mrv}",
+                    msg=(
+                        f"🔴 MRV_5V1X ERROR SEGURO | bot={bot_pick} | round={rid} | "
+                        f"error={str((info_mrv or {}).get('error', reason_mrv))}"
+                    ),
+                    cooldown_s=float(globals().get("MRV_5V1X_LOG_COOLDOWN_S", 20.0)),
+                )
+            _lxv_5v1x_event_cooldown(
+                key=f"mrv_block:{rid}:{estado_mrv}",
+                msg=(
+                    f"🟠 MRV_5V1X BLOQUEA | bot={bot_pick} | round={rid} | "
+                    f"estado={estado_mrv} | reason={reason_mrv} | "
+                    f"green={green_txt} | rebote={rebote_txt} | samples={samples_mrv} | "
+                    f"streak80={streak80_mrv} | streak90={streak90_mrv} | prev90={prev90_mrv}"
+                ),
+                cooldown_s=float(globals().get("MRV_5V1X_LOG_COOLDOWN_S", 20.0)),
+            )
+            return False
+        _lxv_5v1x_event_cooldown(
+            key=f"mrv_allow:{rid}:{estado_mrv}",
+            msg=(
+                f"🟢 MRV_5V1X PERMITE | bot={bot_pick} | round={rid} | "
+                f"estado={estado_mrv} | reason={reason_mrv} | "
+                f"green={green_txt} | rebote={rebote_txt} | samples={samples_mrv} | "
+                f"streak80={streak80_mrv} | streak90={streak90_mrv}"
+            ),
+            cooldown_s=float(globals().get("MRV_5V1X_LOG_COOLDOWN_S", 20.0)),
+        )
     _lxv_5v1x_event_cooldown(
         key=f"route:{rid}",
         msg=f"🧪 REAL route activa: {str(globals().get('LXV_5V1X_REAL_SOURCE', 'LXV_5V1X'))}",
