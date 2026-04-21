@@ -4,7 +4,7 @@
 #
 # Este script coordina:
 # - Lectura de CSV enriquecidos de los bots fulll45–fulll50
-# - Control de Martingala 1-2-4
+# - Control de Martingala 1-2-4-8-16
 # - Gestión de tokens DEMO/REAL
 # - IA (XGBoost) para probabilidades de éxito
 # - HUD visual con Prob IA, % éxito, saldo, meta y eventos
@@ -180,7 +180,7 @@ init(autoreset=True)
 
 # === BLOQUE 2 — CONFIGURACIÓN GLOBAL (MARTINGALA, HUD, AUDIO, IA) ===
 # === CONFIGURACIÓN DE MARTINGALA ===
-MARTI_ESCALADO = [1, 2, 4]  # Escalado oficial de 3 pasos
+MARTI_ESCALADO = [1, 2, 4, 8, 16]  # Escalado oficial de 5 pasos
 MONTO_TOL = 0.01  # Tolerancia para redondeos
 SONAR_TAMBIEN_EN_DEMO = False  # Activar sonidos para victorias en DEMO
 SONAR_SOLO_EN_GATEWIN = True   # Solo sonar dentro de la ventana GateWIN
@@ -14600,7 +14600,7 @@ def mostrar_panel():
         "├────────────────────────────────────────────┤",
         "│ 🤖 ¿CÓMO INVIERTES?                        │",
         "│ [5–0] Elige bot (p.ej. 7 = fulll47)       │",
-        "│ [1–6] Elige ciclo [p.ej. 3 = Marti #3)    │",
+        f"│ [1–{MAX_CICLOS}] Elige ciclo [p.ej. 3 = Marti #3)    │",
     ]
 
     token_file = leer_token_actual()
@@ -18139,7 +18139,7 @@ if __name__ == "__main__":
 # === BLOQUE 99 — RESUMEN FINAL DE LO QUE SE LOGRA ===
 #
 # - Bot maestro 5R6M-1-2-4-8-16 con:
-#   * Martingala 1-2-4 intacta.
+#   * Martingala 1-2-4-8-16 intacta.
 #   * Tokens DEMO/REAL y handshake maestro→bots intactos.
 #   * CSV enriquecidos, dataset_incremental.csv, IA XGBoost, reentrenos intactos.
 #   * HUD visual con Prob IA, % éxito, saldo, meta, eventos
