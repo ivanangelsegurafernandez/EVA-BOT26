@@ -3034,199 +3034,222 @@ def _ack_live_fmt_age(age_s):
 
 
 def _ack_live_snapshot():
-    return _ack_live_build_rows()
-
-
-def _ack_live_norm_resultado(value):
-    try:
-        txt = normalize("NFD", str(value or "")).encode("ascii", "ignore").decode("ascii").upper().strip()
-    except Exception:
-        txt = str(value or "").upper().strip()
-    if txt in ("GANANCIA", "WIN", "CHECK", "✓"):
-        return "WIN"
-    if txt in ("PERDIDA", "LOSS", "X", "✗"):
-        return "LOSS"
-    return "OTHER"
-
-
-def _ack_live_build_rows():
-    out = {"obj_round": 1, "released_round": 1, "rows": []}
+    out = {
+        "ok": True,
+        "msg": "",
+        "rows": [],
+        "round_id_actual": 1,
+        "released_round": 1,
+        "closed_bots_state": {},
+        "bots_missing_state": [],
+        "status_state": "",
+        "reason_state": "",
+        "expected_count": 0,
+        "closed_count": 0,
+        "missing_bots": [],
+        "max_lag_s": None,
+        "avg_lag_s": None,
+        "stale_bots": [],
+        "warn_bots": [],
+    }
     try:
         bots = list(BOT_NAMES)
     except Exception:
-        out["error"] = "📡 ACK LIVE: BOT_NAMES no disponible"
+        out["ok"] = False
+        out["msg"] = "📡 ACK LIVE: BOT_NAMES no disponible"
         return out
+    if not os.path.exists(SYNC_ROUND_STATE_PATH):
+        out["ok"] = False
+        out["msg"] = "📡 ACK LIVE: esperando state.json"
+        return out
+
     state = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
-    obj_round = int(state.get("round_id", state.get("released_round", 1)) or 1)
-    released_round = int(state.get("released_round", obj_round) or obj_round)
-    out["obj_round"] = obj_round
+    round_id_actual = int(state.get("round_id", state.get("released_round", 1)) or 1)
+    released_round = int(state.get("released_round", round_id_actual) or round_id_actual)
+    closed_bots_state = state.get("closed_bots", {})
+    bots_missing_state = state.get("bots_missing", [])
+    status_state = state.get("status", "")
+    reason_state = state.get("reason", "")
+
+    out["round_id_actual"] = round_id_actual
     out["released_round"] = released_round
-    now_ts = float(time.time())
+    out["closed_bots_state"] = closed_bots_state
+    out["bots_missing_state"] = bots_missing_state
+    out["status_state"] = status_state
+    out["reason_state"] = reason_state
+
+    lag_samples = []
+    closed_count = 0
+    missing_bots = []
+    stale_bots = []
+    warn_bots = []
     rows = []
+    now = time.time()
+
     for bot in bots:
-        ack = _sync_round_safe_read_json(_sync_round_ack_path(bot))
+        ack_path = _sync_round_ack_path(bot)
+        ack = _sync_round_safe_read_json(ack_path)
+        raw_exists = os.path.exists(ack_path)
+        ack_err = False
+        if raw_exists and ack is None:
+            try:
+                with open(ack_path, "r", encoding="utf-8") as f:
+                    json.load(f)
+            except Exception:
+                ack_err = True
         if not isinstance(ack, dict):
-            rows.append({
-                "bot": bot, "obj_round": obj_round, "ack_round": 0, "gap": None, "res": "-",
-                "age_s": None, "age_txt": "--", "ciclo": "--", "asset": "--", "estado": "missing",
-                "sync_wait": False, "is_current": False, "is_closed_result": False,
-                "stale": False, "future": False, "warn": False,
-            })
-            continue
-        ack_round = int(ack.get("round_id", 0) or 0)
+            ack = {}
+
+        ack_round_id = int(ack.get("round_id", 0) or 0)
         resultado = ack.get("resultado", "")
-        status_ack = str(ack.get("status", "") or "")
-        sync_wait = bool(ack.get("sync_wait", False))
-        ts = ack.get("ts", None)
+        ts = ack.get("ts")
         age_s = None
+        future = False
         if ts is not None:
             try:
-                age_s = now_ts - float(ts)
+                tsf = float(ts)
+                age_s = now - tsf
+                if age_s < 0:
+                    future = True
             except Exception:
                 age_s = None
-        future = bool(age_s is not None and age_s < 0)
+        asset = ack.get("asset", "--")
+        ciclo = ack.get("ciclo", "--")
+        ack_status = ack.get("status", "")
+        sync_wait = ack.get("sync_wait", None)
+        waiting_release_round = ack.get("waiting_release_round", None)
+        last_seen_ts = ack.get("last_seen_ts", None)
+
         stale = bool(age_s is not None and age_s > float(ACK_LIVE_MAX_AGE_STALE_S))
         warn = bool(age_s is not None and age_s > float(ACK_LIVE_MAX_AGE_WARN_S))
-        is_current = bool(ack_round == obj_round)
-        norm = _ack_live_norm_resultado(resultado)
-        res = "-"
-        if is_current and norm == "WIN" and status_ack == "closed":
-            res = "✓"
-        elif is_current and norm == "LOSS" and status_ack == "closed":
-            res = "X"
-        elif is_current:
-            res = "·"
-        if is_current and status_ack == "closed" and norm in ("WIN", "LOSS"):
-            estado = "closed"
-        elif ack_round > 0 and ack_round < obj_round:
-            estado = "waiting"
-        elif ack_round > obj_round:
-            estado = "future"
-        elif ack_round <= 0:
-            estado = "missing"
+
+        symbol = "-"
+        row_status = "missing"
+        valid_closed = False
+
+        if ack_err:
+            symbol = "ERR"
+            row_status = "error"
+            missing_bots.append(bot)
+        elif not ack:
+            symbol = "-"
+            row_status = "missing"
+            missing_bots.append(bot)
+        elif ack_round_id != round_id_actual:
+            symbol = "-"
+            row_status = "waiting"
+            missing_bots.append(bot)
         else:
-            estado = "open"
+            symbol_eval = _ack_live_symbol(resultado)
+            if str(ack_status).lower() == "closed" and symbol_eval in ("✓", "X"):
+                symbol = symbol_eval
+                row_status = "closed"
+                valid_closed = True
+                closed_count += 1
+                if (age_s is not None) and (not future):
+                    lag_samples.append(float(age_s))
+            else:
+                symbol = "·"
+                row_status = "nonclose"
+                missing_bots.append(bot)
+
         if stale:
-            estado = "stale"
-        elif warn and estado not in ("closed", "waiting", "missing"):
-            estado = "warn"
-        gap = (obj_round - ack_round) if ack_round > 0 else None
+            stale_bots.append(bot)
+        if warn:
+            warn_bots.append(bot)
+
         rows.append({
             "bot": bot,
-            "obj_round": obj_round,
-            "ack_round": ack_round,
-            "gap": gap,
-            "res": res,
+            "symbol": symbol,
+            "round": ack_round_id,
             "age_s": age_s,
             "age_txt": _ack_live_fmt_age(age_s),
-            "ciclo": ack.get("ciclo", "--") if ack.get("ciclo", None) not in (None, "") else "--",
-            "asset": ack.get("asset", "--") if ack.get("asset", None) not in (None, "") else "--",
-            "estado": estado,
+            "ciclo": ciclo if ciclo not in (None, "") else "--",
+            "asset": asset if asset not in (None, "") else "--",
+            "status": row_status,
+            "ack_status": ack_status,
             "sync_wait": sync_wait,
-            "is_current": is_current,
-            "is_closed_result": bool(is_current and res in ("✓", "X")),
+            "waiting_release_round": waiting_release_round,
+            "last_seen_ts": last_seen_ts,
             "stale": stale,
-            "future": future,
             "warn": warn,
+            "future": future,
+            "last_round": ack_round_id,
+            "valid_closed": valid_closed,
         })
+
     out["rows"] = rows
+    out["expected_count"] = len(bots)
+    out["closed_count"] = closed_count
+    out["missing_bots"] = missing_bots
+    out["max_lag_s"] = max(lag_samples) if lag_samples else None
+    out["avg_lag_s"] = (sum(lag_samples) / len(lag_samples)) if lag_samples else None
+    out["stale_bots"] = stale_bots
+    out["warn_bots"] = warn_bots
     return out
 
 
-def _ack_live_calc_summary(rows_pack):
-    rows = list(rows_pack.get("rows", []) or [])
-    obj_round = int(rows_pack.get("obj_round", 1) or 1)
-    released_round = int(rows_pack.get("released_round", obj_round) or obj_round)
-    expected_count = int(len(BOT_NAMES)) if "BOT_NAMES" in globals() else 0
-    valid_current = [r for r in rows if bool(r.get("is_current", False)) and str(r.get("res", "")) in ("✓", "X")]
-    verdes_count = sum(1 for r in valid_current if str(r.get("res")) == "✓")
-    rojas_count = sum(1 for r in valid_current if str(r.get("res")) == "X")
-    closed_count = int(verdes_count + rojas_count)
-    faltan_count = int(max(0, expected_count - closed_count))
-    max_lag_s = None
-    avg_lag_s = None
-    lag_vals = []
-    for r in valid_current:
-        age_s = r.get("age_s", None)
-        if age_s is not None and (not bool(r.get("future", False))):
+def _ack_live_format_lines(snapshot):
+    lines = []
+    if not isinstance(snapshot, dict):
+        return ["📡 ACK LIVE: snapshot inválido"]
+    if not snapshot.get("ok", False):
+        return [str(snapshot.get("msg") or "📡 ACK LIVE: sin datos")]
+
+    round_id_actual = int(snapshot.get("round_id_actual", 1) or 1)
+    released_round = int(snapshot.get("released_round", round_id_actual) or round_id_actual)
+    closed_count = int(snapshot.get("closed_count", 0) or 0)
+    expected_count = int(snapshot.get("expected_count", 0) or 0)
+    missing = list(snapshot.get("missing_bots", []) or [])
+    max_lag_s = snapshot.get("max_lag_s", None)
+    avg_lag_s = snapshot.get("avg_lag_s", None)
+    stale_bots = list(snapshot.get("stale_bots", []) or [])
+    warn_bots = list(snapshot.get("warn_bots", []) or [])
+
+    max_txt = _ack_live_fmt_age(max_lag_s)
+    avg_txt = _ack_live_fmt_age(avg_lag_s)
+    head = f"📡 ACK LIVE | ronda=#{round_id_actual} | cerrados={closed_count}/{expected_count} | faltan={len(missing)} | max_lag={max_txt} | avg_lag={avg_txt} | released=#{released_round}"
+    if stale_bots:
+        head += " | STALE"
+    if warn_bots:
+        head += " | ⚠"
+    lines.append(head)
+    lines.append("BOT      ACK  ROUND  EDAD   CICLO  ACTIVO   STATUS   WAIT")
+
+    for row in list(snapshot.get("rows", []) or [])[:6]:
+        sym = str(row.get("symbol", "-"))
+        status = str(row.get("status", "--"))
+        if row.get("future", False):
+            status = "FUTURE"
+        if row.get("stale", False):
+            status = f"{status}/STALE"
+
+        if "Fore" in globals() and "Style" in globals():
             try:
-                lag_vals.append(float(age_s))
+                if sym == "✓":
+                    sym = Fore.GREEN + sym + Fore.RESET
+                elif sym == "X":
+                    sym = Fore.RED + sym + Fore.RESET
+                elif row.get("stale", False):
+                    sym = Style.BRIGHT + Fore.RED + sym + Fore.RESET + Style.RESET_ALL
+                elif sym in ("-", "ERR") or status.startswith("waiting") or status.startswith("missing"):
+                    sym = Fore.YELLOW + sym + Fore.RESET
             except Exception:
                 pass
-    if lag_vals:
-        max_lag_s = max(lag_vals)
-        avg_lag_s = sum(lag_vals) / float(len(lag_vals))
-    reds = [str(r.get("bot", "")) for r in valid_current if str(r.get("res", "")) == "X"]
-    waiting_bots = [str(r.get("bot", "")) for r in rows if str(r.get("estado", "")) in ("waiting", "missing")]
-    stale_bots = [str(r.get("bot", "")) for r in rows if bool(r.get("stale", False))]
-    all_prev_waiting = bool(rows) and all(int(r.get("ack_round", 0) or 0) > 0 and int(r.get("ack_round", 0) or 0) < obj_round for r in rows)
-    complete = bool(closed_count == expected_count and expected_count > 0)
-    if complete:
-        data_quality = "ok"
-    elif closed_count > 0:
-        data_quality = "partial"
-    else:
-        data_quality = "missing"
-    return {
-        "obj_round": obj_round,
-        "released_round": released_round,
-        "verdes_count": verdes_count,
-        "rojas_count": rojas_count,
-        "faltan_count": faltan_count,
-        "closed_count": closed_count,
-        "expected_count": expected_count,
-        "partial_pattern": f"{verdes_count}V{rojas_count}X",
-        "bot_x_actual": reds[0] if len(reds) == 1 else "",
-        "complete": complete,
-        "data_quality": data_quality,
-        "max_lag_s": max_lag_s,
-        "avg_lag_s": avg_lag_s,
-        "waiting_bots": waiting_bots,
-        "stale_bots": stale_bots,
-        "all_prev_waiting": all_prev_waiting,
-    }
 
+        wait_txt = "sí" if row.get("sync_wait", False) else "--"
+        bot = str(row.get("bot", "--"))[:7]
+        round_txt = str(row.get("round", "--") if row.get("round", 0) else "--")
+        age_txt = str(row.get("age_txt", "--"))
+        ciclo_txt = str(row.get("ciclo", "--"))[:5]
+        asset_txt = str(row.get("asset", "--"))[:7]
+        status_txt = status[:8] if ACK_LIVE_COMPACT else status[:16]
+        lines.append(f"{bot:<7}  {sym:<3}  {round_txt:<5}  {age_txt:<5}  {ciclo_txt:<5}  {asset_txt:<7}  {status_txt:<8}  {wait_txt}")
 
-def _ack_live_format_lines(snapshot):
-    rows_pack = _ack_live_build_rows()
-    if rows_pack.get("error"):
-        return [str(rows_pack.get("error"))]
-    rows = list(rows_pack.get("rows", []) or [])
-    summary = _ack_live_calc_summary(rows_pack)
-    lines = []
-    lines.append(
-        f"⚡ ROUND LIVE | objetivo=#{summary['obj_round']} | released=#{summary['released_round']} | "
-        f"cerrados={summary['closed_count']}/{summary['expected_count']} | faltan={summary['faltan_count']} | "
-        f"max_lag={_ack_live_fmt_age(summary['max_lag_s'])} | avg_lag={_ack_live_fmt_age(summary['avg_lag_s'])}"
-    )
-    lines.append("BOT      OBJ   ACK   GAP   RES   EDAD   CICLO   ACTIVO   ESTADO")
-    for r in rows[:6]:
-        ack_txt = str(r["ack_round"]) if int(r.get("ack_round", 0) or 0) > 0 else "--"
-        gap = r.get("gap", None)
-        gap_txt = str(gap) if gap is not None else "--"
-        st = str(r.get("estado", "--"))
-        if bool(HUD_COMPACT_MODE):
-            st = st[:8]
-        lines.append(
-            f"{str(r.get('bot','--')):<7}  {str(r.get('obj_round','--')):<4}  {ack_txt:<4}  {gap_txt:<4}  "
-            f"{str(r.get('res','-')):<3}  {str(r.get('age_txt','--')):<5}  {str(r.get('ciclo','--')):<5}  "
-            f"{str(r.get('asset','--')):<7}  {st}"
-        )
-    if int(summary.get("closed_count", 0) or 0) <= 0:
-        lines.append(
-            f"📊 RESUMEN LIVE DE RONDA #{summary['obj_round']} | sin cierres aún | "
-            f"Faltan={summary['faltan_count']} | Calidad={summary['data_quality']}"
-        )
-    else:
-        bot_x = summary["bot_x_actual"] if summary["bot_x_actual"] else "--"
-        lines.append(f"📊 RESUMEN LIVE DE RONDA #{summary['obj_round']}")
-        lines.append(
-            f"Verdes={summary['verdes_count']} | Rojas={summary['rojas_count']} | Faltan={summary['faltan_count']} | "
-            f"Parcial={summary['partial_pattern']} | Bot X={bot_x} | Calidad={summary['data_quality']} | "
-            f"max_lag={_ack_live_fmt_age(summary['max_lag_s'])} | avg_lag={_ack_live_fmt_age(summary['avg_lag_s'])}"
-        )
-    if bool(summary.get("all_prev_waiting", False)):
-        lines.append("↳ Esperando cierres de ronda objetivo; los ACK visibles aún pertenecen a ronda previa.")
+    if ACK_LIVE_SHOW_MISSING and missing:
+        miss = ",".join(missing[:6])
+        lines.append(f"faltan: {miss}")
+
     return lines
 
 
@@ -3234,10 +3257,10 @@ def mostrar_ack_live():
     if not ACK_LIVE_HUD_ENABLE:
         return
     try:
-        for line in _ack_live_format_lines(None):
+        for line in _ack_live_format_lines(_ack_live_snapshot()):
             print(line)
     except Exception as e:
-        print(f"⚡ ROUND LIVE error seguro: {e}")
+        print(f"📡 ACK LIVE: error seguro: {e}")
 
 
 def _sync_round_write_json_atomic(path: str, payload: dict) -> bool:
