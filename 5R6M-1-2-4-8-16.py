@@ -2560,6 +2560,11 @@ LXV_SYNC_ROUND_MAX_WAIT_S = 240.0
 LXV_SYNC_BOT_STALE_S = 120.0
 LXV_SYNC_PENDING_MAX_WAIT_S = 240.0
 LXV_SYNC_MIN_CLOSED_FOR_EVAL = 4
+ACK_LIVE_HUD_ENABLE = True
+ACK_LIVE_MAX_AGE_WARN_S = 10.0
+ACK_LIVE_MAX_AGE_STALE_S = 120.0
+ACK_LIVE_SHOW_MISSING = True
+ACK_LIVE_COMPACT = True
 _SYNC_ROUND_LAST_ANNOUNCED = None
 _SYNC_ROUND_LAST_CLOSED_COUNT = {}
 _LXV_LAST_EMITTED_ROUND = 0
@@ -2989,6 +2994,284 @@ def _sync_round_safe_read_json(path: str):
         return data if isinstance(data, dict) else None
     except Exception:
         return None
+
+def _ack_live_symbol(resultado):
+    if resultado is None:
+        return "-"
+    try:
+        txt = str(resultado).strip()
+    except Exception:
+        return "·"
+    if txt == "":
+        return "·"
+    up = txt.upper()
+    up = up.replace("Á", "A").replace("É", "E").replace("Í", "I").replace("Ó", "O").replace("Ú", "U")
+    if up in ("GANANCIA", "WIN", "CHECK", "✓"):
+        return "✓"
+    if up in ("PÉRDIDA", "PERDIDA", "LOSS", "X", "✗"):
+        return "X"
+    if up in ("INDEFINIDO", "PENDING", "", "NONE", "NULL", "-"):
+        return "·"
+    return "·"
+
+
+def _ack_live_fmt_age(age_s):
+    try:
+        if age_s is None:
+            return "--"
+        age = float(age_s)
+        if not math.isfinite(age):
+            return "--"
+        if age < 0:
+            return "FUTURE"
+        if age < 10.0:
+            return f"{age:.1f}s"
+        if age < 60.0:
+            return f"{int(age)}s"
+        return f"{(age / 60.0):.1f}m"
+    except Exception:
+        return "--"
+
+
+def _ack_live_build_rows():
+    out = {
+        "ok": True,
+        "msg": "",
+        "objetivo_round": 1,
+        "released_round": 1,
+        "expected_count": 0,
+        "rows": [],
+    }
+    try:
+        bots = list(BOT_NAMES)
+    except Exception:
+        out["ok"] = False
+        out["msg"] = "📡 ACK LIVE: BOT_NAMES no disponible"
+        return out
+    out["expected_count"] = len(bots)
+    if not os.path.exists(SYNC_ROUND_STATE_PATH):
+        out["ok"] = False
+        out["msg"] = "📡 ACK LIVE: esperando state.json"
+        return out
+
+    state = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+    objetivo_round = int(state.get("round_id", state.get("released_round", 1)) or 1)
+    released_round = int(state.get("released_round", objetivo_round) or objetivo_round)
+    out["objetivo_round"] = objetivo_round
+    out["released_round"] = released_round
+
+    rows = []
+    now_ts = float(time.time())
+    for bot in bots:
+        ack_path = _sync_round_ack_path(bot)
+        ack = _sync_round_safe_read_json(ack_path)
+        ack_exists = os.path.exists(ack_path)
+        ack_error = False
+        if ack_exists and ack is None:
+            try:
+                with open(ack_path, "r", encoding="utf-8") as f:
+                    json.load(f)
+            except Exception:
+                ack_error = True
+        if not isinstance(ack, dict):
+            ack = {}
+
+        ack_round = int(ack.get("round_id", 0) or 0)
+        resultado = ack.get("resultado", "")
+        symbol_base = _ack_live_symbol(resultado)
+        ack_status = str(ack.get("status", "") or "").lower()
+        ts = ack.get("ts", None)
+        age_s = None
+        if ts is not None:
+            try:
+                age_s = now_ts - float(ts)
+            except Exception:
+                age_s = None
+        future = bool(age_s is not None and age_s < 0)
+        stale = bool(age_s is not None and age_s > float(ACK_LIVE_MAX_AGE_STALE_S))
+        is_current_round = bool(ack_round == objetivo_round and ack_round > 0)
+        is_closed_result = bool(is_current_round and ack_status == "closed" and symbol_base in ("✓", "X"))
+
+        if ack_error:
+            status = "error"
+            symbol = "ERR"
+        elif not ack:
+            status = "missing"
+            symbol = "-"
+        elif not is_current_round:
+            status = "waiting"
+            symbol = "-"
+        elif is_closed_result:
+            status = "closed"
+            symbol = symbol_base
+        else:
+            status = "nonclose"
+            symbol = "·"
+
+        if future:
+            status = "future"
+        elif stale:
+            status = f"{status}/stale"
+
+        gap = None
+        if ack_round > 0:
+            try:
+                gap = int(objetivo_round - ack_round)
+            except Exception:
+                gap = None
+
+        rows.append({
+            "bot": bot,
+            "obj_round": objetivo_round,
+            "ack_round": ack_round,
+            "round_gap": gap,
+            "resultado": resultado,
+            "symbol": symbol,
+            "age_s": age_s,
+            "ciclo": ack.get("ciclo", "--") if ack.get("ciclo", None) not in (None, "") else "--",
+            "asset": ack.get("asset", "--") if ack.get("asset", None) not in (None, "") else "--",
+            "status": status,
+            "is_current_round": is_current_round,
+            "is_closed_result": is_closed_result,
+            "stale": stale,
+            "future": future,
+        })
+
+    out["rows"] = rows
+    return out
+
+
+def _ack_live_calc_summary(rows, objetivo_round):
+    expected_count = int(len(BOT_NAMES)) if "BOT_NAMES" in globals() else 0
+    verdes = 0
+    rojas = 0
+    lag_samples = []
+    x_bots = []
+    waiting_prev = 0
+    for r in list(rows or []):
+        if not isinstance(r, dict):
+            continue
+        if bool(r.get("is_closed_result", False)) and int(r.get("ack_round", 0) or 0) == int(objetivo_round):
+            sym = str(r.get("symbol", ""))
+            if sym == "✓":
+                verdes += 1
+            elif sym == "X":
+                rojas += 1
+                x_bots.append(str(r.get("bot", "")))
+            age_s = r.get("age_s", None)
+            if age_s is not None and (not bool(r.get("future", False))):
+                try:
+                    lag_samples.append(float(age_s))
+                except Exception:
+                    pass
+        if str(r.get("status", "")).startswith("waiting") and int(r.get("ack_round", 0) or 0) > 0 and int(r.get("ack_round", 0) or 0) < int(objetivo_round):
+            waiting_prev += 1
+
+    closed_count = int(verdes + rojas)
+    faltan = int(max(0, expected_count - closed_count))
+    complete = bool(closed_count == expected_count and expected_count > 0)
+    data_quality = "ok" if complete else ("partial" if closed_count > 0 else "missing")
+    bot_x_actual = x_bots[0] if len(x_bots) == 1 else ""
+    summary = {
+        "objetivo_round": int(objetivo_round or 1),
+        "expected_count": expected_count,
+        "verdes_count": verdes,
+        "rojas_count": rojas,
+        "faltan_count": faltan,
+        "closed_count": closed_count,
+        "max_lag_s": max(lag_samples) if lag_samples else None,
+        "avg_lag_s": (sum(lag_samples) / len(lag_samples)) if lag_samples else None,
+        "partial_pattern": f"{verdes}V{rojas}X",
+        "bot_x_actual": bot_x_actual,
+        "complete": complete,
+        "data_quality": data_quality,
+        "all_waiting_prev": bool(waiting_prev == expected_count and expected_count > 0),
+    }
+    return summary
+
+
+def _ack_live_render_round_live(rows, summary):
+    lines = []
+    if not isinstance(summary, dict):
+        return ["⚡ ROUND LIVE: sin datos"]
+    objetivo_round = int(summary.get("objetivo_round", 1) or 1)
+    released_round = int(summary.get("released_round", objetivo_round) or objetivo_round)
+    closed_count = int(summary.get("closed_count", 0) or 0)
+    expected_count = int(summary.get("expected_count", 0) or 0)
+    faltan = int(summary.get("faltan_count", 0) or 0)
+    max_lag = _ack_live_fmt_age(summary.get("max_lag_s", None))
+    avg_lag = _ack_live_fmt_age(summary.get("avg_lag_s", None))
+    lines.append(f"⚡ ROUND LIVE | objetivo=#{objetivo_round} | released=#{released_round} | cerrados={closed_count}/{expected_count} | faltan={faltan} | lag_max={max_lag} | lag_avg={avg_lag}")
+    lines.append("BOT      OBJ   ACK   GAP   RES   EDAD   CICLO   ACTIVO   ESTADO")
+
+    for r in list(rows or [])[:6]:
+        bot = str(r.get("bot", "--"))[:7]
+        obj = str(r.get("obj_round", "--"))
+        ack = str(r.get("ack_round", "--") if int(r.get("ack_round", 0) or 0) > 0 else "--")
+        gap_val = r.get("round_gap", None)
+        gap = str(gap_val) if gap_val is not None else "--"
+        sym = str(r.get("symbol", "-"))
+        status = str(r.get("status", "--"))
+        edad = _ack_live_fmt_age(r.get("age_s", None))
+        ciclo = str(r.get("ciclo", "--"))[:5]
+        activo = str(r.get("asset", "--"))[:7]
+        if "Fore" in globals():
+            try:
+                if sym == "✓":
+                    sym = Fore.GREEN + sym + Fore.RESET
+                elif sym == "X":
+                    sym = Fore.RED + sym + Fore.RESET
+                elif status.startswith("waiting") or status.startswith("missing"):
+                    sym = Fore.YELLOW + sym + Fore.RESET
+            except Exception:
+                pass
+        st = status[:9] if bool(HUD_COMPACT_MODE) else status[:16]
+        lines.append(f"{bot:<7}  {obj:<4}  {ack:<4}  {gap:<4}  {sym:<3}  {edad:<5}  {ciclo:<5}  {activo:<7}  {st}")
+
+    if bool(summary.get("all_waiting_prev", False)):
+        lines.append("Esperando cierres de ronda objetivo; los ACK visibles aún pertenecen a la ronda previa.")
+    return lines
+
+
+def _ack_live_render_round_summary(summary):
+    if not isinstance(summary, dict):
+        return ["📊 RESUMEN LIVE DE RONDA: sin datos"]
+    objetivo_round = int(summary.get("objetivo_round", 1) or 1)
+    verdes = int(summary.get("verdes_count", 0) or 0)
+    rojas = int(summary.get("rojas_count", 0) or 0)
+    faltan = int(summary.get("faltan_count", 0) or 0)
+    pattern = str(summary.get("partial_pattern", "0V0X"))
+    bot_x = str(summary.get("bot_x_actual", "") or "--")
+    calidad = str(summary.get("data_quality", "missing"))
+    max_lag = _ack_live_fmt_age(summary.get("max_lag_s", None))
+    avg_lag = _ack_live_fmt_age(summary.get("avg_lag_s", None))
+    complete = bool(summary.get("complete", False))
+    line1 = f"📊 RESUMEN LIVE DE RONDA #{objetivo_round}"
+    line2 = f"Verdes={verdes} | Rojas={rojas} | Faltan={faltan} | Parcial={pattern} | Bot X={bot_x} | Complete={complete} | Calidad={calidad} | max_lag={max_lag} | avg_lag={avg_lag}"
+    if int(summary.get("closed_count", 0) or 0) <= 0:
+        line2 += " | sin cierres aún"
+    return [line1, line2]
+
+
+def mostrar_ack_live():
+    if not ACK_LIVE_HUD_ENABLE:
+        return
+    try:
+        payload = _ack_live_build_rows()
+        if not bool(payload.get("ok", False)):
+            print(str(payload.get("msg") or "📡 ACK LIVE: sin datos"))
+            return
+        rows = list(payload.get("rows", []) or [])
+        objetivo_round = int(payload.get("objetivo_round", 1) or 1)
+        summary = _ack_live_calc_summary(rows, objetivo_round)
+        summary["released_round"] = int(payload.get("released_round", objetivo_round) or objetivo_round)
+        for line in _ack_live_render_round_live(rows, summary):
+            print(line)
+        for line in _ack_live_render_round_summary(summary):
+            print(line)
+    except Exception as e:
+        print(f"ACK LIVE error seguro: {e}")
+
 
 def _sync_round_write_json_atomic(path: str, payload: dict) -> bool:
     try:
@@ -14137,7 +14420,7 @@ def mostrar_panel():
     print(padding + Fore.CYAN + "┌────────┬────────────────────────────────────────────────────────────────────────────────┬─────────┬──────────┬──────────┬──────────┬──────────┬──────────┐")
     print(padding + Fore.CYAN + Style.BRIGHT + "│ ✨ ESTADO INTELIGENTE DE BOTS · ÚLTIMOS 40 · TOKEN · IA · RENDIMIENTO      │" + Style.RESET_ALL)
     print(padding + Fore.CYAN + "├────────┼────────────────────────────────────────────────────────────────────────────────┼─────────┬──────────┬──────────┬──────────┬──────────┬──────────┤")
-    print(padding + Fore.CYAN + "│ BOT    │ Últimos 40 Resultados                                                  │ Token   │ GANANCIAS│ PÉRDIDAS │ % ÉXITO  │ Prob IA  │ Modo IA  │")
+    print(padding + Fore.CYAN + "│ BOT    │ 🧾 HISTÓRICO ÚLTIMOS 40 CIERRES (histórico, no live)                 │ Token   │ GANANCIAS│ PÉRDIDAS │ % ÉXITO  │ Prob IA  │ Modo IA  │")
     print(padding + Fore.CYAN + "├────────┼────────────────────────────────────────────────────────────────────────────────┼─────────┬──────────┬──────────┬──────────┬──────────┬──────────┤")
 
     # Meta IA para colorear Prob IA (estado global del modelo)
@@ -14409,6 +14692,7 @@ def mostrar_panel():
     # ==========================
 
     # Eventos recientes
+    mostrar_ack_live()
     mostrar_eventos()
 
     # Telemetría IA (modelo XGBoost)
