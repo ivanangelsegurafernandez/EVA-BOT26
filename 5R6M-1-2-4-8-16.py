@@ -2565,6 +2565,13 @@ ACK_LIVE_MAX_AGE_WARN_S = 10.0
 ACK_LIVE_MAX_AGE_STALE_S = 120.0
 ACK_LIVE_SHOW_MISSING = True
 ACK_LIVE_COMPACT = True
+ACK_TAPE_ENABLE = True
+ACK_TAPE_WIDTH = 40
+ACK_TAPE_MAX_SEEN = 2000
+ACK_TAPE_USE_COLOR = True
+ACK_TAPE_FILL_CHAR = "·"
+ACK_LIVE_TAPE = {}
+ACK_LIVE_TAPE_SEEN = deque(maxlen=2000)
 _SYNC_ROUND_LAST_ANNOUNCED = None
 _SYNC_ROUND_LAST_CLOSED_COUNT = {}
 _LXV_LAST_EMITTED_ROUND = 0
@@ -3203,6 +3210,169 @@ def _ack_live_norm_resultado(value):
         return "LOSS"
 
     return "OTHER"
+
+
+def _ack_tape_init():
+    try:
+        if "BOT_NAMES" not in globals():
+            return
+        if not isinstance(globals().get("ACK_LIVE_TAPE"), dict):
+            globals()["ACK_LIVE_TAPE"] = {}
+        width = int(globals().get("ACK_TAPE_WIDTH", 40) or 40)
+        for bot in BOT_NAMES:
+            if bot not in ACK_LIVE_TAPE or not isinstance(ACK_LIVE_TAPE.get(bot), deque):
+                ACK_LIVE_TAPE[bot] = deque(maxlen=width)
+        if not isinstance(globals().get("ACK_LIVE_TAPE_SEEN"), deque):
+            max_seen = int(globals().get("ACK_TAPE_MAX_SEEN", 2000) or 2000)
+            globals()["ACK_LIVE_TAPE_SEEN"] = deque(maxlen=max_seen)
+    except Exception:
+        pass
+
+
+def _ack_tape_seen_contains(key):
+    try:
+        if key in (None, ""):
+            return False
+        return str(key) in ACK_LIVE_TAPE_SEEN
+    except Exception:
+        return False
+
+
+def _ack_tape_seen_add(key):
+    try:
+        if key in (None, ""):
+            return
+        k = str(key)
+        if not _ack_tape_seen_contains(k):
+            ACK_LIVE_TAPE_SEEN.append(k)
+    except Exception:
+        pass
+
+
+def _ack_tape_symbol_plain(value):
+    try:
+        norm_fn = globals().get("_ack_live_norm_resultado", None)
+        if callable(norm_fn):
+            norm = str(norm_fn(value) or "").upper()
+            if norm == "WIN":
+                return "✓"
+            if norm == "LOSS":
+                return "X"
+    except Exception:
+        pass
+    try:
+        s = str(value or "").strip().upper()
+        s_ascii = normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    except Exception:
+        return "·"
+    if s in ("✓", "CHECK") or s_ascii in ("GANANCIA", "WIN", "CHECK"):
+        return "✓"
+    if s in ("X", "✗") or s_ascii in ("PERDIDA", "LOSS", "X"):
+        return "X"
+    return "·"
+
+
+def _ack_tape_update_from_ack_live():
+    try:
+        if not bool(globals().get("ACK_TAPE_ENABLE", True)):
+            return
+        _ack_tape_init()
+        if "BOT_NAMES" not in globals():
+            return
+        for bot in BOT_NAMES:
+            try:
+                path = _sync_round_ack_path(bot)
+                ack = _sync_round_safe_read_json(path)
+                if not isinstance(ack, dict):
+                    continue
+                status = str(ack.get("status", "") or "").strip().lower()
+                if status != "closed":
+                    continue
+                round_id = int(ack.get("round_id", 0) or 0)
+                if round_id <= 0:
+                    continue
+                resultado = ack.get("resultado", "")
+                symbol = _ack_tape_symbol_plain(resultado)
+                if symbol not in ("✓", "X"):
+                    continue
+                result_norm = "WIN" if symbol == "✓" else "LOSS"
+                contract_id = str(ack.get("contract_id", "") or "").strip()
+                if contract_id:
+                    key = f"{bot}:{round_id}:{contract_id}:{result_norm}"
+                else:
+                    key = f"{bot}:{round_id}:{result_norm}:{ack.get('ts', '')}"
+                if _ack_tape_seen_contains(key):
+                    continue
+                if bot not in ACK_LIVE_TAPE or not isinstance(ACK_LIVE_TAPE.get(bot), deque):
+                    ACK_LIVE_TAPE[bot] = deque(maxlen=int(globals().get("ACK_TAPE_WIDTH", 40) or 40))
+                ACK_LIVE_TAPE[bot].append(symbol)
+                _ack_tape_seen_add(key)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def _ack_tape_color_symbol(symbol):
+    base = str(symbol or "")
+    try:
+        if not bool(globals().get("ACK_TAPE_USE_COLOR", True)):
+            return base
+        if base == "✓":
+            return f"{Fore.GREEN}✓{Style.RESET_ALL}"
+        if base == "X":
+            return f"{Fore.RED}X{Style.RESET_ALL}"
+        if base == "·":
+            return f"{Fore.LIGHTBLACK_EX}·{Style.RESET_ALL}"
+        return base
+    except Exception:
+        return base
+
+
+def _ack_tape_strip_ansi(text):
+    try:
+        return re.sub(r"\x1b\[[0-9;]*m", "", str(text or ""))
+    except Exception:
+        return str(text or "")
+
+
+def _ack_tape_pad_visible(text, width):
+    try:
+        w = int(width or 0)
+    except Exception:
+        w = 0
+    txt = str(text or "")
+    if w <= 0:
+        return txt
+    try:
+        visible_len = len(_ack_tape_strip_ansi(txt))
+    except Exception:
+        visible_len = len(txt)
+    if visible_len < w:
+        return txt + (" " * (w - visible_len))
+    return txt
+
+
+def _ack_tape_render_bot(bot, fallback_resultados=None, width=None):
+    _ack_tape_init()
+    try:
+        w = int(width if width is not None else globals().get("ACK_TAPE_WIDTH", 40))
+    except Exception:
+        w = 40
+    if w <= 0:
+        w = 40
+    fill_char = str(globals().get("ACK_TAPE_FILL_CHAR", "·") or "·")
+    tape = list(ACK_LIVE_TAPE.get(bot, []) or [])
+    symbols = []
+    if tape:
+        symbols = [_ack_tape_symbol_plain(x) for x in tape][-w:]
+    else:
+        fb = list(fallback_resultados or [])
+        symbols = [_ack_tape_symbol_plain(x) for x in fb][-w:]
+    while len(symbols) < w:
+        symbols.insert(0, fill_char)
+    colored = "".join(_ack_tape_color_symbol(_ack_tape_symbol_plain(s)) for s in symbols[-w:])
+    return _ack_tape_pad_visible(colored, w)
 
 
 def _ack_live_build_rows():
@@ -14614,7 +14784,7 @@ def mostrar_panel():
     print(padding + Fore.CYAN + "┌────────┬────────────────────────────────────────────────────────────────────────────────┬─────────┬──────────┬──────────┬──────────┬──────────┬──────────┐")
     print(padding + Fore.CYAN + Style.BRIGHT + "│ ✨ ESTADO INTELIGENTE DE BOTS · ÚLTIMOS 40 · TOKEN · IA · RENDIMIENTO      │" + Style.RESET_ALL)
     print(padding + Fore.CYAN + "├────────┼────────────────────────────────────────────────────────────────────────────────┼─────────┬──────────┬──────────┬──────────┬──────────┬──────────┤")
-    print(padding + Fore.CYAN + "│ BOT    │ 🧾 HISTÓRICO ÚLTIMOS 40 CIERRES (histórico, no live)                 │ Token   │ GANANCIAS│ PÉRDIDAS │ % ÉXITO  │ Prob IA  │ Modo IA  │")
+    print(padding + Fore.CYAN + "│ BOT    │ ⚡ LIVE ACK 40 · HISTÓRICO VISUAL                                    │ Token   │ GANANCIAS│ PÉRDIDAS │ % ÉXITO  │ Prob IA  │ Modo IA  │")
     print(padding + Fore.CYAN + "├────────┼────────────────────────────────────────────────────────────────────────────────┼─────────┬──────────┬──────────┬──────────┬──────────┬──────────┤")
 
     # Meta IA para colorear Prob IA (estado global del modelo)
@@ -14626,6 +14796,7 @@ def mostrar_panel():
 
     # Sincronía visual dura: si hay owner REAL en memoria, la tabla SIEMPRE lo refleja.
     owner_visual = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+    _ack_tape_update_from_ack_live()
 
     for bot in BOT_NAMES:
         r = estado_bots[bot]["resultados"]
@@ -14640,20 +14811,13 @@ def mostrar_panel():
         token_color = Fore.GREEN if token_text.startswith("REAL") else Fore.CYAN
         token_text = token_color + token_text + Fore.RESET
 
-        # Últimos 40 resultados visuales
-        visual = []
-        for x in r[-40:]:
-            if x == "GANANCIA":
-                visual.append(Fore.GREEN + "✓")
-            elif x == "PÉRDIDA":
-                visual.append(Fore.RED + "✗")
-            elif x == "INDEFINIDO":
-                visual.append(Fore.YELLOW + "·")
-            else:
-                visual.append(Fore.LIGHTBLACK_EX + "─")
-        while len(visual) < 40:
-            visual.insert(0, Fore.LIGHTBLACK_EX + "─")
-        col_resultados = " ".join(visual)
+        fallback = estado_bots.get(bot, {}).get("resultados", [])
+        col_resultados = _ack_tape_render_bot(
+            bot,
+            fallback_resultados=fallback,
+            width=int(globals().get("ACK_TAPE_WIDTH", 40)),
+        )
+        col_resultados = _ack_tape_pad_visible(col_resultados, 80)
 
         # Ganancias / Pérdidas / % éxito
         g = estado_bots[bot]["ganancias"]
@@ -14869,7 +15033,7 @@ def mostrar_panel():
 
         # Línea completa del bot
         linea_bot = (
-            padding + f"│ {bot:<6} │ {col_resultados:<80} │ "
+            padding + f"│ {bot:<6} │ {col_resultados} │ "
             f"{token_text:<9} │ "
             f"{ganancias:<10} │ "
             f"{perdidas:<10} │ "
