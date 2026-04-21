@@ -2918,13 +2918,15 @@ async def ejecutar_panel():
                 estado_bot["ciclo_en_progreso"] = False
                 estado_bot["token_msg_mostrado"] = False
 
+                # LXV_SYNC_COLUMN: cierre definido -> ACK inmediato para maestro/HUD
+                round_id_local = int(estado_bot.get("sync_round_id", 1) or 1)
+                _sync_round_emit_close_ack(round_id_local, resultado, contract_id=contract_id, asset=symbol, ciclo=ciclo)
+
                 print(Back.BLUE + Style.BRIGHT + f"\nTotal DEMO: {resultado_global['demo']:.2f} USD | Total REAL: {resultado_global['real']:.2f} USD")
                 await mostrar_saldos()
                 sep_ciclo()
 
-                # LXV_SYNC_COLUMN: cierre definido -> ACK -> standby hasta liberación global
-                round_id_local = int(estado_bot.get("sync_round_id", 1) or 1)
-                _sync_round_emit_close_ack(round_id_local, resultado, contract_id=contract_id, asset=symbol, ciclo=ciclo)
+                # LXV_SYNC_COLUMN: standby hasta liberación global
                 estado_bot["sync_round_id"] = await _sync_round_wait_release(round_id_local)
 
                 # ========= MODO REAL =========
