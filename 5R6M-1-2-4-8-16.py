@@ -3282,15 +3282,18 @@ def _ack_live_build_rows():
             else:
                 estado = "open"
 
-            if estado != "future":
-                if stale:
-                    estado = "stale"
-                elif warn:
-                    estado = "warn"
+            if stale:
+                estado_visual = f"{estado}‼"
+            elif warn:
+                estado_visual = f"{estado}⚠"
+            else:
+                estado_visual = estado
 
             age_txt = _ack_live_fmt_age(age_s) if age_s is not None else "--"
             ciclo = "--" if ciclo in (None, "") else ciclo
             asset = "--" if asset in (None, "") else asset
+        if not isinstance(ack, dict):
+            estado_visual = estado
 
         rows.append({
             "bot": bot,
@@ -3303,6 +3306,7 @@ def _ack_live_build_rows():
             "ciclo": ciclo,
             "asset": asset,
             "estado": estado,
+            "estado_visual": estado_visual,
             "sync_wait": sync_wait,
             "is_current": is_current,
             "is_closed_result": is_closed_result,
@@ -3432,7 +3436,7 @@ def _ack_live_format_lines(snapshot):
                 ciclo_txt = "--"
 
         asset_txt = str(row.get("asset", "--"))[:7]
-        estado_txt = str(row.get("estado", "--"))[:10]
+        estado_txt = str(row.get("estado_visual", row.get("estado", "--")))[:10]
         lines.append(f"{bot:<7}  {obj_txt:<5} {ack_txt:<5} {gap_txt:<4} {res_txt:<3} {age_txt:<6} {ciclo_txt:<6} {asset_txt:<8} {estado_txt:<10}")
 
     if closed_count == 0:
