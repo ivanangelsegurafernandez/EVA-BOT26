@@ -3655,6 +3655,65 @@ def mostrar_ack_live():
         print(f"⚡ ROUND LIVE error seguro: {e}")
 
 
+def _hud_marti_live_lines(max_cols: int = 3):
+    """Resumen visual de martingala y columnas de matriz (solo HUD, sin lógica operativa)."""
+    lines = []
+    try:
+        owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else next((b for b in BOT_NAMES if str(estado_bots.get(b, {}).get("token", "")).upper().startswith("REAL")), None)
+    except Exception:
+        owner = None
+
+    try:
+        token_file = leer_token_actual()
+        token_txt = "DEMO" if token_file in (None, "none") else f"REAL:{token_file}"
+    except Exception:
+        token_txt = "DEMO"
+
+    ciclo_sig = 1
+    try:
+        ciclo_sig = int(ciclo_martingala_siguiente() or 1)
+    except Exception:
+        ciclo_sig = 1
+
+    ciclo_owner = ciclo_sig
+    fuente_owner = "AUTO"
+    if owner:
+        st_owner = estado_bots.get(owner, {}) if isinstance(estado_bots, dict) else {}
+        try:
+            ciclo_owner = int(st_owner.get("ciclo_actual", ciclo_sig) or ciclo_sig)
+        except Exception:
+            ciclo_owner = ciclo_sig
+        fuente_owner = str(st_owner.get("fuente") or "AUTO")
+
+    idx = max(0, min(int(MAX_CICLOS) - 1, int(ciclo_sig) - 1))
+    monto_sig = float(MARTI_ESCALADO[idx]) if MARTI_ESCALADO else 0.0
+    plan_txt = " ".join([f"C{i+1}={float(v):g}" for i, v in enumerate(list(MARTI_ESCALADO)[: int(MAX_CICLOS)])])
+
+    lines.append(
+        f"🎯 HUD MARTINGALA LIVE | owner={owner or '--'} | token={token_txt} | ciclo=C{int(ciclo_owner)}/{int(MAX_CICLOS)} | fuente={fuente_owner}"
+    )
+    lines.append(f"   Escalado: {plan_txt} | Próximo monto={monto_sig:g}")
+
+    try:
+        pat = dict(globals().get("PATTERN_COL_LAST_STATE", {}) or {})
+    except Exception:
+        pat = {}
+
+    ratio = pat.get("green_ratio_col_actual", None)
+    ratio_txt = "--" if ratio is None else f"{float(ratio)*100:.1f}%"
+    v = int(pat.get("total_verdes_col_actual", 0) or 0)
+    r = int(pat.get("total_rojos_col_actual", 0) or 0)
+    st = str(pat.get("pattern_state", "BLOQUEADO"))
+    st80 = int(pat.get("strong_streak_80", 0) or 0)
+    st90 = int(pat.get("strong_streak_90", 0) or 0)
+    reb = pat.get("rebote_rate_hist", None)
+    reb_txt = "--" if reb is None else f"{float(reb)*100:.1f}%"
+    lines.append(
+        f"🧩 MATRICES LIVE | col0={v}V/{r}X ({ratio_txt}) | state={st} | st80={st80} st90={st90} | rebote_hist={reb_txt}"
+    )
+    return lines[: max(1, int(max_cols))]
+
+
 def _sync_round_write_json_atomic(path: str, payload: dict) -> bool:
     try:
         _atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2))
@@ -15379,6 +15438,11 @@ def mostrar_panel():
 
     # Eventos recientes
     mostrar_ack_live()
+    try:
+        for ln in _hud_marti_live_lines(max_cols=3):
+            print(ln)
+    except Exception:
+        pass
     mostrar_eventos()
 
     mostrar_ia_resumen_compacto()
