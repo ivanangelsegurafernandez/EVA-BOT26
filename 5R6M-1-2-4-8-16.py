@@ -2604,6 +2604,11 @@ _SYNC_STALE_WARN_TS = {}
 _LXV_5V1X_EVENT_TS = {}
 _LXV_HEADER_WARN_TS = {}
 _LXV_HEADER_WARN_COOLDOWN_S = 180.0
+MATRIZ_COLUMNAS_LXV_CSV = "matriz_columnas_lxv.csv"
+MATRIZ_CELDAS_LXV_CSV = "matriz_celdas_lxv.csv"
+MATRIZ_FOLLOWUP_5V1X_CSV = "matriz_followup_5v1x.csv"
+LEGACY_MATRIX_EXPORT_ENABLE = False
+OFFICIAL_MATRIX_EXPORT_ENABLE = True
 LXV_MATRIX_EXPORT_ENABLE = True
 LXV_MATRIX_DIR = script_dir
 LXV_MATRIX_EXPORT_LOCK = "lxv_matrix_export.lock"
@@ -2645,14 +2650,26 @@ _LXV_MATRIX_HEADERS = {
         "origin_marti_ciclo", "origin_marti_monto",
         "round_complete", "missing_bots", "data_quality",
     ],
+    "followup": [
+        "origin_round", "bot_objetivo", "resultado_origen", "ciclo_origen",
+        "origin_marti_ciclo", "origin_marti_monto",
+        "followup_c1", "followup_c2", "followup_c3", "followup_c4", "followup_c5",
+        "outcome_final",
+    ],
 }
 
 def _lxv_matrix_paths() -> dict:
     base = os.path.abspath(os.path.expanduser(LXV_MATRIX_DIR or script_dir))
     return {
-        "matrix": os.path.join(base, "matriz_lxv.csv"),
-        "long": os.path.join(base, "rondas_lxv_long.csv"),
+        # CSV oficial: una fila por columna cerrada
+        "matrix": os.path.join(base, MATRIZ_COLUMNAS_LXV_CSV),
+        # CSV oficial: una fila por bot por columna
+        "long": os.path.join(base, MATRIZ_CELDAS_LXV_CSV),
+        # CSV oficial: seguimiento 5V1X
+        "followup": os.path.join(base, MATRIZ_FOLLOWUP_5V1X_CSV),
+        # legacy desactivado / reemplazado por CSV oficial
         "features": os.path.join(base, "features_columnas_lxv.csv"),
+        # legacy desactivado / reemplazado por CSV oficial
         "xlsx": os.path.join(base, "matriz_lxv.xlsx"),
     }
 
@@ -2777,7 +2794,7 @@ def _lxv_append_rows_csv(path: str, rows: list[dict], headers: list[str], unique
             ts_last = float(_LXV_HEADER_WARN_TS.get(path, 0.0) or 0.0)
             if (now - ts_last) >= float(_LXV_HEADER_WARN_COOLDOWN_S):
                 _LXV_HEADER_WARN_TS[path] = now
-                agregar_evento("⚠ matriz con header viejo; campos marti se omiten hasta archivo nuevo")
+                agregar_evento(f"⚠ header antiguo detectado en {os.path.basename(path)}; columnas nuevas se omiten hasta archivo nuevo")
     with file_lock_required(LXV_MATRIX_EXPORT_LOCK, timeout=3.0, stale_after=30.0) as got:
         if not got:
             return 0
@@ -2953,18 +2970,8 @@ def _lxv_build_features_row(round_row: dict, rows_long: list[dict], marti_snapsh
     return out
 
 def _lxv_export_excel_optional(paths: dict) -> None:
-    try:
-        if importlib.util.find_spec("openpyxl") is None:
-            return
-        matrix_rows = _lxv_csv_read_rows(paths["matrix"], max_lines=50000) if os.path.exists(paths["matrix"]) else []
-        long_rows = _lxv_csv_read_rows(paths["long"], max_lines=120000) if os.path.exists(paths["long"]) else []
-        feat_rows = _lxv_csv_read_rows(paths["features"], max_lines=50000) if os.path.exists(paths["features"]) else []
-        with pd.ExcelWriter(paths["xlsx"], engine="openpyxl", mode="w") as writer:
-            pd.DataFrame(matrix_rows).to_excel(writer, sheet_name="Matriz", index=False)
-            pd.DataFrame(long_rows).to_excel(writer, sheet_name="Long", index=False)
-            pd.DataFrame(feat_rows).to_excel(writer, sheet_name="Features", index=False)
-    except Exception:
-        return
+    # legacy desactivado / reemplazado por CSV oficial
+    return
 
 def _lxv_export_round_snapshot(round_id: int, ts_round: float, closed: dict, expected: list[str], stale_ignored: list[str], released_reason: str) -> None:
     global _LXV_MATRIX_LAST_LOG_TS
@@ -3047,15 +3054,31 @@ def _lxv_export_round_snapshot(round_id: int, ts_round: float, closed: dict, exp
         feat_row["avg_score_verdes"] = ""
         feat_row["avg_score_rojos"] = ""
     round_row["bot_x_fuerte"] = feat_row.get("bot_x_fuerte", "")
+    bot_obj = str(feat_row.get("bot_x_fuerte", "") or round_row.get("bot_x1", "") or "")
+    row_obj = next((r for r in rows_long if str(r.get("bot", "")) == bot_obj), {}) if bot_obj else {}
+    followup_row = {
+        "origin_round": int(round_id),
+        "bot_objetivo": bot_obj,
+        "resultado_origen": str(row_obj.get("resultado_symbol", "") or ""),
+        "ciclo_origen": row_obj.get("ciclo", ""),
+        "origin_marti_ciclo": marti_snapshot.get("ciclo_actual", ""),
+        "origin_marti_monto": marti_snapshot.get("monto_actual", ""),
+        "followup_c1": "",
+        "followup_c2": "",
+        "followup_c3": "",
+        "followup_c4": "",
+        "followup_c5": "",
+        "outcome_final": "",
+    }
     paths = _lxv_matrix_paths()
     wrote_matrix = _lxv_append_rows_csv(paths["matrix"], [round_row], _LXV_MATRIX_HEADERS["matrix"], ["round_id"])
     _lxv_append_rows_csv(paths["long"], rows_long, _LXV_MATRIX_HEADERS["long"], ["round_id", "bot"])
-    _lxv_append_rows_csv(paths["features"], [feat_row], _LXV_MATRIX_HEADERS["features"], ["round_id"])
+    _lxv_append_rows_csv(paths["followup"], [followup_row], _LXV_MATRIX_HEADERS["followup"], ["origin_round", "bot_objetivo"])
     _lxv_export_excel_optional(paths)
     now_ts = time.time()
     if wrote_matrix > 0 and (now_ts - float(_LXV_MATRIX_LAST_LOG_TS or 0.0)) >= float(LXV_MATRIX_EXPORT_LOG_EVERY_S):
         _LXV_MATRIX_LAST_LOG_TS = now_ts
-        agregar_evento(f"📊 Export ronda LXV #{int(round_id)} -> matriz/long/features OK ({data_quality}; reason={released_reason}).")
+        agregar_evento(f"📊 Export ronda LXV #{int(round_id)} -> columnas/celdas/followup OK ({data_quality}; reason={released_reason}).")
 
 def _sync_round_ack_path(bot: str) -> str:
     _ensure_dir(SYNC_ROUND_DIR)
@@ -14743,21 +14766,56 @@ def mostrar_panel_lateral_compacto():
 
 
 def mostrar_bloque_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--", padding=""):
+    def _render_hud_balance_header(saldo_v, meta_v, falta_v, avance_v, modo_v, token_v, refresh_v):
+        saldo_tag = f"SALDO={saldo_v}"
+        meta_tag = f"META={meta_v}"
+        l1_plain = f"💰 {saldo_tag:<22} 🎯 {meta_tag:<22}"
+        l2_plain = f"MODO={modo_v} | TOKEN={token_v} | FALTA={falta_v} | AVANCE={avance_v} | R={refresh_v}"
+        w = max(76, len(_ack_tape_strip_ansi(l1_plain)), len(_ack_tape_strip_ansi(l2_plain)))
+        try:
+            s_col = Fore.LIGHTGREEN_EX + Style.BRIGHT + saldo_tag + Style.RESET_ALL
+            m_col = Fore.LIGHTMAGENTA_EX + Style.BRIGHT + meta_tag + Style.RESET_ALL
+            l1_col = f"💰 {s_col:<22} 🎯 {m_col:<22}"
+            l2_col = (
+                Fore.CYAN + f"MODO={modo_v} | TOKEN={token_v} | " + Fore.WHITE
+                + f"FALTA={falta_v} | AVANCE={avance_v} | R={refresh_v}" + Fore.RESET
+            )
+        except Exception:
+            l1_col = l1_plain
+            l2_col = l2_plain
+        print(padding + Fore.CYAN + "╔" + "═" * (w + 2) + "╗")
+        print(padding + Fore.CYAN + f"║ {_ack_tape_pad_visible(l1_col, w)} ║")
+        print(padding + Fore.CYAN + f"║ {_ack_tape_pad_visible(l2_col, w)} ║")
+        print(padding + Fore.CYAN + "╚" + "═" * (w + 2) + "╝")
+
     try:
-        lines = _resumen_saldo_meta_hud(valor_saldo=valor_saldo, saldo_str=saldo_str, meta_str=meta_str)
-        src1 = str(lines[0] if len(lines) > 0 else "")
-        src2 = str(lines[1] if len(lines) > 1 else "")
-        l1 = _ack_tape_strip_ansi(
-            src1.replace("🧭 ", "💰 ").replace("Modo=", "MODO=").replace("Token=", "TOKEN=").replace("Saldo=", "SALDO=").replace("Meta=", "META=").replace("Falta=", "FALTA=").replace("Avance=", "AVANCE=")
+        owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+        token_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
+        modo_txt = "PAUSA" if maestro_en_pausa() else "ACTIVO"
+        eta_txt = f"{float(globals().get('INTERVALO_ACTUAL', 2.0) or 2.0):.1f}s"
+        saldo_num = float(valor_saldo) if isinstance(valor_saldo, (int, float)) else None
+        meta_num = float(META) if isinstance(globals().get("META"), (int, float)) else None
+        base_num = float(SALDO_INICIAL) if isinstance(globals().get("SALDO_INICIAL"), (int, float)) else None
+        falta_txt = f"{max(0.0, meta_num - saldo_num):.2f}" if (saldo_num is not None and meta_num is not None) else "--"
+        avance_txt = "--"
+        if (saldo_num is not None) and (meta_num is not None) and (base_num is not None):
+            den = float(meta_num - base_num)
+            if abs(den) > 1e-12:
+                avance_txt = f"{max(0.0, min(100.0, ((saldo_num - base_num) / den) * 100.0)):.1f}%"
+        _render_hud_balance_header(
+            saldo_v=str(saldo_str), meta_v=str(meta_str), falta_v=falta_txt, avance_v=avance_txt,
+            modo_v=modo_txt, token_v=token_txt, refresh_v=eta_txt
         )
+        # Línea secundaria: Base/Objetivo/Estado/Marti/Cobertura (mantiene trazabilidad existente)
+        lines = _resumen_saldo_meta_hud(valor_saldo=valor_saldo, saldo_str=saldo_str, meta_str=meta_str)
+        src2 = str(lines[1] if len(lines) > 1 else "")
         l2 = _ack_tape_strip_ansi(
             src2.replace("🎯 ", "📈 ").replace("Base=", "BASE=").replace("Estado=", "ESTADO=").replace("Marti C1-C5=", "MARTI C1-C5=").replace("Cobertura=", "COBERTURA=")
         )
-        w = max(76, len(l1), len(l2))
-        print(padding + Fore.CYAN + "╔" + "═" * (w + 2) + "╗")
-        print(padding + Fore.CYAN + f"║ {l1:<{w}} ║")
-        print(padding + Fore.CYAN + f"║ {l2:<{w}} ║")
-        print(padding + Fore.CYAN + "╚" + "═" * (w + 2) + "╝")
+        w2 = max(76, len(l2))
+        print(padding + Fore.BLUE + f"╭{'─' * (w2 + 2)}╮")
+        print(padding + Fore.BLUE + f"│ {l2:<{w2}} │")
+        print(padding + Fore.BLUE + f"╰{'─' * (w2 + 2)}╯")
     except Exception:
         print(padding + Fore.CYAN + "💰 Saldo/Meta: --")
 
