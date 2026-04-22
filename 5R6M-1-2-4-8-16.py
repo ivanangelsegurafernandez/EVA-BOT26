@@ -60,6 +60,12 @@ warnings.filterwarnings(
     "ignore",
     message="X does not have valid feature names, but StandardScaler was fitted with feature names"
 )
+warnings.filterwarnings("ignore", message="Columns .* have mixed types.*")
+try:
+    from pandas.errors import DtypeWarning
+    warnings.filterwarnings("ignore", category=DtypeWarning)
+except Exception:
+    pass
 
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
@@ -235,9 +241,10 @@ HUD_EVENTS_MAX = 3
 HUD_SHOW_IA_LONG_TEXT = False
 HUD_MERGE_SIDE_PANELS = True
 HUD_ROUND_LIVE_COMPACT = True
-HUD_LIVE_ACK_COL_WIDTH = 44
+HUD_LIVE_ACK_COL_WIDTH = 84
 HUD_TABLE_COMPACT_WIDTH = True
 HUD_SIDE_PANEL_INLINE = True
+HUD_SHOW_SALDO_DEBUG = False
 HUD_EVENT_MAX_CHARS = 150
 
 # --- Objetivos / umbrales globales de IA ---
@@ -2550,13 +2557,15 @@ def _update_saldo_monitor_feed(valor_saldo: float):
             _append_line_safe(p, json.dumps(payload_hist, ensure_ascii=False) + "\n")
         for p in dict.fromkeys(_saldo_feed_targets()["series"]):
             _append_series_csv_if_new(p, ts_iso, val, "MAESTRO_5R6M")
-        print(f"[SALDO LIVE] destino: {SALDO_LIVE_SHARED_PATH}")
-        print(f"[SALDO HIST] destino: {SALDO_LIVE_HISTORY_SHARED_PATH}")
-        print(f"[SALDO CSV] destino: {SALDO_SERIES_CSV_PATH}")
-        print(f"[SALDO FEED][OK] saldo={val:.2f} ts={ts_iso}")
+        if bool(globals().get("HUD_SHOW_SALDO_DEBUG", False)):
+            print(f"[SALDO LIVE] destino: {SALDO_LIVE_SHARED_PATH}")
+            print(f"[SALDO HIST] destino: {SALDO_LIVE_HISTORY_SHARED_PATH}")
+            print(f"[SALDO CSV] destino: {SALDO_SERIES_CSV_PATH}")
+            print(f"[SALDO FEED][OK] saldo={val:.2f} ts={ts_iso}")
         return True
     except Exception as e:
-        print(f"[SALDO FEED][ERROR] {e}")
+        if bool(globals().get("HUD_SHOW_SALDO_DEBUG", False)):
+            print(f"[SALDO FEED][ERROR] {e}")
         return False
 # === /SALDO LIVE FEED ===
 
@@ -2576,7 +2585,7 @@ ACK_LIVE_MAX_AGE_STALE_S = 120.0
 ACK_LIVE_SHOW_MISSING = True
 ACK_LIVE_COMPACT = True
 ACK_TAPE_ENABLE = True
-ACK_TAPE_WIDTH = 40
+ACK_TAPE_WIDTH = 80
 ACK_TAPE_MAX_SEEN = 2000
 ACK_TAPE_USE_COLOR = True
 ACK_TAPE_FILL_CHAR = "·"
@@ -3228,7 +3237,7 @@ def _ack_tape_init():
             return
         if not isinstance(globals().get("ACK_LIVE_TAPE"), dict):
             globals()["ACK_LIVE_TAPE"] = {}
-        width = int(globals().get("ACK_TAPE_WIDTH", 40) or 40)
+        width = int(globals().get("ACK_TAPE_WIDTH", 80) or 80)
         for bot in BOT_NAMES:
             if bot not in ACK_LIVE_TAPE or not isinstance(ACK_LIVE_TAPE.get(bot), deque):
                 ACK_LIVE_TAPE[bot] = deque(maxlen=width)
@@ -3314,7 +3323,7 @@ def _ack_tape_update_from_ack_live():
                 if _ack_tape_seen_contains(key):
                     continue
                 if bot not in ACK_LIVE_TAPE or not isinstance(ACK_LIVE_TAPE.get(bot), deque):
-                    ACK_LIVE_TAPE[bot] = deque(maxlen=int(globals().get("ACK_TAPE_WIDTH", 40) or 40))
+                    ACK_LIVE_TAPE[bot] = deque(maxlen=int(globals().get("ACK_TAPE_WIDTH", 80) or 80))
                 ACK_LIVE_TAPE[bot].append(symbol)
                 _ack_tape_seen_add(key)
             except Exception:
@@ -3366,11 +3375,11 @@ def _ack_tape_pad_visible(text, width):
 def _ack_tape_render_bot(bot, fallback_resultados=None, width=None):
     _ack_tape_init()
     try:
-        w = int(width if width is not None else globals().get("ACK_TAPE_WIDTH", 40))
+        w = int(width if width is not None else globals().get("ACK_TAPE_WIDTH", 80))
     except Exception:
-        w = 40
+        w = 80
     if w <= 0:
-        w = 40
+        w = 80
     fill_char = str(globals().get("ACK_TAPE_FILL_CHAR", "·") or "·")
     tape = list(ACK_LIVE_TAPE.get(bot, []) or [])
     symbols = []
@@ -14282,6 +14291,66 @@ def _fmt_prob_pct(p):
         return "--"
 
 
+def _resumen_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
+    lines = []
+    try:
+        owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+        owner_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
+        modo_txt = "PAUSA" if maestro_en_pausa() else "ACTIVO"
+        eta_txt = f"{float(globals().get('INTERVALO_ACTUAL', 2.0) or 2.0):.1f}s"
+        saldo_num = float(valor_saldo) if isinstance(valor_saldo, (int, float)) else None
+        meta_num = float(META) if isinstance(globals().get("META"), (int, float)) else None
+        base_num = float(SALDO_INICIAL) if isinstance(globals().get("SALDO_INICIAL"), (int, float)) else None
+        falta_txt = "--"
+        avance_txt = "--"
+        if (saldo_num is not None) and (meta_num is not None):
+            falta_txt = f"{max(0.0, meta_num - saldo_num):.2f}"
+        if (saldo_num is not None) and (meta_num is not None) and (base_num is not None):
+            den = float(meta_num - base_num)
+            if abs(den) > 1e-12:
+                avance = ((saldo_num - base_num) / den) * 100.0
+                avance_txt = f"{max(0.0, min(100.0, avance)):.1f}%"
+        lines.append(
+            f"🧭 Modo={modo_txt} | Token={owner_txt} | Saldo={saldo_str} | Meta={meta_str} | Falta={falta_txt} | Avance={avance_txt} | Refresh={eta_txt}"
+        )
+
+        marti_total = float(sum(list(MARTI_ESCALADO or []))) if "MARTI_ESCALADO" in globals() else 0.0
+        cobertura = "NO"
+        estado = "RIESGO"
+        if saldo_num is not None:
+            if meta_num is not None and saldo_num >= meta_num:
+                estado = "OK"
+            elif saldo_num >= marti_total:
+                estado = "AVISO"
+            else:
+                estado = "RIESGO"
+            cobertura = "SI" if saldo_num >= marti_total else "NO"
+        objetivo_txt = "+20.0%"
+        try:
+            if (base_num is not None) and (meta_num is not None) and base_num > 0:
+                objetivo_txt = f"+{((meta_num / base_num) - 1.0)*100.0:.1f}%"
+        except Exception:
+            pass
+        base_txt = f"{base_num:.2f}" if base_num is not None else "--"
+        est_txt = estado
+        try:
+            if estado == "OK":
+                est_txt = f"{Fore.GREEN}OK{Style.RESET_ALL}"
+            elif estado == "AVISO":
+                est_txt = f"{Fore.YELLOW}AVISO{Style.RESET_ALL}"
+            else:
+                est_txt = f"{Fore.RED}RIESGO{Style.RESET_ALL}"
+        except Exception:
+            est_txt = estado
+        lines.append(
+            f"🎯 Base={base_txt} | Objetivo={objetivo_txt} | Estado={est_txt} | Marti C1-C5={marti_total:.2f} | Cobertura={cobertura}"
+        )
+    except Exception:
+        lines.append("🧭 Modo=-- | Token=-- | Saldo=-- | Meta=-- | Falta=-- | Avance=-- | Refresh=--")
+        lines.append("🎯 Base=-- | Objetivo=-- | Estado=-- | Marti C1-C5=-- | Cobertura=--")
+    return lines[:2]
+
+
 def _resumen_top_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
     lines = []
     try:
@@ -14289,10 +14358,19 @@ def _resumen_top_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
         owner_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
         modo_txt = "PAUSA" if maestro_en_pausa() else "ACTIVO"
         eta_txt = f"{float(globals().get('INTERVALO_ACTUAL', 2.0) or 2.0):.1f}s"
-        line1 = f"🧭 Modo={modo_txt} | Token={owner_txt} | Saldo={saldo_str} | Meta={meta_str} | Refresh={eta_txt}"
+        saldo_num = float(valor_saldo) if isinstance(valor_saldo, (int, float)) else None
+        meta_num = float(META) if isinstance(globals().get("META"), (int, float)) else None
+        base_num = float(SALDO_INICIAL) if isinstance(globals().get("SALDO_INICIAL"), (int, float)) else None
+        falta_txt = f"{max(0.0, meta_num - saldo_num):.2f}" if (saldo_num is not None and meta_num is not None) else "--"
+        avance_txt = "--"
+        if (saldo_num is not None) and (meta_num is not None) and (base_num is not None):
+            den = float(meta_num - base_num)
+            if abs(den) > 1e-12:
+                avance_txt = f"{max(0.0, min(100.0, ((saldo_num - base_num) / den) * 100.0)):.1f}%"
+        line1 = f"🧭 Modo={modo_txt} | Token={owner_txt} | Saldo={saldo_str} | Meta={meta_str} | Falta={falta_txt} | Avance={avance_txt} | Refresh={eta_txt}"
         lines.append(line1)
     except Exception:
-        lines.append("🧭 Modo=-- | Token=-- | Saldo=-- | Meta=-- | Refresh=--")
+        lines.append("🧭 Modo=-- | Token=-- | Saldo=-- | Meta=-- | Falta=-- | Avance=-- | Refresh=--")
 
     try:
         umbral_real = float(get_umbral_real_calibrado())
@@ -14470,7 +14548,10 @@ def mostrar_panel():
     # Resumen top compacto (modo normal)
     if bool(globals().get("HUD_MINIMAL_MODE", True)):
         try:
-            for _line in _resumen_top_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str):
+            for _line in _resumen_saldo_meta_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str):
+                print(padding + Fore.CYAN + _line)
+            top_lines = list(_resumen_top_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str) or [])
+            for _line in top_lines[1:]:
                 print(padding + Fore.CYAN + _line)
         except Exception:
             pass
@@ -14905,14 +14986,14 @@ def mostrar_panel():
     # TABLA PRINCIPAL DE BOTS
     # ==========================
 
-    BOT_W = 6
-    LIVE_W = int(globals().get("HUD_LIVE_ACK_COL_WIDTH", 44))
+    BOT_W = 7
+    LIVE_W = int(globals().get("HUD_LIVE_ACK_COL_WIDTH", 84))
     TOKEN_W = 6
     G_W = 3
     P_W = 3
     EXITO_W = 6
-    PROB_W = 7
-    MODO_W = 8
+    PROB_W = 9
+    MODO_W = 10
     top_line = (
         "┌" + "─" * (BOT_W + 2) + "┬" + "─" * (LIVE_W + 2) + "┬" + "─" * (TOKEN_W + 2)
         + "┬" + "─" * (G_W + 2) + "┬" + "─" * (P_W + 2) + "┬" + "─" * (EXITO_W + 2)
@@ -14920,13 +15001,13 @@ def mostrar_panel():
     )
     mid_line = top_line.replace("┌", "├").replace("┐", "┤").replace("─", "─")
     total_inner = len(_ack_tape_strip_ansi(top_line)) - 2
-    bot_title_line = f"│ {'⚡ BOTS · LIVE ACK 40 · RENDIMIENTO':<{total_inner}}│"
+    bot_title_line = f"│ {'⚡ BOTS · LIVE ACK 80 · RENDIMIENTO':<{total_inner}}│"
     print(padding + Fore.CYAN + top_line)
     print(padding + Fore.CYAN + Style.BRIGHT + bot_title_line + Style.RESET_ALL)
     print(padding + Fore.CYAN + mid_line)
     print(
         padding + Fore.CYAN
-        + f"│ {'BOT':<{BOT_W}} │ {'LIVE ACK 40':<{LIVE_W}} │ {'Token':<{TOKEN_W}} │ {'G':>{G_W}} │ {'P':>{P_W}} │ {'%':<{EXITO_W}} │ {'ProbIA':<{PROB_W}} │ {'Modo':<{MODO_W}} │"
+        + f"│ {'BOT':<{BOT_W}} │ {'LIVE ACK 80':<{LIVE_W}} │ {'Token':<{TOKEN_W}} │ {'G':>{G_W}} │ {'P':>{P_W}} │ {'%':<{EXITO_W}} │ {'ProbIA':<{PROB_W}} │ {'Modo':<{MODO_W}} │"
     )
     print(padding + Fore.CYAN + mid_line)
 
@@ -14956,11 +15037,11 @@ def mostrar_panel():
         col_resultados = _ack_tape_render_bot(
             bot,
             fallback_resultados=fallback,
-            width=int(globals().get("ACK_TAPE_WIDTH", 40)),
+            width=int(globals().get("ACK_TAPE_WIDTH", 80)),
         )
         col_resultados = _ack_tape_pad_visible(
             col_resultados,
-            int(globals().get("HUD_LIVE_ACK_COL_WIDTH", 44))
+            int(globals().get("HUD_LIVE_ACK_COL_WIDTH", 84))
         )
 
         # Ganancias / Pérdidas / % éxito
