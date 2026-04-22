@@ -60,6 +60,12 @@ warnings.filterwarnings(
     "ignore",
     message="X does not have valid feature names, but StandardScaler was fitted with feature names"
 )
+warnings.filterwarnings("ignore", message="Columns .* have mixed types.*")
+try:
+    from pandas.errors import DtypeWarning
+    warnings.filterwarnings("ignore", category=DtypeWarning)
+except Exception:
+    pass
 
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
@@ -227,7 +233,18 @@ HUD_VISIBLE = True       # Para ocultarlo con tecla
 HUD_COMPACT_MODE = True
 HUD_SHOW_TOP3_GATES = False
 HUD_SHOW_RACHA_BLOQUES = False
-HUD_EVENTS_MAX = 4
+HUD_MINIMAL_MODE = True
+HUD_SHOW_DEBUG_BLOCKS = False
+HUD_SHOW_VERBOSE_TOP = False
+HUD_SHOW_VERBOSE_EVENTS = False
+HUD_EVENTS_MAX = 3
+HUD_SHOW_IA_LONG_TEXT = False
+HUD_MERGE_SIDE_PANELS = True
+HUD_ROUND_LIVE_COMPACT = True
+HUD_LIVE_ACK_COL_WIDTH = 84
+HUD_TABLE_COMPACT_WIDTH = True
+HUD_SIDE_PANEL_INLINE = True
+HUD_SHOW_SALDO_DEBUG = False
 HUD_EVENT_MAX_CHARS = 150
 
 # --- Objetivos / umbrales globales de IA ---
@@ -2540,13 +2557,15 @@ def _update_saldo_monitor_feed(valor_saldo: float):
             _append_line_safe(p, json.dumps(payload_hist, ensure_ascii=False) + "\n")
         for p in dict.fromkeys(_saldo_feed_targets()["series"]):
             _append_series_csv_if_new(p, ts_iso, val, "MAESTRO_5R6M")
-        print(f"[SALDO LIVE] destino: {SALDO_LIVE_SHARED_PATH}")
-        print(f"[SALDO HIST] destino: {SALDO_LIVE_HISTORY_SHARED_PATH}")
-        print(f"[SALDO CSV] destino: {SALDO_SERIES_CSV_PATH}")
-        print(f"[SALDO FEED][OK] saldo={val:.2f} ts={ts_iso}")
+        if bool(globals().get("HUD_SHOW_SALDO_DEBUG", False)):
+            print(f"[SALDO LIVE] destino: {SALDO_LIVE_SHARED_PATH}")
+            print(f"[SALDO HIST] destino: {SALDO_LIVE_HISTORY_SHARED_PATH}")
+            print(f"[SALDO CSV] destino: {SALDO_SERIES_CSV_PATH}")
+            print(f"[SALDO FEED][OK] saldo={val:.2f} ts={ts_iso}")
         return True
     except Exception as e:
-        print(f"[SALDO FEED][ERROR] {e}")
+        if bool(globals().get("HUD_SHOW_SALDO_DEBUG", False)):
+            print(f"[SALDO FEED][ERROR] {e}")
         return False
 # === /SALDO LIVE FEED ===
 
@@ -2565,12 +2584,31 @@ ACK_LIVE_MAX_AGE_WARN_S = 10.0
 ACK_LIVE_MAX_AGE_STALE_S = 120.0
 ACK_LIVE_SHOW_MISSING = True
 ACK_LIVE_COMPACT = True
+HUD_MARTINGALA_LIVE_ENABLE = True
+HUD_MARTINGALA_ALERT_ON_LOSS = True
+HUD_MARTINGALA_SHOW_NEXT = True
+HUD_MARTINGALA_SHOW_AMOUNT = True
+HUD_MARTINGALA_ALERT_TTL_S = 90.0
+ACK_TAPE_ENABLE = True
+ACK_TAPE_WIDTH = 80
+ACK_TAPE_MAX_SEEN = 2000
+ACK_TAPE_USE_COLOR = True
+ACK_TAPE_FILL_CHAR = "·"
+ACK_LIVE_TAPE = {}
+ACK_LIVE_TAPE_SEEN = deque(maxlen=2000)
 _SYNC_ROUND_LAST_ANNOUNCED = None
 _SYNC_ROUND_LAST_CLOSED_COUNT = {}
 _LXV_LAST_EMITTED_ROUND = 0
 _SYNC_PENDING_WARN_TS = {}
 _SYNC_STALE_WARN_TS = {}
 _LXV_5V1X_EVENT_TS = {}
+_LXV_HEADER_WARN_TS = {}
+_LXV_HEADER_WARN_COOLDOWN_S = 180.0
+MATRIZ_COLUMNAS_LXV_CSV = "matriz_columnas_lxv.csv"
+MATRIZ_CELDAS_LXV_CSV = "matriz_celdas_lxv.csv"
+MATRIZ_FOLLOWUP_5V1X_CSV = "matriz_followup_5v1x.csv"
+LEGACY_MATRIX_EXPORT_ENABLE = False
+OFFICIAL_MATRIX_EXPORT_ENABLE = True
 LXV_MATRIX_EXPORT_ENABLE = True
 LXV_MATRIX_DIR = script_dir
 LXV_MATRIX_EXPORT_LOCK = "lxv_matrix_export.lock"
@@ -2585,6 +2623,8 @@ _LXV_MATRIX_HEADERS = {
         "patron_lxv", "bot_x1", "bot_x2", "bot_x_fuerte",
         "round_complete", "missing_bots", "data_quality",
         "source",
+        "marti_bot", "marti_ciclo_actual", "marti_monto_actual", "marti_ultimo_resultado",
+        "marti_ciclo_siguiente", "marti_monto_siguiente", "marti_estado", "marti_fuente",
     ],
     "long": [
         "round_id", "ts_round", "bot", "bot_order",
@@ -2594,6 +2634,7 @@ _LXV_MATRIX_HEADERS = {
         "token", "prob_ia", "modo_ia", "ia_gate_real",
         "trade_status", "epoch", "ts_trade",
         "ia_decision_id", "puntaje_estrategia",
+        "marti_ciclo_bot", "marti_monto_bot",
         "round_complete", "missing_bots", "data_quality",
     ],
     "features": [
@@ -2606,16 +2647,29 @@ _LXV_MATRIX_HEADERS = {
         "avg_prob_verdes", "avg_prob_rojos", "max_prob_rojos", "min_prob_rojos", "std_prob_columna",
         "avg_score_verdes", "avg_score_rojos",
         "patron_lxv", "patron_simple", "patron_hash",
+        "origin_marti_ciclo", "origin_marti_monto",
         "round_complete", "missing_bots", "data_quality",
+    ],
+    "followup": [
+        "origin_round", "bot_objetivo", "resultado_origen", "ciclo_origen",
+        "origin_marti_ciclo", "origin_marti_monto",
+        "followup_c1", "followup_c2", "followup_c3", "followup_c4", "followup_c5",
+        "outcome_final",
     ],
 }
 
 def _lxv_matrix_paths() -> dict:
     base = os.path.abspath(os.path.expanduser(LXV_MATRIX_DIR or script_dir))
     return {
-        "matrix": os.path.join(base, "matriz_lxv.csv"),
-        "long": os.path.join(base, "rondas_lxv_long.csv"),
+        # CSV oficial: una fila por columna cerrada
+        "matrix": os.path.join(base, MATRIZ_COLUMNAS_LXV_CSV),
+        # CSV oficial: una fila por bot por columna
+        "long": os.path.join(base, MATRIZ_CELDAS_LXV_CSV),
+        # CSV oficial: seguimiento 5V1X
+        "followup": os.path.join(base, MATRIZ_FOLLOWUP_5V1X_CSV),
+        # legacy desactivado / reemplazado por CSV oficial
         "features": os.path.join(base, "features_columnas_lxv.csv"),
+        # legacy desactivado / reemplazado por CSV oficial
         "xlsx": os.path.join(base, "matriz_lxv.xlsx"),
     }
 
@@ -2650,6 +2704,16 @@ def _lxv_safe_int(v, default=None):
 
 def _lxv_csv_read_rows(path: str, max_lines: int = 1800) -> list[dict]:
     return _tail_rows_dict(path, max_lines=max_lines)
+
+def _lxv_read_existing_header(path: str) -> list[str]:
+    try:
+        if (not os.path.exists(path)) or os.path.getsize(path) <= 0:
+            return []
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            row = next(csv.reader(f), [])
+        return [str(x).strip() for x in list(row or []) if str(x).strip()]
+    except Exception:
+        return []
 
 def _lxv_get_last_closed_row_for_bot(bot: str, ack_close: dict, round_id: int) -> dict | None:
     ruta = f"registro_enriquecido_{bot}.csv"
@@ -2714,10 +2778,23 @@ def _lxv_round_already_exported(round_id: int, bot: str | None = None) -> bool:
     return False
 
 def _lxv_append_rows_csv(path: str, rows: list[dict], headers: list[str], unique_keys: list[str]) -> int:
+    global _LXV_HEADER_WARN_TS
     if not rows:
         return 0
     _ensure_dir(os.path.dirname(path) or ".")
     wrote = 0
+    active_headers = list(headers or [])
+    existing_header = _lxv_read_existing_header(path)
+    if existing_header:
+        active_headers = list(existing_header)
+        missing = [h for h in list(headers or []) if h not in set(existing_header)]
+        missing_marti = [h for h in missing if h.startswith("marti_") or h.startswith("origin_marti_")]
+        if missing_marti:
+            now = time.time()
+            ts_last = float(_LXV_HEADER_WARN_TS.get(path, 0.0) or 0.0)
+            if (now - ts_last) >= float(_LXV_HEADER_WARN_COOLDOWN_S):
+                _LXV_HEADER_WARN_TS[path] = now
+                agregar_evento(f"⚠ header antiguo detectado en {os.path.basename(path)}; columnas nuevas se omiten hasta archivo nuevo")
     with file_lock_required(LXV_MATRIX_EXPORT_LOCK, timeout=3.0, stale_after=30.0) as got:
         if not got:
             return 0
@@ -2729,14 +2806,14 @@ def _lxv_append_rows_csv(path: str, rows: list[dict], headers: list[str], unique
                 existing.add(k)
         need_header = (not os.path.exists(path)) or os.path.getsize(path) <= 0
         with open(path, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
+            w = csv.DictWriter(f, fieldnames=active_headers, extrasaction="ignore")
             if need_header:
                 w.writeheader()
             for row in rows:
                 k = tuple(str(row.get(c, "")).strip() for c in unique_keys)
                 if k in existing:
                     continue
-                payload = {h: row.get(h, "") for h in headers}
+                payload = {h: row.get(h, "") for h in active_headers}
                 w.writerow(payload)
                 existing.add(k)
                 wrote += 1
@@ -2744,7 +2821,7 @@ def _lxv_append_rows_csv(path: str, rows: list[dict], headers: list[str], unique
             os.fsync(f.fileno())
     return wrote
 
-def _lxv_build_round_row(round_id: int, ts_round: float, rows_long: list[dict], missing_bots: list[str], round_complete: bool, data_quality: str) -> dict:
+def _lxv_build_round_row(round_id: int, ts_round: float, rows_long: list[dict], missing_bots: list[str], round_complete: bool, data_quality: str, marti_snapshot: dict | None = None) -> dict:
     by_bot = {str(r.get("bot")): r for r in rows_long}
     symbols = []
     n_verdes = n_rojos = n_indef = n_vacios = 0
@@ -2771,6 +2848,7 @@ def _lxv_build_round_row(round_id: int, ts_round: float, rows_long: list[dict], 
         patron = "4V2X"
     else:
         patron = "OTHER"
+    marti = dict(marti_snapshot or {})
     row = {
         "round_id": int(round_id),
         "ts_round": float(ts_round),
@@ -2788,6 +2866,14 @@ def _lxv_build_round_row(round_id: int, ts_round: float, rows_long: list[dict], 
         "missing_bots": "|".join([b for b in BOT_NAMES if b in set(missing_bots or [])]),
         "data_quality": str(data_quality),
         "source": "sync_round",
+        "marti_bot": str(marti.get("bot", "") or ""),
+        "marti_ciclo_actual": marti.get("ciclo_actual", ""),
+        "marti_monto_actual": marti.get("monto_actual", ""),
+        "marti_ultimo_resultado": str(marti.get("ultimo_resultado", "") or ""),
+        "marti_ciclo_siguiente": marti.get("ciclo_siguiente", ""),
+        "marti_monto_siguiente": marti.get("monto_siguiente", ""),
+        "marti_estado": str(marti.get("estado", "") or ""),
+        "marti_fuente": str(marti.get("fuente", "") or ""),
     }
     for idx, b in enumerate(BOT_NAMES):
         row[b] = symbols[idx]
@@ -2814,7 +2900,7 @@ def _lxv_pick_bot_x_fuerte(rojos_rows: list[dict]) -> str:
     ranked = sorted(rojos_rows, key=rank, reverse=True)
     return str(ranked[0].get("bot", "")) if ranked else ""
 
-def _lxv_build_features_row(round_row: dict, rows_long: list[dict]) -> dict:
+def _lxv_build_features_row(round_row: dict, rows_long: list[dict], marti_snapshot: dict | None = None) -> dict:
     vals_prob = []
     verdes_prob = []
     rojos_prob = []
@@ -2848,6 +2934,7 @@ def _lxv_build_features_row(round_row: dict, rows_long: list[dict]) -> dict:
                 rojos_score.append(s)
     bot_x_fuerte = _lxv_pick_bot_x_fuerte(rojos_rows)
     patron_simple = "".join(secuencia)
+    marti = dict(marti_snapshot or {})
     out = {
         "round_id": round_row.get("round_id"),
         "ts_round": round_row.get("ts_round"),
@@ -2874,6 +2961,8 @@ def _lxv_build_features_row(round_row: dict, rows_long: list[dict]) -> dict:
         "patron_lxv": round_row.get("patron_lxv", "OTHER"),
         "patron_simple": patron_simple,
         "patron_hash": hashlib.md5(patron_simple.encode("utf-8")).hexdigest()[:16],
+        "origin_marti_ciclo": marti.get("ciclo_actual", ""),
+        "origin_marti_monto": marti.get("monto_actual", ""),
         "round_complete": round_row.get("round_complete", False),
         "missing_bots": round_row.get("missing_bots", ""),
         "data_quality": round_row.get("data_quality", "partial"),
@@ -2881,18 +2970,8 @@ def _lxv_build_features_row(round_row: dict, rows_long: list[dict]) -> dict:
     return out
 
 def _lxv_export_excel_optional(paths: dict) -> None:
-    try:
-        if importlib.util.find_spec("openpyxl") is None:
-            return
-        matrix_rows = _lxv_csv_read_rows(paths["matrix"], max_lines=50000) if os.path.exists(paths["matrix"]) else []
-        long_rows = _lxv_csv_read_rows(paths["long"], max_lines=120000) if os.path.exists(paths["long"]) else []
-        feat_rows = _lxv_csv_read_rows(paths["features"], max_lines=50000) if os.path.exists(paths["features"]) else []
-        with pd.ExcelWriter(paths["xlsx"], engine="openpyxl", mode="w") as writer:
-            pd.DataFrame(matrix_rows).to_excel(writer, sheet_name="Matriz", index=False)
-            pd.DataFrame(long_rows).to_excel(writer, sheet_name="Long", index=False)
-            pd.DataFrame(feat_rows).to_excel(writer, sheet_name="Features", index=False)
-    except Exception:
-        return
+    # legacy desactivado / reemplazado por CSV oficial
+    return
 
 def _lxv_export_round_snapshot(round_id: int, ts_round: float, closed: dict, expected: list[str], stale_ignored: list[str], released_reason: str) -> None:
     global _LXV_MATRIX_LAST_LOG_TS
@@ -2906,6 +2985,7 @@ def _lxv_export_round_snapshot(round_id: int, ts_round: float, closed: dict, exp
     missing = [b for b in expected if b not in closed]
     round_complete = len(missing) == 0
     data_quality = "ok" if round_complete else "partial"
+    marti_snapshot = _marti_hud_snapshot() if "_marti_hud_snapshot" in globals() else {}
     rows_long = []
     for idx, bot in enumerate(BOT_NAMES, start=1):
         ack = closed.get(bot, {}) if isinstance(closed.get(bot, {}), dict) else {}
@@ -2940,6 +3020,8 @@ def _lxv_export_round_snapshot(round_id: int, ts_round: float, closed: dict, exp
             "ts_trade": (csv_row or {}).get("ts", (ack or {}).get("ts", "")),
             "ia_decision_id": (csv_row or {}).get("ia_decision_id", estado_bots.get(bot, {}).get("ia_decision_id", "")),
             "puntaje_estrategia": (csv_row or {}).get("puntaje_estrategia", ""),
+            "marti_ciclo_bot": marti_snapshot.get("ciclo_actual", ""),
+            "marti_monto_bot": marti_snapshot.get("monto_actual", ""),
             "round_complete": bool(round_complete),
             "missing_bots": "|".join(missing),
             "data_quality": data_quality,
@@ -2957,11 +3039,12 @@ def _lxv_export_round_snapshot(round_id: int, ts_round: float, closed: dict, exp
                 "payout_total": "", "payout_multiplier": "", "token": "",
                 "prob_ia": "", "modo_ia": "", "ia_gate_real": "", "trade_status": "",
                 "epoch": "", "ts_trade": "", "ia_decision_id": "", "puntaje_estrategia": "",
+                "marti_ciclo_bot": marti_snapshot.get("ciclo_actual", ""), "marti_monto_bot": marti_snapshot.get("monto_actual", ""),
                 "round_complete": bool(round_complete), "missing_bots": "|".join(missing), "data_quality": data_quality,
             })
     rows_long = sorted(rows_long, key=lambda r: int(r.get("bot_order", 999)))
-    round_row = _lxv_build_round_row(round_id, ts_round, rows_long, missing, round_complete, data_quality)
-    feat_row = _lxv_build_features_row(round_row, rows_long)
+    round_row = _lxv_build_round_row(round_id, ts_round, rows_long, missing, round_complete, data_quality, marti_snapshot=marti_snapshot)
+    feat_row = _lxv_build_features_row(round_row, rows_long, marti_snapshot=marti_snapshot)
     if str(data_quality) != "ok":
         feat_row["avg_prob_verdes"] = ""
         feat_row["avg_prob_rojos"] = ""
@@ -2971,15 +3054,31 @@ def _lxv_export_round_snapshot(round_id: int, ts_round: float, closed: dict, exp
         feat_row["avg_score_verdes"] = ""
         feat_row["avg_score_rojos"] = ""
     round_row["bot_x_fuerte"] = feat_row.get("bot_x_fuerte", "")
+    bot_obj = str(feat_row.get("bot_x_fuerte", "") or round_row.get("bot_x1", "") or "")
+    row_obj = next((r for r in rows_long if str(r.get("bot", "")) == bot_obj), {}) if bot_obj else {}
+    followup_row = {
+        "origin_round": int(round_id),
+        "bot_objetivo": bot_obj,
+        "resultado_origen": str(row_obj.get("resultado_symbol", "") or ""),
+        "ciclo_origen": row_obj.get("ciclo", ""),
+        "origin_marti_ciclo": marti_snapshot.get("ciclo_actual", ""),
+        "origin_marti_monto": marti_snapshot.get("monto_actual", ""),
+        "followup_c1": "",
+        "followup_c2": "",
+        "followup_c3": "",
+        "followup_c4": "",
+        "followup_c5": "",
+        "outcome_final": "",
+    }
     paths = _lxv_matrix_paths()
     wrote_matrix = _lxv_append_rows_csv(paths["matrix"], [round_row], _LXV_MATRIX_HEADERS["matrix"], ["round_id"])
     _lxv_append_rows_csv(paths["long"], rows_long, _LXV_MATRIX_HEADERS["long"], ["round_id", "bot"])
-    _lxv_append_rows_csv(paths["features"], [feat_row], _LXV_MATRIX_HEADERS["features"], ["round_id"])
+    _lxv_append_rows_csv(paths["followup"], [followup_row], _LXV_MATRIX_HEADERS["followup"], ["origin_round", "bot_objetivo"])
     _lxv_export_excel_optional(paths)
     now_ts = time.time()
     if wrote_matrix > 0 and (now_ts - float(_LXV_MATRIX_LAST_LOG_TS or 0.0)) >= float(LXV_MATRIX_EXPORT_LOG_EVERY_S):
         _LXV_MATRIX_LAST_LOG_TS = now_ts
-        agregar_evento(f"📊 Export ronda LXV #{int(round_id)} -> matriz/long/features OK ({data_quality}; reason={released_reason}).")
+        agregar_evento(f"📊 Export ronda LXV #{int(round_id)} -> columnas/celdas/followup OK ({data_quality}; reason={released_reason}).")
 
 def _sync_round_ack_path(bot: str) -> str:
     _ensure_dir(SYNC_ROUND_DIR)
@@ -3205,6 +3304,169 @@ def _ack_live_norm_resultado(value):
     return "OTHER"
 
 
+def _ack_tape_init():
+    try:
+        if "BOT_NAMES" not in globals():
+            return
+        if not isinstance(globals().get("ACK_LIVE_TAPE"), dict):
+            globals()["ACK_LIVE_TAPE"] = {}
+        width = int(globals().get("ACK_TAPE_WIDTH", 80) or 80)
+        for bot in BOT_NAMES:
+            if bot not in ACK_LIVE_TAPE or not isinstance(ACK_LIVE_TAPE.get(bot), deque):
+                ACK_LIVE_TAPE[bot] = deque(maxlen=width)
+        if not isinstance(globals().get("ACK_LIVE_TAPE_SEEN"), deque):
+            max_seen = int(globals().get("ACK_TAPE_MAX_SEEN", 2000) or 2000)
+            globals()["ACK_LIVE_TAPE_SEEN"] = deque(maxlen=max_seen)
+    except Exception:
+        pass
+
+
+def _ack_tape_seen_contains(key):
+    try:
+        if key in (None, ""):
+            return False
+        return str(key) in ACK_LIVE_TAPE_SEEN
+    except Exception:
+        return False
+
+
+def _ack_tape_seen_add(key):
+    try:
+        if key in (None, ""):
+            return
+        k = str(key)
+        if not _ack_tape_seen_contains(k):
+            ACK_LIVE_TAPE_SEEN.append(k)
+    except Exception:
+        pass
+
+
+def _ack_tape_symbol_plain(value):
+    try:
+        norm_fn = globals().get("_ack_live_norm_resultado", None)
+        if callable(norm_fn):
+            norm = str(norm_fn(value) or "").upper()
+            if norm == "WIN":
+                return "✓"
+            if norm == "LOSS":
+                return "X"
+    except Exception:
+        pass
+    try:
+        s = str(value or "").strip().upper()
+        s_ascii = normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    except Exception:
+        return "·"
+    if s in ("✓", "CHECK") or s_ascii in ("GANANCIA", "WIN", "CHECK"):
+        return "✓"
+    if s in ("X", "✗") or s_ascii in ("PERDIDA", "LOSS", "X"):
+        return "X"
+    return "·"
+
+
+def _ack_tape_update_from_ack_live():
+    try:
+        if not bool(globals().get("ACK_TAPE_ENABLE", True)):
+            return
+        _ack_tape_init()
+        if "BOT_NAMES" not in globals():
+            return
+        for bot in BOT_NAMES:
+            try:
+                path = _sync_round_ack_path(bot)
+                ack = _sync_round_safe_read_json(path)
+                if not isinstance(ack, dict):
+                    continue
+                status = str(ack.get("status", "") or "").strip().lower()
+                if status != "closed":
+                    continue
+                round_id = int(ack.get("round_id", 0) or 0)
+                if round_id <= 0:
+                    continue
+                resultado = ack.get("resultado", "")
+                symbol = _ack_tape_symbol_plain(resultado)
+                if symbol not in ("✓", "X"):
+                    continue
+                result_norm = "WIN" if symbol == "✓" else "LOSS"
+                contract_id = str(ack.get("contract_id", "") or "").strip()
+                if contract_id:
+                    key = f"{bot}:{round_id}:{contract_id}:{result_norm}"
+                else:
+                    key = f"{bot}:{round_id}:{result_norm}:{ack.get('ts', '')}"
+                if _ack_tape_seen_contains(key):
+                    continue
+                if bot not in ACK_LIVE_TAPE or not isinstance(ACK_LIVE_TAPE.get(bot), deque):
+                    ACK_LIVE_TAPE[bot] = deque(maxlen=int(globals().get("ACK_TAPE_WIDTH", 80) or 80))
+                ACK_LIVE_TAPE[bot].append(symbol)
+                _ack_tape_seen_add(key)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def _ack_tape_color_symbol(symbol):
+    base = str(symbol or "")
+    try:
+        if not bool(globals().get("ACK_TAPE_USE_COLOR", True)):
+            return base
+        if base == "✓":
+            return f"{Fore.GREEN}✓{Style.RESET_ALL}"
+        if base == "X":
+            return f"{Fore.RED}X{Style.RESET_ALL}"
+        if base == "·":
+            return f"{Fore.LIGHTBLACK_EX}·{Style.RESET_ALL}"
+        return base
+    except Exception:
+        return base
+
+
+def _ack_tape_strip_ansi(text):
+    try:
+        return re.sub(r"\x1b\[[0-9;]*m", "", str(text or ""))
+    except Exception:
+        return str(text or "")
+
+
+def _ack_tape_pad_visible(text, width):
+    try:
+        w = int(width or 0)
+    except Exception:
+        w = 0
+    txt = str(text or "")
+    if w <= 0:
+        return txt
+    try:
+        visible_len = len(_ack_tape_strip_ansi(txt))
+    except Exception:
+        visible_len = len(txt)
+    if visible_len < w:
+        return txt + (" " * (w - visible_len))
+    return txt
+
+
+def _ack_tape_render_bot(bot, fallback_resultados=None, width=None):
+    _ack_tape_init()
+    try:
+        w = int(width if width is not None else globals().get("ACK_TAPE_WIDTH", 80))
+    except Exception:
+        w = 80
+    if w <= 0:
+        w = 80
+    fill_char = str(globals().get("ACK_TAPE_FILL_CHAR", "·") or "·")
+    tape = list(ACK_LIVE_TAPE.get(bot, []) or [])
+    symbols = []
+    if tape:
+        symbols = [_ack_tape_symbol_plain(x) for x in tape][-w:]
+    else:
+        fb = list(fallback_resultados or [])
+        symbols = [_ack_tape_symbol_plain(x) for x in fb][-w:]
+    while len(symbols) < w:
+        symbols.insert(0, fill_char)
+    colored = "".join(_ack_tape_color_symbol(_ack_tape_symbol_plain(s)) for s in symbols[-w:])
+    return _ack_tape_pad_visible(colored, w)
+
+
 def _ack_live_build_rows():
     state = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
     obj_round = int(state.get("round_id", state.get("released_round", 1)) or 1)
@@ -3406,14 +3668,14 @@ def _ack_live_format_lines(snapshot):
     avg_txt = _ack_live_fmt_age(avg_lag_s) if avg_lag_s is not None else "--"
 
     lines = []
+    lag_txt = max_txt if max_txt != "--" else avg_txt
     lines.append(
-        f"⚡ ROUND LIVE | objetivo=#{obj_round} | released=#{released_round} | cerrados={closed_count}/{expected_count} | faltan={faltan_count} | max_lag={max_txt} | avg_lag={avg_txt}"
+        f"⚡ ROUND LIVE | obj=#{obj_round} | rel=#{released_round} | cerrados={closed_count}/{expected_count} | faltan={faltan_count} | lag={lag_txt}"
     )
-    lines.append("BOT      OBJ   ACK   GAP   RES   EDAD   CICLO   ACTIVO   ESTADO")
+    lines.append("BOT      ACK   GAP  RES  EDAD   CICLO  ESTADO")
 
     for row in list(rows)[:6]:
         bot = str(row.get("bot", "--"))[:7]
-        obj_txt = str(row.get("obj_round", "--"))
         ack_round = int(row.get("ack_round", 0) or 0)
         ack_txt = str(ack_round) if ack_round > 0 else "--"
         gap = row.get("gap")
@@ -3435,23 +3697,22 @@ def _ack_live_format_lines(snapshot):
             else:
                 ciclo_txt = "--"
 
-        asset_txt = str(row.get("asset", "--"))[:7]
         estado_txt = str(row.get("estado_visual", row.get("estado", "--")))[:10]
-        lines.append(f"{bot:<7}  {obj_txt:<5} {ack_txt:<5} {gap_txt:<4} {res_txt:<3} {age_txt:<6} {ciclo_txt:<6} {asset_txt:<8} {estado_txt:<10}")
+        lines.append(f"{bot:<7}  {ack_txt:<5} {gap_txt:<4} {res_txt:<4} {age_txt:<6} {ciclo_txt:<6} {estado_txt:<10}")
 
-    if closed_count == 0:
-        lines.append(f"📊 RESUMEN LIVE DE RONDA #{obj_round} | sin cierres aún | Faltan={faltan_count} | Calidad=missing")
-    else:
-        lines.append(f"📊 RESUMEN LIVE DE RONDA #{obj_round}")
-        lines.append(
-            f"Verdes={summary.get('verdes_count', 0)} | Rojas={summary.get('rojas_count', 0)} | Faltan={faltan_count} | Parcial={summary.get('partial_pattern', '0V0X')} | Bot X={summary.get('bot_x_actual') or '-'} | Calidad={summary.get('data_quality', 'missing')} | max_lag={max_txt} | avg_lag={avg_txt}"
-        )
+    botx = summary.get("bot_x_actual") or "-"
+    resumen = (
+        f"📊 RONDA #{obj_round} | V={summary.get('verdes_count', 0)} | R={summary.get('rojas_count', 0)} | "
+        f"Faltan={faltan_count} | Parcial={summary.get('partial_pattern', '0V0X')} | "
+        f"{'BotX=' + botx + ' | ' if botx != '-' else ''}Calidad={summary.get('data_quality', 'missing')}"
+    )
+    lines.append(resumen)
 
-    if summary.get("all_prev_waiting", False):
+    if summary.get("all_prev_waiting", False) and bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False)):
         lines.append("↳ Esperando cierres de ronda objetivo; los ACK visibles aún pertenecen a ronda previa.")
 
     stale_bots = list(summary.get("stale_bots", []) or [])
-    if stale_bots:
+    if stale_bots and bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False)):
         lines.append(f"⚠ STALE bots: {','.join(stale_bots)}")
 
     return lines
@@ -3465,6 +3726,238 @@ def mostrar_ack_live():
             print(line)
     except Exception as e:
         print(f"⚡ ROUND LIVE error seguro: {e}")
+
+
+def _marti_hud_safe_cycle(value):
+    if value is None:
+        return None
+    try:
+        txt = str(value).strip()
+        if txt == "":
+            return None
+        up = txt.upper()
+        if up.startswith("C"):
+            txt = up[1:]
+        cyc = int(float(txt))
+    except Exception:
+        return None
+    try:
+        max_c = int(globals().get("MAX_CICLOS", len(list(globals().get("MARTI_ESCALADO", []) or [])) or 1) or 1)
+    except Exception:
+        max_c = 1
+    cyc = max(1, min(max_c, cyc))
+    return int(cyc)
+
+
+def _marti_hud_get_owner():
+    bots = list(BOT_NAMES) if "BOT_NAMES" in globals() else []
+    # 1) Lock REAL en memoria
+    lock = globals().get("REAL_OWNER_LOCK", None)
+    if isinstance(lock, str) and lock in bots:
+        return lock, f"REAL:{lock}", "lock"
+    # 2) token actual
+    try:
+        tok = leer_token_actual()
+    except Exception:
+        tok = None
+    if isinstance(tok, str):
+        tok_s = tok.strip()
+        if tok_s in bots:
+            return tok_s, f"REAL:{tok_s}", "token"
+        up = tok_s.upper()
+        if up.startswith("REAL:"):
+            cand = tok_s.split(":", 1)[1].strip()
+            if cand in bots:
+                return cand, f"REAL:{cand}", "token"
+    # 3) selección manual si existe
+    manual_bot = globals().get("PENDIENTE_FORZAR_BOT", None)
+    if isinstance(manual_bot, str) and manual_bot in bots:
+        return manual_bot, "DEMO", "manual"
+    # 4) último bot con ciclo válido en estado_bots
+    try:
+        for b in list(reversed(bots)):
+            st = estado_bots.get(b, {}) if isinstance(estado_bots, dict) else {}
+            if _marti_hud_safe_cycle(st.get("ciclo_actual", None)) is not None:
+                tk = str(st.get("token", "DEMO") or "DEMO").upper()
+                return b, (f"REAL:{b}" if tk.startswith("REAL") else "DEMO"), "estado"
+    except Exception:
+        pass
+    # 5) último bot con ACK cerrado reciente
+    try:
+        rows_pack = _ack_live_build_rows()
+        rows = list((rows_pack or {}).get("rows", []) or [])
+        cands = [r for r in rows if str(r.get("bot", "")) in bots and r.get("res") in ("✓", "X")]
+        if cands:
+            cands.sort(key=lambda r: (float(r.get("age_s", 1e18) or 1e18), -int(r.get("ack_round", 0) or 0)))
+            b = str(cands[0].get("bot", ""))
+            if b in bots:
+                return b, "DEMO", "ack"
+    except Exception:
+        pass
+    return "", "DEMO", "--"
+
+
+def _marti_hud_get_last_result(bot):
+    if not bot:
+        return ""
+    try:
+        rows_pack = _ack_live_build_rows()
+        for row in list((rows_pack or {}).get("rows", []) or []):
+            if str(row.get("bot", "")) != str(bot):
+                continue
+            r = str(row.get("res", "") or "")
+            if r == "✓":
+                return "WIN"
+            if r == "X":
+                return "LOSS"
+            break
+    except Exception:
+        pass
+    try:
+        ack = _sync_round_safe_read_json(_sync_round_ack_path(str(bot))) or {}
+        if str(ack.get("status", "") or "").lower() == "closed":
+            norm = _ack_live_norm_resultado(ack.get("resultado"))
+            if norm == "WIN":
+                return "WIN"
+            if norm == "LOSS":
+                return "LOSS"
+    except Exception:
+        pass
+    return ""
+
+
+def _marti_hud_snapshot():
+    bot, token_txt, source_owner = _marti_hud_get_owner()
+    max_c = int(globals().get("MAX_CICLOS", len(list(globals().get("MARTI_ESCALADO", []) or [])) or 1) or 1)
+    escala = list(globals().get("MARTI_ESCALADO", []) or [])
+    st = estado_bots.get(bot, {}) if (bot and isinstance(estado_bots, dict)) else {}
+
+    ciclo_actual = _marti_hud_safe_cycle(st.get("ciclo_actual", None))
+    fuente = source_owner
+    if ciclo_actual is None:
+        ciclo_actual = _marti_hud_safe_cycle(st.get("ciclo", None))
+        if ciclo_actual is not None:
+            fuente = "estado_ciclo"
+    if ciclo_actual is None:
+        try:
+            ciclo_actual = _marti_hud_safe_cycle(int(marti_paso) + 1)
+            if ciclo_actual is not None:
+                fuente = "marti_paso"
+        except Exception:
+            ciclo_actual = None
+    if ciclo_actual is None:
+        try:
+            ciclo_actual = _marti_hud_safe_cycle(int(marti_ciclos_perdidos) + 1)
+            if ciclo_actual is not None:
+                fuente = "marti_ciclos"
+        except Exception:
+            ciclo_actual = None
+    if ciclo_actual is None:
+        ciclo_actual = 1
+        fuente = "fallback"
+
+    monto_actual = ""
+    try:
+        idx = int(ciclo_actual) - 1
+        if 0 <= idx < len(escala):
+            monto_actual = float(escala[idx])
+    except Exception:
+        monto_actual = ""
+
+    ultimo = _marti_hud_get_last_result(bot)
+    ciclo_siguiente = ciclo_actual
+    monto_siguiente = monto_actual
+    estado = "ESPERANDO"
+    alerta = ""
+
+    if ultimo == "LOSS":
+        if int(ciclo_actual) < int(max_c):
+            ciclo_siguiente = int(ciclo_actual) + 1
+            try:
+                monto_siguiente = float(escala[int(ciclo_siguiente) - 1])
+            except Exception:
+                monto_siguiente = ""
+            estado = f"SUBE_C{int(ciclo_siguiente)}"
+            alerta = f"{bot or '--'} perdió C{int(ciclo_actual)} → próximo C{int(ciclo_siguiente)}"
+        else:
+            ciclo_siguiente = 1
+            try:
+                monto_siguiente = float(escala[0]) if escala else ""
+            except Exception:
+                monto_siguiente = ""
+            estado = "FIN_C5"
+            alerta = f"{bot or '--'} perdió C{int(ciclo_actual)} → fin Martingala / reinicio esperado"
+    elif ultimo == "WIN":
+        ciclo_siguiente = 1
+        try:
+            monto_siguiente = float(escala[0]) if escala else ""
+        except Exception:
+            monto_siguiente = ""
+        estado = "RESET_C1"
+        alerta = f"{bot or '--'} ganó → reset C1"
+
+    return {
+        "bot": bot,
+        "token": token_txt,
+        "ciclo_actual": ciclo_actual,
+        "monto_actual": monto_actual,
+        "ultimo_resultado": ultimo,
+        "ciclo_siguiente": ciclo_siguiente,
+        "monto_siguiente": monto_siguiente,
+        "estado": estado,
+        "fuente": fuente,
+        "alerta": alerta,
+    }
+
+
+def _marti_hud_render_line():
+    snap = _marti_hud_snapshot()
+    bot = str(snap.get("bot", "") or "")
+    estado = str(snap.get("estado", "ESPERANDO") or "ESPERANDO")
+    ult = str(snap.get("ultimo_resultado", "") or "")
+    c_act = snap.get("ciclo_actual", None)
+    c_nxt = snap.get("ciclo_siguiente", None)
+    m_act = snap.get("monto_actual", "")
+    m_nxt = snap.get("monto_siguiente", "")
+
+    def _fmt_m(v):
+        if not bool(globals().get("HUD_MARTINGALA_SHOW_AMOUNT", True)):
+            return ""
+        try:
+            if v in ("", None):
+                return ""
+            return f" ${float(v):g}"
+        except Exception:
+            return ""
+
+    if not bot:
+        return "🧩 MARTINGALA LIVE | Bot=-- | Actual=-- | Próx=-- | Estado=ESPERANDO"
+    if estado.startswith("SUBE_C"):
+        c_prev = int(c_act) if isinstance(c_act, (int, float)) else 1
+        txt = f"⚠️ MARTINGALA | {bot} perdió C{c_prev} → próximo C{int(c_nxt)} ({_fmt_m(m_nxt).strip() or '$--'})"
+        return (Fore.YELLOW + txt + Fore.RESET) if ("Fore" in globals() and bool(globals().get("HUD_MARTINGALA_ALERT_ON_LOSS", True))) else txt
+    if estado == "RESET_C1":
+        txt = f"✅ MARTINGALA | {bot} ganó → reset C1"
+        return (Fore.GREEN + txt + Fore.RESET) if "Fore" in globals() else txt
+    if estado == "FIN_C5":
+        c_prev = int(c_act) if isinstance(c_act, (int, float)) else int(globals().get("MAX_CICLOS", 5) or 5)
+        txt = f"🛑 MARTINGALA | {bot} perdió C{c_prev} → fin C5 / reinicio esperado"
+        return (Fore.RED + txt + Fore.RESET) if "Fore" in globals() else txt
+    ult_txt = ult if ult else "--"
+    act_txt = f"C{c_act}{_fmt_m(m_act)}" if c_act else "--"
+    if bool(globals().get("HUD_MARTINGALA_SHOW_NEXT", True)):
+        nxt_txt = f"C{c_nxt}{_fmt_m(m_nxt)}" if c_nxt else "--"
+    else:
+        nxt_txt = "--"
+    txt = f"🧩 MARTINGALA LIVE | Bot={bot} | Actual={act_txt} | Último={ult_txt} | Próx={nxt_txt} | Estado={estado}"
+    return (Fore.CYAN + txt + Fore.RESET) if "Fore" in globals() else txt
+
+
+def _hud_marti_live_lines():
+    try:
+        return [_marti_hud_render_line()]
+    except Exception:
+        return []
 
 
 def _sync_round_write_json_atomic(path: str, payload: dict) -> bool:
@@ -14102,6 +14595,308 @@ def _fmt_prob_pct(p):
     except Exception:
         return "--"
 
+
+def _resumen_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
+    lines = []
+    try:
+        owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+        owner_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
+        modo_txt = "PAUSA" if maestro_en_pausa() else "ACTIVO"
+        eta_txt = f"{float(globals().get('INTERVALO_ACTUAL', 2.0) or 2.0):.1f}s"
+        saldo_num = float(valor_saldo) if isinstance(valor_saldo, (int, float)) else None
+        meta_num = float(META) if isinstance(globals().get("META"), (int, float)) else None
+        base_num = float(SALDO_INICIAL) if isinstance(globals().get("SALDO_INICIAL"), (int, float)) else None
+        falta_txt = "--"
+        avance_txt = "--"
+        if (saldo_num is not None) and (meta_num is not None):
+            falta_txt = f"{max(0.0, meta_num - saldo_num):.2f}"
+        if (saldo_num is not None) and (meta_num is not None) and (base_num is not None):
+            den = float(meta_num - base_num)
+            if abs(den) > 1e-12:
+                avance = ((saldo_num - base_num) / den) * 100.0
+                avance_txt = f"{max(0.0, min(100.0, avance)):.1f}%"
+        lines.append(
+            f"🧭 Modo={modo_txt} | Token={owner_txt} | Saldo={saldo_str} | Meta={meta_str} | Falta={falta_txt} | Avance={avance_txt} | Refresh={eta_txt}"
+        )
+
+        marti_total = float(sum(list(MARTI_ESCALADO or []))) if "MARTI_ESCALADO" in globals() else 0.0
+        cobertura = "NO"
+        estado = "RIESGO"
+        if saldo_num is not None:
+            if meta_num is not None and saldo_num >= meta_num:
+                estado = "OK"
+            elif saldo_num >= marti_total:
+                estado = "AVISO"
+            else:
+                estado = "RIESGO"
+            cobertura = "SI" if saldo_num >= marti_total else "NO"
+        objetivo_txt = "+20.0%"
+        try:
+            if (base_num is not None) and (meta_num is not None) and base_num > 0:
+                objetivo_txt = f"+{((meta_num / base_num) - 1.0)*100.0:.1f}%"
+        except Exception:
+            pass
+        base_txt = f"{base_num:.2f}" if base_num is not None else "--"
+        est_txt = estado
+        try:
+            if estado == "OK":
+                est_txt = f"{Fore.GREEN}OK{Style.RESET_ALL}"
+            elif estado == "AVISO":
+                est_txt = f"{Fore.YELLOW}AVISO{Style.RESET_ALL}"
+            else:
+                est_txt = f"{Fore.RED}RIESGO{Style.RESET_ALL}"
+        except Exception:
+            est_txt = estado
+        lines.append(
+            f"🎯 Base={base_txt} | Objetivo={objetivo_txt} | Estado={est_txt} | Marti C1-C5={marti_total:.2f} | Cobertura={cobertura}"
+        )
+    except Exception:
+        lines.append("🧭 Modo=-- | Token=-- | Saldo=-- | Meta=-- | Falta=-- | Avance=-- | Refresh=--")
+        lines.append("🎯 Base=-- | Objetivo=-- | Estado=-- | Marti C1-C5=-- | Cobertura=--")
+    return lines[:2]
+
+
+def _resumen_top_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
+    lines = []
+    try:
+        owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+        owner_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
+        modo_txt = "PAUSA" if maestro_en_pausa() else "ACTIVO"
+        eta_txt = f"{float(globals().get('INTERVALO_ACTUAL', 2.0) or 2.0):.1f}s"
+        saldo_num = float(valor_saldo) if isinstance(valor_saldo, (int, float)) else None
+        meta_num = float(META) if isinstance(globals().get("META"), (int, float)) else None
+        base_num = float(SALDO_INICIAL) if isinstance(globals().get("SALDO_INICIAL"), (int, float)) else None
+        falta_txt = f"{max(0.0, meta_num - saldo_num):.2f}" if (saldo_num is not None and meta_num is not None) else "--"
+        avance_txt = "--"
+        if (saldo_num is not None) and (meta_num is not None) and (base_num is not None):
+            den = float(meta_num - base_num)
+            if abs(den) > 1e-12:
+                avance_txt = f"{max(0.0, min(100.0, ((saldo_num - base_num) / den) * 100.0)):.1f}%"
+        line1 = f"🧭 Modo={modo_txt} | Token={owner_txt} | Saldo={saldo_str} | Meta={meta_str} | Falta={falta_txt} | Avance={avance_txt} | Refresh={eta_txt}"
+        lines.append(line1)
+    except Exception:
+        lines.append("🧭 Modo=-- | Token=-- | Saldo=-- | Meta=-- | Falta=-- | Avance=-- | Refresh=--")
+
+    try:
+        umbral_real = float(get_umbral_real_calibrado())
+        umbral_obs = float(globals().get("IA_OBSERVE_THR", 0.70) or 0.70)
+        mejor = None
+        visibles = 0
+        obs = 0
+        real = 0
+        planos = 0
+        for b in BOT_NAMES:
+            pb = _prob_ia_operativa_bot(b, default=None)
+            if isinstance(pb, (int, float)):
+                visibles += 1
+                if float(pb) >= umbral_obs:
+                    obs += 1
+                if float(pb) >= umbral_real:
+                    real += 1
+                if (mejor is None) or (float(pb) > mejor[1]):
+                    mejor = (b, float(pb))
+            if bool(estado_bots.get(b, {}).get("ia_sensor_plano", False)):
+                planos += 1
+        mejor_txt = "--" if mejor is None else f"{mejor[0]} {mejor[1]*100:.1f}%"
+        n_min_real, n_req_real = _n_minimo_real_status()
+        line2 = (
+            f"📊 Prob={visibles}/{len(BOT_NAMES)} | OBS={obs} | REAL={real} | Mejor={mejor_txt} | "
+            f"SENSOR_PLANO={planos}/{len(BOT_NAMES)} | n_min_real={int(n_min_real)}/{int(n_req_real)}"
+        )
+        lines.append(line2)
+    except Exception:
+        lines.append("📊 Prob=-- | OBS=-- | REAL=-- | Mejor=-- | SENSOR_PLANO=-- | n_min_real=--")
+
+    try:
+        emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
+        meta = resolver_canary_estado(leer_model_meta() or {})
+        reliable = bool(meta.get("reliable", False))
+        warmup = bool(meta.get("warmup_mode", False))
+        estado_ia = "reliable" if reliable else ("warmup" if warmup else "unreliable")
+        motivo = str(emb.get("decision_reason", "--") or "--")
+        why = str(emb.get("soft_wait_reason", emb.get("hard_block_reason", "--")) or "--")
+        gate = str(emb.get("gate_quality", "--") or "--")
+        trigger = str(emb.get("decision_final", "--") or "--")
+        lines.append(f"🧠 IA={estado_ia} | motivo={motivo} | why={why} | gate={gate} | trigger={trigger}")
+    except Exception:
+        lines.append("🧠 IA=-- | motivo=-- | why=-- | gate=-- | trigger=--")
+    return lines[:3]
+
+
+def mostrar_ia_resumen_compacto():
+    try:
+        meta = resolver_canary_estado(leer_model_meta() or {})
+        auc = meta.get("auc", None)
+        auc_txt = "N/A" if not isinstance(auc, (int, float)) else f"{float(auc):.3f}"
+        thr = float(get_umbral_real_calibrado())
+        conf = "Alta" if bool(meta.get("reliable", False)) else "Baja"
+        n = int(meta.get("n_samples", meta.get("n", 0)) or 0)
+        warm_t = int(TRAIN_WARMUP_MIN_ROWS)
+        print(
+            Fore.CYAN
+            + f"IA RESUMEN | AUC={auc_txt} | Thr={thr:.2f} | Conf={conf} | Warmup={min(n, warm_t)}/{warm_t} | Cierres={n}"
+        )
+    except Exception:
+        print(Fore.CYAN + "IA RESUMEN | AUC=N/A | Thr=-- | Conf=-- | Warmup=-- | Cierres=--")
+
+
+def mostrar_panel_lateral_compacto():
+    token_file = leer_token_actual()
+    token_hud = "DEMO" if (token_file in (None, "none")) else f"REAL:{token_file}"
+    activo_real = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
+    fuente = (estado_bots.get(activo_real, {}).get("fuente") or "AUTO") if activo_real else "--"
+    bot_txt = activo_real or "--"
+    ciclo = estado_bots.get(activo_real, {}).get("ciclo_actual", 1) if activo_real else ciclo_martingala_siguiente()
+    estado_sem, estado_lbl, detalle = evaluar_semaforo()
+    marti_line = marti_audit_resumen_linea()
+    return [
+        "╔══════════════════════════════════════════════╗",
+        "║ 🛠 CONTROL / ESTADO                          ║",
+        "╠══════════════════════════════════════════════╣",
+        "║ [S] Salir   [P] Pausar   [C] Continuar      ║",
+        "║ [R] Reiniciar ciclo   [T] Ver token         ║",
+        "║ [L] Limpiar visual    [D] Limpieza dura     ║",
+        "║ [G] Probar audio      [E] Entrenar IA ya    ║",
+        "╠══════════════════════════════════════════════╣",
+        f"║ Bot={bot_txt:<8}  Marti=C{int(ciclo):<2}  Fuente={str(fuente)[:8]:<8}   ║",
+        f"║ Token={token_hud:<14} Estado={estado_lbl[:14]:<14} ║",
+        f"║ {marti_line[:42]:<42}║",
+        "╚══════════════════════════════════════════════╝",
+    ]
+
+
+def mostrar_bloque_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--", padding=""):
+    def _render_hud_balance_header(saldo_v, meta_v, falta_v, avance_v, modo_v, token_v, refresh_v):
+        saldo_tag = f"SALDO={saldo_v}"
+        meta_tag = f"META={meta_v}"
+        l1_plain = f"💰 {saldo_tag:<22} 🎯 {meta_tag:<22}"
+        l2_plain = f"MODO={modo_v} | TOKEN={token_v} | FALTA={falta_v} | AVANCE={avance_v} | R={refresh_v}"
+        w = max(76, len(_ack_tape_strip_ansi(l1_plain)), len(_ack_tape_strip_ansi(l2_plain)))
+        try:
+            s_col = Fore.LIGHTGREEN_EX + Style.BRIGHT + saldo_tag + Style.RESET_ALL
+            m_col = Fore.LIGHTMAGENTA_EX + Style.BRIGHT + meta_tag + Style.RESET_ALL
+            l1_col = f"💰 {s_col:<22} 🎯 {m_col:<22}"
+            l2_col = (
+                Fore.CYAN + f"MODO={modo_v} | TOKEN={token_v} | " + Fore.WHITE
+                + f"FALTA={falta_v} | AVANCE={avance_v} | R={refresh_v}" + Fore.RESET
+            )
+        except Exception:
+            l1_col = l1_plain
+            l2_col = l2_plain
+        print(padding + Fore.CYAN + "╔" + "═" * (w + 2) + "╗")
+        print(padding + Fore.CYAN + f"║ {_ack_tape_pad_visible(l1_col, w)} ║")
+        print(padding + Fore.CYAN + f"║ {_ack_tape_pad_visible(l2_col, w)} ║")
+        print(padding + Fore.CYAN + "╚" + "═" * (w + 2) + "╝")
+
+    try:
+        owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+        token_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
+        modo_txt = "PAUSA" if maestro_en_pausa() else "ACTIVO"
+        eta_txt = f"{float(globals().get('INTERVALO_ACTUAL', 2.0) or 2.0):.1f}s"
+        saldo_num = float(valor_saldo) if isinstance(valor_saldo, (int, float)) else None
+        meta_num = float(META) if isinstance(globals().get("META"), (int, float)) else None
+        base_num = float(SALDO_INICIAL) if isinstance(globals().get("SALDO_INICIAL"), (int, float)) else None
+        falta_txt = f"{max(0.0, meta_num - saldo_num):.2f}" if (saldo_num is not None and meta_num is not None) else "--"
+        avance_txt = "--"
+        if (saldo_num is not None) and (meta_num is not None) and (base_num is not None):
+            den = float(meta_num - base_num)
+            if abs(den) > 1e-12:
+                avance_txt = f"{max(0.0, min(100.0, ((saldo_num - base_num) / den) * 100.0)):.1f}%"
+        _render_hud_balance_header(
+            saldo_v=str(saldo_str), meta_v=str(meta_str), falta_v=falta_txt, avance_v=avance_txt,
+            modo_v=modo_txt, token_v=token_txt, refresh_v=eta_txt
+        )
+        # Línea secundaria: Base/Objetivo/Estado/Marti/Cobertura (mantiene trazabilidad existente)
+        lines = _resumen_saldo_meta_hud(valor_saldo=valor_saldo, saldo_str=saldo_str, meta_str=meta_str)
+        src2 = str(lines[1] if len(lines) > 1 else "")
+        l2 = _ack_tape_strip_ansi(
+            src2.replace("🎯 ", "📈 ").replace("Base=", "BASE=").replace("Estado=", "ESTADO=").replace("Marti C1-C5=", "MARTI C1-C5=").replace("Cobertura=", "COBERTURA=")
+        )
+        w2 = max(76, len(l2))
+        print(padding + Fore.BLUE + f"╭{'─' * (w2 + 2)}╮")
+        print(padding + Fore.BLUE + f"│ {l2:<{w2}} │")
+        print(padding + Fore.BLUE + f"╰{'─' * (w2 + 2)}╯")
+    except Exception:
+        print(padding + Fore.CYAN + "💰 Saldo/Meta: --")
+
+
+def mostrar_panel_teclado_activo(bot, rest_s, max_ciclos, ciclo_actual="C1", fuente="--"):
+    bot_txt = str(bot or "--")
+    rest = max(0, int(rest_s or 0))
+    ciclo_txt = str(ciclo_actual or "C1")
+    src_txt = str(fuente or "--")
+    estado_txt = f"Tiempo para decidir : {rest:>3}s" if rest > 0 else "Estado            : decisión cerrada / orden enviada"
+    return [
+        "╔══════════════════════════════════════════════╗",
+        "║ ⌨ MODO TECLADO ACTIVO                       ║",
+        "╠══════════════════════════════════════════════╣",
+        f"║ Bot seleccionado : {bot_txt:<26}║",
+        f"║ {estado_txt:<44}║",
+        f"║ Ciclo actual      : {ciclo_txt:<26}║",
+        f"║ Fuente            : {src_txt:<26}║",
+        f"║ Acción            : Elegir ciclo [1..{int(max_ciclos)}]{'':<12}║",
+        "║ Cancelar          : ESC                     ║",
+        "╚══════════════════════════════════════════════╝",
+    ]
+
+
+def mostrar_panel_inversion_activo(bot, rest_s, max_ciclos, ciclo_actual="C1", fuente="--"):
+    return mostrar_panel_teclado_activo(
+        bot=bot,
+        rest_s=rest_s,
+        max_ciclos=max_ciclos,
+        ciclo_actual=ciclo_actual,
+        fuente=fuente,
+    )
+
+
+def mostrar_panel_real_activo():
+    owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+    if owner in (None, "none"):
+        return []
+    owner_txt = str(owner)
+    st = estado_bots.get(owner_txt, {}) if isinstance(estado_bots, dict) else {}
+    ciclo = st.get("ciclo_actual", 1)
+    fuente = st.get("fuente", "AUTO")
+    token_txt = f"REAL:{owner_txt}"
+    estado_txt = "ORDEN REAL ESCRITA ✅"
+    hhmmss = "--"
+    try:
+        trace = globals().get("LAST_REAL_CLOSE_TRACE", {}) if isinstance(globals().get("LAST_REAL_CLOSE_TRACE", {}), dict) else {}
+        ts = trace.get("ts", None) or trace.get("epoch", None)
+        if ts is not None:
+            hhmmss = datetime.fromtimestamp(float(ts)).strftime("%H:%M:%S")
+    except Exception:
+        hhmmss = "--"
+    return [
+        "╔══════════════════════════════════════════════╗",
+        "║ 🚀 REAL ACTIVO / INVERSIÓN EN CURSO         ║",
+        "╠══════════════════════════════════════════════╣",
+        f"║ Bot          : {owner_txt:<29}║",
+        f"║ Ciclo        : C{int(ciclo):<28}║",
+        f"║ Fuente       : {str(fuente)[:29]:<29}║",
+        f"║ Token        : {token_txt:<29}║",
+        f"║ Estado       : {estado_txt:<29}║",
+        f"║ Última orden : {hhmmss:<29}║",
+        "╚══════════════════════════════════════════════╝",
+    ]
+
+
+def mostrar_panel_confirmacion_riesgo(bot):
+    bot_txt = str(bot or "--")
+    lines = [
+        "╔══════════════════════════════════════════════╗",
+        "║ ⚠ CONFIRMACIÓN DE RIESGO                    ║",
+        "╠══════════════════════════════════════════════╣",
+        f"║ Bot: {bot_txt:<38}║",
+        "║ Semáforo: NO VERDE                          ║",
+        "║ Acción: ¿Forzar inversión de todos modos?   ║",
+        "║ Sí = Y        No = N                        ║",
+        "╚══════════════════════════════════════════════╝",
+    ]
+    for ln in lines:
+        print(Fore.YELLOW + ln)
+
 # Mostrar panel
 def mostrar_panel():
     # === IA: actualizar Prob IA antes de render (NO afecta lógica de trading) ===
@@ -14140,19 +14935,22 @@ def mostrar_panel():
         mm, ss = divmod(max(0, int(rem)), 60)
         ref_txt = f"{float(maestro_pause_ref_balance):.2f}" if isinstance(maestro_pause_ref_balance, (int, float)) else "--"
         trg_txt = f"{float(maestro_pause_trigger_balance):.2f}" if isinstance(maestro_pause_trigger_balance, (int, float)) else "--"
-        print(padding + Fore.LIGHTRED_EX + Style.BRIGHT + "⛔ MAESTRO EN PAUSA")
-        print(padding + Fore.LIGHTRED_EX + "Protección por drawdown 20% activada desde monitor")
-        print(padding + Fore.LIGHTRED_EX + f"⏳ Restante: {mm:02d}:{ss:02d} | reason={maestro_pause_reason or 'drawdown_20_monitor'}")
-        print(padding + Fore.LIGHTRED_EX + f"📉 Ref={ref_txt} | Trigger={trg_txt}")
+        if not bool(globals().get("HUD_MINIMAL_MODE", True)):
+            print(padding + Fore.LIGHTRED_EX + Style.BRIGHT + "⛔ MAESTRO EN PAUSA")
+            print(padding + Fore.LIGHTRED_EX + "Protección por drawdown 20% activada desde monitor")
+            print(padding + Fore.LIGHTRED_EX + f"⏳ Restante: {mm:02d}:{ss:02d} | reason={maestro_pause_reason or 'drawdown_20_monitor'}")
+            print(padding + Fore.LIGHTRED_EX + f"📉 Ref={ref_txt} | Trigger={trg_txt}")
     else:
-        print(padding + Fore.GREEN + "🟢 MODO OPERACIÓN ACTIVO – Escaneando…")
-    if _purificacion_real_activa():
+        if not bool(globals().get("HUD_MINIMAL_MODE", True)):
+            print(padding + Fore.GREEN + "🟢 MODO OPERACIÓN ACTIVO – Escaneando…")
+    if _purificacion_real_activa() and (not bool(globals().get("HUD_MINIMAL_MODE", True))):
         print(padding + Fore.YELLOW + "🧪 IA REAL purificada | LXV_SYNC habilitado")
 
     # Etapa activa para depuración de flujo
     try:
         edad_etapa = max(0, int(time.time() - float(ETAPA_TS)))
-        print(padding + Fore.YELLOW + f"🧭 ETAPA {ETAPA_ACTUAL}: {ETAPA_DETALLE} ({edad_etapa}s)")
+        if not bool(globals().get("HUD_MINIMAL_MODE", True)):
+            print(padding + Fore.YELLOW + f"🧭 ETAPA {ETAPA_ACTUAL}: {ETAPA_DETALLE} ({edad_etapa}s)")
     except Exception:
         pass
 
@@ -14166,7 +14964,8 @@ def mostrar_panel():
         valor = None
         saldo_str = "--"
 
-    print(padding + Fore.GREEN + f"💰 SALDO EN CUENTA REAL DERIV: {saldo_str}")
+    if not bool(globals().get("HUD_MINIMAL_MODE", True)):
+        print(padding + Fore.GREEN + f"💰 SALDO EN CUENTA REAL DERIV: {saldo_str}")
 
     # Saldo inicial y meta
     try:
@@ -14181,423 +14980,435 @@ def mostrar_panel():
     except Exception:
         meta_str = "--"
 
-    print(padding + Fore.GREEN + f"💰 SALDO INICIAL {inicial_str} 🎯 META {meta_str}")
+    if not bool(globals().get("HUD_MINIMAL_MODE", True)):
+        print(padding + Fore.GREEN + f"💰 SALDO INICIAL {inicial_str} 🎯 META {meta_str}")
 
-    # Resumen rápido para que el HUD no se vea "vacío"
+    # Bloque visual destacado de saldo/meta + cabecera compacta secundaria
     try:
-        bots_con_prob = 0
-        umbral_real_vigente = float(get_umbral_real_calibrado())
-        umbral_obs = float(globals().get("IA_OBSERVE_THR", 0.70) or 0.70)
-        bots_real = 0
-        bots_obs = 0
-        mejor = None
-        for b in BOT_NAMES:
-            pb = _prob_ia_operativa_bot(b, default=None)
-            if isinstance(pb, (int, float)):
-                bots_con_prob += 1
-                if float(pb) >= float(umbral_real_vigente):
-                    bots_real += 1
-                if float(pb) >= float(umbral_obs):
-                    bots_obs += 1
-                if (mejor is None) or (float(pb) > mejor[1]):
-                    mejor = (b, float(pb))
-        owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
-        owner_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
-        mejor_txt = "--" if mejor is None else f"{mejor[0]} {mejor[1]*100:.1f}%"
-        suceso_vals = [float(estado_bots.get(b, {}).get("ia_suceso_idx", 0.0) or 0.0) for b in BOT_NAMES]
-        best_suceso = max(suceso_vals) if suceso_vals else 0.0
-        sensores_planos = sum(1 for b in BOT_NAMES if bool(estado_bots.get(b, {}).get("ia_sensor_plano", False)))
-        sensores_warmup = sum(1 for b in BOT_NAMES if bool(estado_bots.get(b, {}).get("ia_sensor_warmup", False)))
-        n_min_real, n_req_real = _n_minimo_real_status()
-        n_min_disp = min(int(n_min_real), int(n_req_real))
-        n_min_extra = max(0, int(n_min_real) - int(n_req_real))
-        n_min_txt = f"{n_min_disp}/{n_req_real}" + (f" (+{n_min_extra} acum)" if n_min_extra > 0 else "")
-        print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | OBS≥{umbral_obs*100:.1f}%: {bots_obs} | REAL≥{umbral_real_vigente*100:.1f}%: {bots_real} | Mejor: {mejor_txt} | Suceso↑: {best_suceso:5.1f} | SENSOR_PLANO: {sensores_planos}/{len(BOT_NAMES)} (warmup:{sensores_warmup}) | n_min_real: {n_min_txt} | Token: {owner_txt}")
+        mostrar_bloque_saldo_meta_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str, padding=padding)
+        top_lines = list(_resumen_top_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str) or [])
+        for _line in top_lines[1:]:
+            print(padding + Fore.CYAN + _line)
+    except Exception:
+        pass
 
+    # Bloques técnicos extensos (solo verbose/debug)
+    if bool(globals().get("HUD_SHOW_VERBOSE_TOP", False)) or (not bool(globals().get("HUD_MINIMAL_MODE", True))):
+        # Resumen rápido para que el HUD no se vea "vacío"
         try:
-            meta_live = resolver_canary_estado(leer_model_meta() or {})
-            reliable = bool(meta_live.get("reliable", False))
-            canary_live = bool(meta_live.get("canary_mode", False))
-            n_samples_live = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
-            warmup_live = bool(meta_live.get("warmup_mode", n_samples_live < int(TRAIN_WARMUP_MIN_ROWS)))
-            cap_base = float(IA_WARMUP_LOW_EVIDENCE_CAP_BASE)
-            cap_post = float(IA_WARMUP_LOW_EVIDENCE_CAP_POST_N15)
-            post_n15 = bool(_todos_bots_con_n_minimo_real())
-            cap_now = cap_post if post_n15 else cap_base
-            mode_h = str(DYN_ROOF_STATE.get("last_gate_mode", "A") or "A")
-            confirm_h = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
-            confirm_need_h = int(DYN_ROOF_STATE.get("last_confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
-            confirm_disp_h = min(confirm_h, confirm_need_h)
-            confirm_extra_h = max(0, confirm_h - confirm_need_h)
-            confirm_txt_h = f"{confirm_disp_h}/{confirm_need_h}" + (f" (+{confirm_extra_h} acum)" if confirm_extra_h > 0 else "")
-            trigger_ok_h = bool(DYN_ROOF_STATE.get("last_trigger_ok", False))
-            clone_gate = bool(DYN_ROOF_STATE.get("gate_consumed", False))
-            best_prob = float(mejor[1]) if isinstance(mejor, tuple) and len(mejor) >= 2 else 0.0
-            unrel_thr_live = float(_umbral_unrel_operativo(mejor[0] if isinstance(mejor, tuple) else None, best_prob))
-            auto_adapt_ok = bool(
-                AUTO_REAL_ALLOW_UNRELIABLE_POST_N15
-                and post_n15
-                and (n_samples_live >= int(AUTO_REAL_UNRELIABLE_MIN_N))
-                and (best_prob >= float(unrel_thr_live))
-            )
-            auto_state = "OK" if reliable else ("ADAPT" if auto_adapt_ok else "BLOCK")
+            bots_con_prob = 0
+            umbral_real_vigente = float(get_umbral_real_calibrado())
+            umbral_obs = float(globals().get("IA_OBSERVE_THR", 0.70) or 0.70)
+            bots_real = 0
+            bots_obs = 0
+            mejor = None
+            for b in BOT_NAMES:
+                pb = _prob_ia_operativa_bot(b, default=None)
+                if isinstance(pb, (int, float)):
+                    bots_con_prob += 1
+                    if float(pb) >= float(umbral_real_vigente):
+                        bots_real += 1
+                    if float(pb) >= float(umbral_obs):
+                        bots_obs += 1
+                    if (mejor is None) or (float(pb) > mejor[1]):
+                        mejor = (b, float(pb))
+            owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+            owner_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
+            mejor_txt = "--" if mejor is None else f"{mejor[0]} {mejor[1]*100:.1f}%"
+            suceso_vals = [float(estado_bots.get(b, {}).get("ia_suceso_idx", 0.0) or 0.0) for b in BOT_NAMES]
+            best_suceso = max(suceso_vals) if suceso_vals else 0.0
+            sensores_planos = sum(1 for b in BOT_NAMES if bool(estado_bots.get(b, {}).get("ia_sensor_plano", False)))
+            sensores_warmup = sum(1 for b in BOT_NAMES if bool(estado_bots.get(b, {}).get("ia_sensor_warmup", False)))
+            n_min_real, n_req_real = _n_minimo_real_status()
+            n_min_disp = min(int(n_min_real), int(n_req_real))
+            n_min_extra = max(0, int(n_min_real) - int(n_req_real))
+            n_min_txt = f"{n_min_disp}/{n_req_real}" + (f" (+{n_min_extra} acum)" if n_min_extra > 0 else "")
+            print(padding + Fore.CYAN + f"📊 Prob IA visibles: {bots_con_prob}/{len(BOT_NAMES)} | OBS≥{umbral_obs*100:.1f}%: {bots_obs} | REAL≥{umbral_real_vigente*100:.1f}%: {bots_real} | Mejor: {mejor_txt} | Suceso↑: {best_suceso:5.1f} | SENSOR_PLANO: {sensores_planos}/{len(BOT_NAMES)} (warmup:{sensores_warmup}) | n_min_real: {n_min_txt} | Token: {owner_txt}")
 
-            c_prog = int(meta_live.get('canary_closed_signals', 0) or 0)
-            c_tgt = int(meta_live.get('canary_target_closed', 0) or 0)
-            c_hit = float(meta_live.get('canary_hitrate', 0.0) or 0.0) * 100.0
-            canary_prog_txt = f"{c_prog}/{c_tgt}" if canary_live else "-"
-
-            why_reasons = []
-            if warmup_live:
-                why_reasons.append("warmup")
-            if (not reliable) and (not canary_live) and (not auto_adapt_ok):
-                if not bool(AUTO_REAL_ALLOW_UNRELIABLE_POST_N15):
-                    why_reasons.append("adapt_off")
-                if not post_n15:
-                    why_reasons.append("n15_pending")
-                if n_samples_live < int(AUTO_REAL_UNRELIABLE_MIN_N):
-                    why_reasons.append(f"n<{int(AUTO_REAL_UNRELIABLE_MIN_N)}")
-                if best_prob < float(unrel_thr_live):
-                    why_reasons.append(f"p_best<{float(unrel_thr_live)*100:.1f}%")
-            if confirm_h < confirm_need_h:
-                why_reasons.append(f"confirm_pending({confirm_txt_h})")
-            if not trigger_ok_h:
-                why_reasons.append("trigger_no")
             try:
-                ctt_status_h = str(CTT_STATE.get("status", "NEUTRAL") or "NEUTRAL")
-                ctt_gate_h = str(CTT_STATE.get("gate", "NEUTRAL") or "NEUTRAL")
-                ctt_reason_h = str(CTT_STATE.get("reason", "na") or "na")
-                if ctt_gate_h == "BLOCK":
-                    why_reasons.append(f"ctt_block({ctt_status_h.lower()}:{ctt_reason_h})")
-                elif ctt_status_h in {"RED_WEAK", "GREEN_DIAGNOSTIC"}:
-                    why_reasons.append(f"ctt_{ctt_status_h.lower()}({ctt_reason_h})")
-            except Exception:
-                pass
-            why_txt = "none" if not why_reasons else ",".join(why_reasons)
+                meta_live = resolver_canary_estado(leer_model_meta() or {})
+                reliable = bool(meta_live.get("reliable", False))
+                canary_live = bool(meta_live.get("canary_mode", False))
+                n_samples_live = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
+                warmup_live = bool(meta_live.get("warmup_mode", n_samples_live < int(TRAIN_WARMUP_MIN_ROWS)))
+                cap_base = float(IA_WARMUP_LOW_EVIDENCE_CAP_BASE)
+                cap_post = float(IA_WARMUP_LOW_EVIDENCE_CAP_POST_N15)
+                post_n15 = bool(_todos_bots_con_n_minimo_real())
+                cap_now = cap_post if post_n15 else cap_base
+                mode_h = str(DYN_ROOF_STATE.get("last_gate_mode", "A") or "A")
+                confirm_h = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
+                confirm_need_h = int(DYN_ROOF_STATE.get("last_confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
+                confirm_disp_h = min(confirm_h, confirm_need_h)
+                confirm_extra_h = max(0, confirm_h - confirm_need_h)
+                confirm_txt_h = f"{confirm_disp_h}/{confirm_need_h}" + (f" (+{confirm_extra_h} acum)" if confirm_extra_h > 0 else "")
+                trigger_ok_h = bool(DYN_ROOF_STATE.get("last_trigger_ok", False))
+                clone_gate = bool(DYN_ROOF_STATE.get("gate_consumed", False))
+                best_prob = float(mejor[1]) if isinstance(mejor, tuple) and len(mejor) >= 2 else 0.0
+                unrel_thr_live = float(_umbral_unrel_operativo(mejor[0] if isinstance(mejor, tuple) else None, best_prob))
+                auto_adapt_ok = bool(
+                    AUTO_REAL_ALLOW_UNRELIABLE_POST_N15
+                    and post_n15
+                    and (n_samples_live >= int(AUTO_REAL_UNRELIABLE_MIN_N))
+                    and (best_prob >= float(unrel_thr_live))
+                )
+                auto_state = "OK" if reliable else ("ADAPT" if auto_adapt_ok else "BLOCK")
 
-            p_raw_best = None
-            p_pre_best = None
-            try:
-                bb = DYN_ROOF_STATE.get("confirm_bot", None)
-                if not (isinstance(bb, str) and bb in estado_bots):
-                    live_best = []
-                    for bname in BOT_NAMES:
-                        stx = estado_bots.get(bname, {})
-                        px = stx.get("prob_ia", None)
-                        if bool(stx.get("ia_ready", False)) and isinstance(px, (int, float)) and np.isfinite(float(px)):
-                            live_best.append((float(px), bname))
-                    if live_best:
-                        bb = max(live_best, key=lambda t: t[0])[1]
-                if isinstance(bb, str) and bb in estado_bots:
-                    stbb = estado_bots.get(bb, {})
-                    pr = stbb.get("ia_prob_raw_model", None)
-                    if isinstance(pr, (int, float)) and np.isfinite(float(pr)):
-                        p_raw_best = float(pr)
-                    else:
-                        pc = stbb.get("ia_prob_cal_model", None)
-                        if isinstance(pc, (int, float)) and np.isfinite(float(pc)):
-                            p_raw_best = float(pc)
-                        else:
-                            pf = stbb.get("prob_ia", None)
-                            if isinstance(pf, (int, float)) and np.isfinite(float(pf)):
-                                p_raw_best = float(pf)
-                    pp = stbb.get("ia_prob_pre_cap", None)
-                    if isinstance(pp, (int, float)) and np.isfinite(float(pp)):
-                        p_pre_best = float(pp)
-                    elif isinstance(stbb.get("prob_ia", None), (int, float)) and np.isfinite(float(stbb.get("prob_ia", None))):
-                        p_pre_best = float(stbb.get("prob_ia", None))
-            except Exception:
+                c_prog = int(meta_live.get('canary_closed_signals', 0) or 0)
+                c_tgt = int(meta_live.get('canary_target_closed', 0) or 0)
+                c_hit = float(meta_live.get('canary_hitrate', 0.0) or 0.0) * 100.0
+                canary_prog_txt = f"{c_prog}/{c_tgt}" if canary_live else "-"
+
+                why_reasons = []
+                if warmup_live:
+                    why_reasons.append("warmup")
+                if (not reliable) and (not canary_live) and (not auto_adapt_ok):
+                    if not bool(AUTO_REAL_ALLOW_UNRELIABLE_POST_N15):
+                        why_reasons.append("adapt_off")
+                    if not post_n15:
+                        why_reasons.append("n15_pending")
+                    if n_samples_live < int(AUTO_REAL_UNRELIABLE_MIN_N):
+                        why_reasons.append(f"n<{int(AUTO_REAL_UNRELIABLE_MIN_N)}")
+                    if best_prob < float(unrel_thr_live):
+                        why_reasons.append(f"p_best<{float(unrel_thr_live)*100:.1f}%")
+                if confirm_h < confirm_need_h:
+                    why_reasons.append(f"confirm_pending({confirm_txt_h})")
+                if not trigger_ok_h:
+                    why_reasons.append("trigger_no")
+                try:
+                    ctt_status_h = str(CTT_STATE.get("status", "NEUTRAL") or "NEUTRAL")
+                    ctt_gate_h = str(CTT_STATE.get("gate", "NEUTRAL") or "NEUTRAL")
+                    ctt_reason_h = str(CTT_STATE.get("reason", "na") or "na")
+                    if ctt_gate_h == "BLOCK":
+                        why_reasons.append(f"ctt_block({ctt_status_h.lower()}:{ctt_reason_h})")
+                    elif ctt_status_h in {"RED_WEAK", "GREEN_DIAGNOSTIC"}:
+                        why_reasons.append(f"ctt_{ctt_status_h.lower()}({ctt_reason_h})")
+                except Exception:
+                    pass
+                why_txt = "none" if not why_reasons else ",".join(why_reasons)
+
                 p_raw_best = None
                 p_pre_best = None
-            p_raw_txt = f"{p_raw_best*100:.1f}%" if isinstance(p_raw_best, (int, float)) else "--"
-            p_pre_txt = f"{p_pre_best*100:.1f}%" if isinstance(p_pre_best, (int, float)) else "--"
-
-            why_line = (
-                f"🧩 WHY-NO: CAP≈{cap_now*100:.1f}% (warmup={'sí' if warmup_live else 'no'}) | "
-                f"AUTO={auto_state} reliable={'sí' if reliable else 'no'} canary={'sí' if canary_live else 'no'} n={n_samples_live} p_raw={p_raw_txt} p_pre={p_pre_txt} p_cap={best_prob*100:.1f}% why={why_txt} | canary_prog={canary_prog_txt} hit={c_hit:.1f}% | "
-                f"ROOF mode={mode_h} confirm={confirm_txt_h} trigger_ok={'sí' if trigger_ok_h else 'no'} trig_force={'sí' if bool(DYN_ROOF_STATE.get('last_trigger_force', False)) else 'no'} gate_consumed={'sí' if clone_gate else 'no'}"
-            )
-            print(padding + Fore.YELLOW + why_line)
-            _runtime_audit_append(why_line)
-
-            # ===== HUD DIAGNÓSTICO RÁPIDO (solo visual, no cambia lógica) =====
-            roof_h = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
-            floor_h = float(DYN_ROOF_STATE.get("last_floor_eff", _umbral_real_operativo_actual()) or _umbral_real_operativo_actual())
-            floor_gate_h = float(DYN_ROOF_STATE.get("last_floor_gate", floor_h) or floor_h)
-            live_peak_h = float(DYN_ROOF_STATE.get("last_live_peak", 0.0) or 0.0)
-            live_peak_n_h = len(DYN_ROOF_STATE.get("live_peak_hist", []) or [])
-            obs_ok = bool(best_prob >= float(umbral_obs))
-            unrel_ok = bool(best_prob >= float(unrel_thr_live))
-            roof_ok = bool(best_prob >= float(roof_h))
-            confirm_ok = bool(confirm_h >= confirm_need_h)
-            trig_ok = bool(trigger_ok_h)
-            rel_ok = bool(reliable)
-            can_ok = bool(canary_live)
-            classic_ok = bool(best_prob >= float(AUTO_REAL_THR_MIN))
-
-            p_diag = float(best_prob)
-            p_model = float(best_prob)
-            p_oper = float(best_prob) if (confirm_ok and trig_ok and (rel_ok or can_ok or auto_adapt_ok)) else 0.0
-            modo_score = "MODEL" if str(estado_bots.get(mejor[0], {}).get("modo_ia", "off")).lower() == "modelo" else str(estado_bots.get(mejor[0], {}).get("modo_ia", "off")).upper()
-
-            funnel_checks = [
-                ("OBS70", obs_ok),
-                (f"UNREL{int(round(unrel_thr_live*100))}", unrel_ok),
-                ("ROOF", roof_ok),
-                (f"CONF {confirm_txt_h}", confirm_ok),
-                ("TRIG", trig_ok),
-                ("REL", rel_ok),
-                ("CAN", can_ok),
-                (f"CLASS{int(round(AUTO_REAL_THR_MIN*100))}", classic_ok),
-            ]
-            funnel_txt = " | ".join([f"{k}{'✅' if v else '❌'}" for k, v in funnel_checks])
-
-            bloqueos = [
-                (f"UNREL{int(round(unrel_thr_live*100))}", unrel_ok, max(0.0, float(unrel_thr_live) - best_prob), "%"),
-                ("ROOF", roof_ok, max(0.0, float(roof_h) - best_prob), "%"),
-                (f"CONF {confirm_txt_h}", confirm_ok, float(max(0, confirm_need_h - confirm_h)), "ticks"),
-                ("TRIGGER", trig_ok, 0.0, ""),
-                ("RELIABLE", rel_ok, 0.0, ""),
-                ("CANARY", can_ok, 0.0, ""),
-                (f"CLASS{int(round(AUTO_REAL_THR_MIN*100))}", classic_ok, max(0.0, float(AUTO_REAL_THR_MIN) - best_prob), "%"),
-            ]
-            principal = next((b for b in bloqueos if not b[1]), None)
-            if principal is None:
-                principal_txt = "NONE"
-            else:
-                if principal[3] == "%":
-                    principal_txt = f"{principal[0]} (faltan {principal[2]*100:.1f} pts)"
-                elif principal[3] == "ticks":
-                    principal_txt = f"{principal[0]} (faltan {int(principal[2])})"
-                else:
-                    principal_txt = principal[0]
-
-            # Histograma compacto del bloqueo dominante para ventana reciente.
-            try:
-                principal_key = "ALLOW" if principal is None else str(principal[0])
-                HUD_BLOQUEOS_RECIENTES.append(principal_key)
-                agg = {}
-                for k in HUD_BLOQUEOS_RECIENTES:
-                    agg[k] = int(agg.get(k, 0)) + 1
-                total_blk = max(1, len(HUD_BLOQUEOS_RECIENTES))
-                top_blk = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)[:3]
-                top_txt = " | ".join([f"{k}:{(v*100.0/total_blk):.0f}%" for k, v in top_blk])
-            except Exception:
-                top_txt = "--"
-
-            if bool(HUD_COMPACT_MODE):
-                failed = [k for (k, ok) in funnel_checks if not ok]
-                funnel_compact = ("OK" if not failed else ",".join(failed[:4]))
-                if len(failed) > 4:
-                    funnel_compact += f" +{len(failed)-4}"
-                print(padding + Fore.CYAN + f"🧪 Embudo: {funnel_compact}")
-            else:
-                print(padding + Fore.CYAN + f"🧪 Embudo: {funnel_txt}")
-            if owner in BOT_NAMES:
-                principal_txt = f"{principal_txt} (solo nuevas entradas; REAL activo={owner})"
-            decision_line = f"🧭 Decisión tick: P_diag={p_diag*100:.1f}% | P_model={p_model*100:.1f}% | P_oper={p_oper*100:.1f}% | modo={modo_score} | Bloqueo principal={principal_txt}"
-            print(padding + Fore.CYAN + decision_line)
-            _runtime_audit_append(decision_line)
-            if bool(HUD_COMPACT_MODE):
-                print(padding + Fore.CYAN + f"📏 Umbrales: UNREL={unrel_thr_live*100:.0f}% | ROOF={roof_h*100:.1f}% | FLOOR={floor_h*100:.1f}% | CLASSIC={AUTO_REAL_THR_MIN*100:.0f}%")
-            else:
-                print(padding + Fore.CYAN + f"📏 Umbrales activos: OBS={umbral_obs*100:.0f}% | UNREL={unrel_thr_live*100:.0f}% | ROOF={roof_h*100:.1f}% | FLOOR={floor_h*100:.1f}% | B-GATE={floor_gate_h*100:.1f}% | LIVE_MAX={live_peak_h*100:.1f}% (n={live_peak_n_h}) | CLASSIC={AUTO_REAL_THR_MIN*100:.0f}%")
-            bloqueos_line = f"📉 Bloqueo dominante ({len(HUD_BLOQUEOS_RECIENTES)} ticks): {top_txt}"
-            print(padding + Fore.CYAN + bloqueos_line)
-            _runtime_audit_append(bloqueos_line)
-
-            # Etiquetas separadas por bot: CONTABLE (calibración) vs OPERABLE (REAL).
-            try:
-                tags = []
-                thr_oper = float(_umbral_real_operativo_actual())
-                for b in BOT_NAMES:
-                    st_b = estado_bots.get(b, {}) if isinstance(estado_bots, dict) else {}
-                    p_diag_b = st_b.get("prob_ia", None)
-                    p_oper_b = _prob_ia_operativa_bot(b, default=None)
-                    c_ok = bool(isinstance(p_diag_b, (int, float)) and np.isfinite(float(p_diag_b)) and float(p_diag_b) >= float(IA_CALIB_THRESHOLD))
-                    o_ok = bool(
-                        isinstance(p_oper_b, (int, float))
-                        and np.isfinite(float(p_oper_b))
-                        and bool(st_b.get("ia_ready", False))
-                        and str(st_b.get("modo_ia", "off")).lower() != "off"
-                        and ia_prob_valida(b, max_age_s=12.0)
-                        and (float(p_oper_b) >= float(thr_oper))
-                    )
-                    tags.append(f"{b}:C{'✅' if c_ok else '❌'}|O{'✅' if o_ok else '❌'}")
-                tags_line = "🏷️ Etiquetas bot: " + " · ".join(tags)
-                print(padding + Fore.CYAN + tags_line)
-                _runtime_audit_append(tags_line)
-            except Exception:
-                pass
-
-            # GO/NO-GO rápido para REAL continuo (disciplina operativa).
-            try:
-                meta_go = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
-                n_samples_go = int(meta_go.get("n_samples", meta_go.get("n", 0)) or 0)
-                auc_go = float(meta_go.get("auc", 0.0) or 0.0)
-                rel_go = bool(meta_go.get("reliable", False))
-                rep_go = auditar_calibracion_seniales_reales(min_prob=float(IA_CALIB_THRESHOLD)) or {}
-                closed_go = int(rep_go.get("n_total_closed", rep_go.get("n", 0)) or 0)
-                hg_go = _estado_guardrail_ia_fuerte(force=False)
-                go_ok = bool(
-                    (n_samples_go >= int(REAL_GO_N_MIN))
-                    and (closed_go >= int(REAL_GO_CLOSED_MIN))
-                    and rel_go
-                    and (auc_go >= 0.53)
-                    and (not bool(hg_go.get("hard_block", False)))
-                )
-                go_reasons = []
-                if n_samples_go < int(REAL_GO_N_MIN):
-                    go_reasons.append(f"n_samples<{int(REAL_GO_N_MIN)}")
-                if closed_go < int(REAL_GO_CLOSED_MIN):
-                    go_reasons.append(f"closed<{int(REAL_GO_CLOSED_MIN)}")
-                if not rel_go:
-                    go_reasons.append("reliable=false")
-                if auc_go < 0.53:
-                    go_reasons.append("auc<0.53")
-                if bool(hg_go.get("hard_block", False)):
-                    go_reasons.append("hard_guard=RED")
-                go_line = (
-                    f"🧭 GO/NO-GO REAL: {'GO ✅' if go_ok else 'NO-GO ❌'} "
-                    f"(n={n_samples_go}, closed={closed_go}, auc={auc_go:.3f}, rel={'sí' if rel_go else 'no'}, HG={hg_go.get('level','GREEN')})"
-                )
-                if go_reasons:
-                    go_line += " | why=" + ",".join(go_reasons[:5])
-                print(padding + Fore.CYAN + go_line)
-                _runtime_audit_append(go_line)
-            except Exception:
-                pass
-
-            # Diagnóstico por bot (top-3) para ver exactamente qué compuerta frena.
-            try:
-                global _LAST_HUD_BOT_GATE_DIAG_TS
-                now_dbg = time.time()
-                if (now_dbg - float(_LAST_HUD_BOT_GATE_DIAG_TS or 0.0)) >= float(HUD_BOT_GATE_DIAG_EVERY_S):
-                    _LAST_HUD_BOT_GATE_DIAG_TS = now_dbg
-                    live_diag = []
-                    for b in BOT_NAMES:
-                        pb = estado_bots.get(b, {}).get("prob_ia", None)
-                        if isinstance(pb, (int, float)) and np.isfinite(float(pb)):
-                            live_diag.append((b, float(pb)))
-                    live_diag.sort(key=lambda x: x[1], reverse=True)
-
-                    roof_dbg = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
-                    confirm_bot_dbg = DYN_ROOF_STATE.get("confirm_bot")
-                    confirm_st_dbg = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
-                    confirm_need_dbg = int(DYN_ROOF_STATE.get("last_confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
-
-                    dbg_chunks = []
-                    for b, pb in live_diag[:3]:
-                        unrel_b = float(_umbral_unrel_operativo(b, pb))
-                        unrel_ok_b = bool(pb >= unrel_b)
-                        roof_ok_b = bool(pb >= roof_dbg)
-                        suceso_ok_b = bool(estado_bots.get(b, {}).get("ia_suceso_ok", False))
-                        clone_b = bool(estado_bots.get(b, {}).get("ia_input_duplicado", False))
-
-                        if b == confirm_bot_dbg:
-                            conf_txt = f"{min(confirm_st_dbg, confirm_need_dbg)}/{confirm_need_dbg}"
+                try:
+                    bb = DYN_ROOF_STATE.get("confirm_bot", None)
+                    if not (isinstance(bb, str) and bb in estado_bots):
+                        live_best = []
+                        for bname in BOT_NAMES:
+                            stx = estado_bots.get(bname, {})
+                            px = stx.get("prob_ia", None)
+                            if bool(stx.get("ia_ready", False)) and isinstance(px, (int, float)) and np.isfinite(float(px)):
+                                live_best.append((float(px), bname))
+                        if live_best:
+                            bb = max(live_best, key=lambda t: t[0])[1]
+                    if isinstance(bb, str) and bb in estado_bots:
+                        stbb = estado_bots.get(bb, {})
+                        pr = stbb.get("ia_prob_raw_model", None)
+                        if isinstance(pr, (int, float)) and np.isfinite(float(pr)):
+                            p_raw_best = float(pr)
                         else:
-                            conf_txt = f"0/{confirm_need_dbg}"
+                            pc = stbb.get("ia_prob_cal_model", None)
+                            if isinstance(pc, (int, float)) and np.isfinite(float(pc)):
+                                p_raw_best = float(pc)
+                            else:
+                                pf = stbb.get("prob_ia", None)
+                                if isinstance(pf, (int, float)) and np.isfinite(float(pf)):
+                                    p_raw_best = float(pf)
+                        pp = stbb.get("ia_prob_pre_cap", None)
+                        if isinstance(pp, (int, float)) and np.isfinite(float(pp)):
+                            p_pre_best = float(pp)
+                        elif isinstance(stbb.get("prob_ia", None), (int, float)) and np.isfinite(float(stbb.get("prob_ia", None))):
+                            p_pre_best = float(stbb.get("prob_ia", None))
+                except Exception:
+                    p_raw_best = None
+                    p_pre_best = None
+                p_raw_txt = f"{p_raw_best*100:.1f}%" if isinstance(p_raw_best, (int, float)) else "--"
+                p_pre_txt = f"{p_pre_best*100:.1f}%" if isinstance(p_pre_best, (int, float)) else "--"
 
-                        dbg_chunks.append(
-                            f"{b}:{pb*100:.1f}% UNR{'✅' if unrel_ok_b else f'❌({max(0.0,(unrel_b-pb))*100:.1f})'} "
-                            f"ROOF{'✅' if roof_ok_b else f'❌({max(0.0,(roof_dbg-pb))*100:.1f})'} "
-                            f"CONF{conf_txt} SUC{'✅' if suceso_ok_b else '❌'} CLN{'🛑' if clone_b else 'ok'}"
+                why_line = (
+                    f"🧩 WHY-NO: CAP≈{cap_now*100:.1f}% (warmup={'sí' if warmup_live else 'no'}) | "
+                    f"AUTO={auto_state} reliable={'sí' if reliable else 'no'} canary={'sí' if canary_live else 'no'} n={n_samples_live} p_raw={p_raw_txt} p_pre={p_pre_txt} p_cap={best_prob*100:.1f}% why={why_txt} | canary_prog={canary_prog_txt} hit={c_hit:.1f}% | "
+                    f"ROOF mode={mode_h} confirm={confirm_txt_h} trigger_ok={'sí' if trigger_ok_h else 'no'} trig_force={'sí' if bool(DYN_ROOF_STATE.get('last_trigger_force', False)) else 'no'} gate_consumed={'sí' if clone_gate else 'no'}"
+                )
+                print(padding + Fore.YELLOW + why_line)
+                _runtime_audit_append(why_line)
+
+                # ===== HUD DIAGNÓSTICO RÁPIDO (solo visual, no cambia lógica) =====
+                roof_h = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
+                floor_h = float(DYN_ROOF_STATE.get("last_floor_eff", _umbral_real_operativo_actual()) or _umbral_real_operativo_actual())
+                floor_gate_h = float(DYN_ROOF_STATE.get("last_floor_gate", floor_h) or floor_h)
+                live_peak_h = float(DYN_ROOF_STATE.get("last_live_peak", 0.0) or 0.0)
+                live_peak_n_h = len(DYN_ROOF_STATE.get("live_peak_hist", []) or [])
+                obs_ok = bool(best_prob >= float(umbral_obs))
+                unrel_ok = bool(best_prob >= float(unrel_thr_live))
+                roof_ok = bool(best_prob >= float(roof_h))
+                confirm_ok = bool(confirm_h >= confirm_need_h)
+                trig_ok = bool(trigger_ok_h)
+                rel_ok = bool(reliable)
+                can_ok = bool(canary_live)
+                classic_ok = bool(best_prob >= float(AUTO_REAL_THR_MIN))
+
+                p_diag = float(best_prob)
+                p_model = float(best_prob)
+                p_oper = float(best_prob) if (confirm_ok and trig_ok and (rel_ok or can_ok or auto_adapt_ok)) else 0.0
+                modo_score = "MODEL" if str(estado_bots.get(mejor[0], {}).get("modo_ia", "off")).lower() == "modelo" else str(estado_bots.get(mejor[0], {}).get("modo_ia", "off")).upper()
+
+                funnel_checks = [
+                    ("OBS70", obs_ok),
+                    (f"UNREL{int(round(unrel_thr_live*100))}", unrel_ok),
+                    ("ROOF", roof_ok),
+                    (f"CONF {confirm_txt_h}", confirm_ok),
+                    ("TRIG", trig_ok),
+                    ("REL", rel_ok),
+                    ("CAN", can_ok),
+                    (f"CLASS{int(round(AUTO_REAL_THR_MIN*100))}", classic_ok),
+                ]
+                funnel_txt = " | ".join([f"{k}{'✅' if v else '❌'}" for k, v in funnel_checks])
+
+                bloqueos = [
+                    (f"UNREL{int(round(unrel_thr_live*100))}", unrel_ok, max(0.0, float(unrel_thr_live) - best_prob), "%"),
+                    ("ROOF", roof_ok, max(0.0, float(roof_h) - best_prob), "%"),
+                    (f"CONF {confirm_txt_h}", confirm_ok, float(max(0, confirm_need_h - confirm_h)), "ticks"),
+                    ("TRIGGER", trig_ok, 0.0, ""),
+                    ("RELIABLE", rel_ok, 0.0, ""),
+                    ("CANARY", can_ok, 0.0, ""),
+                    (f"CLASS{int(round(AUTO_REAL_THR_MIN*100))}", classic_ok, max(0.0, float(AUTO_REAL_THR_MIN) - best_prob), "%"),
+                ]
+                principal = next((b for b in bloqueos if not b[1]), None)
+                if principal is None:
+                    principal_txt = "NONE"
+                else:
+                    if principal[3] == "%":
+                        principal_txt = f"{principal[0]} (faltan {principal[2]*100:.1f} pts)"
+                    elif principal[3] == "ticks":
+                        principal_txt = f"{principal[0]} (faltan {int(principal[2])})"
+                    else:
+                        principal_txt = principal[0]
+
+                # Histograma compacto del bloqueo dominante para ventana reciente.
+                try:
+                    principal_key = "ALLOW" if principal is None else str(principal[0])
+                    HUD_BLOQUEOS_RECIENTES.append(principal_key)
+                    agg = {}
+                    for k in HUD_BLOQUEOS_RECIENTES:
+                        agg[k] = int(agg.get(k, 0)) + 1
+                    total_blk = max(1, len(HUD_BLOQUEOS_RECIENTES))
+                    top_blk = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)[:3]
+                    top_txt = " | ".join([f"{k}:{(v*100.0/total_blk):.0f}%" for k, v in top_blk])
+                except Exception:
+                    top_txt = "--"
+
+                if bool(HUD_COMPACT_MODE):
+                    failed = [k for (k, ok) in funnel_checks if not ok]
+                    funnel_compact = ("OK" if not failed else ",".join(failed[:4]))
+                    if len(failed) > 4:
+                        funnel_compact += f" +{len(failed)-4}"
+                    print(padding + Fore.CYAN + f"🧪 Embudo: {funnel_compact}")
+                else:
+                    print(padding + Fore.CYAN + f"🧪 Embudo: {funnel_txt}")
+                if owner in BOT_NAMES:
+                    principal_txt = f"{principal_txt} (solo nuevas entradas; REAL activo={owner})"
+                decision_line = f"🧭 Decisión tick: P_diag={p_diag*100:.1f}% | P_model={p_model*100:.1f}% | P_oper={p_oper*100:.1f}% | modo={modo_score} | Bloqueo principal={principal_txt}"
+                print(padding + Fore.CYAN + decision_line)
+                _runtime_audit_append(decision_line)
+                if bool(HUD_COMPACT_MODE):
+                    print(padding + Fore.CYAN + f"📏 Umbrales: UNREL={unrel_thr_live*100:.0f}% | ROOF={roof_h*100:.1f}% | FLOOR={floor_h*100:.1f}% | CLASSIC={AUTO_REAL_THR_MIN*100:.0f}%")
+                else:
+                    print(padding + Fore.CYAN + f"📏 Umbrales activos: OBS={umbral_obs*100:.0f}% | UNREL={unrel_thr_live*100:.0f}% | ROOF={roof_h*100:.1f}% | FLOOR={floor_h*100:.1f}% | B-GATE={floor_gate_h*100:.1f}% | LIVE_MAX={live_peak_h*100:.1f}% (n={live_peak_n_h}) | CLASSIC={AUTO_REAL_THR_MIN*100:.0f}%")
+                bloqueos_line = f"📉 Bloqueo dominante ({len(HUD_BLOQUEOS_RECIENTES)} ticks): {top_txt}"
+                print(padding + Fore.CYAN + bloqueos_line)
+                _runtime_audit_append(bloqueos_line)
+
+                # Etiquetas separadas por bot: CONTABLE (calibración) vs OPERABLE (REAL).
+                try:
+                    tags = []
+                    thr_oper = float(_umbral_real_operativo_actual())
+                    for b in BOT_NAMES:
+                        st_b = estado_bots.get(b, {}) if isinstance(estado_bots, dict) else {}
+                        p_diag_b = st_b.get("prob_ia", None)
+                        p_oper_b = _prob_ia_operativa_bot(b, default=None)
+                        c_ok = bool(isinstance(p_diag_b, (int, float)) and np.isfinite(float(p_diag_b)) and float(p_diag_b) >= float(IA_CALIB_THRESHOLD))
+                        o_ok = bool(
+                            isinstance(p_oper_b, (int, float))
+                            and np.isfinite(float(p_oper_b))
+                            and bool(st_b.get("ia_ready", False))
+                            and str(st_b.get("modo_ia", "off")).lower() != "off"
+                            and ia_prob_valida(b, max_age_s=12.0)
+                            and (float(p_oper_b) >= float(thr_oper))
                         )
+                        tags.append(f"{b}:C{'✅' if c_ok else '❌'}|O{'✅' if o_ok else '❌'}")
+                    tags_line = "🏷️ Etiquetas bot: " + " · ".join(tags)
+                    print(padding + Fore.CYAN + tags_line)
+                    _runtime_audit_append(tags_line)
+                except Exception:
+                    pass
 
-                    if dbg_chunks and bool(HUD_SHOW_TOP3_GATES):
-                        print(padding + Fore.CYAN + f"🔬 Gates(top3): {' | '.join(dbg_chunks)}")
+                # GO/NO-GO rápido para REAL continuo (disciplina operativa).
+                try:
+                    meta_go = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+                    n_samples_go = int(meta_go.get("n_samples", meta_go.get("n", 0)) or 0)
+                    auc_go = float(meta_go.get("auc", 0.0) or 0.0)
+                    rel_go = bool(meta_go.get("reliable", False))
+                    rep_go = auditar_calibracion_seniales_reales(min_prob=float(IA_CALIB_THRESHOLD)) or {}
+                    closed_go = int(rep_go.get("n_total_closed", rep_go.get("n", 0)) or 0)
+                    hg_go = _estado_guardrail_ia_fuerte(force=False)
+                    go_ok = bool(
+                        (n_samples_go >= int(REAL_GO_N_MIN))
+                        and (closed_go >= int(REAL_GO_CLOSED_MIN))
+                        and rel_go
+                        and (auc_go >= 0.53)
+                        and (not bool(hg_go.get("hard_block", False)))
+                    )
+                    go_reasons = []
+                    if n_samples_go < int(REAL_GO_N_MIN):
+                        go_reasons.append(f"n_samples<{int(REAL_GO_N_MIN)}")
+                    if closed_go < int(REAL_GO_CLOSED_MIN):
+                        go_reasons.append(f"closed<{int(REAL_GO_CLOSED_MIN)}")
+                    if not rel_go:
+                        go_reasons.append("reliable=false")
+                    if auc_go < 0.53:
+                        go_reasons.append("auc<0.53")
+                    if bool(hg_go.get("hard_block", False)):
+                        go_reasons.append("hard_guard=RED")
+                    go_line = (
+                        f"🧭 GO/NO-GO REAL: {'GO ✅' if go_ok else 'NO-GO ❌'} "
+                        f"(n={n_samples_go}, closed={closed_go}, auc={auc_go:.3f}, rel={'sí' if rel_go else 'no'}, HG={hg_go.get('level','GREEN')})"
+                    )
+                    if go_reasons:
+                        go_line += " | why=" + ",".join(go_reasons[:5])
+                    print(padding + Fore.CYAN + go_line)
+                    _runtime_audit_append(go_line)
+                except Exception:
+                    pass
+
+                # Diagnóstico por bot (top-3) para ver exactamente qué compuerta frena.
+                try:
+                    global _LAST_HUD_BOT_GATE_DIAG_TS
+                    now_dbg = time.time()
+                    if (now_dbg - float(_LAST_HUD_BOT_GATE_DIAG_TS or 0.0)) >= float(HUD_BOT_GATE_DIAG_EVERY_S):
+                        _LAST_HUD_BOT_GATE_DIAG_TS = now_dbg
+                        live_diag = []
+                        for b in BOT_NAMES:
+                            pb = estado_bots.get(b, {}).get("prob_ia", None)
+                            if isinstance(pb, (int, float)) and np.isfinite(float(pb)):
+                                live_diag.append((b, float(pb)))
+                        live_diag.sort(key=lambda x: x[1], reverse=True)
+
+                        roof_dbg = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
+                        confirm_bot_dbg = DYN_ROOF_STATE.get("confirm_bot")
+                        confirm_st_dbg = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
+                        confirm_need_dbg = int(DYN_ROOF_STATE.get("last_confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
+
+                        dbg_chunks = []
+                        for b, pb in live_diag[:3]:
+                            unrel_b = float(_umbral_unrel_operativo(b, pb))
+                            unrel_ok_b = bool(pb >= unrel_b)
+                            roof_ok_b = bool(pb >= roof_dbg)
+                            suceso_ok_b = bool(estado_bots.get(b, {}).get("ia_suceso_ok", False))
+                            clone_b = bool(estado_bots.get(b, {}).get("ia_input_duplicado", False))
+
+                            if b == confirm_bot_dbg:
+                                conf_txt = f"{min(confirm_st_dbg, confirm_need_dbg)}/{confirm_need_dbg}"
+                            else:
+                                conf_txt = f"0/{confirm_need_dbg}"
+
+                            dbg_chunks.append(
+                                f"{b}:{pb*100:.1f}% UNR{'✅' if unrel_ok_b else f'❌({max(0.0,(unrel_b-pb))*100:.1f})'} "
+                                f"ROOF{'✅' if roof_ok_b else f'❌({max(0.0,(roof_dbg-pb))*100:.1f})'} "
+                                f"CONF{conf_txt} SUC{'✅' if suceso_ok_b else '❌'} CLN{'🛑' if clone_b else 'ok'}"
+                            )
+
+                        if dbg_chunks and bool(HUD_SHOW_TOP3_GATES):
+                            print(padding + Fore.CYAN + f"🔬 Gates(top3): {' | '.join(dbg_chunks)}")
+                except Exception:
+                    pass
+
+                emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
+                print(
+                    padding + Fore.CYAN +
+                    f"🧪 Embudo: final={emb.get('decision_final','--')} risk={emb.get('risk_mode','--')} gate={emb.get('gate_quality','--')} "
+                    f"top1={emb.get('top1_bot') or '--'}({float(emb.get('top1_prob',0.0) or 0.0)*100:.1f}%) "
+                    f"top2={emb.get('top2_bot') or '--'} gap={float(emb.get('gap_value',0.0) or 0.0)*100:.1f}pp "
+                    f"why={emb.get('decision_reason','--')} wait={emb.get('soft_wait_reason','') or '--'} "
+                    f"hard={emb.get('hard_block_reason','') or '--'} deg={emb.get('degrade_from','--')}"
+                )
+                owner_state = globals().get("LAST_REAL_OWNER_STATE", {}) if isinstance(globals().get("LAST_REAL_OWNER_STATE", {}), dict) else {}
+                if owner_state:
+                    print(
+                        padding + Fore.CYAN +
+                        f"🧾 REAL owner: {owner_state.get('owner_bot','--')} | ciclo C{owner_state.get('ciclo','--')} | source={owner_state.get('source','--')}"
+                    )
+                close_state = globals().get("LAST_REAL_CLOSE_TRACE", {}) if isinstance(globals().get("LAST_REAL_CLOSE_TRACE", {}), dict) else {}
+                if close_state:
+                    print(
+                        padding + Fore.CYAN +
+                        f"🧾 Último cierre REAL: {close_state.get('bot','--')} {close_state.get('resultado','--')} "
+                        f"{float(close_state.get('saldo_real_antes', 0.0) or 0.0):,.2f} -> {float(close_state.get('saldo_real_despues', 0.0) or 0.0):,.2f}"
+                    )
+
+                ref_racha = ultimo_bot_real if ultimo_bot_real in BOT_NAMES else "--"
+                elegido_tick = mejor[0] if isinstance(mejor, tuple) and len(mejor) >= 1 else "--"
+                print(padding + Fore.CYAN + f"🧾 Contexto racha: ref={ref_racha} | elegido_tick={elegido_tick} | token_real={owner_txt}")
             except Exception:
                 pass
 
-            emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
-            print(
-                padding + Fore.CYAN +
-                f"🧪 Embudo: final={emb.get('decision_final','--')} risk={emb.get('risk_mode','--')} gate={emb.get('gate_quality','--')} "
-                f"top1={emb.get('top1_bot') or '--'}({float(emb.get('top1_prob',0.0) or 0.0)*100:.1f}%) "
-                f"top2={emb.get('top2_bot') or '--'} gap={float(emb.get('gap_value',0.0) or 0.0)*100:.1f}pp "
-                f"why={emb.get('decision_reason','--')} wait={emb.get('soft_wait_reason','') or '--'} "
-                f"hard={emb.get('hard_block_reason','') or '--'} deg={emb.get('degrade_from','--')}"
-            )
-            owner_state = globals().get("LAST_REAL_OWNER_STATE", {}) if isinstance(globals().get("LAST_REAL_OWNER_STATE", {}), dict) else {}
-            if owner_state:
-                print(
-                    padding + Fore.CYAN +
-                    f"🧾 REAL owner: {owner_state.get('owner_bot','--')} | ciclo C{owner_state.get('ciclo','--')} | source={owner_state.get('source','--')}"
-                )
-            close_state = globals().get("LAST_REAL_CLOSE_TRACE", {}) if isinstance(globals().get("LAST_REAL_CLOSE_TRACE", {}), dict) else {}
-            if close_state:
-                print(
-                    padding + Fore.CYAN +
-                    f"🧾 Último cierre REAL: {close_state.get('bot','--')} {close_state.get('resultado','--')} "
-                    f"{float(close_state.get('saldo_real_antes', 0.0) or 0.0):,.2f} -> {float(close_state.get('saldo_real_despues', 0.0) or 0.0):,.2f}"
-                )
+            # Diagnóstico de rachas por bot: detecta transición/continuidad sin usarlo como señal directa.
+            try:
+                resumen_racha = []
+                score_racha = []
+                for b in BOT_NAMES:
+                    rr = estado_bots.get(b, {}).get("resultados", [])
+                    reg = _clasificar_regimen_racha(rr)
+                    col, lar = _racha_actual_color(rr)
+                    p23, p34 = _persistencia_racha_verde(rr)
+                    d8 = _densidad_verde(rr, 8)
+                    d12 = _densidad_verde(rr, 12)
+                    acel = d8 - d12
+                    lbl = ("V" if col == "V" else ("R" if col == "R" else "N"))
+                    edad = _edad_regimen_racha(rr)
+                    d4 = _densidad_verde(rr, 4)
+                    resumen_racha.append(f"{b}:{reg}@{edad} {lbl}{lar} d4={d4*100:.0f}% d8={d8*100:.0f}% P23={_fmt_prob_pct(p23)} P34={_fmt_prob_pct(p34)}")
+                    score = (2.6 if reg == "R3" else 2.1 if reg == "R2" else 1.0 if reg == "R1" else 0.4 if reg == "R4" else 0.0) + max(0.0, acel) + max(0.0, d8 - 0.5)
+                    score_racha.append((b, score, reg, lar, acel))
 
-            ref_racha = ultimo_bot_real if ultimo_bot_real in BOT_NAMES else "--"
-            elegido_tick = mejor[0] if isinstance(mejor, tuple) and len(mejor) >= 1 else "--"
-            print(padding + Fore.CYAN + f"🧾 Contexto racha: ref={ref_racha} | elegido_tick={elegido_tick} | token_real={owner_txt}")
+                if resumen_racha and bool(HUD_SHOW_RACHA_BLOQUES):
+                    print(padding + Fore.CYAN + "🧩 Régimen racha (obs): " + " | ".join(resumen_racha[:3]))
+                    if len(resumen_racha) > 3:
+                        print(padding + Fore.CYAN + "                          " + " | ".join(resumen_racha[3:]))
+
+                if score_racha:
+                    score_racha.sort(key=lambda t: t[1], reverse=True)
+                    b0, _, reg0, lar0, acel0 = score_racha[0]
+                    print(padding + Fore.MAGENTA + f"🎯 Oportunidad racha (obs): {b0} {reg0} V{lar0 if lar0 > 0 else 0} Δdens={acel0:+.2f} (solo contexto)")
+            except Exception:
+                pass
+
+            if owner not in (None, "none") and mejor is not None and owner != mejor[0]:
+                print(padding + Fore.YELLOW + f"⛓️ Token bloqueado en {owner}; mejor IA actual es {mejor[0]} ({mejor[1]*100:.1f}%).")
         except Exception:
             pass
-
-        # Diagnóstico de rachas por bot: detecta transición/continuidad sin usarlo como señal directa.
         try:
-            resumen_racha = []
-            score_racha = []
-            for b in BOT_NAMES:
-                rr = estado_bots.get(b, {}).get("resultados", [])
-                reg = _clasificar_regimen_racha(rr)
-                col, lar = _racha_actual_color(rr)
-                p23, p34 = _persistencia_racha_verde(rr)
-                d8 = _densidad_verde(rr, 8)
-                d12 = _densidad_verde(rr, 12)
-                acel = d8 - d12
-                lbl = ("V" if col == "V" else ("R" if col == "R" else "N"))
-                edad = _edad_regimen_racha(rr)
-                d4 = _densidad_verde(rr, 4)
-                resumen_racha.append(f"{b}:{reg}@{edad} {lbl}{lar} d4={d4*100:.0f}% d8={d8*100:.0f}% P23={_fmt_prob_pct(p23)} P34={_fmt_prob_pct(p34)}")
-                score = (2.6 if reg == "R3" else 2.1 if reg == "R2" else 1.0 if reg == "R1" else 0.4 if reg == "R4" else 0.0) + max(0.0, acel) + max(0.0, d8 - 0.5)
-                score_racha.append((b, score, reg, lar, acel))
-
-            if resumen_racha and bool(HUD_SHOW_RACHA_BLOQUES):
-                print(padding + Fore.CYAN + "🧩 Régimen racha (obs): " + " | ".join(resumen_racha[:3]))
-                if len(resumen_racha) > 3:
-                    print(padding + Fore.CYAN + "                          " + " | ".join(resumen_racha[3:]))
-
-            if score_racha:
-                score_racha.sort(key=lambda t: t[1], reverse=True)
-                b0, _, reg0, lar0, acel0 = score_racha[0]
-                print(padding + Fore.MAGENTA + f"🎯 Oportunidad racha (obs): {b0} {reg0} V{lar0 if lar0 > 0 else 0} Δdens={acel0:+.2f} (solo contexto)")
+            pat = dict(globals().get("PATTERN_COL_LAST_STATE", {}) or {})
+            ratio = pat.get("green_ratio_col_actual", None)
+            ratio_txt = "--" if ratio is None else f"{float(ratio)*100:.1f}%"
+            reb_txt = "--"
+            if pat.get("rebote_rate_hist", None) is not None:
+                reb_txt = f"{float(pat.get('rebote_rate_hist', 0.0))*100:.1f}%"
+            print(
+                padding
+                + Fore.CYAN
+                + "🧠 PatternCol: "
+                + f"ratio={ratio_txt} V={int(pat.get('total_verdes_col_actual', 0) or 0)} "
+                + f"R={int(pat.get('total_rojos_col_actual', 0) or 0)} "
+                + f"reb_hist={reb_txt} "
+                + f"X={int(pat.get('total_x_hist', 0) or 0)} "
+                + f"X→✓={int(pat.get('total_x_rebote_hist', 0) or 0)} "
+                + f"state={str(pat.get('pattern_state', 'BLOQUEADO'))} "
+                + f"st80={int(pat.get('strong_streak_80', 0) or 0)} "
+                + f"st90={int(pat.get('strong_streak_90', 0) or 0)} "
+                + f"late={'sí' if bool(pat.get('late_chase', False)) else 'no'} "
+                + f"Δ={float(pat.get('pattern_delta', 0.0) or 0.0):+.2f}"
+            )
         except Exception:
             pass
-
-        if owner not in (None, "none") and mejor is not None and owner != mejor[0]:
-            print(padding + Fore.YELLOW + f"⛓️ Token bloqueado en {owner}; mejor IA actual es {mejor[0]} ({mejor[1]*100:.1f}%).")
-    except Exception:
-        pass
-    try:
-        pat = dict(globals().get("PATTERN_COL_LAST_STATE", {}) or {})
-        ratio = pat.get("green_ratio_col_actual", None)
-        ratio_txt = "--" if ratio is None else f"{float(ratio)*100:.1f}%"
-        reb_txt = "--"
-        if pat.get("rebote_rate_hist", None) is not None:
-            reb_txt = f"{float(pat.get('rebote_rate_hist', 0.0))*100:.1f}%"
-        print(
-            padding
-            + Fore.CYAN
-            + "🧠 PatternCol: "
-            + f"ratio={ratio_txt} V={int(pat.get('total_verdes_col_actual', 0) or 0)} "
-            + f"R={int(pat.get('total_rojos_col_actual', 0) or 0)} "
-            + f"reb_hist={reb_txt} "
-            + f"X={int(pat.get('total_x_hist', 0) or 0)} "
-            + f"X→✓={int(pat.get('total_x_rebote_hist', 0) or 0)} "
-            + f"state={str(pat.get('pattern_state', 'BLOQUEADO'))} "
-            + f"st80={int(pat.get('strong_streak_80', 0) or 0)} "
-            + f"st90={int(pat.get('strong_streak_90', 0) or 0)} "
-            + f"late={'sí' if bool(pat.get('late_chase', False)) else 'no'} "
-            + f"Δ={float(pat.get('pattern_delta', 0.0) or 0.0):+.2f}"
-        )
-    except Exception:
-        pass
 
     # Marcar meta_mostrada si ya se alcanzó la META y todavía no fue aceptada
     try:
@@ -14607,15 +15418,40 @@ def mostrar_panel():
         # No tocamos meta_mostrada si hay algún problema de conversión
         pass
 
+    try:
+        if bool(globals().get("HUD_MARTINGALA_LIVE_ENABLE", True)):
+            print(_marti_hud_render_line())
+    except Exception as e:
+        agregar_evento(f"⚠ martingala HUD error: {str(e)[:80]}")
+
     # ==========================
     # TABLA PRINCIPAL DE BOTS
     # ==========================
 
-    print(padding + Fore.CYAN + "┌────────┬────────────────────────────────────────────────────────────────────────────────┬─────────┬──────────┬──────────┬──────────┬──────────┬──────────┐")
-    print(padding + Fore.CYAN + Style.BRIGHT + "│ ✨ ESTADO INTELIGENTE DE BOTS · ÚLTIMOS 40 · TOKEN · IA · RENDIMIENTO      │" + Style.RESET_ALL)
-    print(padding + Fore.CYAN + "├────────┼────────────────────────────────────────────────────────────────────────────────┼─────────┬──────────┬──────────┬──────────┬──────────┬──────────┤")
-    print(padding + Fore.CYAN + "│ BOT    │ 🧾 HISTÓRICO ÚLTIMOS 40 CIERRES (histórico, no live)                 │ Token   │ GANANCIAS│ PÉRDIDAS │ % ÉXITO  │ Prob IA  │ Modo IA  │")
-    print(padding + Fore.CYAN + "├────────┼────────────────────────────────────────────────────────────────────────────────┼─────────┬──────────┬──────────┬──────────┬──────────┬──────────┤")
+    BOT_W = 7
+    LIVE_W = int(globals().get("HUD_LIVE_ACK_COL_WIDTH", 84))
+    TOKEN_W = 6
+    G_W = 3
+    P_W = 3
+    EXITO_W = 6
+    PROB_W = 9
+    MODO_W = 10
+    top_line = (
+        "┌" + "─" * (BOT_W + 2) + "┬" + "─" * (LIVE_W + 2) + "┬" + "─" * (TOKEN_W + 2)
+        + "┬" + "─" * (G_W + 2) + "┬" + "─" * (P_W + 2) + "┬" + "─" * (EXITO_W + 2)
+        + "┬" + "─" * (PROB_W + 2) + "┬" + "─" * (MODO_W + 2) + "┐"
+    )
+    mid_line = top_line.replace("┌", "├").replace("┐", "┤").replace("─", "─")
+    total_inner = len(_ack_tape_strip_ansi(top_line)) - 2
+    bot_title_line = f"│ {'⚡ BOTS · LIVE ACK 80 · RENDIMIENTO':<{total_inner}}│"
+    print(padding + Fore.CYAN + top_line)
+    print(padding + Fore.CYAN + Style.BRIGHT + bot_title_line + Style.RESET_ALL)
+    print(padding + Fore.CYAN + mid_line)
+    print(
+        padding + Fore.CYAN
+        + f"│ {'BOT':<{BOT_W}} │ {'LIVE ACK 80':<{LIVE_W}} │ {'Token':<{TOKEN_W}} │ {'G':>{G_W}} │ {'P':>{P_W}} │ {'%':<{EXITO_W}} │ {'ProbIA':<{PROB_W}} │ {'Modo':<{MODO_W}} │"
+    )
+    print(padding + Fore.CYAN + mid_line)
 
     # Meta IA para colorear Prob IA (estado global del modelo)
     model_meta_live = resolver_canary_estado(leer_model_meta() or {})
@@ -14626,6 +15462,7 @@ def mostrar_panel():
 
     # Sincronía visual dura: si hay owner REAL en memoria, la tabla SIEMPRE lo refleja.
     owner_visual = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+    _ack_tape_update_from_ack_live()
 
     for bot in BOT_NAMES:
         r = estado_bots[bot]["resultados"]
@@ -14635,25 +15472,19 @@ def mostrar_panel():
 
         # Token + origen
         token_text = token
-        if src and str(src).strip().upper() != "MANUAL":
-            token_text += f" ({src})"
         token_color = Fore.GREEN if token_text.startswith("REAL") else Fore.CYAN
         token_text = token_color + token_text + Fore.RESET
 
-        # Últimos 40 resultados visuales
-        visual = []
-        for x in r[-40:]:
-            if x == "GANANCIA":
-                visual.append(Fore.GREEN + "✓")
-            elif x == "PÉRDIDA":
-                visual.append(Fore.RED + "✗")
-            elif x == "INDEFINIDO":
-                visual.append(Fore.YELLOW + "·")
-            else:
-                visual.append(Fore.LIGHTBLACK_EX + "─")
-        while len(visual) < 40:
-            visual.insert(0, Fore.LIGHTBLACK_EX + "─")
-        col_resultados = " ".join(visual)
+        fallback = estado_bots.get(bot, {}).get("resultados", [])
+        col_resultados = _ack_tape_render_bot(
+            bot,
+            fallback_resultados=fallback,
+            width=int(globals().get("ACK_TAPE_WIDTH", 80)),
+        )
+        col_resultados = _ack_tape_pad_visible(
+            col_resultados,
+            int(globals().get("HUD_LIVE_ACK_COL_WIDTH", 84))
+        )
 
         # Ganancias / Pérdidas / % éxito
         g = estado_bots[bot]["ganancias"]
@@ -14868,18 +15699,25 @@ def mostrar_panel():
 
 
         # Línea completa del bot
+        exito_short = f"{porc:.1f}%" if porc is not None else "--"
+        token_cell = _ack_tape_pad_visible(token_text, TOKEN_W)
+        g_cell = _ack_tape_pad_visible(ganancias, G_W)
+        p_cell = _ack_tape_pad_visible(perdidas, P_W)
+        exito_cell = _ack_tape_pad_visible(exito_short, EXITO_W)
+        prob_cell = _ack_tape_pad_visible(prob_str, PROB_W)
+        modo_cell = _ack_tape_pad_visible(modo_str, MODO_W)
         linea_bot = (
-            padding + f"│ {bot:<6} │ {col_resultados:<80} │ "
-            f"{token_text:<9} │ "
-            f"{ganancias:<10} │ "
-            f"{perdidas:<10} │ "
-            f"{exito:<10} │ "
-            f"{prob_str:<10} │ "
-            f"{modo_str:<10} │"
+            padding + f"│ {bot:<{BOT_W}} │ {col_resultados} │ "
+            f"{token_cell} │ "
+            f"{g_cell} │ "
+            f"{p_cell} │ "
+            f"{exito_cell} │ "
+            f"{prob_cell} │ "
+            f"{modo_cell} │"
         )
         print(linea_bot)
 
-    print(padding + Fore.CYAN + "└────────┴────────────────────────────────────────────────────────────────────────────────┴─────────┴──────────┴──────────┴──────────┴──────────┴──────────┘")
+    print(padding + Fore.CYAN + top_line.replace("┌", "└").replace("┬", "┴").replace("┐", "┘"))
 
     # ==========================
     # EVENTOS + TELEMETRÍA IA
@@ -14889,220 +15727,228 @@ def mostrar_panel():
     mostrar_ack_live()
     mostrar_eventos()
 
-    # Telemetría IA (modelo XGBoost)
-    ruta_inc = "dataset_incremental.csv"
-    dataset_rows = contar_filas_incremental()
-    meta = _ORACLE_CACHE.get("meta") or {}
-    try:
-        # Normalizar SIEMPRE el meta en memoria
-        if isinstance(meta, dict) and meta:
-            meta = _normalize_model_meta(meta)
-        else:
-            meta = {}
-        # Fallback duro: si el cache está incompleto, lee disco
-        if (int(meta.get("n_samples", meta.get("n", 0)) or 0) == 0) and os.path.exists(_META_PATH):
-            meta_disk = leer_model_meta() or {}
-            if isinstance(meta_disk, dict) and meta_disk:
-                meta = meta_disk
-                _ORACLE_CACHE["meta"] = meta_disk
-    except Exception:
-        meta = meta if isinstance(meta, dict) else {}
+    mostrar_ia_resumen_compacto()
 
-    if dataset_rows == 0 and not meta:
-        print(Fore.CYAN + " IA ▶ sin dataset_incremental.csv (n=0). Esperando que los bots generen datos...")
-    elif dataset_rows < MIN_FIT_ROWS_LOW and not meta:
-        faltan = max(0, MIN_FIT_ROWS_LOW - dataset_rows)
-        print(Fore.CYAN + f" IA ▶ dataset con n={dataset_rows}, pero sin modelo entrenado aún.")
-        print(Fore.CYAN + f"      Faltan {faltan} filas para el primer entrenamiento.")
-    elif not meta:
-        print(Fore.CYAN + f" IA ▶ dataset listo (n={dataset_rows}), pero sin modelo entrenado todavía.")
-        print(Fore.CYAN + "      Se entrenará automáticamente por tick o al usar [E].")
-        print(Fore.CYAN + f"      Requisitos mínimos: filas útiles >= {MIN_FIT_ROWS_LOW}, 2 clases (GAN/PERD), y features válidas.")
-        print(Fore.CYAN + f"      Modo confiable recomendado desde n >= {TRAIN_WARMUP_MIN_ROWS}.")
+    if bool(globals().get("HUD_SHOW_IA_LONG_TEXT", False)):
+        # Telemetría IA (modelo XGBoost)
+        ruta_inc = "dataset_incremental.csv"
+        dataset_rows = contar_filas_incremental()
+        meta = _ORACLE_CACHE.get("meta") or {}
         try:
-            df_diag = pd.read_csv(ruta_inc, encoding="utf-8", on_bad_lines="skip") if os.path.exists(ruta_inc) else pd.DataFrame()
-            y_diag = pd.to_numeric(df_diag.get("result_bin", pd.Series(dtype=float)), errors="coerce")
-            pos_diag = int((y_diag == 1).sum())
-            neg_diag = int((y_diag == 0).sum())
-            feats_validas = int(len([c for c in df_diag.columns if c in INCREMENTAL_FEATURES_V2]))
-            last_err = str(globals().get("LAST_RETRAIN_ERROR", "") or "--")
-            print(Fore.CYAN + f"      Diagnóstico: clases pos/neg={pos_diag}/{neg_diag} | features válidas={feats_validas}/{len(INCREMENTAL_FEATURES_V2)} | último error train={last_err}")
+            # Normalizar SIEMPRE el meta en memoria
+            if isinstance(meta, dict) and meta:
+                meta = _normalize_model_meta(meta)
+            else:
+                meta = {}
+            # Fallback duro: si el cache está incompleto, lee disco
+            if (int(meta.get("n_samples", meta.get("n", 0)) or 0) == 0) and os.path.exists(_META_PATH):
+                meta_disk = leer_model_meta() or {}
+                if isinstance(meta_disk, dict) and meta_disk:
+                    meta = meta_disk
+                    _ORACLE_CACHE["meta"] = meta_disk
         except Exception:
-            pass
-    else:
-        pos = int(meta.get("pos", meta.get("n_pos", 0)) or 0)
-        neg = int(meta.get("neg", meta.get("n_neg", 0)) or 0)
-        n   = int(meta.get("n_samples", meta.get("n", 0)) or 0)
+            meta = meta if isinstance(meta, dict) else {}
 
-        # Fallback final: si no hay n, usa pos+neg
-        if n == 0 and (pos + neg) > 0:
-            n = pos + neg
-
-        auc = float(meta.get("auc", 0.0) or 0.0)
-        thr = float(meta.get("threshold", ORACULO_THR_MIN))
-        reliable = bool(meta.get("reliable", False))
-        auc_applicable = bool(meta.get("auc_applicable", False))
-        warmup_mode = bool(meta.get("warmup_mode", n < int(TRAIN_WARMUP_MIN_ROWS)))
-
-        modo_txt = "CONFIABLE ✅" if (reliable and n >= MIN_FIT_ROWS_PROD and not warmup_mode) else "EXPERIMENTAL ⚠"
-        auc_txt = f"{auc:.3f}" if auc_applicable else "N/A (clases insuficientes en TEST)"
-
-        print(Fore.CYAN + f" IA ▶ modelo XGBoost entrenado: n={n} (GAN={pos}, PERD={neg})")
-        print(Fore.CYAN + f"      AUC={auc_txt}  | Thr={thr:.2f}  | Modo={modo_txt}")
-        datos_utiles = int(max(0, pos + neg))
-        mismatch = int(max(0, n - datos_utiles))
-        if mismatch > 0:
-            print(Fore.YELLOW + f"      ⚠️ Data quality IA: n-meta={n} pero cierres útiles={datos_utiles} (delta={mismatch}).")
-        if warmup_mode:
-            print(Fore.CYAN + f"      Confianza IA: BAJA (Warmup n={n}<{int(TRAIN_WARMUP_MIN_ROWS)} | cierres útiles={datos_utiles}).")
-            print(Fore.CYAN + f"      Warmup activo: n={n}<{int(TRAIN_WARMUP_MIN_ROWS)} (solo monitoreo/calibración).")
-        else:
-            print(Fore.CYAN + f"      Confianza IA: {'MEDIA/ALTA' if reliable else 'MEDIA'} | cierres útiles={datos_utiles}.")
-
-    # Mostrar contadores de aciertos IA por bot (resumen compacto para reducir ruido)
-    resumen_hits = []
-    for bot in BOT_NAMES:
-        sig = int(estado_bots[bot].get("ia_seniales", 0) or 0)
-        if sig <= 0:
-            continue
-        ac = int(estado_bots[bot].get("ia_aciertos", 0) or 0)
-        pct = (ac / sig * 100.0) if sig > 0 else 0.0
-        resumen_hits.append((pct, bot, ac, sig))
-
-    if resumen_hits:
-        top_hits = sorted(resumen_hits, key=lambda x: x[0], reverse=True)[:3]
-        txt = " | ".join([f"{b}:{ac}/{sg} ({pc:.1f}%)" for pc, b, ac, sg in top_hits])
-        print(Fore.CYAN + f" IA ACIERTOS (Top): {txt}")
-    else:
-        print(Fore.CYAN + " IA ACIERTOS: sin cierres auditados todavía.")
-
-    # HISTÓRICO: señales IA que llegaron a ejecutarse y cerraron con resultado
-    # (se mantiene con IA_METRIC_THRESHOLD para comparabilidad histórica de auditoría)
-    print(Fore.YELLOW + f" IA HISTÓRICO (señales cerradas, ≥{IA_METRIC_THRESHOLD*100:.0f}%):")
-    has_hist = False
-    for bot in BOT_NAMES:
-        stats = IA90_stats.get(bot)
-        if stats and stats.get("n", 0) > 0:
-            has_hist = True
-            okh = int(stats.get("ok", 0) or 0)
-            nh = int(stats.get("n", 0) or 0)
-            pct_raw_h = float((okh / nh) * 100.0) if nh > 0 else 0.0
-            print(Fore.YELLOW + f"   {bot}: {okh}/{nh} ({pct_raw_h:.1f}%)")
-    if not has_hist:
-        print(Fore.YELLOW + f"   (Aún no hay operaciones cerradas con señal IA ≥{IA_METRIC_THRESHOLD*100:.0f}%.)")
-
-    # ACTUAL: quién está >= umbral vigente para compuerta REAL en este tick.
-    umbral_actual_hud = float(_umbral_senal_actual_hud())
-    print(Fore.YELLOW + f"\nIA SEÑALES OBSERVACIÓN (≥{umbral_actual_hud*100:.0f}% ahora):")
-    now = []
-    for bot in BOT_NAMES:
-        st = estado_bots.get(bot, {}) if isinstance(estado_bots, dict) else {}
-
-        # Anti-confusión: si este bot tiene token REAL, no lo consideramos “señal actual”
-        token_ui = str(st.get("token") or "DEMO").strip().upper()
-        if bool(st.get("trigger_real", False)) or token_ui.startswith("REAL"):
-            continue
-
-        modo = (st.get("modo_ia") or "off").lower()
-        p = st.get("prob_ia", None)
-        if modo != "off" and isinstance(p, (int, float)) and p >= float(umbral_actual_hud):
-            now.append((bot, float(p)))
-
-    if bool(REAL_CLASSIC_GATE):
-        try:
-            roof_h = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
-            cbot_h = DYN_ROOF_STATE.get("confirm_bot")
-            cst_h = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
-            mode_h = str(DYN_ROOF_STATE.get("last_gate_mode", "A") or "A")
-            floor_eff_h = float(DYN_ROOF_STATE.get("last_floor_eff", _umbral_real_operativo_actual()) or _umbral_real_operativo_actual())
-            confirm_need_h = int(DYN_ROOF_STATE.get("last_confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
-            trigger_ok_h = bool(DYN_ROOF_STATE.get("last_trigger_ok", False))
-            crowd_h = int(DYN_ROOF_STATE.get("crowd_count", 0) or 0)
-            n_min_real, n_req_real = _n_minimo_real_status()
-            bloqueado_txt = "bloqueado" if n_min_real < n_req_real else "ok"
-            cst_disp_h = min(cst_h, confirm_need_h)
-            cst_extra_h = max(0, cst_h - confirm_need_h)
-            cst_txt_h = f"{cst_disp_h}/{confirm_need_h}" + (f" (+{cst_extra_h} acum)" if cst_extra_h > 0 else "")
-            n_disp_h = min(int(n_min_real), int(n_req_real))
-            n_extra_h = max(0, int(n_min_real) - int(n_req_real))
-            n_txt_h = f"{n_disp_h}/{n_req_real}" + (f" (+{n_extra_h} acum)" if n_extra_h > 0 else "")
-            print(
-                Fore.YELLOW
-                + f" Compuerta REAL (operativa): mode={mode_h} | roof={roof_h*100:.1f}% | floor={floor_eff_h*100:.1f}% | "
-                  f"confirm={cst_txt_h}" + (f" ({cbot_h})" if cbot_h else "")
-                  + f" | trigger_ok={'sí' if trigger_ok_h else 'no'} | crowd={crowd_h}"
-                  + f" | n_min_real={n_txt_h} ({bloqueado_txt})"
-            )
-        except Exception:
-            pass
-
-    if not now:
-        print(Fore.YELLOW + f"(Ningún bot ≥{umbral_actual_hud*100:.0f}% en este tick.)")
-    else:
-        for b, p in sorted(now, key=lambda x: x[1], reverse=True):
-            print(Fore.YELLOW + f"  {b}: {p*100:.1f}%")
-
-    try:
-        hot_rows = []
-        for b in BOT_NAMES:
-            st = estado_bots.get(b, {})
-            hot = list(st.get("ia_sensor_hot_feats", []) or [])[:3]
-            if hot:
-                hot_rows.append(f"{b}:{','.join(hot)}")
-        if hot_rows:
-            hot_msg = " SENSOR_PLANO hot-features: " + " | ".join(hot_rows)
+        if dataset_rows == 0 and not meta:
+            print(Fore.CYAN + " IA ▶ sin dataset_incremental.csv (n=0). Esperando que los bots generen datos...")
+        elif dataset_rows < MIN_FIT_ROWS_LOW and not meta:
+            faltan = max(0, MIN_FIT_ROWS_LOW - dataset_rows)
+            print(Fore.CYAN + f" IA ▶ dataset con n={dataset_rows}, pero sin modelo entrenado aún.")
+            print(Fore.CYAN + f"      Faltan {faltan} filas para el primer entrenamiento.")
+        elif not meta:
+            print(Fore.CYAN + f" IA ▶ dataset listo (n={dataset_rows}), pero sin modelo entrenado todavía.")
+            print(Fore.CYAN + "      Se entrenará automáticamente por tick o al usar [E].")
+            print(Fore.CYAN + f"      Requisitos mínimos: filas útiles >= {MIN_FIT_ROWS_LOW}, 2 clases (GAN/PERD), y features válidas.")
+            print(Fore.CYAN + f"      Modo confiable recomendado desde n >= {TRAIN_WARMUP_MIN_ROWS}.")
             try:
-                term_cols_clip = os.get_terminal_size().columns
+                df_diag = pd.read_csv(ruta_inc, encoding="utf-8", on_bad_lines="skip") if os.path.exists(ruta_inc) else pd.DataFrame()
+                y_diag = pd.to_numeric(df_diag.get("result_bin", pd.Series(dtype=float)), errors="coerce")
+                pos_diag = int((y_diag == 1).sum())
+                neg_diag = int((y_diag == 0).sum())
+                feats_validas = int(len([c for c in df_diag.columns if c in INCREMENTAL_FEATURES_V2]))
+                last_err = str(globals().get("LAST_RETRAIN_ERROR", "") or "--")
+                print(Fore.CYAN + f"      Diagnóstico: clases pos/neg={pos_diag}/{neg_diag} | features válidas={feats_validas}/{len(INCREMENTAL_FEATURES_V2)} | último error train={last_err}")
             except Exception:
-                term_cols_clip = 140
-            # Mantener esta línea lejos del HUD/panel derecho (evita solapado visual).
-            # Tope fijo corto para consolas angostas o con zoom/fuentes variables.
-            max_hot_len = 72
-            if len(hot_msg) > max_hot_len:
-                hot_msg = hot_msg[:max(0, max_hot_len - 3)] + "..."
-            print(Fore.YELLOW + hot_msg)
-    except Exception:
-        pass
+                pass
+        else:
+            pos = int(meta.get("pos", meta.get("n_pos", 0)) or 0)
+            neg = int(meta.get("neg", meta.get("n_neg", 0)) or 0)
+            n   = int(meta.get("n_samples", meta.get("n", 0)) or 0)
 
-        # Calibración detallada movida a reporte externo (menos ruido en HUD principal)
-    print(Fore.MAGENTA + "\nℹ️ Calibración IA detallada desactivada en HUD (usar: python reporte_real_vs_ficticio_ia.py --session debug).")
+            # Fallback final: si no hay n, usa pos+neg
+            if n == 0 and (pos + neg) > 0:
+                n = pos + neg
 
-    panel_lines = [
-        "┌────────────────────────────────────────────┐",
-        "│ 🎮 PANEL DE CONTROL TECLADO               │",
-        "├────────────────────────────────────────────┤",
-        "│ [S] Salir  [P] Pausar  [C] Continuar      │",
-        "│ [R] Reiniciar ciclo  [T] Ver token        │",
-        "│ [L] Limpiar visual  [D] Limpieza dura     │",
-        "│ [G] Probar audio  [E] Entrenar IA ya      │",
-        "├────────────────────────────────────────────┤",
-        "│ 🤖 ¿CÓMO INVIERTES?                        │",
-        "│ [5–0] Elige bot (p.ej. 7 = fulll47)       │",
-        f"│ [1–{MAX_CICLOS}] Elige ciclo [p.ej. 3 = Marti #3)    │",
-    ]
+            auc = float(meta.get("auc", 0.0) or 0.0)
+            thr = float(meta.get("threshold", ORACULO_THR_MIN))
+            reliable = bool(meta.get("reliable", False))
+            auc_applicable = bool(meta.get("auc_applicable", False))
+            warmup_mode = bool(meta.get("warmup_mode", n < int(TRAIN_WARMUP_MIN_ROWS)))
 
-    token_file = leer_token_actual()
-    token_hud  = "DEMO" if (token_file in (None, "none")) else f"REAL:{token_file}"
-    activo_real = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
-    fuente = estado_bots.get(activo_real, {}).get("fuente") or "AUTO" if activo_real else "--"
-    panel_lines.append(f"│ Fuente={fuente} → Token={token_hud:<12}          │")
+            modo_txt = "CONFIABLE ✅" if (reliable and n >= MIN_FIT_ROWS_PROD and not warmup_mode) else "EXPERIMENTAL ⚠"
+            auc_txt = f"{auc:.3f}" if auc_applicable else "N/A (clases insuficientes en TEST)"
 
-    panel_lines.append("└────────────────────────────────────────────┘")
+            print(Fore.CYAN + f" IA ▶ modelo XGBoost entrenado: n={n} (GAN={pos}, PERD={neg})")
+            print(Fore.CYAN + f"      AUC={auc_txt}  | Thr={thr:.2f}  | Modo={modo_txt}")
+            datos_utiles = int(max(0, pos + neg))
+            mismatch = int(max(0, n - datos_utiles))
+            if mismatch > 0:
+                print(Fore.YELLOW + f"      ⚠️ Data quality IA: n-meta={n} pero cierres útiles={datos_utiles} (delta={mismatch}).")
+            if warmup_mode:
+                print(Fore.CYAN + f"      Confianza IA: BAJA (Warmup n={n}<{int(TRAIN_WARMUP_MIN_ROWS)} | cierres útiles={datos_utiles}).")
+                print(Fore.CYAN + f"      Warmup activo: n={n}<{int(TRAIN_WARMUP_MIN_ROWS)} (solo monitoreo/calibración).")
+            else:
+                print(Fore.CYAN + f"      Confianza IA: {'MEDIA/ALTA' if reliable else 'MEDIA'} | cierres útiles={datos_utiles}.")
+
+        # Mostrar contadores de aciertos IA por bot (resumen compacto para reducir ruido)
+        resumen_hits = []
+        for bot in BOT_NAMES:
+            sig = int(estado_bots[bot].get("ia_seniales", 0) or 0)
+            if sig <= 0:
+                continue
+            ac = int(estado_bots[bot].get("ia_aciertos", 0) or 0)
+            pct = (ac / sig * 100.0) if sig > 0 else 0.0
+            resumen_hits.append((pct, bot, ac, sig))
+
+        if resumen_hits:
+            top_hits = sorted(resumen_hits, key=lambda x: x[0], reverse=True)[:3]
+            txt = " | ".join([f"{b}:{ac}/{sg} ({pc:.1f}%)" for pc, b, ac, sg in top_hits])
+            print(Fore.CYAN + f" IA ACIERTOS (Top): {txt}")
+        else:
+            print(Fore.CYAN + " IA ACIERTOS: sin cierres auditados todavía.")
+
+        # HISTÓRICO: señales IA que llegaron a ejecutarse y cerraron con resultado
+        # (se mantiene con IA_METRIC_THRESHOLD para comparabilidad histórica de auditoría)
+        print(Fore.YELLOW + f" IA HISTÓRICO (señales cerradas, ≥{IA_METRIC_THRESHOLD*100:.0f}%):")
+        has_hist = False
+        for bot in BOT_NAMES:
+            stats = IA90_stats.get(bot)
+            if stats and stats.get("n", 0) > 0:
+                has_hist = True
+                okh = int(stats.get("ok", 0) or 0)
+                nh = int(stats.get("n", 0) or 0)
+                pct_raw_h = float((okh / nh) * 100.0) if nh > 0 else 0.0
+                print(Fore.YELLOW + f"   {bot}: {okh}/{nh} ({pct_raw_h:.1f}%)")
+        if not has_hist:
+            print(Fore.YELLOW + f"   (Aún no hay operaciones cerradas con señal IA ≥{IA_METRIC_THRESHOLD*100:.0f}%.)")
+
+        # ACTUAL: quién está >= umbral vigente para compuerta REAL en este tick.
+        umbral_actual_hud = float(_umbral_senal_actual_hud())
+        print(Fore.YELLOW + f"\nIA SEÑALES OBSERVACIÓN (≥{umbral_actual_hud*100:.0f}% ahora):")
+        now = []
+        for bot in BOT_NAMES:
+            st = estado_bots.get(bot, {}) if isinstance(estado_bots, dict) else {}
+
+            # Anti-confusión: si este bot tiene token REAL, no lo consideramos “señal actual”
+            token_ui = str(st.get("token") or "DEMO").strip().upper()
+            if bool(st.get("trigger_real", False)) or token_ui.startswith("REAL"):
+                continue
+
+            modo = (st.get("modo_ia") or "off").lower()
+            p = st.get("prob_ia", None)
+            if modo != "off" and isinstance(p, (int, float)) and p >= float(umbral_actual_hud):
+                now.append((bot, float(p)))
+
+        if bool(REAL_CLASSIC_GATE):
+            try:
+                roof_h = float(DYN_ROOF_STATE.get("roof", DYN_ROOF_FLOOR) or DYN_ROOF_FLOOR)
+                cbot_h = DYN_ROOF_STATE.get("confirm_bot")
+                cst_h = int(DYN_ROOF_STATE.get("confirm_streak", 0) or 0)
+                mode_h = str(DYN_ROOF_STATE.get("last_gate_mode", "A") or "A")
+                floor_eff_h = float(DYN_ROOF_STATE.get("last_floor_eff", _umbral_real_operativo_actual()) or _umbral_real_operativo_actual())
+                confirm_need_h = int(DYN_ROOF_STATE.get("last_confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
+                trigger_ok_h = bool(DYN_ROOF_STATE.get("last_trigger_ok", False))
+                crowd_h = int(DYN_ROOF_STATE.get("crowd_count", 0) or 0)
+                n_min_real, n_req_real = _n_minimo_real_status()
+                bloqueado_txt = "bloqueado" if n_min_real < n_req_real else "ok"
+                cst_disp_h = min(cst_h, confirm_need_h)
+                cst_extra_h = max(0, cst_h - confirm_need_h)
+                cst_txt_h = f"{cst_disp_h}/{confirm_need_h}" + (f" (+{cst_extra_h} acum)" if cst_extra_h > 0 else "")
+                n_disp_h = min(int(n_min_real), int(n_req_real))
+                n_extra_h = max(0, int(n_min_real) - int(n_req_real))
+                n_txt_h = f"{n_disp_h}/{n_req_real}" + (f" (+{n_extra_h} acum)" if n_extra_h > 0 else "")
+                print(
+                    Fore.YELLOW
+                    + f" Compuerta REAL (operativa): mode={mode_h} | roof={roof_h*100:.1f}% | floor={floor_eff_h*100:.1f}% | "
+                      f"confirm={cst_txt_h}" + (f" ({cbot_h})" if cbot_h else "")
+                      + f" | trigger_ok={'sí' if trigger_ok_h else 'no'} | crowd={crowd_h}"
+                      + f" | n_min_real={n_txt_h} ({bloqueado_txt})"
+                )
+            except Exception:
+                pass
+
+        if not now:
+            print(Fore.YELLOW + f"(Ningún bot ≥{umbral_actual_hud*100:.0f}% en este tick.)")
+        else:
+            for b, p in sorted(now, key=lambda x: x[1], reverse=True):
+                print(Fore.YELLOW + f"  {b}: {p*100:.1f}%")
+
+        try:
+            hot_rows = []
+            for b in BOT_NAMES:
+                st = estado_bots.get(b, {})
+                hot = list(st.get("ia_sensor_hot_feats", []) or [])[:3]
+                if hot:
+                    hot_rows.append(f"{b}:{','.join(hot)}")
+            if hot_rows:
+                hot_msg = " SENSOR_PLANO hot-features: " + " | ".join(hot_rows)
+                try:
+                    term_cols_clip = os.get_terminal_size().columns
+                except Exception:
+                    term_cols_clip = 140
+                # Mantener esta línea lejos del HUD/panel derecho (evita solapado visual).
+                # Tope fijo corto para consolas angostas o con zoom/fuentes variables.
+                max_hot_len = 72
+                if len(hot_msg) > max_hot_len:
+                    hot_msg = hot_msg[:max(0, max_hot_len - 3)] + "..."
+                print(Fore.YELLOW + hot_msg)
+        except Exception:
+            pass
+
+            # Calibración detallada movida a reporte externo (menos ruido en HUD principal)
+        print(Fore.MAGENTA + "\nℹ️ Calibración IA detallada desactivada en HUD (usar: python reporte_real_vs_ficticio_ia.py --session debug).")
+
+    if bool(globals().get("HUD_MERGE_SIDE_PANELS", True)):
+        panel_lines = mostrar_panel_lateral_compacto()
+    else:
+        panel_lines = [
+            "┌────────────────────────────────────────────┐",
+            "│ 🎮 PANEL DE CONTROL TECLADO               │",
+            "├────────────────────────────────────────────┤",
+            "│ [S] Salir  [P] Pausar  [C] Continuar      │",
+            "│ [R] Reiniciar ciclo  [T] Ver token        │",
+            "│ [L] Limpiar visual  [D] Limpieza dura     │",
+            "│ [G] Probar audio  [E] Entrenar IA ya      │",
+            "├────────────────────────────────────────────┤",
+            "│ 🤖 ¿CÓMO INVIERTES?                        │",
+            "│ [5–0] Elige bot (p.ej. 7 = fulll47)       │",
+            f"│ [1–{MAX_CICLOS}] Elige ciclo [p.ej. 3 = Marti #3)    │",
+        ]
+        token_file = leer_token_actual()
+        token_hud = "DEMO" if (token_file in (None, "none")) else f"REAL:{token_file}"
+        activo_real = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
+        fuente = estado_bots.get(activo_real, {}).get("fuente") or "AUTO" if activo_real else "--"
+        panel_lines.append(f"│ Fuente={fuente} → Token={token_hud:<12}          │")
+        panel_lines.append("└────────────────────────────────────────────┘")
+
+    real_panel_lines = mostrar_panel_real_activo()
+    if real_panel_lines:
+        panel_lines += real_panel_lines
 
     if PENDIENTE_FORZAR_BOT:
         rest = 0
         if PENDIENTE_FORZAR_EXPIRA:
             rest = max(0, int(PENDIENTE_FORZAR_EXPIRA - time.time()))
-        panel_lines += [
-            "┌────────────────────────────────────────────┐",
-            f"│ Bot seleccionado: {PENDIENTE_FORZAR_BOT:<22}│",
-            f"│ Tiempo para decidir: {rest:>3}s               │",
-            f"│ Elige ciclo [1..{MAX_CICLOS}] o ESC          │",
-            "└────────────────────────────────────────────┘",
-        ]
+        panel_lines += mostrar_panel_teclado_activo(
+            PENDIENTE_FORZAR_BOT,
+            rest_s=rest,
+            max_ciclos=MAX_CICLOS,
+            ciclo_actual=f"C{ciclo_martingala_siguiente()}",
+            fuente=(estado_bots.get(PENDIENTE_FORZAR_BOT, {}).get("fuente") or "DEMO"),
+        )
 
 
-    if HUD_VISIBLE:
+    if HUD_VISIBLE and (not bool(globals().get("HUD_MERGE_SIDE_PANELS", True))):
         dibujar_hud_gatewin(len(panel_lines), HUD_LAYOUT)
     def _strip_ansi(s: str) -> str:
         return re.sub(r'\x1b\[[0-9;]*m', '', s)
@@ -15112,11 +15958,15 @@ def mostrar_panel():
         term_cols, term_rows = os.get_terminal_size()
     except:
         term_cols, term_rows = 140, 50
-    start_col = max(1, term_cols - panel_width - 1)
-    start_row = max(1, term_rows - panel_height - 1)
-    for i, line in enumerate(panel_lines):
-        print(f"\x1b[{start_row + i};{start_col}H" + Fore.MAGENTA + line + Fore.RESET)
-    print(f"\x1b[{term_rows};1H", end="")
+    if bool(globals().get("HUD_SIDE_PANEL_INLINE", True)):
+        for line in panel_lines:
+            print(padding + Fore.MAGENTA + line + Fore.RESET)
+    else:
+        start_col = max(1, term_cols - panel_width - 1)
+        start_row = max(2, term_rows - panel_height - 8)
+        for i, line in enumerate(panel_lines):
+            print(f"\x1b[{start_row + i};{start_col}H" + Fore.MAGENTA + line + Fore.RESET)
+        print(f"\x1b[{term_rows};1H", end="")
 
 # Mostrar advertencia meta
 def mostrar_advertencia_meta():
@@ -15337,8 +16187,11 @@ def _hud_trim_line(txt: str, max_chars: int | None = None) -> str:
 
 def mostrar_eventos():
     if eventos_recentes:
-        print(Fore.MAGENTA + "\nEventos recientes:")
-        for ev in list(eventos_recentes)[-int(HUD_EVENTS_MAX):]:
+        print(Fore.MAGENTA + "Eventos recientes:")
+        max_ev = int(HUD_EVENTS_MAX)
+        if bool(globals().get("HUD_SHOW_VERBOSE_EVENTS", False)):
+            max_ev = max(max_ev, len(list(eventos_recentes)))
+        for ev in list(eventos_recentes)[-max_ev:]:
             print(Fore.MAGENTA + " - " + _hud_trim_line(ev, HUD_EVENT_MAX_CHARS))
 # === FIN BLOQUE 11 ===
 
@@ -15386,7 +16239,7 @@ def forzar_real_manual(bot: str, ciclo: int):
             MODAL_ACTIVO = True
             try:
                 with RENDER_LOCK:
-                    print(Fore.YELLOW + f"⚠️ Semáforo no verde para {bot}. ¿Forzar de todos modos? [Y/N]")
+                    mostrar_panel_confirmacion_riesgo(bot)
                 while True:
                     if msvcrt.kbhit():
                         k = msvcrt.getch().decode("utf-8", errors="ignore").lower()
