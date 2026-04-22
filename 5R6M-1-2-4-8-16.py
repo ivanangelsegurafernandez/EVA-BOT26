@@ -2584,6 +2584,11 @@ ACK_LIVE_MAX_AGE_WARN_S = 10.0
 ACK_LIVE_MAX_AGE_STALE_S = 120.0
 ACK_LIVE_SHOW_MISSING = True
 ACK_LIVE_COMPACT = True
+HUD_MARTINGALA_LIVE_ENABLE = True
+HUD_MARTINGALA_ALERT_ON_LOSS = True
+HUD_MARTINGALA_SHOW_NEXT = True
+HUD_MARTINGALA_SHOW_AMOUNT = True
+HUD_MARTINGALA_ALERT_TTL_S = 90.0
 ACK_TAPE_ENABLE = True
 ACK_TAPE_WIDTH = 80
 ACK_TAPE_MAX_SEEN = 2000
@@ -2597,6 +2602,8 @@ _LXV_LAST_EMITTED_ROUND = 0
 _SYNC_PENDING_WARN_TS = {}
 _SYNC_STALE_WARN_TS = {}
 _LXV_5V1X_EVENT_TS = {}
+_LXV_HEADER_WARN_TS = {}
+_LXV_HEADER_WARN_COOLDOWN_S = 180.0
 LXV_MATRIX_EXPORT_ENABLE = True
 LXV_MATRIX_DIR = script_dir
 LXV_MATRIX_EXPORT_LOCK = "lxv_matrix_export.lock"
@@ -2611,6 +2618,8 @@ _LXV_MATRIX_HEADERS = {
         "patron_lxv", "bot_x1", "bot_x2", "bot_x_fuerte",
         "round_complete", "missing_bots", "data_quality",
         "source",
+        "marti_bot", "marti_ciclo_actual", "marti_monto_actual", "marti_ultimo_resultado",
+        "marti_ciclo_siguiente", "marti_monto_siguiente", "marti_estado", "marti_fuente",
     ],
     "long": [
         "round_id", "ts_round", "bot", "bot_order",
@@ -2620,6 +2629,7 @@ _LXV_MATRIX_HEADERS = {
         "token", "prob_ia", "modo_ia", "ia_gate_real",
         "trade_status", "epoch", "ts_trade",
         "ia_decision_id", "puntaje_estrategia",
+        "marti_ciclo_bot", "marti_monto_bot",
         "round_complete", "missing_bots", "data_quality",
     ],
     "features": [
@@ -2632,6 +2642,7 @@ _LXV_MATRIX_HEADERS = {
         "avg_prob_verdes", "avg_prob_rojos", "max_prob_rojos", "min_prob_rojos", "std_prob_columna",
         "avg_score_verdes", "avg_score_rojos",
         "patron_lxv", "patron_simple", "patron_hash",
+        "origin_marti_ciclo", "origin_marti_monto",
         "round_complete", "missing_bots", "data_quality",
     ],
 }
@@ -2676,6 +2687,16 @@ def _lxv_safe_int(v, default=None):
 
 def _lxv_csv_read_rows(path: str, max_lines: int = 1800) -> list[dict]:
     return _tail_rows_dict(path, max_lines=max_lines)
+
+def _lxv_read_existing_header(path: str) -> list[str]:
+    try:
+        if (not os.path.exists(path)) or os.path.getsize(path) <= 0:
+            return []
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            row = next(csv.reader(f), [])
+        return [str(x).strip() for x in list(row or []) if str(x).strip()]
+    except Exception:
+        return []
 
 def _lxv_get_last_closed_row_for_bot(bot: str, ack_close: dict, round_id: int) -> dict | None:
     ruta = f"registro_enriquecido_{bot}.csv"
@@ -2740,10 +2761,23 @@ def _lxv_round_already_exported(round_id: int, bot: str | None = None) -> bool:
     return False
 
 def _lxv_append_rows_csv(path: str, rows: list[dict], headers: list[str], unique_keys: list[str]) -> int:
+    global _LXV_HEADER_WARN_TS
     if not rows:
         return 0
     _ensure_dir(os.path.dirname(path) or ".")
     wrote = 0
+    active_headers = list(headers or [])
+    existing_header = _lxv_read_existing_header(path)
+    if existing_header:
+        active_headers = list(existing_header)
+        missing = [h for h in list(headers or []) if h not in set(existing_header)]
+        missing_marti = [h for h in missing if h.startswith("marti_") or h.startswith("origin_marti_")]
+        if missing_marti:
+            now = time.time()
+            ts_last = float(_LXV_HEADER_WARN_TS.get(path, 0.0) or 0.0)
+            if (now - ts_last) >= float(_LXV_HEADER_WARN_COOLDOWN_S):
+                _LXV_HEADER_WARN_TS[path] = now
+                agregar_evento("⚠ matriz con header viejo; campos marti se omiten hasta archivo nuevo")
     with file_lock_required(LXV_MATRIX_EXPORT_LOCK, timeout=3.0, stale_after=30.0) as got:
         if not got:
             return 0
@@ -2755,14 +2789,14 @@ def _lxv_append_rows_csv(path: str, rows: list[dict], headers: list[str], unique
                 existing.add(k)
         need_header = (not os.path.exists(path)) or os.path.getsize(path) <= 0
         with open(path, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
+            w = csv.DictWriter(f, fieldnames=active_headers, extrasaction="ignore")
             if need_header:
                 w.writeheader()
             for row in rows:
                 k = tuple(str(row.get(c, "")).strip() for c in unique_keys)
                 if k in existing:
                     continue
-                payload = {h: row.get(h, "") for h in headers}
+                payload = {h: row.get(h, "") for h in active_headers}
                 w.writerow(payload)
                 existing.add(k)
                 wrote += 1
@@ -2770,7 +2804,7 @@ def _lxv_append_rows_csv(path: str, rows: list[dict], headers: list[str], unique
             os.fsync(f.fileno())
     return wrote
 
-def _lxv_build_round_row(round_id: int, ts_round: float, rows_long: list[dict], missing_bots: list[str], round_complete: bool, data_quality: str) -> dict:
+def _lxv_build_round_row(round_id: int, ts_round: float, rows_long: list[dict], missing_bots: list[str], round_complete: bool, data_quality: str, marti_snapshot: dict | None = None) -> dict:
     by_bot = {str(r.get("bot")): r for r in rows_long}
     symbols = []
     n_verdes = n_rojos = n_indef = n_vacios = 0
@@ -2797,6 +2831,7 @@ def _lxv_build_round_row(round_id: int, ts_round: float, rows_long: list[dict], 
         patron = "4V2X"
     else:
         patron = "OTHER"
+    marti = dict(marti_snapshot or {})
     row = {
         "round_id": int(round_id),
         "ts_round": float(ts_round),
@@ -2814,6 +2849,14 @@ def _lxv_build_round_row(round_id: int, ts_round: float, rows_long: list[dict], 
         "missing_bots": "|".join([b for b in BOT_NAMES if b in set(missing_bots or [])]),
         "data_quality": str(data_quality),
         "source": "sync_round",
+        "marti_bot": str(marti.get("bot", "") or ""),
+        "marti_ciclo_actual": marti.get("ciclo_actual", ""),
+        "marti_monto_actual": marti.get("monto_actual", ""),
+        "marti_ultimo_resultado": str(marti.get("ultimo_resultado", "") or ""),
+        "marti_ciclo_siguiente": marti.get("ciclo_siguiente", ""),
+        "marti_monto_siguiente": marti.get("monto_siguiente", ""),
+        "marti_estado": str(marti.get("estado", "") or ""),
+        "marti_fuente": str(marti.get("fuente", "") or ""),
     }
     for idx, b in enumerate(BOT_NAMES):
         row[b] = symbols[idx]
@@ -2840,7 +2883,7 @@ def _lxv_pick_bot_x_fuerte(rojos_rows: list[dict]) -> str:
     ranked = sorted(rojos_rows, key=rank, reverse=True)
     return str(ranked[0].get("bot", "")) if ranked else ""
 
-def _lxv_build_features_row(round_row: dict, rows_long: list[dict]) -> dict:
+def _lxv_build_features_row(round_row: dict, rows_long: list[dict], marti_snapshot: dict | None = None) -> dict:
     vals_prob = []
     verdes_prob = []
     rojos_prob = []
@@ -2874,6 +2917,7 @@ def _lxv_build_features_row(round_row: dict, rows_long: list[dict]) -> dict:
                 rojos_score.append(s)
     bot_x_fuerte = _lxv_pick_bot_x_fuerte(rojos_rows)
     patron_simple = "".join(secuencia)
+    marti = dict(marti_snapshot or {})
     out = {
         "round_id": round_row.get("round_id"),
         "ts_round": round_row.get("ts_round"),
@@ -2900,6 +2944,8 @@ def _lxv_build_features_row(round_row: dict, rows_long: list[dict]) -> dict:
         "patron_lxv": round_row.get("patron_lxv", "OTHER"),
         "patron_simple": patron_simple,
         "patron_hash": hashlib.md5(patron_simple.encode("utf-8")).hexdigest()[:16],
+        "origin_marti_ciclo": marti.get("ciclo_actual", ""),
+        "origin_marti_monto": marti.get("monto_actual", ""),
         "round_complete": round_row.get("round_complete", False),
         "missing_bots": round_row.get("missing_bots", ""),
         "data_quality": round_row.get("data_quality", "partial"),
@@ -2932,6 +2978,7 @@ def _lxv_export_round_snapshot(round_id: int, ts_round: float, closed: dict, exp
     missing = [b for b in expected if b not in closed]
     round_complete = len(missing) == 0
     data_quality = "ok" if round_complete else "partial"
+    marti_snapshot = _marti_hud_snapshot() if "_marti_hud_snapshot" in globals() else {}
     rows_long = []
     for idx, bot in enumerate(BOT_NAMES, start=1):
         ack = closed.get(bot, {}) if isinstance(closed.get(bot, {}), dict) else {}
@@ -2966,6 +3013,8 @@ def _lxv_export_round_snapshot(round_id: int, ts_round: float, closed: dict, exp
             "ts_trade": (csv_row or {}).get("ts", (ack or {}).get("ts", "")),
             "ia_decision_id": (csv_row or {}).get("ia_decision_id", estado_bots.get(bot, {}).get("ia_decision_id", "")),
             "puntaje_estrategia": (csv_row or {}).get("puntaje_estrategia", ""),
+            "marti_ciclo_bot": marti_snapshot.get("ciclo_actual", ""),
+            "marti_monto_bot": marti_snapshot.get("monto_actual", ""),
             "round_complete": bool(round_complete),
             "missing_bots": "|".join(missing),
             "data_quality": data_quality,
@@ -2983,11 +3032,12 @@ def _lxv_export_round_snapshot(round_id: int, ts_round: float, closed: dict, exp
                 "payout_total": "", "payout_multiplier": "", "token": "",
                 "prob_ia": "", "modo_ia": "", "ia_gate_real": "", "trade_status": "",
                 "epoch": "", "ts_trade": "", "ia_decision_id": "", "puntaje_estrategia": "",
+                "marti_ciclo_bot": marti_snapshot.get("ciclo_actual", ""), "marti_monto_bot": marti_snapshot.get("monto_actual", ""),
                 "round_complete": bool(round_complete), "missing_bots": "|".join(missing), "data_quality": data_quality,
             })
     rows_long = sorted(rows_long, key=lambda r: int(r.get("bot_order", 999)))
-    round_row = _lxv_build_round_row(round_id, ts_round, rows_long, missing, round_complete, data_quality)
-    feat_row = _lxv_build_features_row(round_row, rows_long)
+    round_row = _lxv_build_round_row(round_id, ts_round, rows_long, missing, round_complete, data_quality, marti_snapshot=marti_snapshot)
+    feat_row = _lxv_build_features_row(round_row, rows_long, marti_snapshot=marti_snapshot)
     if str(data_quality) != "ok":
         feat_row["avg_prob_verdes"] = ""
         feat_row["avg_prob_rojos"] = ""
@@ -3655,63 +3705,236 @@ def mostrar_ack_live():
         print(f"⚡ ROUND LIVE error seguro: {e}")
 
 
-def _hud_marti_live_lines(max_cols: int = 3):
-    """Resumen visual de martingala y columnas de matriz (solo HUD, sin lógica operativa)."""
-    lines = []
+def _marti_hud_safe_cycle(value):
+    if value is None:
+        return None
     try:
-        owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else next((b for b in BOT_NAMES if str(estado_bots.get(b, {}).get("token", "")).upper().startswith("REAL")), None)
+        txt = str(value).strip()
+        if txt == "":
+            return None
+        up = txt.upper()
+        if up.startswith("C"):
+            txt = up[1:]
+        cyc = int(float(txt))
     except Exception:
-        owner = None
-
+        return None
     try:
-        token_file = leer_token_actual()
-        token_txt = "DEMO" if token_file in (None, "none") else f"REAL:{token_file}"
+        max_c = int(globals().get("MAX_CICLOS", len(list(globals().get("MARTI_ESCALADO", []) or [])) or 1) or 1)
     except Exception:
-        token_txt = "DEMO"
+        max_c = 1
+    cyc = max(1, min(max_c, cyc))
+    return int(cyc)
 
-    ciclo_sig = 1
+
+def _marti_hud_get_owner():
+    bots = list(BOT_NAMES) if "BOT_NAMES" in globals() else []
+    # 1) Lock REAL en memoria
+    lock = globals().get("REAL_OWNER_LOCK", None)
+    if isinstance(lock, str) and lock in bots:
+        return lock, f"REAL:{lock}", "lock"
+    # 2) token actual
     try:
-        ciclo_sig = int(ciclo_martingala_siguiente() or 1)
+        tok = leer_token_actual()
     except Exception:
-        ciclo_sig = 1
+        tok = None
+    if isinstance(tok, str):
+        tok_s = tok.strip()
+        if tok_s in bots:
+            return tok_s, f"REAL:{tok_s}", "token"
+        up = tok_s.upper()
+        if up.startswith("REAL:"):
+            cand = tok_s.split(":", 1)[1].strip()
+            if cand in bots:
+                return cand, f"REAL:{cand}", "token"
+    # 3) selección manual si existe
+    manual_bot = globals().get("PENDIENTE_FORZAR_BOT", None)
+    if isinstance(manual_bot, str) and manual_bot in bots:
+        return manual_bot, "DEMO", "manual"
+    # 4) último bot con ciclo válido en estado_bots
+    try:
+        for b in list(reversed(bots)):
+            st = estado_bots.get(b, {}) if isinstance(estado_bots, dict) else {}
+            if _marti_hud_safe_cycle(st.get("ciclo_actual", None)) is not None:
+                tk = str(st.get("token", "DEMO") or "DEMO").upper()
+                return b, (f"REAL:{b}" if tk.startswith("REAL") else "DEMO"), "estado"
+    except Exception:
+        pass
+    # 5) último bot con ACK cerrado reciente
+    try:
+        rows_pack = _ack_live_build_rows()
+        rows = list((rows_pack or {}).get("rows", []) or [])
+        cands = [r for r in rows if str(r.get("bot", "")) in bots and r.get("res") in ("✓", "X")]
+        if cands:
+            cands.sort(key=lambda r: (float(r.get("age_s", 1e18) or 1e18), -int(r.get("ack_round", 0) or 0)))
+            b = str(cands[0].get("bot", ""))
+            if b in bots:
+                return b, "DEMO", "ack"
+    except Exception:
+        pass
+    return "", "DEMO", "--"
 
-    ciclo_owner = ciclo_sig
-    fuente_owner = "AUTO"
-    if owner:
-        st_owner = estado_bots.get(owner, {}) if isinstance(estado_bots, dict) else {}
+
+def _marti_hud_get_last_result(bot):
+    if not bot:
+        return ""
+    try:
+        rows_pack = _ack_live_build_rows()
+        for row in list((rows_pack or {}).get("rows", []) or []):
+            if str(row.get("bot", "")) != str(bot):
+                continue
+            r = str(row.get("res", "") or "")
+            if r == "✓":
+                return "WIN"
+            if r == "X":
+                return "LOSS"
+            break
+    except Exception:
+        pass
+    try:
+        ack = _sync_round_safe_read_json(_sync_round_ack_path(str(bot))) or {}
+        if str(ack.get("status", "") or "").lower() == "closed":
+            norm = _ack_live_norm_resultado(ack.get("resultado"))
+            if norm == "WIN":
+                return "WIN"
+            if norm == "LOSS":
+                return "LOSS"
+    except Exception:
+        pass
+    return ""
+
+
+def _marti_hud_snapshot():
+    bot, token_txt, source_owner = _marti_hud_get_owner()
+    max_c = int(globals().get("MAX_CICLOS", len(list(globals().get("MARTI_ESCALADO", []) or [])) or 1) or 1)
+    escala = list(globals().get("MARTI_ESCALADO", []) or [])
+    st = estado_bots.get(bot, {}) if (bot and isinstance(estado_bots, dict)) else {}
+
+    ciclo_actual = _marti_hud_safe_cycle(st.get("ciclo_actual", None))
+    fuente = source_owner
+    if ciclo_actual is None:
+        ciclo_actual = _marti_hud_safe_cycle(st.get("ciclo", None))
+        if ciclo_actual is not None:
+            fuente = "estado_ciclo"
+    if ciclo_actual is None:
         try:
-            ciclo_owner = int(st_owner.get("ciclo_actual", ciclo_sig) or ciclo_sig)
+            ciclo_actual = _marti_hud_safe_cycle(int(marti_paso) + 1)
+            if ciclo_actual is not None:
+                fuente = "marti_paso"
         except Exception:
-            ciclo_owner = ciclo_sig
-        fuente_owner = str(st_owner.get("fuente") or "AUTO")
+            ciclo_actual = None
+    if ciclo_actual is None:
+        try:
+            ciclo_actual = _marti_hud_safe_cycle(int(marti_ciclos_perdidos) + 1)
+            if ciclo_actual is not None:
+                fuente = "marti_ciclos"
+        except Exception:
+            ciclo_actual = None
+    if ciclo_actual is None:
+        ciclo_actual = 1
+        fuente = "fallback"
 
-    idx = max(0, min(int(MAX_CICLOS) - 1, int(ciclo_sig) - 1))
-    monto_sig = float(MARTI_ESCALADO[idx]) if MARTI_ESCALADO else 0.0
-    plan_txt = " ".join([f"C{i+1}={float(v):g}" for i, v in enumerate(list(MARTI_ESCALADO)[: int(MAX_CICLOS)])])
-
-    lines.append(
-        f"🎯 HUD MARTINGALA LIVE | owner={owner or '--'} | token={token_txt} | ciclo=C{int(ciclo_owner)}/{int(MAX_CICLOS)} | fuente={fuente_owner}"
-    )
-    lines.append(f"   Escalado: {plan_txt} | Próximo monto={monto_sig:g}")
-
+    monto_actual = ""
     try:
-        pat = dict(globals().get("PATTERN_COL_LAST_STATE", {}) or {})
+        idx = int(ciclo_actual) - 1
+        if 0 <= idx < len(escala):
+            monto_actual = float(escala[idx])
     except Exception:
-        pat = {}
+        monto_actual = ""
 
-    ratio = pat.get("green_ratio_col_actual", None)
-    ratio_txt = "--" if ratio is None else f"{float(ratio)*100:.1f}%"
-    v = int(pat.get("total_verdes_col_actual", 0) or 0)
-    r = int(pat.get("total_rojos_col_actual", 0) or 0)
-    st = str(pat.get("pattern_state", "BLOQUEADO"))
-    st80 = int(pat.get("strong_streak_80", 0) or 0)
-    st90 = int(pat.get("strong_streak_90", 0) or 0)
-    reb = pat.get("rebote_rate_hist", None)
-    reb_txt = "--" if reb is None else f"{float(reb)*100:.1f}%"
-    lines.append(
-        f"🧩 MATRICES LIVE | col0={v}V/{r}X ({ratio_txt}) | state={st} | st80={st80} st90={st90} | rebote_hist={reb_txt}"
-    )
-    return lines[: max(1, int(max_cols))]
+    ultimo = _marti_hud_get_last_result(bot)
+    ciclo_siguiente = ciclo_actual
+    monto_siguiente = monto_actual
+    estado = "ESPERANDO"
+    alerta = ""
+
+    if ultimo == "LOSS":
+        if int(ciclo_actual) < int(max_c):
+            ciclo_siguiente = int(ciclo_actual) + 1
+            try:
+                monto_siguiente = float(escala[int(ciclo_siguiente) - 1])
+            except Exception:
+                monto_siguiente = ""
+            estado = f"SUBE_C{int(ciclo_siguiente)}"
+            alerta = f"{bot or '--'} perdió C{int(ciclo_actual)} → próximo C{int(ciclo_siguiente)}"
+        else:
+            ciclo_siguiente = 1
+            try:
+                monto_siguiente = float(escala[0]) if escala else ""
+            except Exception:
+                monto_siguiente = ""
+            estado = "FIN_C5"
+            alerta = f"{bot or '--'} perdió C{int(ciclo_actual)} → fin Martingala / reinicio esperado"
+    elif ultimo == "WIN":
+        ciclo_siguiente = 1
+        try:
+            monto_siguiente = float(escala[0]) if escala else ""
+        except Exception:
+            monto_siguiente = ""
+        estado = "RESET_C1"
+        alerta = f"{bot or '--'} ganó → reset C1"
+
+    return {
+        "bot": bot,
+        "token": token_txt,
+        "ciclo_actual": ciclo_actual,
+        "monto_actual": monto_actual,
+        "ultimo_resultado": ultimo,
+        "ciclo_siguiente": ciclo_siguiente,
+        "monto_siguiente": monto_siguiente,
+        "estado": estado,
+        "fuente": fuente,
+        "alerta": alerta,
+    }
+
+
+def _marti_hud_render_line():
+    snap = _marti_hud_snapshot()
+    bot = str(snap.get("bot", "") or "")
+    estado = str(snap.get("estado", "ESPERANDO") or "ESPERANDO")
+    ult = str(snap.get("ultimo_resultado", "") or "")
+    c_act = snap.get("ciclo_actual", None)
+    c_nxt = snap.get("ciclo_siguiente", None)
+    m_act = snap.get("monto_actual", "")
+    m_nxt = snap.get("monto_siguiente", "")
+
+    def _fmt_m(v):
+        if not bool(globals().get("HUD_MARTINGALA_SHOW_AMOUNT", True)):
+            return ""
+        try:
+            if v in ("", None):
+                return ""
+            return f" ${float(v):g}"
+        except Exception:
+            return ""
+
+    if not bot:
+        return "🧩 MARTINGALA LIVE | Bot=-- | Actual=-- | Próx=-- | Estado=ESPERANDO"
+    if estado.startswith("SUBE_C"):
+        c_prev = int(c_act) if isinstance(c_act, (int, float)) else 1
+        txt = f"⚠️ MARTINGALA | {bot} perdió C{c_prev} → próximo C{int(c_nxt)} ({_fmt_m(m_nxt).strip() or '$--'})"
+        return (Fore.YELLOW + txt + Fore.RESET) if ("Fore" in globals() and bool(globals().get("HUD_MARTINGALA_ALERT_ON_LOSS", True))) else txt
+    if estado == "RESET_C1":
+        txt = f"✅ MARTINGALA | {bot} ganó → reset C1"
+        return (Fore.GREEN + txt + Fore.RESET) if "Fore" in globals() else txt
+    if estado == "FIN_C5":
+        c_prev = int(c_act) if isinstance(c_act, (int, float)) else int(globals().get("MAX_CICLOS", 5) or 5)
+        txt = f"🛑 MARTINGALA | {bot} perdió C{c_prev} → fin C5 / reinicio esperado"
+        return (Fore.RED + txt + Fore.RESET) if "Fore" in globals() else txt
+    ult_txt = ult if ult else "--"
+    act_txt = f"C{c_act}{_fmt_m(m_act)}" if c_act else "--"
+    if bool(globals().get("HUD_MARTINGALA_SHOW_NEXT", True)):
+        nxt_txt = f"C{c_nxt}{_fmt_m(m_nxt)}" if c_nxt else "--"
+    else:
+        nxt_txt = "--"
+    txt = f"🧩 MARTINGALA LIVE | Bot={bot} | Actual={act_txt} | Último={ult_txt} | Próx={nxt_txt} | Estado={estado}"
+    return (Fore.CYAN + txt + Fore.RESET) if "Fore" in globals() else txt
+
+
+def _hud_marti_live_lines():
+    try:
+        return [_marti_hud_render_line()]
+    except Exception:
+        return []
 
 
 def _sync_round_write_json_atomic(path: str, payload: dict) -> bool:
@@ -15137,6 +15360,12 @@ def mostrar_panel():
         # No tocamos meta_mostrada si hay algún problema de conversión
         pass
 
+    try:
+        if bool(globals().get("HUD_MARTINGALA_LIVE_ENABLE", True)):
+            print(_marti_hud_render_line())
+    except Exception as e:
+        agregar_evento(f"⚠ martingala HUD error: {str(e)[:80]}")
+
     # ==========================
     # TABLA PRINCIPAL DE BOTS
     # ==========================
@@ -15438,11 +15667,6 @@ def mostrar_panel():
 
     # Eventos recientes
     mostrar_ack_live()
-    try:
-        for ln in _hud_marti_live_lines(max_cols=3):
-            print(ln)
-    except Exception:
-        pass
     mostrar_eventos()
 
     mostrar_ia_resumen_compacto()
