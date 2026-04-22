@@ -2607,6 +2607,8 @@ _LXV_HEADER_WARN_COOLDOWN_S = 180.0
 _MATRIZ_SKIP_WARN_TS = 0.0
 _MARTI_HUD_DEMO_IGNORED_TS = {}
 _MATRIZ_STRICT_MODE_ANNOUNCED = False
+_FOLLOWUP_5V1X_EVENT_TS = {}
+_FOLLOWUP_5V1X_LAST_APPLIED = {}
 MATRIZ_COLUMNAS_LXV_CSV = "matriz_columnas_lxv.csv"
 MATRIZ_CELDAS_LXV_CSV = "matriz_celdas_lxv.csv"
 MATRIZ_FOLLOWUP_5V1X_CSV = "matriz_followup_5v1x.csv"
@@ -2654,10 +2656,10 @@ _LXV_MATRIX_HEADERS = {
         "round_complete", "missing_bots", "data_quality",
     ],
     "followup": [
-        "origin_round", "bot_objetivo", "resultado_origen", "ciclo_origen",
-        "origin_marti_ciclo", "origin_marti_monto",
+        "origin_round", "origin_ts_utc", "x_bot", "bot_objetivo", "regimen_fase", "origin_pattern",
+        "resultado_origen", "ciclo_origen", "origin_marti_ciclo", "origin_marti_monto",
         "followup_c1", "followup_c2", "followup_c3", "followup_c4", "followup_c5",
-        "outcome_final",
+        "future_sequence", "hit", "hit_step", "outcome_final", "resolved_round", "resolved_ts_utc",
     ],
 }
 
@@ -2717,6 +2719,207 @@ def _lxv_read_existing_header(path: str) -> list[str]:
         return [str(x).strip() for x in list(row or []) if str(x).strip()]
     except Exception:
         return []
+
+def _followup_5v1x_is_origin_valid(row_or_pack):
+    d = dict(row_or_pack or {})
+    pattern = str(d.get("pattern", d.get("patron_lxv", d.get("origin_pattern", ""))) or "").upper()
+    try:
+        v_count = int(d.get("v_count", d.get("n_verdes", 0)) or 0)
+        x_count = int(d.get("x_count", d.get("n_rojos", 0)) or 0)
+    except Exception:
+        return False
+    complete = bool(d.get("round_complete", d.get("complete", False)))
+    quality = str(d.get("data_quality", d.get("quality", "")) or "").lower()
+    x_bot = str(d.get("x_bot", d.get("bot_objetivo", "")) or "")
+    return bool(pattern == "5V1X" and v_count == 5 and x_count == 1 and complete and quality == "ok" and x_bot in BOT_NAMES)
+
+def _followup_5v1x_load_rows():
+    path = _lxv_matrix_paths().get("followup")
+    official = list(_LXV_MATRIX_HEADERS.get("followup", []))
+    if not path or (not os.path.exists(path)):
+        return [], official
+    rows = []
+    fieldnames = []
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            fieldnames = list(reader.fieldnames or [])
+            for r in reader:
+                try:
+                    rr = dict(r or {})
+                    if (not str(rr.get("origin_round", "")).strip()) or (not str(rr.get("x_bot", rr.get("bot_objetivo", "")) or "").strip()):
+                        continue
+                    rows.append(rr)
+                except Exception:
+                    continue
+    except Exception:
+        return [], official
+    return rows, (fieldnames if fieldnames else official)
+
+def _followup_5v1x_write_rows_atomic(rows, fieldnames):
+    path = _lxv_matrix_paths().get("followup")
+    if not path:
+        return False
+    try:
+        _ensure_dir(os.path.dirname(path) or ".")
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(fieldnames or []), extrasaction="ignore")
+            w.writeheader()
+            for r in list(rows or []):
+                payload = {k: (r.get(k, "") if isinstance(r, dict) else "") for k in list(fieldnames or [])}
+                w.writerow(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        agregar_evento(f"⚠ followup write error: {str(e)[:70]}")
+        return False
+
+def _followup_5v1x_update_pending_with_column(column_pack):
+    global _FOLLOWUP_5V1X_EVENT_TS, _FOLLOWUP_5V1X_LAST_APPLIED
+    d = dict(column_pack or {})
+    complete = bool(d.get("complete", d.get("round_complete", False)))
+    quality = str(d.get("quality", d.get("data_quality", "")) or "").lower()
+    results = dict(d.get("results", {}) or {})
+    if (not complete) or (quality != "ok") or (len(results) != len(BOT_NAMES)) or any(str(results.get(b, "")) not in ("✓", "X") for b in BOT_NAMES):
+        return
+    current_round = int(d.get("round_id", 0) or 0)
+    if current_round <= 0:
+        return
+    rows, fieldnames = _followup_5v1x_load_rows()
+    fset = set(fieldnames or [])
+    needed = {"followup_c1", "followup_c2", "followup_c3", "followup_c4", "followup_c5", "outcome_final"}
+    if not needed.issubset(fset):
+        now = time.time()
+        last = float(_FOLLOWUP_5V1X_EVENT_TS.get("old_header", 0.0) or 0.0)
+        if (now - last) >= 180.0:
+            _FOLLOWUP_5V1X_EVENT_TS["old_header"] = now
+            agregar_evento("⚠ followup header antiguo: no se puede completar C1..C5 hasta crear archivo nuevo")
+        return
+
+    changed = False
+    for r in rows:
+        try:
+            x_bot = str(r.get("x_bot", r.get("bot_objetivo", "")) or "")
+            origin_round = int(float(r.get("origin_round", 0) or 0))
+        except Exception:
+            continue
+        if x_bot not in BOT_NAMES or origin_round <= 0 or current_round <= origin_round:
+            continue
+        if r.get("resolved_round", "") not in ("", None, "--"):
+            continue
+        if not _followup_5v1x_is_origin_valid(r):
+            continue
+        key = f"{origin_round}:{x_bot}"
+        if int(_FOLLOWUP_5V1X_LAST_APPLIED.get(key, 0) or 0) >= current_round:
+            continue
+        outcome = str(r.get("outcome_final", "") or "").upper().strip()
+        if outcome not in ("", "PENDING", "--"):
+            continue
+        if x_bot not in results:
+            continue
+        res = str(results.get(x_bot, "") or "")
+        if res not in ("✓", "X"):
+            continue
+        slot = None
+        for i in range(1, 6):
+            c = f"followup_c{i}"
+            if str(r.get(c, "") or "").strip() == "":
+                slot = i
+                break
+        if slot is None:
+            continue
+        r[f"followup_c{slot}"] = res
+        seq_vals = [str(r.get(f"followup_c{i}", "") or "").strip() for i in range(1, 6) if str(r.get(f"followup_c{i}", "") or "").strip() in ("✓", "X")]
+        r["future_sequence"] = ",".join(seq_vals)
+        r["outcome_final"] = "PENDING"
+        if res == "✓":
+            r["hit"] = "1"
+            r["hit_step"] = str(slot)
+            r["outcome_final"] = f"HIT_C{slot}"
+            r["resolved_round"] = str(current_round)
+            r["resolved_ts_utc"] = datetime.now(timezone.utc).isoformat()
+        elif slot == 5:
+            r["hit"] = "0"
+            r["hit_step"] = ""
+            r["outcome_final"] = "MISS_C5"
+            r["resolved_round"] = str(current_round)
+            r["resolved_ts_utc"] = datetime.now(timezone.utc).isoformat()
+        _FOLLOWUP_5V1X_LAST_APPLIED[key] = int(current_round)
+        changed = True
+
+        now = time.time()
+        ev_key = f"upd:{origin_round}:{x_bot}:{slot}"
+        if (now - float(_FOLLOWUP_5V1X_EVENT_TS.get(ev_key, 0.0) or 0.0)) >= 15.0:
+            _FOLLOWUP_5V1X_EVENT_TS[ev_key] = now
+            agregar_evento(f"🧾 followup 5V1X update: origin={origin_round} {x_bot} C{slot}={res}")
+        if str(r.get("outcome_final", "")).startswith("HIT_C"):
+            ev2 = f"hit:{origin_round}:{x_bot}"
+            if (now - float(_FOLLOWUP_5V1X_EVENT_TS.get(ev2, 0.0) or 0.0)) >= 30.0:
+                _FOLLOWUP_5V1X_EVENT_TS[ev2] = now
+                agregar_evento(f"✅ followup 5V1X {r.get('outcome_final')}: origin={origin_round} {x_bot}")
+        elif str(r.get("outcome_final", "")) == "MISS_C5":
+            ev2 = f"miss:{origin_round}:{x_bot}"
+            if (now - float(_FOLLOWUP_5V1X_EVENT_TS.get(ev2, 0.0) or 0.0)) >= 30.0:
+                _FOLLOWUP_5V1X_EVENT_TS[ev2] = now
+                agregar_evento(f"❌ followup 5V1X MISS_C5: origin={origin_round} {x_bot}")
+
+    if changed:
+        _followup_5v1x_write_rows_atomic(rows, fieldnames)
+
+def _followup_5v1x_create_origin_if_needed(column_pack):
+    global _FOLLOWUP_5V1X_EVENT_TS
+    d = dict(column_pack or {})
+    if not _followup_5v1x_is_origin_valid(d):
+        return
+    round_id = int(d.get("round_id", 0) or 0)
+    x_bot = str(d.get("x_bot", d.get("bot_objetivo", "")) or "")
+    if round_id <= 0 or x_bot not in BOT_NAMES:
+        return
+    rows, fieldnames = _followup_5v1x_load_rows()
+    exists = any(
+        (str(r.get("origin_round", "")).strip() == str(round_id) and str(r.get("x_bot", r.get("bot_objetivo", "")) or "").strip() == x_bot)
+        for r in rows
+    )
+    if exists:
+        return
+    base = {k: "" for k in list(fieldnames or _LXV_MATRIX_HEADERS.get("followup", []))}
+    base["origin_round"] = str(round_id)
+    base["origin_ts_utc"] = str(d.get("ts_utc", "") or datetime.now(timezone.utc).isoformat())
+    base["x_bot"] = x_bot
+    base["bot_objetivo"] = x_bot
+    base["regimen_fase"] = str(d.get("regimen_fase", "") or "")
+    base["origin_pattern"] = "5V1X"
+    base["resultado_origen"] = "X"
+    ciclo_map = dict(d.get("ciclo_by_bot", {}) or {})
+    base["ciclo_origen"] = str(ciclo_map.get(x_bot, d.get("ciclo_origen", "")) or "")
+    base["origin_marti_ciclo"] = str(d.get("origin_marti_ciclo", d.get("marti_ciclo_actual", "")) or "")
+    base["origin_marti_monto"] = str(d.get("origin_marti_monto", d.get("marti_monto_actual", "")) or "")
+    for i in range(1, 6):
+        c = f"followup_c{i}"
+        if c in base:
+            base[c] = ""
+    if "future_sequence" in base:
+        base["future_sequence"] = ""
+    if "hit" in base:
+        base["hit"] = ""
+    if "hit_step" in base:
+        base["hit_step"] = ""
+    if "outcome_final" in base:
+        base["outcome_final"] = "PENDING"
+    if "resolved_round" in base:
+        base["resolved_round"] = ""
+    if "resolved_ts_utc" in base:
+        base["resolved_ts_utc"] = ""
+    rows.append(base)
+    if _followup_5v1x_write_rows_atomic(rows, fieldnames):
+        now = time.time()
+        k = f"new:{round_id}:{x_bot}"
+        if (now - float(_FOLLOWUP_5V1X_EVENT_TS.get(k, 0.0) or 0.0)) >= 10.0:
+            _FOLLOWUP_5V1X_EVENT_TS[k] = now
+            agregar_evento(f"🧾 followup 5V1X creado: round={round_id} x_bot={x_bot}")
 
 def _lxv_get_last_closed_row_for_bot(bot: str, ack_close: dict, round_id: int) -> dict | None:
     ruta = f"registro_enriquecido_{bot}.csv"
@@ -3069,28 +3272,38 @@ def _lxv_export_round_snapshot(round_id: int, ts_round: float, closed: dict, exp
     pattern = str(round_row.get("patron_lxv", "") or "")
     is_5v1x = int(v_count == 5 and x_count == 1 and pattern == "5V1X")
     bot_obj = str(feat_row.get("bot_x_fuerte", "") or round_row.get("bot_x1", "") or "")
-    followup_row = None
-    if is_5v1x == 1 and bot_obj in BOT_NAMES:
-        row_obj = next((r for r in rows_long if str(r.get("bot", "")) == bot_obj), {})
-        followup_row = {
-            "origin_round": int(round_id),
-            "bot_objetivo": bot_obj,
-            "resultado_origen": str(row_obj.get("resultado_symbol", "") or ""),
-            "ciclo_origen": row_obj.get("ciclo", ""),
-            "origin_marti_ciclo": marti_snapshot.get("ciclo_actual", ""),
-            "origin_marti_monto": marti_snapshot.get("monto_actual", ""),
-            "followup_c1": "",
-            "followup_c2": "",
-            "followup_c3": "",
-            "followup_c4": "",
-            "followup_c5": "",
-            "outcome_final": "",
-        }
+    row_obj = next((r for r in rows_long if str(r.get("bot", "")) == bot_obj), {}) if bot_obj else {}
+    results_map = {str(r.get("bot", "")): str(r.get("resultado_symbol", "") or "") for r in rows_long}
+    ciclo_map = {str(r.get("bot", "")): r.get("ciclo", "") for r in rows_long}
+    column_pack = {
+        "round_id": int(round_id),
+        "ts_utc": datetime.now(timezone.utc).isoformat(),
+        "complete": bool(round_complete),
+        "round_complete": bool(round_complete),
+        "quality": str(data_quality),
+        "data_quality": str(data_quality),
+        "results": results_map,
+        "pattern": pattern,
+        "patron_lxv": pattern,
+        "v_count": int(v_count),
+        "x_count": int(x_count),
+        "n_verdes": int(v_count),
+        "n_rojos": int(x_count),
+        "x_bot": bot_obj,
+        "bot_objetivo": bot_obj,
+        "resultado_origen": str(row_obj.get("resultado_symbol", "") or ""),
+        "ciclo_origen": row_obj.get("ciclo", ""),
+        "ciclo_by_bot": ciclo_map,
+        "origin_marti_ciclo": marti_snapshot.get("ciclo_actual", ""),
+        "origin_marti_monto": marti_snapshot.get("monto_actual", ""),
+        "regimen_fase": "",
+        "is_5v1x": int(is_5v1x),
+    }
     paths = _lxv_matrix_paths()
     wrote_matrix = _lxv_append_rows_csv(paths["matrix"], [round_row], _LXV_MATRIX_HEADERS["matrix"], ["round_id"])
     _lxv_append_rows_csv(paths["long"], rows_long, _LXV_MATRIX_HEADERS["long"], ["round_id", "bot"])
-    if followup_row is not None:
-        _lxv_append_rows_csv(paths["followup"], [followup_row], _LXV_MATRIX_HEADERS["followup"], ["origin_round", "bot_objetivo"])
+    _followup_5v1x_update_pending_with_column(column_pack)
+    _followup_5v1x_create_origin_if_needed(column_pack)
     _lxv_export_excel_optional(paths)
     now_ts = time.time()
     if wrote_matrix > 0 and (now_ts - float(_LXV_MATRIX_LAST_LOG_TS or 0.0)) >= float(LXV_MATRIX_EXPORT_LOG_EVERY_S):
