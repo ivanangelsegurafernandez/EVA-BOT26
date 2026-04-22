@@ -14291,6 +14291,66 @@ def _fmt_prob_pct(p):
         return "--"
 
 
+def _resumen_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
+    lines = []
+    try:
+        owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+        owner_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
+        modo_txt = "PAUSA" if maestro_en_pausa() else "ACTIVO"
+        eta_txt = f"{float(globals().get('INTERVALO_ACTUAL', 2.0) or 2.0):.1f}s"
+        saldo_num = float(valor_saldo) if isinstance(valor_saldo, (int, float)) else None
+        meta_num = float(META) if isinstance(globals().get("META"), (int, float)) else None
+        base_num = float(SALDO_INICIAL) if isinstance(globals().get("SALDO_INICIAL"), (int, float)) else None
+        falta_txt = "--"
+        avance_txt = "--"
+        if (saldo_num is not None) and (meta_num is not None):
+            falta_txt = f"{max(0.0, meta_num - saldo_num):.2f}"
+        if (saldo_num is not None) and (meta_num is not None) and (base_num is not None):
+            den = float(meta_num - base_num)
+            if abs(den) > 1e-12:
+                avance = ((saldo_num - base_num) / den) * 100.0
+                avance_txt = f"{max(0.0, min(100.0, avance)):.1f}%"
+        lines.append(
+            f"🧭 Modo={modo_txt} | Token={owner_txt} | Saldo={saldo_str} | Meta={meta_str} | Falta={falta_txt} | Avance={avance_txt} | Refresh={eta_txt}"
+        )
+
+        marti_total = float(sum(list(MARTI_ESCALADO or []))) if "MARTI_ESCALADO" in globals() else 0.0
+        cobertura = "NO"
+        estado = "RIESGO"
+        if saldo_num is not None:
+            if meta_num is not None and saldo_num >= meta_num:
+                estado = "OK"
+            elif saldo_num >= marti_total:
+                estado = "AVISO"
+            else:
+                estado = "RIESGO"
+            cobertura = "SI" if saldo_num >= marti_total else "NO"
+        objetivo_txt = "+20.0%"
+        try:
+            if (base_num is not None) and (meta_num is not None) and base_num > 0:
+                objetivo_txt = f"+{((meta_num / base_num) - 1.0)*100.0:.1f}%"
+        except Exception:
+            pass
+        base_txt = f"{base_num:.2f}" if base_num is not None else "--"
+        est_txt = estado
+        try:
+            if estado == "OK":
+                est_txt = f"{Fore.GREEN}OK{Style.RESET_ALL}"
+            elif estado == "AVISO":
+                est_txt = f"{Fore.YELLOW}AVISO{Style.RESET_ALL}"
+            else:
+                est_txt = f"{Fore.RED}RIESGO{Style.RESET_ALL}"
+        except Exception:
+            est_txt = estado
+        lines.append(
+            f"🎯 Base={base_txt} | Objetivo={objetivo_txt} | Estado={est_txt} | Marti C1-C5={marti_total:.2f} | Cobertura={cobertura}"
+        )
+    except Exception:
+        lines.append("🧭 Modo=-- | Token=-- | Saldo=-- | Meta=-- | Falta=-- | Avance=-- | Refresh=--")
+        lines.append("🎯 Base=-- | Objetivo=-- | Estado=-- | Marti C1-C5=-- | Cobertura=--")
+    return lines[:2]
+
+
 def _resumen_top_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
     lines = []
     try:
@@ -14298,10 +14358,19 @@ def _resumen_top_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
         owner_txt = "DEMO" if owner in (None, "none") else f"REAL:{owner}"
         modo_txt = "PAUSA" if maestro_en_pausa() else "ACTIVO"
         eta_txt = f"{float(globals().get('INTERVALO_ACTUAL', 2.0) or 2.0):.1f}s"
-        line1 = f"🧭 Modo={modo_txt} | Token={owner_txt} | Saldo={saldo_str} | Meta={meta_str} | Refresh={eta_txt}"
+        saldo_num = float(valor_saldo) if isinstance(valor_saldo, (int, float)) else None
+        meta_num = float(META) if isinstance(globals().get("META"), (int, float)) else None
+        base_num = float(SALDO_INICIAL) if isinstance(globals().get("SALDO_INICIAL"), (int, float)) else None
+        falta_txt = f"{max(0.0, meta_num - saldo_num):.2f}" if (saldo_num is not None and meta_num is not None) else "--"
+        avance_txt = "--"
+        if (saldo_num is not None) and (meta_num is not None) and (base_num is not None):
+            den = float(meta_num - base_num)
+            if abs(den) > 1e-12:
+                avance_txt = f"{max(0.0, min(100.0, ((saldo_num - base_num) / den) * 100.0)):.1f}%"
+        line1 = f"🧭 Modo={modo_txt} | Token={owner_txt} | Saldo={saldo_str} | Meta={meta_str} | Falta={falta_txt} | Avance={avance_txt} | Refresh={eta_txt}"
         lines.append(line1)
     except Exception:
-        lines.append("🧭 Modo=-- | Token=-- | Saldo=-- | Meta=-- | Refresh=--")
+        lines.append("🧭 Modo=-- | Token=-- | Saldo=-- | Meta=-- | Falta=-- | Avance=-- | Refresh=--")
 
     try:
         umbral_real = float(get_umbral_real_calibrado())
@@ -14479,7 +14548,10 @@ def mostrar_panel():
     # Resumen top compacto (modo normal)
     if bool(globals().get("HUD_MINIMAL_MODE", True)):
         try:
-            for _line in _resumen_top_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str):
+            for _line in _resumen_saldo_meta_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str):
+                print(padding + Fore.CYAN + _line)
+            top_lines = list(_resumen_top_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str) or [])
+            for _line in top_lines[1:]:
                 print(padding + Fore.CYAN + _line)
         except Exception:
             pass
