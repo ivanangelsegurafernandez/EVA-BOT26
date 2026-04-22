@@ -14445,19 +14445,69 @@ def mostrar_panel_lateral_compacto():
     estado_sem, estado_lbl, detalle = evaluar_semaforo()
     marti_line = marti_audit_resumen_linea()
     return [
-        "┌────────────────────────────────────────────┐",
-        "│ 🛠 CONTROL / ESTADO                        │",
-        "├────────────────────────────────────────────┤",
-        "│ [S] Salir  [P] Pausar  [C] Continuar      │",
-        "│ [R] Reiniciar ciclo  [T] Ver token        │",
-        "│ [L] Limpiar visual  [D] Limpieza dura     │",
-        "│ [G] Probar audio  [E] Entrenar IA ya      │",
-        "├────────────────────────────────────────────┤",
-        f"│ Bot={bot_txt:<8} | Marti=C{int(ciclo):<2} | Fuente={str(fuente)[:8]:<8}│",
-        f"│ Token={token_hud:<14} Estado={estado_lbl[:14]:<14}│",
-        f"│ {marti_line[:40]:<40} │",
-        "└────────────────────────────────────────────┘",
+        "╔══════════════════════════════════════════════╗",
+        "║ 🛠 CONTROL / ESTADO                          ║",
+        "╠══════════════════════════════════════════════╣",
+        "║ [S] Salir   [P] Pausar   [C] Continuar      ║",
+        "║ [R] Reiniciar ciclo   [T] Ver token         ║",
+        "║ [L] Limpiar visual    [D] Limpieza dura     ║",
+        "║ [G] Probar audio      [E] Entrenar IA ya    ║",
+        "╠══════════════════════════════════════════════╣",
+        f"║ Bot={bot_txt:<8}  Marti=C{int(ciclo):<2}  Fuente={str(fuente)[:8]:<8}   ║",
+        f"║ Token={token_hud:<14} Estado={estado_lbl[:14]:<14} ║",
+        f"║ {marti_line[:42]:<42}║",
+        "╚══════════════════════════════════════════════╝",
     ]
+
+
+def mostrar_bloque_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--", padding=""):
+    try:
+        lines = _resumen_saldo_meta_hud(valor_saldo=valor_saldo, saldo_str=saldo_str, meta_str=meta_str)
+        l1 = _ack_tape_strip_ansi(lines[0] if len(lines) > 0 else "💰 SALDO ACTUAL: --")
+        l2 = _ack_tape_strip_ansi(lines[1] if len(lines) > 1 else "🎯 Base=-- | Objetivo=-- | Estado=-- | Marti C1-C5=-- | Cobertura=--")
+        w = max(76, len(l1), len(l2))
+        print(padding + Fore.CYAN + "╔" + "═" * (w + 2) + "╗")
+        print(padding + Fore.CYAN + f"║ {l1:<{w}} ║")
+        print(padding + Fore.CYAN + f"║ {l2:<{w}} ║")
+        print(padding + Fore.CYAN + "╚" + "═" * (w + 2) + "╝")
+    except Exception:
+        print(padding + Fore.CYAN + "💰 Saldo/Meta: --")
+
+
+def mostrar_panel_inversion_activo(bot, rest_s, max_ciclos, ciclo_actual="C1", fuente="--"):
+    bot_txt = str(bot or "--")
+    rest = max(0, int(rest_s or 0))
+    ciclo_txt = str(ciclo_actual or "C1")
+    src_txt = str(fuente or "--")
+    return [
+        "╔══════════════════════════════════════════════╗",
+        "║ 🚀 INVERSIÓN MANUAL / CONFIRMACIÓN          ║",
+        "╠══════════════════════════════════════════════╣",
+        "║ ⌨ MODO TECLADO ACTIVO                       ║",
+        f"║ Bot seleccionado : {bot_txt:<26}║",
+        f"║ Tiempo para decidir : {rest:>3}s{'':<22}║",
+        f"║ Ciclo actual      : {ciclo_txt:<26}║",
+        f"║ Fuente            : {src_txt:<26}║",
+        f"║ Acción            : Elegir ciclo [1..{int(max_ciclos)}]{'':<12}║",
+        "║ Cancelar          : ESC                     ║",
+        "╚══════════════════════════════════════════════╝",
+    ]
+
+
+def mostrar_panel_confirmacion_riesgo(bot):
+    bot_txt = str(bot or "--")
+    lines = [
+        "╔══════════════════════════════════════════════╗",
+        "║ ⚠ CONFIRMACIÓN DE RIESGO                    ║",
+        "╠══════════════════════════════════════════════╣",
+        f"║ Bot: {bot_txt:<38}║",
+        "║ Semáforo: NO VERDE                          ║",
+        "║ Acción: ¿Forzar inversión de todos modos?   ║",
+        "║ Sí = Y        No = N                        ║",
+        "╚══════════════════════════════════════════════╝",
+    ]
+    for ln in lines:
+        print(Fore.YELLOW + ln)
 
 # Mostrar panel
 def mostrar_panel():
@@ -14545,16 +14595,14 @@ def mostrar_panel():
     if not bool(globals().get("HUD_MINIMAL_MODE", True)):
         print(padding + Fore.GREEN + f"💰 SALDO INICIAL {inicial_str} 🎯 META {meta_str}")
 
-    # Resumen top compacto (modo normal)
-    if bool(globals().get("HUD_MINIMAL_MODE", True)):
-        try:
-            for _line in _resumen_saldo_meta_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str):
-                print(padding + Fore.CYAN + _line)
-            top_lines = list(_resumen_top_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str) or [])
-            for _line in top_lines[1:]:
-                print(padding + Fore.CYAN + _line)
-        except Exception:
-            pass
+    # Bloque visual destacado de saldo/meta + cabecera compacta secundaria
+    try:
+        mostrar_bloque_saldo_meta_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str, padding=padding)
+        top_lines = list(_resumen_top_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str) or [])
+        for _line in top_lines[1:]:
+            print(padding + Fore.CYAN + _line)
+    except Exception:
+        pass
 
     # Bloques técnicos extensos (solo verbose/debug)
     if bool(globals().get("HUD_SHOW_VERBOSE_TOP", False)) or (not bool(globals().get("HUD_MINIMAL_MODE", True))):
@@ -15493,13 +15541,13 @@ def mostrar_panel():
         rest = 0
         if PENDIENTE_FORZAR_EXPIRA:
             rest = max(0, int(PENDIENTE_FORZAR_EXPIRA - time.time()))
-        panel_lines += [
-            "┌────────────────────────────────────────────┐",
-            f"│ Bot seleccionado: {PENDIENTE_FORZAR_BOT:<22}│",
-            f"│ Tiempo para decidir: {rest:>3}s               │",
-            f"│ Elige ciclo [1..{MAX_CICLOS}] o ESC          │",
-            "└────────────────────────────────────────────┘",
-        ]
+        panel_lines += mostrar_panel_inversion_activo(
+            PENDIENTE_FORZAR_BOT,
+            rest_s=rest,
+            max_ciclos=MAX_CICLOS,
+            ciclo_actual=f"C{ciclo_martingala_siguiente()}",
+            fuente=(estado_bots.get(PENDIENTE_FORZAR_BOT, {}).get("fuente") or "DEMO"),
+        )
 
 
     if HUD_VISIBLE and (not bool(globals().get("HUD_MERGE_SIDE_PANELS", True))):
@@ -15793,7 +15841,7 @@ def forzar_real_manual(bot: str, ciclo: int):
             MODAL_ACTIVO = True
             try:
                 with RENDER_LOCK:
-                    print(Fore.YELLOW + f"⚠️ Semáforo no verde para {bot}. ¿Forzar de todos modos? [Y/N]")
+                    mostrar_panel_confirmacion_riesgo(bot)
                 while True:
                     if msvcrt.kbhit():
                         k = msvcrt.getch().decode("utf-8", errors="ignore").lower()
