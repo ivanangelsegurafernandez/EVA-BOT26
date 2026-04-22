@@ -235,6 +235,9 @@ HUD_EVENTS_MAX = 3
 HUD_SHOW_IA_LONG_TEXT = False
 HUD_MERGE_SIDE_PANELS = True
 HUD_ROUND_LIVE_COMPACT = True
+HUD_LIVE_ACK_COL_WIDTH = 44
+HUD_TABLE_COMPACT_WIDTH = True
+HUD_SIDE_PANEL_INLINE = True
 HUD_EVENT_MAX_CHARS = 150
 
 # --- Objetivos / umbrales globales de IA ---
@@ -3585,7 +3588,7 @@ def _ack_live_format_lines(snapshot):
     lines = []
     lag_txt = max_txt if max_txt != "--" else avg_txt
     lines.append(
-        f"⚡ ROUND LIVE | obj=#{obj_round} | released=#{released_round} | cerrados={closed_count}/{expected_count} | faltan={faltan_count} | lag={lag_txt}"
+        f"⚡ ROUND LIVE | obj=#{obj_round} | rel=#{released_round} | cerrados={closed_count}/{expected_count} | faltan={faltan_count} | lag={lag_txt}"
     )
     lines.append("BOT      ACK   GAP  RES  EDAD   CICLO  ESTADO")
 
@@ -14902,11 +14905,30 @@ def mostrar_panel():
     # TABLA PRINCIPAL DE BOTS
     # ==========================
 
-    print(padding + Fore.CYAN + "┌────────┬────────────────────────────────────────────────────────────────────────────────┬─────────┬──────────┬──────────┬──────────┬──────────┬──────────┐")
-    print(padding + Fore.CYAN + Style.BRIGHT + "│ ⚡ BOTS · LIVE ACK 40 · RENDIMIENTO                                           │" + Style.RESET_ALL)
-    print(padding + Fore.CYAN + "├────────┼────────────────────────────────────────────────────────────────────────────────┼─────────┬──────────┬──────────┬──────────┬──────────┬──────────┤")
-    print(padding + Fore.CYAN + "│ BOT    │ ⚡ LIVE ACK 40 · HISTÓRICO VISUAL                                    │ Token   │ GANANCIAS│ PÉRDIDAS │ % ÉXITO  │ Prob IA  │ Modo IA  │")
-    print(padding + Fore.CYAN + "├────────┼────────────────────────────────────────────────────────────────────────────────┼─────────┬──────────┬──────────┬──────────┬──────────┬──────────┤")
+    BOT_W = 6
+    LIVE_W = int(globals().get("HUD_LIVE_ACK_COL_WIDTH", 44))
+    TOKEN_W = 6
+    G_W = 3
+    P_W = 3
+    EXITO_W = 6
+    PROB_W = 7
+    MODO_W = 8
+    top_line = (
+        "┌" + "─" * (BOT_W + 2) + "┬" + "─" * (LIVE_W + 2) + "┬" + "─" * (TOKEN_W + 2)
+        + "┬" + "─" * (G_W + 2) + "┬" + "─" * (P_W + 2) + "┬" + "─" * (EXITO_W + 2)
+        + "┬" + "─" * (PROB_W + 2) + "┬" + "─" * (MODO_W + 2) + "┐"
+    )
+    mid_line = top_line.replace("┌", "├").replace("┐", "┤").replace("─", "─")
+    total_inner = len(_ack_tape_strip_ansi(top_line)) - 2
+    bot_title_line = f"│ {'⚡ BOTS · LIVE ACK 40 · RENDIMIENTO':<{total_inner}}│"
+    print(padding + Fore.CYAN + top_line)
+    print(padding + Fore.CYAN + Style.BRIGHT + bot_title_line + Style.RESET_ALL)
+    print(padding + Fore.CYAN + mid_line)
+    print(
+        padding + Fore.CYAN
+        + f"│ {'BOT':<{BOT_W}} │ {'LIVE ACK 40':<{LIVE_W}} │ {'Token':<{TOKEN_W}} │ {'G':>{G_W}} │ {'P':>{P_W}} │ {'%':<{EXITO_W}} │ {'ProbIA':<{PROB_W}} │ {'Modo':<{MODO_W}} │"
+    )
+    print(padding + Fore.CYAN + mid_line)
 
     # Meta IA para colorear Prob IA (estado global del modelo)
     model_meta_live = resolver_canary_estado(leer_model_meta() or {})
@@ -14927,8 +14949,6 @@ def mostrar_panel():
 
         # Token + origen
         token_text = token
-        if src and str(src).strip().upper() != "MANUAL":
-            token_text += f" ({src})"
         token_color = Fore.GREEN if token_text.startswith("REAL") else Fore.CYAN
         token_text = token_color + token_text + Fore.RESET
 
@@ -14938,7 +14958,10 @@ def mostrar_panel():
             fallback_resultados=fallback,
             width=int(globals().get("ACK_TAPE_WIDTH", 40)),
         )
-        col_resultados = _ack_tape_pad_visible(col_resultados, 80)
+        col_resultados = _ack_tape_pad_visible(
+            col_resultados,
+            int(globals().get("HUD_LIVE_ACK_COL_WIDTH", 44))
+        )
 
         # Ganancias / Pérdidas / % éxito
         g = estado_bots[bot]["ganancias"]
@@ -15153,18 +15176,25 @@ def mostrar_panel():
 
 
         # Línea completa del bot
+        exito_short = f"{porc:.1f}%" if porc is not None else "--"
+        token_cell = _ack_tape_pad_visible(token_text, TOKEN_W)
+        g_cell = _ack_tape_pad_visible(ganancias, G_W)
+        p_cell = _ack_tape_pad_visible(perdidas, P_W)
+        exito_cell = _ack_tape_pad_visible(exito_short, EXITO_W)
+        prob_cell = _ack_tape_pad_visible(prob_str, PROB_W)
+        modo_cell = _ack_tape_pad_visible(modo_str, MODO_W)
         linea_bot = (
-            padding + f"│ {bot:<6} │ {col_resultados} │ "
-            f"{token_text:<9} │ "
-            f"{ganancias:<10} │ "
-            f"{perdidas:<10} │ "
-            f"{exito:<10} │ "
-            f"{prob_str:<10} │ "
-            f"{modo_str:<10} │"
+            padding + f"│ {bot:<{BOT_W}} │ {col_resultados} │ "
+            f"{token_cell} │ "
+            f"{g_cell} │ "
+            f"{p_cell} │ "
+            f"{exito_cell} │ "
+            f"{prob_cell} │ "
+            f"{modo_cell} │"
         )
         print(linea_bot)
 
-    print(padding + Fore.CYAN + "└────────┴────────────────────────────────────────────────────────────────────────────────┴─────────┴──────────┴──────────┴──────────┴──────────┴──────────┘")
+    print(padding + Fore.CYAN + top_line.replace("┌", "└").replace("┬", "┴").replace("┐", "┘"))
 
     # ==========================
     # EVENTOS + TELEMETRÍA IA
@@ -15401,11 +15431,15 @@ def mostrar_panel():
         term_cols, term_rows = os.get_terminal_size()
     except:
         term_cols, term_rows = 140, 50
-    start_col = max(1, term_cols - panel_width - 1)
-    start_row = max(1, term_rows - panel_height - 1)
-    for i, line in enumerate(panel_lines):
-        print(f"\x1b[{start_row + i};{start_col}H" + Fore.MAGENTA + line + Fore.RESET)
-    print(f"\x1b[{term_rows};1H", end="")
+    if bool(globals().get("HUD_SIDE_PANEL_INLINE", True)):
+        for line in panel_lines:
+            print(padding + Fore.MAGENTA + line + Fore.RESET)
+    else:
+        start_col = max(1, term_cols - panel_width - 1)
+        start_row = max(2, term_rows - panel_height - 8)
+        for i, line in enumerate(panel_lines):
+            print(f"\x1b[{start_row + i};{start_col}H" + Fore.MAGENTA + line + Fore.RESET)
+        print(f"\x1b[{term_rows};1H", end="")
 
 # Mostrar advertencia meta
 def mostrar_advertencia_meta():
@@ -15626,7 +15660,7 @@ def _hud_trim_line(txt: str, max_chars: int | None = None) -> str:
 
 def mostrar_eventos():
     if eventos_recentes:
-        print(Fore.MAGENTA + "\nEventos recientes:")
+        print(Fore.MAGENTA + "Eventos recientes:")
         max_ev = int(HUD_EVENTS_MAX)
         if bool(globals().get("HUD_SHOW_VERBOSE_EVENTS", False)):
             max_ev = max(max_ev, len(list(eventos_recentes)))
