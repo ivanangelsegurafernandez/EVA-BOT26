@@ -14463,8 +14463,14 @@ def mostrar_panel_lateral_compacto():
 def mostrar_bloque_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--", padding=""):
     try:
         lines = _resumen_saldo_meta_hud(valor_saldo=valor_saldo, saldo_str=saldo_str, meta_str=meta_str)
-        l1 = _ack_tape_strip_ansi(lines[0] if len(lines) > 0 else "💰 SALDO ACTUAL: --")
-        l2 = _ack_tape_strip_ansi(lines[1] if len(lines) > 1 else "🎯 Base=-- | Objetivo=-- | Estado=-- | Marti C1-C5=-- | Cobertura=--")
+        src1 = str(lines[0] if len(lines) > 0 else "")
+        src2 = str(lines[1] if len(lines) > 1 else "")
+        l1 = _ack_tape_strip_ansi(
+            src1.replace("🧭 ", "💰 ").replace("Modo=", "MODO=").replace("Token=", "TOKEN=").replace("Saldo=", "SALDO=").replace("Meta=", "META=").replace("Falta=", "FALTA=").replace("Avance=", "AVANCE=")
+        )
+        l2 = _ack_tape_strip_ansi(
+            src2.replace("🎯 ", "📈 ").replace("Base=", "BASE=").replace("Estado=", "ESTADO=").replace("Marti C1-C5=", "MARTI C1-C5=").replace("Cobertura=", "COBERTURA=")
+        )
         w = max(76, len(l1), len(l2))
         print(padding + Fore.CYAN + "╔" + "═" * (w + 2) + "╗")
         print(padding + Fore.CYAN + f"║ {l1:<{w}} ║")
@@ -14474,22 +14480,64 @@ def mostrar_bloque_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--
         print(padding + Fore.CYAN + "💰 Saldo/Meta: --")
 
 
-def mostrar_panel_inversion_activo(bot, rest_s, max_ciclos, ciclo_actual="C1", fuente="--"):
+def mostrar_panel_teclado_activo(bot, rest_s, max_ciclos, ciclo_actual="C1", fuente="--"):
     bot_txt = str(bot or "--")
     rest = max(0, int(rest_s or 0))
     ciclo_txt = str(ciclo_actual or "C1")
     src_txt = str(fuente or "--")
+    estado_txt = f"Tiempo para decidir : {rest:>3}s" if rest > 0 else "Estado            : decisión cerrada / orden enviada"
     return [
         "╔══════════════════════════════════════════════╗",
-        "║ 🚀 INVERSIÓN MANUAL / CONFIRMACIÓN          ║",
-        "╠══════════════════════════════════════════════╣",
         "║ ⌨ MODO TECLADO ACTIVO                       ║",
+        "╠══════════════════════════════════════════════╣",
         f"║ Bot seleccionado : {bot_txt:<26}║",
-        f"║ Tiempo para decidir : {rest:>3}s{'':<22}║",
+        f"║ {estado_txt:<44}║",
         f"║ Ciclo actual      : {ciclo_txt:<26}║",
         f"║ Fuente            : {src_txt:<26}║",
         f"║ Acción            : Elegir ciclo [1..{int(max_ciclos)}]{'':<12}║",
         "║ Cancelar          : ESC                     ║",
+        "╚══════════════════════════════════════════════╝",
+    ]
+
+
+def mostrar_panel_inversion_activo(bot, rest_s, max_ciclos, ciclo_actual="C1", fuente="--"):
+    return mostrar_panel_teclado_activo(
+        bot=bot,
+        rest_s=rest_s,
+        max_ciclos=max_ciclos,
+        ciclo_actual=ciclo_actual,
+        fuente=fuente,
+    )
+
+
+def mostrar_panel_real_activo():
+    owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+    if owner in (None, "none"):
+        return []
+    owner_txt = str(owner)
+    st = estado_bots.get(owner_txt, {}) if isinstance(estado_bots, dict) else {}
+    ciclo = st.get("ciclo_actual", 1)
+    fuente = st.get("fuente", "AUTO")
+    token_txt = f"REAL:{owner_txt}"
+    estado_txt = "ORDEN REAL ESCRITA ✅"
+    hhmmss = "--"
+    try:
+        trace = globals().get("LAST_REAL_CLOSE_TRACE", {}) if isinstance(globals().get("LAST_REAL_CLOSE_TRACE", {}), dict) else {}
+        ts = trace.get("ts", None) or trace.get("epoch", None)
+        if ts is not None:
+            hhmmss = datetime.fromtimestamp(float(ts)).strftime("%H:%M:%S")
+    except Exception:
+        hhmmss = "--"
+    return [
+        "╔══════════════════════════════════════════════╗",
+        "║ 🚀 REAL ACTIVO / INVERSIÓN EN CURSO         ║",
+        "╠══════════════════════════════════════════════╣",
+        f"║ Bot          : {owner_txt:<29}║",
+        f"║ Ciclo        : C{int(ciclo):<28}║",
+        f"║ Fuente       : {str(fuente)[:29]:<29}║",
+        f"║ Token        : {token_txt:<29}║",
+        f"║ Estado       : {estado_txt:<29}║",
+        f"║ Última orden : {hhmmss:<29}║",
         "╚══════════════════════════════════════════════╝",
     ]
 
@@ -15537,11 +15585,15 @@ def mostrar_panel():
         panel_lines.append(f"│ Fuente={fuente} → Token={token_hud:<12}          │")
         panel_lines.append("└────────────────────────────────────────────┘")
 
+    real_panel_lines = mostrar_panel_real_activo()
+    if real_panel_lines:
+        panel_lines += real_panel_lines
+
     if PENDIENTE_FORZAR_BOT:
         rest = 0
         if PENDIENTE_FORZAR_EXPIRA:
             rest = max(0, int(PENDIENTE_FORZAR_EXPIRA - time.time()))
-        panel_lines += mostrar_panel_inversion_activo(
+        panel_lines += mostrar_panel_teclado_activo(
             PENDIENTE_FORZAR_BOT,
             rest_s=rest,
             max_ciclos=MAX_CICLOS,
