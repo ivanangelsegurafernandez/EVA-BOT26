@@ -292,6 +292,7 @@ MODO_PURIFICACION_REAL = True  # Llave maestra: bypassea toda promoción/activac
 LXV_SYNC_REAL_ROUTE_ENABLE = True
 LXV_SYNC_REAL_SOURCE = "LXV_SYNC"
 LXV_5V1X_ONLY_ENABLE = False  # 5V1X en reposo para emisión REAL (compatibilidad conservada)
+LXV_5V1X_ZV_ROUTE_ENABLE = True  # habilita ruta 5V1X bajo compuerta ZV sin abrir ONLY global
 LXV_5V1X_REAL_SOURCE = "LXV_5V1X"
 LXV_5V1X_REQUIRE_DATA_QUALITY_OK = True
 LXV_5V1X_REQUIRE_ROUND_COMPLETE = True
@@ -683,7 +684,7 @@ def _purificacion_real_activa() -> bool:
         allow_5v1x = str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X")).upper()
         allow_4v2x = str(globals().get("LXV_4V2X_REAL_SOURCE", "LXV_4V2X")).upper()
         allowed_sources = {allow_sync}
-        if bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)):
+        if bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)) or bool(globals().get("LXV_5V1X_ZV_ROUTE_ENABLE", False)):
             allowed_sources.add(allow_5v1x)
         if bool(globals().get("LXV_4V2X_ENABLE", False)):
             allowed_sources.add(allow_4v2x)
@@ -5386,13 +5387,21 @@ def _sync_round_tick_maestro():
                             cooldown_s=8.0,
                         )
                         ok_emit = False
-                elif bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)) and patron_norm == "5V1X":
+                elif patron_norm == "5V1X" and (
+                    bool(globals().get("LXV_5V1X_ONLY_ENABLE", False))
+                    or bool(globals().get("LXV_5V1X_ZV_ROUTE_ENABLE", False))
+                ):
                     candidate = _lxv_5v1x_candidate_from_round(round_row, feat_row)
                     gate_ok, gate_reason = _lxv_5v1x_gate_ok(candidate)
                     if gate_ok:
                         zv_estado = str((zv_eval or {}).get("estado", "SIN_MUESTRA"))
                         zv_allow_5v1x = bool((zv_eval or {}).get("allow_5v1x", False))
                         if zv_estado == "VERDE_CONFIRMADO" and zv_allow_5v1x:
+                            _lxv_5v1x_event_cooldown(
+                                key=f"5v1x_zv_open:{round_id}",
+                                msg="🔓 5V1X-ZV route habilitada por VERDE_CONFIRMADO",
+                                cooldown_s=float(globals().get("ZV_LOG_COOLDOWN_S", 12.0)),
+                            )
                             _lxv_5v1x_event_cooldown(
                                 key=f"gate_ok:{round_id}",
                                 msg=f"✅ 5V1X gate OK ronda #{round_id}: candidato REAL válido",
@@ -5402,7 +5411,7 @@ def _sync_round_tick_maestro():
                         else:
                             _lxv_5v1x_event_cooldown(
                                 key=f"5v1x_zv_block:{round_id}:{zv_estado}",
-                                msg=f"⏸️ ZV bloquea 5V1X ronda #{round_id}: estado={zv_estado}",
+                                msg=f"⛔ 5V1X-ZV bloqueada por estado ZV={zv_estado}",
                                 cooldown_s=float(globals().get("ZV_LOG_COOLDOWN_S", 12.0)),
                             )
                             ok_emit = False
@@ -5803,7 +5812,7 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY") -> bool
     allow_5v1x = str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X")).upper()
     allow_4v2x = str(globals().get("LXV_4V2X_REAL_SOURCE", "LXV_4V2X")).upper()
     allow_sources = {allow_sync}
-    if bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)):
+    if bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)) or bool(globals().get("LXV_5V1X_ZV_ROUTE_ENABLE", False)):
         allow_sources.add(allow_5v1x)
     if bool(globals().get("LXV_4V2X_ENABLE", False)):
         allow_sources.add(allow_4v2x)
