@@ -4744,6 +4744,12 @@ def evaluar_detector_zona_verde(
     estado_prev: str | None = None,
     update_global: bool = True,
 ):
+    BOT_TOTAL_ZV = 6.0
+    ZV_3_6 = 3.0 / BOT_TOTAL_ZV
+    ZV_4_6 = 4.0 / BOT_TOTAL_ZV
+    ZV_5_6 = 5.0 / BOT_TOTAL_ZV
+    ZV_6_6 = 6.0 / BOT_TOTAL_ZV
+    EPS = 1e-6
     out = {
         "estado": "SIN_MUESTRA",
         "g0": g0,
@@ -4795,27 +4801,27 @@ def evaluar_detector_zona_verde(
             out["estado"] = "SAT_BLOQUEO"
             out["motivo"] = "sat_prev90_late"
         elif (
-            (float(g0f) >= 0.83 and float(g0f) < 0.90 and d1 is not None and float(d1) <= 0.0 and estado_prev in ("VERDE_CONFIRMADO", "ENTRADA_VERDE"))
-            or (float(g1f) >= 0.83 and d1 is not None and float(d1) <= -float(step))
+            (float(g0f) >= (ZV_5_6 - EPS) and float(g0f) < 0.90 and d1 is not None and float(d1) <= 0.0 and estado_prev in ("VERDE_CONFIRMADO", "ENTRADA_VERDE"))
+            or (float(g1f) >= (ZV_5_6 - EPS) and d1 is not None and float(d1) <= -float(step))
             or (int(strong_streak_80) >= int(PATTERN_STRONG_STREAK_BLOCK))
         ):
             out["estado"] = "VERDE_CULMINANDO"
             out["motivo"] = "culminando"
         elif (
-            float(g0f) >= 0.83 and float(g0f) < 0.90
+            float(g0f) >= (ZV_5_6 - EPS) and float(g0f) < 0.90
             and d1 is not None and float(d1) >= 0.0
             and (not bool(late_chase))
             and (not bool(prev90))
-            and (float(g1f) >= 0.67 or bool(rebote_fuerte))
+            and (float(g1f) >= (ZV_4_6 - EPS) or bool(rebote_fuerte))
         ):
             out["estado"] = "VERDE_CONFIRMADO"
             out["allow_4v2x"] = True
             out["allow_5v1x"] = True
             out["motivo"] = "confirmado"
         elif (
-            float(g0f) >= 0.67 and float(g0f) < 0.83
-            and float(g1f) < 0.67
-            and d1 is not None and float(d1) >= float(step)
+            float(g0f) >= (ZV_4_6 - EPS) and float(g0f) < (ZV_5_6 - EPS)
+            and float(g1f) < (ZV_4_6 - EPS)
+            and d1 is not None and float(d1) >= (float(step) - EPS)
             and (not bool(late_chase))
             and (not bool(prev90))
         ):
@@ -4824,8 +4830,8 @@ def evaluar_detector_zona_verde(
             out["allow_5v1x"] = False
             out["motivo"] = "entrada_verde"
         elif (
-            float(g0f) >= 0.50 and float(g0f) < 0.67
-            and d1 is not None and float(d1) >= float(step)
+            float(g0f) >= ZV_3_6 and float(g0f) < (ZV_4_6 - EPS)
+            and d1 is not None and float(d1) >= (float(step) - EPS)
             and (not bool(late_chase))
         ):
             out["estado"] = "PRE_VERDE"
@@ -5371,11 +5377,20 @@ def _sync_round_tick_maestro():
                             )
                             ok_emit = bool(_lxv_4v2x_apply_real_route(candidate, ciclo_pick))
                         else:
+                            g0_zv = (zv_eval or {}).get("g0", None)
+                            g1_zv = (zv_eval or {}).get("g1", None)
+                            d1_zv = (zv_eval or {}).get("d1", None)
+                            g0_txt_zv = "--" if g0_zv is None else f"{float(g0_zv):.6f}"
+                            g1_txt_zv = "--" if g1_zv is None else f"{float(g1_zv):.6f}"
+                            d1_txt_zv = "--" if d1_zv is None else f"{float(d1_zv):+.6f}"
                             _lxv_5v1x_event_cooldown(
                                 key=f"4v2x_zv_block:{round_id}:{str((zv_eval or {}).get('estado', 'SIN_MUESTRA'))}",
                                 msg=(
                                     f"⏸️ ZV bloquea 4V2X ronda #{round_id}: "
-                                    f"estado={str((zv_eval or {}).get('estado', 'SIN_MUESTRA'))}"
+                                    f"estado={str((zv_eval or {}).get('estado', 'SIN_MUESTRA'))} | "
+                                    f"g0={g0_txt_zv} g1={g1_txt_zv} d1={d1_txt_zv} | "
+                                    f"allow_4v2x={'ON' if bool((zv_eval or {}).get('allow_4v2x', False)) else 'OFF'} | "
+                                    f"motivo={str((zv_eval or {}).get('motivo', 'na'))}"
                                 ),
                                 cooldown_s=float(globals().get("ZV_LOG_COOLDOWN_S", 12.0)),
                             )
