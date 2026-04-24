@@ -292,6 +292,7 @@ MODO_PURIFICACION_REAL = True  # Llave maestra: bypassea toda promoción/activac
 LXV_SYNC_REAL_ROUTE_ENABLE = True
 LXV_SYNC_REAL_SOURCE = "LXV_SYNC"
 LXV_5V1X_ONLY_ENABLE = False  # 5V1X en reposo para emisión REAL (compatibilidad conservada)
+LXV_5V1X_ZV_ROUTE_ENABLE = True  # habilita ruta 5V1X bajo compuerta ZV sin abrir ONLY global
 LXV_5V1X_REAL_SOURCE = "LXV_5V1X"
 LXV_5V1X_REQUIRE_DATA_QUALITY_OK = True
 LXV_5V1X_REQUIRE_ROUND_COMPLETE = True
@@ -498,6 +499,15 @@ MRV_5V1X_BLOCK_LATE_CHASE = True
 MRV_5V1X_BLOCK_SATURACION = True
 MRV_5V1X_PREV90_BLOCK = True
 MRV_5V1X_LOG_COOLDOWN_S = 20.0
+ZV_ENABLE = True
+ZV_STEP_BOT = 1.0 / 6.0
+ZV_REBOTE_FUERTE_MIN_SAMPLES = 5
+ZV_ALLOW_4V2X_IN_ENTRADA = True
+ZV_ALLOW_5V1X_ONLY_IN_CONFIRMADO = True
+ZV_BLOCK_4V2X_IN_CULMINANDO = True
+ZV_BLOCK_5V1X_IN_CULMINANDO = True
+ZV_BLOCK_BOTH_IN_SAT = True
+ZV_LOG_COOLDOWN_S = 12.0
 PATTERN_COL_LAST_STATE = {
     "green_ratio_col_actual": None,
     "total_verdes_col_actual": 0,
@@ -512,6 +522,19 @@ PATTERN_COL_LAST_STATE = {
     "late_chase": False,
     "pattern_delta": 0.0,
     "pattern_bonus_penalty": 0.0,
+}
+ZONA_VERDE_LAST_STATE = {
+    "estado": "SIN_MUESTRA",
+    "g0": None,
+    "g1": None,
+    "g2": None,
+    "d1": None,
+    "d2": None,
+    "rebote_fuerte": False,
+    "allow_4v2x": False,
+    "allow_5v1x": False,
+    "motivo": "init",
+    "round_id": 0,
 }
 PATTERN_V1_Q3_PROXY = {
     "rsi_9": 64.0,
@@ -661,7 +684,7 @@ def _purificacion_real_activa() -> bool:
         allow_5v1x = str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X")).upper()
         allow_4v2x = str(globals().get("LXV_4V2X_REAL_SOURCE", "LXV_4V2X")).upper()
         allowed_sources = {allow_sync}
-        if bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)):
+        if bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)) or bool(globals().get("LXV_5V1X_ZV_ROUTE_ENABLE", False)):
             allowed_sources.add(allow_5v1x)
         if bool(globals().get("LXV_4V2X_ENABLE", False)):
             allowed_sources.add(allow_4v2x)
@@ -4706,6 +4729,218 @@ def _lxv_5v1x_calc_rebote_hist(rows, bot_x, current_round_id):
     rebote_rate_hist = float(total_x_rebote_hist) / float(rebote_samples_hist)
     return rebote_rate_hist, int(rebote_samples_hist), int(total_x_rebote_hist), int(total_x_hist)
 
+def evaluar_detector_zona_verde(
+    *,
+    round_id: int = 0,
+    g0=None,
+    g1=None,
+    g2=None,
+    strong_streak_80: int = 0,
+    prev90: bool = False,
+    late_chase: bool = False,
+    saturacion: bool = False,
+    rebote_rate_hist=None,
+    rebote_samples_hist: int = 0,
+    estado_prev: str | None = None,
+    update_global: bool = True,
+):
+    BOT_TOTAL_ZV = 6.0
+    ZV_3_6 = 3.0 / BOT_TOTAL_ZV
+    ZV_4_6 = 4.0 / BOT_TOTAL_ZV
+    ZV_5_6 = 5.0 / BOT_TOTAL_ZV
+    ZV_6_6 = 6.0 / BOT_TOTAL_ZV
+    EPS = 1e-6
+    out = {
+        "estado": "SIN_MUESTRA",
+        "g0": g0,
+        "g1": g1,
+        "g2": g2,
+        "d1": None,
+        "d2": None,
+        "rebote_fuerte": False,
+        "allow_4v2x": False,
+        "allow_5v1x": False,
+        "motivo": "sin_muestra",
+        "round_id": int(round_id or 0),
+    }
+    try:
+        if not bool(globals().get("ZV_ENABLE", True)):
+            out["estado"] = "ZV_OFF"
+            out["allow_4v2x"] = True
+            out["allow_5v1x"] = True
+            out["motivo"] = "feature_off"
+            return out
+
+        g0f = None if g0 is None else float(g0)
+        g1f = None if g1 is None else float(g1)
+        g2f = None if g2 is None else float(g2)
+        out["g0"], out["g1"], out["g2"] = g0f, g1f, g2f
+        if (g0f is not None) and (g1f is not None):
+            out["d1"] = float(g0f - g1f)
+        if (g1f is not None) and (g2f is not None):
+            out["d2"] = float(g1f - g2f)
+        d1 = out["d1"]
+        step = float(globals().get("ZV_STEP_BOT", 1.0 / 6.0))
+        estado_prev = str(estado_prev or (globals().get("ZONA_VERDE_LAST_STATE", {}) or {}).get("estado", "SIN_MUESTRA"))
+
+        rebote_fuerte = bool(
+            (rebote_rate_hist is not None)
+            and (int(rebote_samples_hist) >= int(globals().get("ZV_REBOTE_FUERTE_MIN_SAMPLES", 5)))
+            and (float(rebote_rate_hist) >= float(PATTERN_REBOTE_MIN))
+            and (not bool(late_chase))
+            and (not bool(saturacion))
+        )
+        out["rebote_fuerte"] = bool(rebote_fuerte)
+
+        if g0f is None or g1f is None:
+            out["estado"] = "SIN_MUESTRA"
+            out["motivo"] = "falta_g0_g1"
+        elif bool(globals().get("ZV_BLOCK_BOTH_IN_SAT", True)) and (
+            float(g0f) >= float(PATTERN_COL90_THRESHOLD) or bool(prev90) or bool(late_chase)
+        ):
+            out["estado"] = "SAT_BLOQUEO"
+            out["motivo"] = "sat_prev90_late"
+        elif (
+            (float(g0f) >= (ZV_5_6 - EPS) and float(g0f) < 0.90 and d1 is not None and float(d1) <= 0.0 and estado_prev in ("VERDE_CONFIRMADO", "ENTRADA_VERDE"))
+            or (float(g1f) >= (ZV_5_6 - EPS) and d1 is not None and float(d1) <= -float(step))
+            or (int(strong_streak_80) >= int(PATTERN_STRONG_STREAK_BLOCK))
+        ):
+            out["estado"] = "VERDE_CULMINANDO"
+            out["motivo"] = "culminando"
+        elif (
+            float(g0f) >= (ZV_5_6 - EPS) and float(g0f) < 0.90
+            and d1 is not None and float(d1) >= 0.0
+            and (not bool(late_chase))
+            and (not bool(prev90))
+            and (float(g1f) >= (ZV_4_6 - EPS) or bool(rebote_fuerte))
+        ):
+            out["estado"] = "VERDE_CONFIRMADO"
+            out["allow_4v2x"] = True
+            out["allow_5v1x"] = True
+            out["motivo"] = "confirmado"
+        elif (
+            float(g0f) >= (ZV_4_6 - EPS) and float(g0f) < (ZV_5_6 - EPS)
+            and float(g1f) < (ZV_4_6 - EPS)
+            and d1 is not None and float(d1) >= (float(step) - EPS)
+            and (not bool(late_chase))
+            and (not bool(prev90))
+        ):
+            out["estado"] = "ENTRADA_VERDE"
+            out["allow_4v2x"] = bool(globals().get("ZV_ALLOW_4V2X_IN_ENTRADA", True))
+            out["allow_5v1x"] = False
+            out["motivo"] = "entrada_verde"
+        elif (
+            float(g0f) >= ZV_3_6 and float(g0f) < (ZV_4_6 - EPS)
+            and d1 is not None and float(d1) >= (float(step) - EPS)
+            and (not bool(late_chase))
+        ):
+            out["estado"] = "PRE_VERDE"
+            out["motivo"] = "pre_verde"
+        else:
+            out["estado"] = "SIN_MUESTRA"
+            out["motivo"] = "fuera_regla"
+
+        if out["estado"] == "VERDE_CULMINANDO":
+            if bool(globals().get("ZV_BLOCK_4V2X_IN_CULMINANDO", True)):
+                out["allow_4v2x"] = False
+            if bool(globals().get("ZV_BLOCK_5V1X_IN_CULMINANDO", True)):
+                out["allow_5v1x"] = False
+        if bool(globals().get("ZV_ALLOW_5V1X_ONLY_IN_CONFIRMADO", True)) and out["estado"] != "VERDE_CONFIRMADO":
+            out["allow_5v1x"] = False
+    except Exception as e:
+        out["estado"] = "ERROR_SEGURO"
+        out["allow_4v2x"] = False
+        out["allow_5v1x"] = False
+        out["motivo"] = f"error:{str(e)[:80]}"
+    finally:
+        if update_global:
+            prev = dict(globals().get("ZONA_VERDE_LAST_STATE", {}) or {})
+            globals()["ZONA_VERDE_LAST_STATE"] = dict(out)
+            prev_estado = str(prev.get("estado", ""))
+            new_estado = str(out.get("estado", ""))
+            if prev_estado != new_estado:
+                event_map = {
+                    "ENTRADA_VERDE": "🟩 ZV ENTRADA_VERDE",
+                    "VERDE_CONFIRMADO": "✅ ZV VERDE_CONFIRMADO",
+                    "VERDE_CULMINANDO": "🟨 ZV VERDE_CULMINANDO",
+                    "SAT_BLOQUEO": "🟥 ZV SAT_BLOQUEO",
+                }
+                msg = event_map.get(new_estado, "⚪ ZV SIN_MUESTRA / ERROR_SEGURO")
+                _lxv_5v1x_event_cooldown(
+                    key=f"zv_state:{new_estado}",
+                    msg=msg,
+                    cooldown_s=float(globals().get("ZV_LOG_COOLDOWN_S", 12.0)),
+                )
+        return out
+
+def _zv_context_from_round(round_id: int, bot_x: str = "") -> dict:
+    ctx = {
+        "round_id": int(round_id or 0),
+        "g0": None, "g1": None, "g2": None,
+        "strong_streak_80": 0,
+        "prev90": False,
+        "late_chase": False,
+        "saturacion": False,
+        "rebote_rate_hist": None,
+        "rebote_samples_hist": 0,
+    }
+    try:
+        rid = int(round_id or 0)
+        if rid <= 0:
+            return ctx
+        round_row, feat_row = _lxv_5v1x_get_exported_rows(rid)
+        current_row = round_row if isinstance(round_row, dict) and round_row else (feat_row if isinstance(feat_row, dict) else {})
+        g0 = _mrv_5v1x_green_ratio_from_row(current_row)
+        ctx["g0"] = None if g0 is None else float(g0)
+        rows = _lxv_5v1x_load_recent_matrix_rows(PATTERN_COL_WINDOW)
+        hist_rows = []
+        for r in list(rows or []):
+            rr = r if isinstance(r, dict) else {}
+            rr_id = _mrv_5v1x_to_int(rr.get("round_id", 0), 0)
+            if rr_id < rid:
+                hist_rows.append(rr)
+        prev_rows = list(hist_rows[-max(1, int(PATTERN_REBOTE_LOOKBACK)):])
+        prev_ratios = []
+        for rr in prev_rows:
+            dq = str(rr.get("data_quality", "") or "").strip().lower()
+            if dq and dq != "ok":
+                continue
+            gr = _mrv_5v1x_green_ratio_from_row(rr)
+            if gr is not None:
+                prev_ratios.append(float(gr))
+        if prev_ratios:
+            ctx["g1"] = float(prev_ratios[-1])
+        if len(prev_ratios) >= 2:
+            ctx["g2"] = float(prev_ratios[-2])
+        st80 = 0
+        st90 = 0
+        for gr in reversed(prev_ratios):
+            if float(gr) >= float(PATTERN_COL80_THRESHOLD):
+                st80 += 1
+            else:
+                break
+        for gr in reversed(prev_ratios):
+            if float(gr) >= float(PATTERN_COL90_THRESHOLD):
+                st90 += 1
+            else:
+                break
+        prev90 = bool(prev_ratios and (float(prev_ratios[-1]) >= float(PATTERN_COL90_THRESHOLD)))
+        if not bool(globals().get("MRV_5V1X_PREV90_BLOCK", True)):
+            prev90 = False
+        late_chase = bool((st80 >= int(PATTERN_STRONG_STREAK_BLOCK)) or (st90 >= 1) or prev90)
+        ctx["strong_streak_80"] = int(st80)
+        ctx["prev90"] = bool(prev90)
+        ctx["late_chase"] = bool(late_chase)
+        ctx["saturacion"] = bool((ctx["g0"] is not None) and (float(ctx["g0"]) >= float(PATTERN_COL90_THRESHOLD)))
+        b = str(bot_x or "").strip()
+        if b in BOT_NAMES:
+            reb_rate, reb_samples, _txr, _tx = _lxv_5v1x_calc_rebote_hist(hist_rows, b, rid)
+            ctx["rebote_rate_hist"] = reb_rate
+            ctx["rebote_samples_hist"] = int(reb_samples)
+    except Exception:
+        return ctx
+    return ctx
+
 def _lxv_5v1x_mrv_gate_ok(candidate):
     info = {
         "estado": "BLOQUEADO",
@@ -4806,6 +5041,25 @@ def _lxv_5v1x_mrv_gate_ok(candidate):
         info["rebote_samples_hist"] = int(rebote_samples_hist)
         info["total_x_hist"] = int(total_x_hist)
         info["total_x_rebote_hist"] = int(total_x_rebote_hist)
+        g1 = float(prev_ratios[-1]) if prev_ratios else None
+        g2 = float(prev_ratios[-2]) if len(prev_ratios) >= 2 else None
+        zv_eval = evaluar_detector_zona_verde(
+            round_id=int(round_id),
+            g0=green_ratio_actual,
+            g1=g1,
+            g2=g2,
+            strong_streak_80=int(strong_streak_80),
+            prev90=bool(prev90),
+            late_chase=bool(late_chase),
+            saturacion=bool(saturacion),
+            rebote_rate_hist=rebote_rate_hist,
+            rebote_samples_hist=int(rebote_samples_hist),
+            update_global=True,
+        )
+        info["zv_estado"] = str((zv_eval or {}).get("estado", "SIN_MUESTRA"))
+        info["zv_allow_4v2x"] = bool((zv_eval or {}).get("allow_4v2x", False))
+        info["zv_allow_5v1x"] = bool((zv_eval or {}).get("allow_5v1x", False))
+        info["zv_rebote_fuerte"] = bool((zv_eval or {}).get("rebote_fuerte", False))
 
         rebote_valido = bool(
             (rebote_rate_hist is not None)
@@ -5082,17 +5336,65 @@ def _sync_round_tick_maestro():
             )
             if int(_LXV_LAST_EMITTED_ROUND or 0) != int(round_id):
                 ok_emit = False
-                if str(patron).upper() == "4V/2X" and bool(globals().get("LXV_4V2X_ENABLE", False)):
-                    round_row, feat_row = _lxv_5v1x_get_exported_rows(int(round_id))
+                patron_norm = str(patron or "").upper().replace(" ", "")
+                round_row, feat_row = _lxv_5v1x_get_exported_rows(int(round_id))
+                bot_ctx = str((feat_row or {}).get("bot_x_fuerte", (round_row or {}).get("bot_x_fuerte", "")) or "").strip()
+                zv_ctx = _zv_context_from_round(int(round_id), bot_x=bot_ctx)
+                zv_eval = evaluar_detector_zona_verde(
+                    round_id=int(round_id),
+                    g0=zv_ctx.get("g0", None),
+                    g1=zv_ctx.get("g1", None),
+                    g2=zv_ctx.get("g2", None),
+                    strong_streak_80=int(zv_ctx.get("strong_streak_80", 0) or 0),
+                    prev90=bool(zv_ctx.get("prev90", False)),
+                    late_chase=bool(zv_ctx.get("late_chase", False)),
+                    saturacion=bool(zv_ctx.get("saturacion", False)),
+                    rebote_rate_hist=zv_ctx.get("rebote_rate_hist", None),
+                    rebote_samples_hist=int(zv_ctx.get("rebote_samples_hist", 0) or 0),
+                    update_global=True,
+                )
+                g0_txt = "--" if zv_eval.get("g0", None) is None else f"{float(zv_eval.get('g0')):.4f}"
+                g1_txt = "--" if zv_eval.get("g1", None) is None else f"{float(zv_eval.get('g1')):.4f}"
+                d1_txt = "--" if zv_eval.get("d1", None) is None else f"{float(zv_eval.get('d1')):+.4f}"
+                _lxv_5v1x_event_cooldown(
+                    key=f"zv_line:{round_id}",
+                    msg=(
+                        f"ZV: {str(zv_eval.get('estado', 'SIN_MUESTRA'))} | g0={g0_txt} g1={g1_txt} d1={d1_txt} | "
+                        f"4V2X={'ON' if bool(zv_eval.get('allow_4v2x', False)) else 'OFF'} | "
+                        f"5V1X={'ON' if bool(zv_eval.get('allow_5v1x', False)) else 'OFF'}"
+                    ),
+                    cooldown_s=float(globals().get("ZV_LOG_COOLDOWN_S", 12.0)),
+                )
+                if patron_norm == "4V/2X" and bool(globals().get("LXV_4V2X_ENABLE", False)):
                     candidate = _lxv_4v2x_candidate_from_round(round_row, feat_row)
                     gate_ok, gate_reason = _lxv_4v2x_gate_ok(candidate)
                     if gate_ok:
-                        _lxv_5v1x_event_cooldown(
-                            key=f"4v2x_gate_ok:{round_id}",
-                            msg=f"✅ 4V2X gate OK ronda #{round_id}: candidato REAL válido",
-                            cooldown_s=8.0,
-                        )
-                        ok_emit = bool(_lxv_4v2x_apply_real_route(candidate, ciclo_pick))
+                        if bool((zv_eval or {}).get("allow_4v2x", False)):
+                            _lxv_5v1x_event_cooldown(
+                                key=f"4v2x_gate_ok:{round_id}",
+                                msg=f"✅ 4V2X gate OK ronda #{round_id}: candidato REAL válido",
+                                cooldown_s=8.0,
+                            )
+                            ok_emit = bool(_lxv_4v2x_apply_real_route(candidate, ciclo_pick))
+                        else:
+                            g0_zv = (zv_eval or {}).get("g0", None)
+                            g1_zv = (zv_eval or {}).get("g1", None)
+                            d1_zv = (zv_eval or {}).get("d1", None)
+                            g0_txt_zv = "--" if g0_zv is None else f"{float(g0_zv):.6f}"
+                            g1_txt_zv = "--" if g1_zv is None else f"{float(g1_zv):.6f}"
+                            d1_txt_zv = "--" if d1_zv is None else f"{float(d1_zv):+.6f}"
+                            _lxv_5v1x_event_cooldown(
+                                key=f"4v2x_zv_block:{round_id}:{str((zv_eval or {}).get('estado', 'SIN_MUESTRA'))}",
+                                msg=(
+                                    f"⏸️ ZV bloquea 4V2X ronda #{round_id}: "
+                                    f"estado={str((zv_eval or {}).get('estado', 'SIN_MUESTRA'))} | "
+                                    f"g0={g0_txt_zv} g1={g1_txt_zv} d1={d1_txt_zv} | "
+                                    f"allow_4v2x={'ON' if bool((zv_eval or {}).get('allow_4v2x', False)) else 'OFF'} | "
+                                    f"motivo={str((zv_eval or {}).get('motivo', 'na'))}"
+                                ),
+                                cooldown_s=float(globals().get("ZV_LOG_COOLDOWN_S", 12.0)),
+                            )
+                            ok_emit = False
                     else:
                         _lxv_5v1x_event_cooldown(
                             key=f"4v2x_gate_no:{round_id}",
@@ -5100,17 +5402,34 @@ def _sync_round_tick_maestro():
                             cooldown_s=8.0,
                         )
                         ok_emit = False
-                elif bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)):
-                    round_row, feat_row = _lxv_5v1x_get_exported_rows(int(round_id))
+                elif patron_norm == "5V1X" and (
+                    bool(globals().get("LXV_5V1X_ONLY_ENABLE", False))
+                    or bool(globals().get("LXV_5V1X_ZV_ROUTE_ENABLE", False))
+                ):
                     candidate = _lxv_5v1x_candidate_from_round(round_row, feat_row)
                     gate_ok, gate_reason = _lxv_5v1x_gate_ok(candidate)
                     if gate_ok:
-                        _lxv_5v1x_event_cooldown(
-                            key=f"gate_ok:{round_id}",
-                            msg=f"✅ 5V1X gate OK ronda #{round_id}: candidato REAL válido",
-                            cooldown_s=8.0,
-                        )
-                        ok_emit = bool(_lxv_5v1x_apply_real_route(candidate, ciclo_pick))
+                        zv_estado = str((zv_eval or {}).get("estado", "SIN_MUESTRA"))
+                        zv_allow_5v1x = bool((zv_eval or {}).get("allow_5v1x", False))
+                        if zv_estado == "VERDE_CONFIRMADO" and zv_allow_5v1x:
+                            _lxv_5v1x_event_cooldown(
+                                key=f"5v1x_zv_open:{round_id}",
+                                msg="🔓 5V1X-ZV route habilitada por VERDE_CONFIRMADO",
+                                cooldown_s=float(globals().get("ZV_LOG_COOLDOWN_S", 12.0)),
+                            )
+                            _lxv_5v1x_event_cooldown(
+                                key=f"gate_ok:{round_id}",
+                                msg=f"✅ 5V1X gate OK ronda #{round_id}: candidato REAL válido",
+                                cooldown_s=8.0,
+                            )
+                            ok_emit = bool(_lxv_5v1x_apply_real_route(candidate, ciclo_pick))
+                        else:
+                            _lxv_5v1x_event_cooldown(
+                                key=f"5v1x_zv_block:{round_id}:{zv_estado}",
+                                msg=f"⛔ 5V1X-ZV bloqueada por estado ZV={zv_estado}",
+                                cooldown_s=float(globals().get("ZV_LOG_COOLDOWN_S", 12.0)),
+                            )
+                            ok_emit = False
                     else:
                         _lxv_5v1x_event_cooldown(
                             key=f"gate_no:{round_id}",
@@ -5508,7 +5827,7 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY") -> bool
     allow_5v1x = str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X")).upper()
     allow_4v2x = str(globals().get("LXV_4V2X_REAL_SOURCE", "LXV_4V2X")).upper()
     allow_sources = {allow_sync}
-    if bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)):
+    if bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)) or bool(globals().get("LXV_5V1X_ZV_ROUTE_ENABLE", False)):
         allow_sources.add(allow_5v1x)
     if bool(globals().get("LXV_4V2X_ENABLE", False)):
         allow_sources.add(allow_4v2x)
@@ -15828,6 +16147,23 @@ def mostrar_panel():
             )
         except Exception:
             pass
+        try:
+            zv = dict(globals().get("ZONA_VERDE_LAST_STATE", {}) or {})
+            g0 = zv.get("g0", None)
+            g1 = zv.get("g1", None)
+            d1 = zv.get("d1", None)
+            g0_txt = "--" if g0 is None else f"{float(g0):.4f}"
+            g1_txt = "--" if g1 is None else f"{float(g1):.4f}"
+            d1_txt = "--" if d1 is None else f"{float(d1):+.4f}"
+            print(
+                padding
+                + Fore.GREEN
+                + f"ZV: {str(zv.get('estado', 'SIN_MUESTRA'))} | g0={g0_txt} g1={g1_txt} d1={d1_txt} | "
+                + f"4V2X={'ON' if bool(zv.get('allow_4v2x', False)) else 'OFF'} | "
+                + f"5V1X={'ON' if bool(zv.get('allow_5v1x', False)) else 'OFF'}"
+            )
+        except Exception:
+            pass
 
     # Marcar meta_mostrada si ya se alcanzó la META y todavía no fue aceptada
     try:
@@ -19435,6 +19771,22 @@ async def main():
                                     "pattern_delta": float(_d_pat),
                                     "pattern_bonus_penalty": float(_d_pat),
                                 })
+                                _g0 = col_actual.get("green_ratio", None)
+                                _g1 = col_anterior.get("green_ratio", None) if isinstance(col_anterior, dict) else None
+                                _g2 = cols_stats[2].get("green_ratio", None) if len(cols_stats) > 2 and isinstance(cols_stats[2], dict) else None
+                                evaluar_detector_zona_verde(
+                                    round_id=int(pattern_col_eval.get("round_id", 0) or 0),
+                                    g0=_g0,
+                                    g1=_g1,
+                                    g2=_g2,
+                                    strong_streak_80=int(col_actual.get("strong_streak_80", 0) or 0),
+                                    prev90=bool(col_anterior.get("es_col90", False) if isinstance(col_anterior, dict) else False),
+                                    late_chase=bool(pattern_col_eval.get("late_chase", False)),
+                                    saturacion=bool(col_actual.get("es_col90", False)),
+                                    rebote_rate_hist=rebote_hist.get("rebote_rate_hist", None),
+                                    rebote_samples_hist=int(rebote_hist.get("rebote_samples_hist", 0) or 0),
+                                    update_global=True,
+                                )
                             except Exception:
                                 pattern_col_eval = dict(PATTERN_COL_LAST_STATE)
                         globals()["PATTERN_COL_LAST_STATE"] = dict(pattern_col_eval)
