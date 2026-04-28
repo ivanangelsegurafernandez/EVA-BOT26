@@ -709,7 +709,7 @@ def _purificacion_real_activa() -> bool:
         allow_5v1x = str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X")).upper()
         allow_4v2x = str(globals().get("LXV_4V2X_REAL_SOURCE", "LXV_4V2X")).upper()
         allowed_sources = {allow_sync}
-        if bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)):
+        if bool(globals().get("LXV_5V1X_ENABLE", False)) or bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)):
             allowed_sources.add(allow_5v1x)
         if bool(globals().get("LXV_4V2X_ENABLE", False)):
             allowed_sources.add(allow_4v2x)
