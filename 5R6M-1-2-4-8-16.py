@@ -16180,6 +16180,11 @@ def mostrar_panel():
     try:
         if bool(globals().get("HUD_MARTINGALA_LIVE_ENABLE", True)):
             print(_marti_hud_render_line())
+            try:
+                for _ln in _manual_confirm_inline_lines():
+                    print(_ln)
+            except Exception:
+                pass
             owner_live = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
             token_raw = _leer_token_linea_raw()
             token_confirma = bool(owner_live in BOT_NAMES and token_raw == f"REAL:{owner_live}")
@@ -17072,28 +17077,41 @@ def _manual_confirm_remaining() -> int:
 
 
 def mostrar_panel_confirmacion_manual(bot: str, ciclo: int, restante: int | None = None):
+    """
+    Compatibilidad: ya no imprime nada.
+    La confirmación manual se dibuja INLINE dentro de mostrar_panel().
+    Prohibido limpiar pantalla o pintar cuadros desde aquí.
+    """
+    return None
+
+
+HUD_MANUAL_CONFIRM_INLINE = True
+
+
+def _manual_confirm_inline_lines() -> list[str]:
     try:
-        bot_txt = str(bot or "--").upper()
-        ciclo_txt = f"C{int(ciclo)}"
-        rest_txt = f"{int(max(0, restante or 0))}s" if restante is not None else "--"
-        lines = [
-            "╔════════════════════════════════════════════════════════════╗",
-            "║ 🚨 CONFIRMAR INVERSIÓN MANUAL EN REAL                     ║",
-            "╠════════════════════════════════════════════════════════════╣",
-            f"║ Bot elegido : {bot_txt:<43}║",
-            f"║ Ciclo       : {ciclo_txt:<43}║",
-            "║                                                            ║",
-            "║ ¿DESEA INVERTIR AHORA EN CUENTA REAL?                     ║",
-            "║                                                            ║",
-            "║ Confirmar: [Y] o [S]                                      ║",
-            "║ Cancelar : [N] o [ESC]                                    ║",
-            f"║ Tiempo    : {rest_txt:<43}║",
-            "╚════════════════════════════════════════════════════════════╝",
-        ]
-        for ln in lines:
-            print(Fore.YELLOW + Style.BRIGHT + ln + Style.RESET_ALL)
+        if not bool(globals().get("HUD_MANUAL_CONFIRM_INLINE", True)):
+            return []
+        if not _manual_confirm_active():
+            return []
+
+        bot = str(PENDIENTE_CONFIRMAR_REAL.get("bot") or "--").upper()
+        ciclo = int(PENDIENTE_CONFIRMAR_REAL.get("ciclo") or 1)
+        restante = _manual_confirm_remaining()
+
+        line1 = (
+            Fore.YELLOW + Style.BRIGHT +
+            f"🚨 CONFIRMAR REAL | BOT={bot} | CICLO=C{ciclo} | RESTAN={restante}s"
+            + Style.RESET_ALL
+        )
+        line2 = (
+            Fore.YELLOW + Style.BRIGHT +
+            "👉 [Y/S]=INVERTIR EN REAL | [N/ESC]=CANCELAR"
+            + Style.RESET_ALL
+        )
+        return [line1, line2]
     except Exception:
-        pass
+        return []
 
 
 def _start_manual_confirm(bot: str, ciclo: int):
@@ -17107,17 +17125,13 @@ def _start_manual_confirm(bot: str, ciclo: int):
             "expira": now + float(MANUAL_CONFIRM_TIMEOUT_S),
         })
         agregar_evento(
-            f"⚠️ CONFIRMAR REAL: {str(bot).upper()} C{int(ciclo)}. "
-            f"Presiona Y/S para invertir o N/ESC para cancelar."
+            f"🚨 CONFIRMAR REAL: {str(bot).upper()} C{int(ciclo)}. "
+            f"Pulsa Y/S para invertir o N/ESC para cancelar."
         )
-        try:
-            limpiar_consola()
-        except Exception:
-            pass
-        mostrar_panel_confirmacion_manual(str(bot), int(ciclo), int(MANUAL_CONFIRM_TIMEOUT_S))
+        _safe_render_keyboard_panel()
     except Exception as e:
         try:
-            agregar_evento(f"⚠️ No se pudo abrir confirmación manual: {type(e).__name__}: {e}")
+            agregar_evento(f"⚠️ No se pudo activar confirmación manual: {type(e).__name__}: {e}")
         except Exception:
             pass
 
@@ -19409,11 +19423,7 @@ def escuchar_teclas():
                         continue
 
                     agregar_evento(f"⚠️ Confirmación pendiente: Y/S confirma, N/ESC cancela. Restan {restante}s.")
-                    try:
-                        limpiar_consola()
-                    except Exception:
-                        pass
-                    mostrar_panel_confirmacion_manual(str(bot_conf), int(ciclo_conf), restante)
+                    _safe_render_keyboard_panel()
                     continue
 
                 if k == "s":
