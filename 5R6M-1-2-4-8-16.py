@@ -19626,6 +19626,21 @@ def escuchar_teclas():
                 PENDIENTE_FORZAR_EXPIRA = 0.0
                 _safe_render_keyboard_panel()
 
+            if PENDIENTE_FORZAR_BOT and float(PENDIENTE_FORZAR_EXPIRA or 0) > 0 and time.time() > float(PENDIENTE_FORZAR_EXPIRA):
+                bot_exp = PENDIENTE_FORZAR_BOT
+                agregar_evento(f"⏱️ Selección manual REAL expirada: {str(bot_exp).upper()}.")
+                _manual_status_set(
+                    "expirado",
+                    bot=bot_exp,
+                    msg=f"Selección expirada BOT={str(bot_exp).upper()}",
+                    ttl_s=6,
+                )
+                _manual_key_audit(f"pending_bot_expired bot={bot_exp}")
+                PENDIENTE_FORZAR_BOT = None
+                PENDIENTE_FORZAR_INICIO = 0.0
+                PENDIENTE_FORZAR_EXPIRA = 0.0
+                _safe_render_keyboard_panel()
+
             if _manual_confirm_active():
                 bot_conf = PENDIENTE_CONFIRMAR_REAL.get("bot")
                 ciclo_conf = int(PENDIENTE_CONFIRMAR_REAL.get("ciclo") or 1)
