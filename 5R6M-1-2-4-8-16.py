@@ -1345,6 +1345,7 @@ CTT_STATE = {
 REAL_OWNER_LOCK = None  # owner REAL en memoria (evita carreras de lectura de archivo)
 REAL_LOCK_MISMATCH_SINCE = 0.0
 REAL_LOCK_RECONCILE_S = 6.0
+REAL_UI_RECON_LOG_TS = 0.0
 REAL_OWNER_STATE_FILE = "real_owner_state.json"
 REAL_CLOSE_TRACE_FILE = "real_close_trace.jsonl"
 LAST_REAL_CLOSE_TRACE = {}
@@ -3949,6 +3950,31 @@ def _fmt_estado_round_live(estado_visual: str, estado_base: str = "") -> str:
         return str(estado_visual or estado_base or "--")
 
 
+def _round_live_estado_display(row: dict) -> str:
+    try:
+        res = str(row.get("res") or row.get("symbol") or "")
+        estado = str(row.get("estado") or row.get("status") or "")
+        is_current = bool(row.get("is_current", True))
+        is_closed = bool(row.get("is_closed_result") or row.get("valid_closed") or estado == "closed")
+
+        if is_current and is_closed and res == "X":
+            return Fore.RED + Style.BRIGHT + "🔴 ES HORA DE INVERTIR" + Style.RESET_ALL
+        if is_current and is_closed and res == "✓":
+            return Fore.GREEN + Style.BRIGHT + "✅ CERRADO VERDE" + Style.RESET_ALL
+
+        visual = str(row.get("estado_visual") or estado or "--")
+        vlow = visual.lower()
+        if vlow.startswith("waiting"):
+            return Fore.YELLOW + "waiting⚠" + Style.RESET_ALL
+        if vlow.startswith("missing"):
+            return Fore.YELLOW + "missing" + Style.RESET_ALL
+        if vlow.startswith("open"):
+            return Fore.CYAN + "open" + Style.RESET_ALL
+        return visual
+    except Exception:
+        return str((row or {}).get("estado_visual") or (row or {}).get("estado") or "--")
+
+
 def _ack_live_format_lines(snapshot):
     rows_pack = _ack_live_build_rows()
     summary = _ack_live_calc_summary(rows_pack)
@@ -3995,8 +4021,7 @@ def _ack_live_format_lines(snapshot):
             else:
                 ciclo_txt = "--"
 
-        estado_raw = str(row.get("estado_visual", row.get("estado", "--")))
-        estado_fmt = _fmt_estado_round_live(estado_raw, str(row.get("estado", "--")))
+        estado_fmt = _round_live_estado_display(row if isinstance(row, dict) else {})
         estado_txt = _ack_tape_pad_visible(estado_fmt, 24)
         lines.append(f"{bot:<7}  {ack_txt:<5} {gap_txt:<4} {res_txt:<4} {age_txt:<6} {ciclo_txt:<6} {estado_txt}")
 
@@ -5231,6 +5256,10 @@ def limpiar_orden_real(bot: str):
             os.remove(p)
     except Exception:
         pass
+    try:
+        reconciliar_real_owner_ui("limpiar_orden_real")
+    except Exception:
+        pass
 
 def _set_ui_token_holder(holder: str | None):
     """
@@ -5743,6 +5772,77 @@ def refrescar_ia_ack_desde_hud(intervalo_s: float = 1.0):
             continue
 
     _LAST_IA_ACK_HEARTBEAT_TS = now
+
+
+def _leer_token_linea_raw() -> str:
+    try:
+        if not os.path.exists(TOKEN_FILE):
+            return ""
+        with open(TOKEN_FILE, "r", encoding="utf-8", errors="replace") as f:
+            return str((f.read() or "").strip())
+    except Exception:
+        return ""
+
+
+def reconciliar_real_owner_ui(reason: str = "tick"):
+    global REAL_OWNER_LOCK, REAL_UI_RECON_LOG_TS
+    try:
+        token_raw = _leer_token_linea_raw()
+        owner_file = None
+        if token_raw.startswith("REAL:"):
+            val = token_raw.split(":", 1)[1].strip()
+            if val in BOT_NAMES:
+                owner_file = val
+
+        owner_mem = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+        now = float(time.time())
+
+        def _log_recon(msg: str):
+            global REAL_UI_RECON_LOG_TS
+            if (now - float(REAL_UI_RECON_LOG_TS or 0.0)) >= 20.0:
+                REAL_UI_RECON_LOG_TS = now
+                try:
+                    agregar_evento(msg)
+                except Exception:
+                    pass
+
+        if owner_file is None:
+            if owner_mem in BOT_NAMES:
+                try:
+                    estado_bots[owner_mem]["token"] = "DEMO"
+                    estado_bots[owner_mem]["trigger_real"] = False
+                    estado_bots[owner_mem]["fuente"] = None
+                    estado_bots[owner_mem]["real_activado_en"] = 0.0
+                except Exception:
+                    pass
+                _log_recon(f"⚠️ REAL UI reconcile: memoria decía REAL:{owner_mem} pero token_actual no confirma. HUD limpiado.")
+            REAL_OWNER_LOCK = None
+            try:
+                _set_real_manual_alert(None)
+            except Exception:
+                pass
+            return
+
+        if owner_file in BOT_NAMES:
+            if owner_mem != owner_file:
+                _log_recon(f"⚠️ REAL UI reconcile: token_actual confirma REAL:{owner_file} pero memoria no. HUD sincronizado.")
+            REAL_OWNER_LOCK = owner_file
+            try:
+                estado_bots[owner_file]["token"] = "REAL"
+                estado_bots[owner_file]["trigger_real"] = True
+                if not estado_bots[owner_file].get("fuente"):
+                    estado_bots[owner_file]["fuente"] = "MANUAL" if REAL_MANUAL_ALERT.get("bot") == owner_file else "LXV"
+            except Exception:
+                pass
+            for b in BOT_NAMES:
+                if b != owner_file:
+                    try:
+                        estado_bots[b]["token"] = "DEMO"
+                        estado_bots[b]["trigger_real"] = False
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 # Leer token actual
 def leer_token_actual():
     """
@@ -11387,6 +11487,37 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
     except Exception:
         pass
 
+    try:
+        _set_real_manual_alert(None)
+    except Exception:
+        pass
+
+    try:
+        if isinstance(REAL_MANUAL_ALERT, dict):
+            REAL_MANUAL_ALERT.update({
+                "active": False,
+                "bot": None,
+                "ciclo": None,
+                "source": None,
+                "ts": 0.0,
+                "msg": "",
+            })
+    except Exception:
+        pass
+
+    try:
+        for b in BOT_NAMES:
+            if b != bot and estado_bots.get(b, {}).get("token") == "REAL":
+                estado_bots[b]["token"] = "DEMO"
+                estado_bots[b]["trigger_real"] = False
+    except Exception:
+        pass
+
+    try:
+        reconciliar_real_owner_ui("cerrar_por_fin_de_ciclo")
+    except Exception:
+        pass
+
     # Forzar refresco del loop principal
     try:
         reinicio_forzado.set()
@@ -15352,8 +15483,26 @@ def mostrar_panel_real_activo():
         return []
     owner_txt = str(owner)
     st = estado_bots.get(owner_txt, {}) if isinstance(estado_bots, dict) else {}
+    token_line = _leer_token_linea_raw()
+    token_confirma = (token_line == f"REAL:{owner_txt}")
+    activo_elapsed = int(max(0, time.time() - float(st.get("real_activado_en", 0.0) or 0.0)))
+    if (not token_confirma) and activo_elapsed > 180:
+        try:
+            reconciliar_real_owner_ui("panel_real_timeout")
+            _set_real_manual_alert(None)
+        except Exception:
+            pass
+        return []
     ciclo = st.get("ciclo_actual", 1)
-    fuente = st.get("fuente", "AUTO")
+    fuente = st.get("fuente")
+    if not fuente:
+        if REAL_MANUAL_ALERT.get("bot") == owner_txt:
+            fuente = REAL_MANUAL_ALERT.get("source") or "MANUAL"
+        elif REAL_OWNER_LOCK == owner_txt:
+            fuente = "LXV"
+        else:
+            fuente = "--"
+    fuente = str(fuente).upper()
     token_txt = f"REAL:{owner_txt}"
     estado_txt = "ORDEN REAL ESCRITA ✅"
     hhmmss = "--"
@@ -15405,6 +15554,12 @@ def mostrar_panel():
     HUD principal: muestra estado de los bots, saldos, IA y eventos recientes.
     """
     global meta_mostrada
+
+    # Respetar ventana de limpieza (para mensajes especiales)
+    try:
+        reconciliar_real_owner_ui("mostrar_panel")
+    except Exception:
+        pass
 
     # Respetar ventana de limpieza (para mensajes especiales)
     if time.time() < LIMPIEZA_PANEL_HASTA:
@@ -15917,10 +16072,19 @@ def mostrar_panel():
     try:
         if bool(globals().get("HUD_MARTINGALA_LIVE_ENABLE", True)):
             print(_marti_hud_render_line())
-            owner_live = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_archivo_raw()
-            if owner_live in BOT_NAMES:
+            owner_live = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+            token_raw = _leer_token_linea_raw()
+            token_confirma = bool(owner_live in BOT_NAMES and token_raw == f"REAL:{owner_live}")
+            if not token_confirma:
+                try:
+                    _set_real_manual_alert(None)
+                except Exception:
+                    pass
+            if token_confirma and owner_live in BOT_NAMES:
                 st_live = estado_bots.get(owner_live, {}) if isinstance(estado_bots, dict) else {}
                 fuente_live = str(st_live.get("fuente") or REAL_MANUAL_ALERT.get("source") or "--").upper()
+                if fuente_live in ("", "--", "NONE") and REAL_MANUAL_ALERT.get("bot") == owner_live:
+                    fuente_live = str(REAL_MANUAL_ALERT.get("source") or "MANUAL").upper()
                 ciclo_live = int(st_live.get("ciclo_actual", REAL_MANUAL_ALERT.get("ciclo") or 1) or 1)
                 base_ts = float(st_live.get("real_activado_en", REAL_MANUAL_ALERT.get("ts") or time.time()) or time.time())
                 elapsed = int(max(0, time.time() - base_ts))
@@ -18869,12 +19033,26 @@ async def cargar_datos_bot(bot, token_actual):
 
             # Cierre especial para REAL manual: SIEMPRE 1 sola operación
             if (
-                estado_bots[bot].get("fuente") == "MANUAL"
+                str(estado_bots[bot].get("fuente") or "").upper() == "MANUAL"
                 and resultado in ("GANANCIA", "PÉRDIDA")
             ):
                 reason = f"REAL manual: {resultado} → una operación y regreso a DEMO"
                 cerrar_por_fin_de_ciclo(bot, reason)
-                _set_real_manual_alert(None)
+                try:
+                    _set_real_manual_alert(None)
+                except Exception:
+                    pass
+                try:
+                    REAL_MANUAL_ALERT.update({
+                        "active": False,
+                        "bot": None,
+                        "ciclo": None,
+                        "source": None,
+                        "ts": 0.0,
+                        "msg": "",
+                    })
+                except Exception:
+                    pass
                 agregar_evento(f"✅ REAL MANUAL cerrado para {bot.upper()} tras {resultado}. Volviendo a DEMO.")
 
             # --- Contadores de IA: SOLO cuando llega un cierre real ---
@@ -19370,6 +19548,7 @@ async def main():
             try:  
                 set_etapa("TICK_01")
                 token_actual_loop = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else (leer_token_actual() or next((b for b in BOT_NAMES if estado_bots.get(b, {}).get("token") == "REAL"), None))
+                reconciliar_real_owner_ui("tick_pre_hud")
 
                 # Reconciliación anti-desincronía maestro↔bots:
                 # si memoria dice REAL pero token_actual.txt ya está en none por varios segundos,
@@ -19419,6 +19598,7 @@ async def main():
                             # No mostrar_panel inmediato; dejar al tick
                             break
                         await cargar_datos_bot(bot, token_actual_loop)
+                        reconciliar_real_owner_ui("post_csv_close")
                         # Evita desincronizar REAL por inactividad normal durante contrato.
                         # El owner REAL se vigila en TICK_02 (watchdog sin salida a DEMO).
                         if time.time() - last_update_time[bot] > 60:
