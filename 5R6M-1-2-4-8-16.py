@@ -1309,6 +1309,14 @@ OCULTAR_HASTA_NUEVO = {bot: False for bot in BOT_NAMES}
 t_inicio_indef = {bot: None for bot in BOT_NAMES}
 last_update_time = {bot: time.time() for bot in BOT_NAMES}
 LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # evita procesar el mismo cierre REAL varias veces
+REAL_MANUAL_ALERT = {
+    "active": False,
+    "bot": None,
+    "ciclo": None,
+    "source": None,
+    "ts": 0.0,
+    "msg": "",
+}
 CTT_CLOSE_EVENTS = deque(maxlen=6000)
 CTT_CLOSE_SEEN = set()
 CTT_STATE = {
@@ -5408,8 +5416,14 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
 
         # 2) Estado interno inmediato (HUD)
         _set_ui_token_holder(bot)
+        estado_bots[bot]["token"] = "REAL"
         estado_bots[bot]["trigger_real"] = True
         estado_bots[bot]["ciclo_actual"] = ciclo_obj
+        estado_bots[bot]["real_activado_en"] = now
+        estado_bots[bot]["modo_real_anunciado"] = True
+        if str(globals().get("_REAL_ROUTE_SOURCE", "")).upper() == "MANUAL" or str(origen).lower() == "manual":
+            estado_bots[bot]["fuente"] = "MANUAL"
+            _set_real_manual_alert(bot, ciclo_obj, "MANUAL")
 
         # Congelar probabilidad de señal al entrar REAL (si no estaba ya fijada)
         # para evitar divergencia visual/ACK durante toda la operación.
@@ -15903,6 +15917,18 @@ def mostrar_panel():
     try:
         if bool(globals().get("HUD_MARTINGALA_LIVE_ENABLE", True)):
             print(_marti_hud_render_line())
+            owner_live = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_archivo_raw()
+            if owner_live in BOT_NAMES:
+                st_live = estado_bots.get(owner_live, {}) if isinstance(estado_bots, dict) else {}
+                fuente_live = str(st_live.get("fuente") or REAL_MANUAL_ALERT.get("source") or "--").upper()
+                ciclo_live = int(st_live.get("ciclo_actual", REAL_MANUAL_ALERT.get("ciclo") or 1) or 1)
+                base_ts = float(st_live.get("real_activado_en", REAL_MANUAL_ALERT.get("ts") or time.time()) or time.time())
+                elapsed = int(max(0, time.time() - base_ts))
+                print(
+                    Fore.GREEN + Style.BRIGHT
+                    + f"🟢 REAL ACTIVO | BOT={owner_live.upper()} | CICLO=C{ciclo_live} | FUENTE={fuente_live} | ACTIVO={elapsed}s"
+                    + Style.RESET_ALL
+                )
     except Exception as e:
         agregar_evento(f"⚠ martingala HUD error: {str(e)[:80]}")
 
@@ -15954,8 +15980,10 @@ def mostrar_panel():
 
         # Token + origen
         token_text = token
-        token_color = Fore.GREEN if token_text.startswith("REAL") else Fore.CYAN
-        token_text = token_color + token_text + Fore.RESET
+        if token_text.startswith("REAL"):
+            token_text = Fore.GREEN + Style.BRIGHT + "REAL" + Style.RESET_ALL
+        else:
+            token_text = Fore.CYAN + token_text + Fore.RESET
 
         fallback = estado_bots.get(bot, {}).get("resultados", [])
         col_resultados = _ack_tape_render_bot(
@@ -16708,6 +16736,33 @@ def condiciones_seguras_para(bot: str) -> bool:
         return False
     return (n >= ORACULO_N_MIN) and (prob >= thr) and (dec in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO))
 
+
+def _set_real_manual_alert(bot: str | None, ciclo: int | None = None, source: str = "MANUAL"):
+    try:
+        if bot in BOT_NAMES:
+            ciclo_val = int(ciclo or estado_bots.get(bot, {}).get("ciclo_actual", 1) or 1)
+            source_val = str(source or "MANUAL").upper()
+            REAL_MANUAL_ALERT.update({
+                "active": True,
+                "bot": str(bot),
+                "ciclo": ciclo_val,
+                "source": source_val,
+                "ts": float(time.time()),
+                "msg": f"🟢 REAL ACTIVO | BOT={str(bot).upper()} | CICLO=C{ciclo_val} | FUENTE={source_val}",
+            })
+        else:
+            REAL_MANUAL_ALERT.update({
+                "active": False,
+                "bot": None,
+                "ciclo": None,
+                "source": None,
+                "ts": 0.0,
+                "msg": "",
+            })
+    except Exception:
+        pass
+
+
 # forzar_real_manual
 def forzar_real_manual(bot: str, ciclo: int):
     if not FORZAR_LOCK.acquire(blocking=False):
@@ -16767,15 +16822,18 @@ def forzar_real_manual(bot: str, ciclo: int):
                 pass
 
 
-        if not emitir_real_autorizado(bot, ciclo, source="MANUAL"):
-            agregar_evento(f"🔒 Forzar REAL bloqueado para {bot.upper()}: ya hay otro bot en REAL.")
-            return
-
         estado_bots[bot]["reintentar_ciclo"] = True
         estado_bots[bot]["ciclo_actual"] = ciclo
+        estado_bots[bot]["fuente"] = "MANUAL"
         global marti_paso
         marti_paso = ciclo - 1
-        estado_bots[bot]["fuente"] = "MANUAL"
+        _set_real_manual_alert(bot, ciclo, "MANUAL")
+        agregar_evento(f"🟢 MANUAL REAL CONFIRMADO: {bot.upper()} entra a REAL en C{int(ciclo)}.")
+
+        if not emitir_real_autorizado(bot, ciclo, source="MANUAL"):
+            _set_real_manual_alert(None)
+            agregar_evento(f"🔒 Forzar REAL bloqueado para {bot.upper()}: ya hay otro bot en REAL.")
+            return
 
         requerido = float(MARTI_ESCALADO[ciclo - 1])
         val = obtener_valor_saldo()
@@ -18811,12 +18869,12 @@ async def cargar_datos_bot(bot, token_actual):
 
             # Cierre especial para REAL manual: SIEMPRE 1 sola operación
             if (
-                MODO_REAL_MANUAL
-                and estado_bots[bot].get("fuente") == "MANUAL"
+                estado_bots[bot].get("fuente") == "MANUAL"
                 and resultado in ("GANANCIA", "PÉRDIDA")
             ):
                 reason = f"REAL manual: {resultado} → una operación y regreso a DEMO"
                 cerrar_por_fin_de_ciclo(bot, reason)
+                _set_real_manual_alert(None)
                 agregar_evento(f"✅ REAL MANUAL cerrado para {bot.upper()} tras {resultado}. Volviendo a DEMO.")
 
             # --- Contadores de IA: SOLO cuando llega un cierre real ---

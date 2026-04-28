@@ -523,7 +523,7 @@ COOLDOWN_REAL_S = 12
 # >>> PATCH BLOQUE 4 y 8
 REFRESCO_SALDO = 12
 _last_saldo_ts = 0.0
-PENDING_CONTRACT_FENCE_S = 95.0
+PENDING_CONTRACT_FENCE_S = 35.0
 
 
 def _set_pending_contract_resolution(round_id: int, contract_id=None, reason: str = ""):
@@ -1617,6 +1617,7 @@ async def check_token_and_reconnect(ws, current_token):
             if not estado_bot.get("token_msg_mostrado", False):
                 if not (MODO_SILENCIOSO and estado_bot.get("modo_manual")):
                     print(Fore.MAGENTA + Style.BRIGHT + "Cambio de token detectado: cortando ciclo y aplicando de inmediato.")
+                    print(Fore.YELLOW + Style.BRIGHT + "⚠️ REAL llegó mientras había contrato anterior abierto. Esperando cierre seguro antes de comprar en REAL.")
                 estado_bot["token_msg_mostrado"] = True
             estado_bot["interrumpir_ciclo"] = True
             reinicio_forzado.set()
@@ -1798,6 +1799,7 @@ async def vigilar_token():
                 if not estado_bot.get("token_msg_mostrado", False):
                     if not (MODO_SILENCIOSO and estado_bot.get("modo_manual")):
                         print(Fore.MAGENTA + Style.BRIGHT + "Cambio de token detectado: cortando ciclo y aplicando de inmediato.")
+                        print(Fore.YELLOW + Style.BRIGHT + "⚠️ REAL llegó mientras había contrato anterior abierto. Esperando cierre seguro antes de comprar en REAL.")
                     estado_bot["token_msg_mostrado"] = True
                 estado_bot["interrumpir_ciclo"] = True
                 reinicio_forzado.set()
@@ -2318,6 +2320,22 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
             _buffer_log(msg2)
         else:
             print(msg2)
+
+        try:
+            _clear_pending_contract_resolution(reason="bg_resolved")
+        except Exception:
+            pass
+
+        try:
+            estado_bot["ciclo_en_progreso"] = False
+            estado_bot["token_msg_mostrado"] = False
+        except Exception:
+            pass
+
+        try:
+            reinicio_forzado.set()
+        except Exception:
+            pass
 
     except Exception as e:
         msg = Fore.YELLOW + f"finalizar_contrato_bg: {type(e).__name__}: {e!r}"
