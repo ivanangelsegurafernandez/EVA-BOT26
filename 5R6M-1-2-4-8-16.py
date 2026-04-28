@@ -16181,7 +16181,7 @@ def mostrar_panel():
         if bool(globals().get("HUD_MARTINGALA_LIVE_ENABLE", True)):
             print(_marti_hud_render_line())
             try:
-                for _ln in _manual_confirm_inline_lines():
+                for _ln in _manual_status_lines():
                     print(_ln)
             except Exception:
                 pass
@@ -17006,6 +17006,17 @@ PENDIENTE_CONFIRMAR_REAL = {
     "ts": 0.0,
     "expira": 0.0,
 }
+MANUAL_KEYBOARD_STATUS = {
+    "active": False,
+    "phase": "idle",
+    "bot": None,
+    "ciclo": None,
+    "msg": "",
+    "ts": 0.0,
+    "expires": 0.0,
+    "last_key": "",
+    "last_error": "",
+}
 
 FORZAR_LOCK = threading.Lock()
 
@@ -17061,6 +17072,49 @@ def _clear_manual_confirm():
         pass
 
 
+def _manual_status_set(phase="idle", bot=None, ciclo=None, msg="", ttl_s=8, last_key="", error=""):
+    try:
+        now = time.time()
+        MANUAL_KEYBOARD_STATUS.update({
+            "active": bool(phase != "idle"),
+            "phase": str(phase or "idle"),
+            "bot": bot,
+            "ciclo": ciclo,
+            "msg": str(msg or ""),
+            "ts": now,
+            "expires": now + float(ttl_s or 8),
+            "last_key": str(last_key or ""),
+            "last_error": str(error or ""),
+        })
+    except Exception:
+        pass
+
+
+def _manual_status_clear():
+    try:
+        MANUAL_KEYBOARD_STATUS.update({
+            "active": False,
+            "phase": "idle",
+            "bot": None,
+            "ciclo": None,
+            "msg": "",
+            "ts": 0.0,
+            "expires": 0.0,
+            "last_key": "",
+            "last_error": "",
+        })
+    except Exception:
+        pass
+
+
+def _manual_key_audit(msg: str):
+    try:
+        with open("manual_keyboard_audit.log", "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%F %T')} | {msg}\n")
+    except Exception:
+        pass
+
+
 def _manual_confirm_active() -> bool:
     try:
         return bool(PENDIENTE_CONFIRMAR_REAL.get("active"))
@@ -17078,38 +17132,52 @@ def _manual_confirm_remaining() -> int:
 
 def mostrar_panel_confirmacion_manual(bot: str, ciclo: int, restante: int | None = None):
     """
-    Compatibilidad: ya no imprime nada.
-    La confirmación manual se dibuja INLINE dentro de mostrar_panel().
-    Prohibido limpiar pantalla o pintar cuadros desde aquí.
+    Compatibilidad: no imprime nada.
+    La confirmación se muestra inline mediante _manual_status_lines().
     """
     return None
 
 
-HUD_MANUAL_CONFIRM_INLINE = True
-
-
-def _manual_confirm_inline_lines() -> list[str]:
+def _manual_status_lines() -> list[str]:
     try:
-        if not bool(globals().get("HUD_MANUAL_CONFIRM_INLINE", True)):
-            return []
-        if not _manual_confirm_active():
-            return []
+        lines = []
+        now = time.time()
 
-        bot = str(PENDIENTE_CONFIRMAR_REAL.get("bot") or "--").upper()
-        ciclo = int(PENDIENTE_CONFIRMAR_REAL.get("ciclo") or 1)
-        restante = _manual_confirm_remaining()
+        if _manual_confirm_active():
+            bot = str(PENDIENTE_CONFIRMAR_REAL.get("bot") or "--").upper()
+            ciclo = int(PENDIENTE_CONFIRMAR_REAL.get("ciclo") or 1)
+            restante = _manual_confirm_remaining()
+            lines.append(
+                Fore.YELLOW + Style.BRIGHT +
+                f"🚨 CONFIRMAR REAL | BOT={bot} | CICLO=C{ciclo} | RESTAN={restante}s"
+                + Style.RESET_ALL
+            )
+            lines.append(
+                Fore.YELLOW + Style.BRIGHT +
+                "👉 [Y/S]=INVERTIR EN REAL | [N/ESC]=CANCELAR"
+                + Style.RESET_ALL
+            )
+            return lines
 
-        line1 = (
-            Fore.YELLOW + Style.BRIGHT +
-            f"🚨 CONFIRMAR REAL | BOT={bot} | CICLO=C{ciclo} | RESTAN={restante}s"
-            + Style.RESET_ALL
-        )
-        line2 = (
-            Fore.YELLOW + Style.BRIGHT +
-            "👉 [Y/S]=INVERTIR EN REAL | [N/ESC]=CANCELAR"
-            + Style.RESET_ALL
-        )
-        return [line1, line2]
+        if PENDIENTE_FORZAR_BOT:
+            bot = str(PENDIENTE_FORZAR_BOT).upper()
+            restante = max(0, int(float(PENDIENTE_FORZAR_EXPIRA or 0) - now))
+            lines.append(
+                Fore.MAGENTA + Style.BRIGHT +
+                f"🎯 MANUAL REAL ARMADO | BOT={bot} | PRESIONA CICLO [1..{MAX_CICLOS}] | ESC=CANCELAR | {restante}s"
+                + Style.RESET_ALL
+            )
+            return lines
+
+        st = MANUAL_KEYBOARD_STATUS if isinstance(MANUAL_KEYBOARD_STATUS, dict) else {}
+        if st.get("active") and now <= float(st.get("expires") or 0):
+            msg = str(st.get("msg") or "")
+            err = str(st.get("last_error") or "")
+            if err:
+                lines.append(Fore.RED + Style.BRIGHT + f"⛔ MANUAL REAL | {err}" + Style.RESET_ALL)
+            elif msg:
+                lines.append(Fore.CYAN + Style.BRIGHT + f"⌨️ MANUAL REAL | {msg}" + Style.RESET_ALL)
+        return lines
     except Exception:
         return []
 
@@ -17128,6 +17196,7 @@ def _start_manual_confirm(bot: str, ciclo: int):
             f"🚨 CONFIRMAR REAL: {str(bot).upper()} C{int(ciclo)}. "
             f"Pulsa Y/S para invertir o N/ESC para cancelar."
         )
+        _manual_key_audit(f"confirm_start bot={str(bot)} ciclo={int(ciclo)}")
         _safe_render_keyboard_panel()
     except Exception as e:
         try:
@@ -17140,8 +17209,13 @@ def _start_manual_confirm(bot: str, ciclo: int):
 def forzar_real_manual(bot: str, ciclo: int):
     if not FORZAR_LOCK.acquire(blocking=False):
         agregar_evento("🔒 Forzar REAL: ya en progreso; espera.")
-        return
+        _manual_key_audit(f"forzar_real_manual lock_busy bot={bot} ciclo={ciclo}")
+        return False
     try:
+        if bot not in BOT_NAMES:
+            agregar_evento(f"⛔ Forzar REAL falló: bot inválido {bot}.")
+            _manual_key_audit(f"forzar_real_manual invalid_bot bot={bot} ciclo={ciclo}")
+            return False
         ciclo = max(1, min(int(ciclo), MAX_CICLOS))
 
         # Confirmación ya fue hecha antes por teclado.
@@ -17161,7 +17235,8 @@ def forzar_real_manual(bot: str, ciclo: int):
                             break
                         elif k == "n":
                             agregar_evento("❎ Forzar REAL cancelado (no confirmado).")
-                            return
+                            _manual_key_audit(f"forzar_real_manual cancel_risk bot={bot} ciclo={ciclo}")
+                            return False
                     time.sleep(0.05)
             finally:
                 MODAL_ACTIVO = False
@@ -17206,7 +17281,8 @@ def forzar_real_manual(bot: str, ciclo: int):
         if not emitir_real_autorizado(bot, ciclo, source="MANUAL"):
             _set_real_manual_alert(None)
             agregar_evento(f"🔒 Forzar REAL bloqueado para {bot.upper()}: ya hay otro bot en REAL.")
-            return
+            _manual_key_audit(f"forzar_real_manual blocked_emit bot={bot} ciclo={ciclo}")
+            return False
 
         requerido = float(MARTI_ESCALADO[ciclo - 1])
         val = obtener_valor_saldo()
@@ -17215,11 +17291,57 @@ def forzar_real_manual(bot: str, ciclo: int):
 
         # escribir_orden_real(...) ya dejó token+HUD sincronizados; evitamos doble token_sync.
         agregar_evento(f"⚡ Forzar REAL: {bot} → ciclo #{ciclo} (fuente=MANUAL)")
+        _manual_key_audit(f"forzar_real_manual success bot={bot} ciclo={ciclo}")
         _safe_render_keyboard_panel()
+        return True
     except Exception as e:
         agregar_evento(f"⛔ Forzar REAL falló en {bot}: {e}")
+        _manual_key_audit(f"forzar_real_manual exception bot={bot} ciclo={ciclo} err={type(e).__name__}:{e}")
+        return False
     finally:
         FORZAR_LOCK.release()
+
+
+def _manual_verify_real_order(bot: str, ciclo: int, delay_s: float = 1.0):
+    try:
+        time.sleep(float(delay_s))
+        token_raw = ""
+        try:
+            token_raw = leer_token_archivo_raw()
+        except Exception:
+            try:
+                token_raw = leer_token_actual()
+            except Exception:
+                token_raw = ""
+
+        owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+        if token_raw == bot or token_raw == f"REAL:{bot}" or owner == bot:
+            _manual_status_set(
+                "real_confirmado",
+                bot=bot,
+                ciclo=ciclo,
+                msg=f"REAL CONFIRMADO | BOT={bot.upper()} | CICLO=C{ciclo}",
+                ttl_s=10,
+            )
+            agregar_evento(f"🟢 REAL confirmado por teclado: {bot.upper()} C{ciclo}.")
+            _manual_key_audit(f"verify_ok bot={bot} ciclo={ciclo} token={token_raw} owner={owner}")
+        else:
+            _manual_status_set(
+                "error",
+                bot=bot,
+                ciclo=ciclo,
+                error=f"ORDEN ENVIADA PERO TOKEN NO CONFIRMA REAL:{bot.upper()}",
+                ttl_s=12,
+            )
+            agregar_evento(f"⚠️ Manual REAL: orden enviada pero token no confirma REAL:{bot}. token={token_raw} owner={owner}")
+            _manual_key_audit(f"verify_mismatch bot={bot} ciclo={ciclo} token={token_raw} owner={owner}")
+        _safe_render_keyboard_panel()
+    except Exception as e:
+        try:
+            agregar_evento(f"⚠️ Manual verify falló: {type(e).__name__}: {e}")
+            _manual_key_audit(f"verify_exception bot={bot} ciclo={ciclo} err={type(e).__name__}:{e}")
+        except Exception:
+            pass
 
 def evaluar_semaforo():
     thr = float(get_umbral_operativo())
@@ -19380,12 +19502,35 @@ def escuchar_teclas():
             if MODAL_ACTIVO:
                 time.sleep(0.1); continue
 
+            if PENDIENTE_FORZAR_BOT and float(PENDIENTE_FORZAR_EXPIRA or 0) > 0 and time.time() > float(PENDIENTE_FORZAR_EXPIRA):
+                bot_exp = PENDIENTE_FORZAR_BOT
+                agregar_evento(f"⏱️ Selección manual REAL expirada: {str(bot_exp).upper()}.")
+                _manual_status_set(
+                    "expirado",
+                    bot=bot_exp,
+                    msg=f"Selección expirada BOT={str(bot_exp).upper()}",
+                    ttl_s=6,
+                )
+                _manual_key_audit(f"pending_bot_expired bot={bot_exp}")
+                PENDIENTE_FORZAR_BOT = None
+                PENDIENTE_FORZAR_INICIO = 0.0
+                PENDIENTE_FORZAR_EXPIRA = 0.0
+                _safe_render_keyboard_panel()
+
             if _manual_confirm_active():
                 bot_conf = PENDIENTE_CONFIRMAR_REAL.get("bot")
                 ciclo_conf = int(PENDIENTE_CONFIRMAR_REAL.get("ciclo") or 1)
                 restante = _manual_confirm_remaining()
                 if restante <= 0:
                     agregar_evento(f"⏱️ CONFIRMACIÓN REAL expirada: {str(bot_conf).upper()} C{ciclo_conf}. Cancelado.")
+                    _manual_status_set(
+                        "expirado",
+                        bot=str(bot_conf),
+                        ciclo=int(ciclo_conf),
+                        msg=f"Confirmación expirada BOT={str(bot_conf).upper()} C{ciclo_conf}",
+                        ttl_s=6,
+                    )
+                    _manual_key_audit(f"confirm_expired bot={bot_conf} ciclo={ciclo_conf}")
                     _clear_manual_confirm()
                     _safe_render_keyboard_panel()
                     time.sleep(0.05)
@@ -19404,6 +19549,7 @@ def escuchar_teclas():
                     k = k.decode("utf-8", errors="ignore").lower()
                 except:
                     continue
+                _manual_key_audit(f"key={repr(k)} phase={MANUAL_KEYBOARD_STATUS.get('phase')} pending_bot={PENDIENTE_FORZAR_BOT}")
 
                 if _manual_confirm_active():
                     bot_conf = PENDIENTE_CONFIRMAR_REAL.get("bot")
@@ -19412,17 +19558,109 @@ def escuchar_teclas():
 
                     if k in ("y", "s"):
                         agregar_evento(f"✅ CONFIRMADO: invirtiendo en REAL {str(bot_conf).upper()} C{ciclo_conf}.")
+                        _manual_key_audit(f"confirm_yes key={k} bot={bot_conf} ciclo={ciclo_conf}")
                         _clear_manual_confirm()
-                        forzar_real_manual(str(bot_conf), int(ciclo_conf))
+                        ok = forzar_real_manual(str(bot_conf), int(ciclo_conf))
+                        _manual_key_audit(f"confirm_result ok={ok} bot={bot_conf} ciclo={ciclo_conf}")
+                        if ok:
+                            _manual_status_set(
+                                "orden_enviada",
+                                bot=str(bot_conf),
+                                ciclo=int(ciclo_conf),
+                                msg=f"✅ ORDEN REAL ENVIADA | BOT={str(bot_conf).upper()} | CICLO=C{ciclo_conf} | ESPERANDO BOT",
+                                ttl_s=10,
+                                last_key=k,
+                            )
+                            threading.Thread(
+                                target=_manual_verify_real_order,
+                                args=(str(bot_conf), int(ciclo_conf), 1.0),
+                                daemon=True,
+                                name="manual-real-verify",
+                            ).start()
+                        else:
+                            _manual_status_set(
+                                "error",
+                                bot=str(bot_conf),
+                                ciclo=int(ciclo_conf),
+                                error=f"NO SE ENVIÓ ORDEN REAL | BOT={str(bot_conf).upper()} | CICLO=C{ciclo_conf}. Revisa eventos.",
+                                ttl_s=12,
+                                last_key=k,
+                            )
+                        _safe_render_keyboard_panel()
                         continue
 
                     if k in ("n", "\x1b"):
                         agregar_evento(f"❎ CANCELADO: inversión manual REAL {str(bot_conf).upper()} C{ciclo_conf}.")
+                        _manual_key_audit(f"confirm_cancel key={repr(k)} bot={bot_conf} ciclo={ciclo_conf}")
+                        _manual_status_set(
+                            "cancelado",
+                            bot=str(bot_conf),
+                            ciclo=int(ciclo_conf),
+                            msg=f"Cancelado BOT={str(bot_conf).upper()} C{ciclo_conf}",
+                            ttl_s=6,
+                            last_key=k,
+                        )
                         _clear_manual_confirm()
                         _safe_render_keyboard_panel()
                         continue
 
                     agregar_evento(f"⚠️ Confirmación pendiente: Y/S confirma, N/ESC cancela. Restan {restante}s.")
+                    _manual_status_set(
+                        "confirmar",
+                        bot=str(bot_conf),
+                        ciclo=int(ciclo_conf),
+                        msg=f"CONFIRMAR BOT={str(bot_conf).upper()} C{ciclo_conf}",
+                        ttl_s=max(2, restante),
+                        last_key=k,
+                    )
+                    _safe_render_keyboard_panel()
+                    continue
+
+                if PENDIENTE_FORZAR_BOT:
+                    if k == "\x1b":
+                        agregar_evento("❎ Selección manual REAL cancelada.")
+                        _manual_key_audit(f"pending_cancel key={repr(k)} bot={PENDIENTE_FORZAR_BOT}")
+                        _manual_status_set("cancelado", bot=PENDIENTE_FORZAR_BOT, msg=f"Cancelado BOT={str(PENDIENTE_FORZAR_BOT).upper()}", ttl_s=6)
+                        PENDIENTE_FORZAR_BOT = None
+                        PENDIENTE_FORZAR_INICIO = 0.0
+                        PENDIENTE_FORZAR_EXPIRA = 0.0
+                        _safe_render_keyboard_panel()
+                        continue
+
+                    if k.isdigit() and k in [str(i) for i in range(1, MAX_CICLOS + 1)]:
+                        ciclo = int(k)
+                        bot_sel = PENDIENTE_FORZAR_BOT
+
+                        PENDIENTE_FORZAR_BOT = None
+                        PENDIENTE_FORZAR_INICIO = 0.0
+                        PENDIENTE_FORZAR_EXPIRA = 0.0
+
+                        agregar_evento(
+                            f"⚠️ CICLO ELEGIDO: {bot_sel.upper()} C{ciclo}. Falta confirmar Y/S para invertir en REAL."
+                        )
+                        _manual_key_audit(f"pending_cycle key={k} bot={bot_sel} ciclo={ciclo}")
+                        _manual_status_set(
+                            "confirmar",
+                            bot=bot_sel,
+                            ciclo=ciclo,
+                            msg=f"CONFIRMAR BOT={bot_sel.upper()} C{ciclo}",
+                            ttl_s=MANUAL_CONFIRM_TIMEOUT_S,
+                            last_key=k,
+                        )
+                        _start_manual_confirm(bot_sel, ciclo)
+                        _safe_render_keyboard_panel()
+                        continue
+
+                    restante = max(0, int(float(PENDIENTE_FORZAR_EXPIRA or 0) - time.time()))
+                    agregar_evento(f"⚠️ MANUAL REAL: primero elige ciclo [1..{MAX_CICLOS}] o ESC. Restan {restante}s.")
+                    _manual_status_set(
+                        "esperando_ciclo",
+                        bot=PENDIENTE_FORZAR_BOT,
+                        msg=f"BOT={str(PENDIENTE_FORZAR_BOT).upper()} esperando ciclo [1..{MAX_CICLOS}]",
+                        ttl_s=6,
+                        last_key=k,
+                    )
+                    _manual_key_audit(f"pending_invalid key={repr(k)} bot={PENDIENTE_FORZAR_BOT} rest={restante}")
                     _safe_render_keyboard_panel()
                     continue
 
@@ -19465,26 +19703,14 @@ def escuchar_teclas():
                         f"🎯 BOT ELEGIDO PARA REAL: {PENDIENTE_FORZAR_BOT.upper()}. "
                         f"Ahora elige ciclo [1..{MAX_CICLOS}] o ESC."
                     )
-                    _safe_render_keyboard_panel()
-
-                elif PENDIENTE_FORZAR_BOT and k.isdigit() and k in [str(i) for i in range(1, MAX_CICLOS+1)]:
-                    ciclo = int(k)
-                    bot_sel = PENDIENTE_FORZAR_BOT
-                    PENDIENTE_FORZAR_BOT = None
-                    PENDIENTE_FORZAR_INICIO = 0.0
-                    PENDIENTE_FORZAR_EXPIRA = 0.0
-                    agregar_evento(
-                        f"⚠️ CICLO ELEGIDO: {bot_sel.upper()} C{ciclo}. "
-                        f"Falta confirmar Y/S para invertir en REAL."
+                    _manual_key_audit(f"bot_selected key={k} bot={PENDIENTE_FORZAR_BOT}")
+                    _manual_status_set(
+                        "esperando_ciclo",
+                        bot=PENDIENTE_FORZAR_BOT,
+                        msg=f"BOT={PENDIENTE_FORZAR_BOT.upper()} seleccionado. Presiona ciclo [1..{MAX_CICLOS}].",
+                        ttl_s=MANUAL_REAL_DECISION_WINDOW_S,
+                        last_key=k,
                     )
-                    _start_manual_confirm(bot_sel, ciclo)
-                    continue
-
-                elif PENDIENTE_FORZAR_BOT and k == "\x1b":  # ESC
-                    agregar_evento("❎ Selección manual REAL cancelada.")
-                    PENDIENTE_FORZAR_BOT = None
-                    PENDIENTE_FORZAR_INICIO = 0.0
-                    PENDIENTE_FORZAR_EXPIRA = 0.0
                     _safe_render_keyboard_panel()
                     continue
 
