@@ -246,6 +246,41 @@ HUD_TABLE_COMPACT_WIDTH = True
 HUD_SIDE_PANEL_INLINE = True
 HUD_SHOW_SALDO_DEBUG = False
 HUD_EVENT_MAX_CHARS = 150
+HUD_SHOW_CONTROL_PANEL = False
+ROUND_LIVE_INVEST_WINDOW_S = 45
+KEYBOARD_ENABLE = True
+KEYBOARD_DEBUG = False
+
+
+def _keyboard_can_start():
+    try:
+        return bool(KEYBOARD_ENABLE and HAVE_MSVCRT and os.name == "nt")
+    except Exception:
+        return False
+
+
+def _windows_console_input_safe_mode():
+    """
+    Best-effort para consola Windows:
+    desactiva QuickEdit para evitar congelamientos por selección accidental.
+    """
+    try:
+        if os.name != "nt":
+            return
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        h_stdin = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        if h_stdin in (None, 0):
+            return
+        mode = ctypes.c_uint()
+        if not kernel32.GetConsoleMode(h_stdin, ctypes.byref(mode)):
+            return
+        ENABLE_QUICK_EDIT_MODE = 0x0040
+        ENABLE_EXTENDED_FLAGS = 0x0080
+        new_mode = (mode.value | ENABLE_EXTENDED_FLAGS) & ~ENABLE_QUICK_EDIT_MODE
+        kernel32.SetConsoleMode(h_stdin, new_mode)
+    except Exception:
+        pass
 
 # --- Objetivos / umbrales globales de IA ---
 IA_OBJETIVO_REAL_THR = 0.75   # objetivo de calidad REAL (meta: 75% aprox)
@@ -299,6 +334,8 @@ LXV_4V2X_ENABLE = True
 LXV_4V2X_REAL_SOURCE = "LXV_4V2X"
 LXV_4V2X_REQUIRE_DATA_QUALITY_OK = True
 LXV_4V2X_REQUIRE_ROUND_COMPLETE = True
+MANUAL_REAL_ROUTE_ENABLE = True
+MANUAL_REAL_REQUIRE_CONFIRM_RISK = False
 
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
 # Esto es lo que querías: contar cierres desde 60% sin afectar la operativa.
@@ -665,6 +702,8 @@ def _purificacion_real_activa() -> bool:
             allowed_sources.add(allow_5v1x)
         if bool(globals().get("LXV_4V2X_ENABLE", False)):
             allowed_sources.add(allow_4v2x)
+        if bool(globals().get("MANUAL_REAL_ROUTE_ENABLE", False)):
+            allowed_sources.add("MANUAL")
         if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and route_src in allowed_sources:
             try:
                 _lxv_5v1x_event_cooldown(
@@ -1271,6 +1310,14 @@ OCULTAR_HASTA_NUEVO = {bot: False for bot in BOT_NAMES}
 t_inicio_indef = {bot: None for bot in BOT_NAMES}
 last_update_time = {bot: time.time() for bot in BOT_NAMES}
 LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # evita procesar el mismo cierre REAL varias veces
+REAL_MANUAL_ALERT = {
+    "active": False,
+    "bot": None,
+    "ciclo": None,
+    "source": None,
+    "ts": 0.0,
+    "msg": "",
+}
 CTT_CLOSE_EVENTS = deque(maxlen=6000)
 CTT_CLOSE_SEEN = set()
 CTT_STATE = {
@@ -1299,6 +1346,7 @@ CTT_STATE = {
 REAL_OWNER_LOCK = None  # owner REAL en memoria (evita carreras de lectura de archivo)
 REAL_LOCK_MISMATCH_SINCE = 0.0
 REAL_LOCK_RECONCILE_S = 6.0
+REAL_UI_RECON_LOG_TS = 0.0
 REAL_OWNER_STATE_FILE = "real_owner_state.json"
 REAL_CLOSE_TRACE_FILE = "real_close_trace.jsonl"
 LAST_REAL_CLOSE_TRACE = {}
@@ -3888,6 +3936,69 @@ def _ack_live_calc_summary(rows_pack):
     }
 
 
+def _fmt_estado_round_live(estado_visual: str, estado_base: str = "") -> str:
+    return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
+
+
+def _round_live_estado_display(row: dict) -> str:
+    """
+    ROUND LIVE solo muestra 2 estados visuales:
+    1) waiting
+    2) 🔴 ES HORA DE INVERTIR
+
+    Esta función NO modifica datos internos.
+    Solo transforma la fila en texto visual.
+    """
+    try:
+        row = row if isinstance(row, dict) else {}
+
+        estado = str(row.get("estado") or row.get("status") or "").strip().lower()
+        res = str(row.get("res") or row.get("symbol") or "").strip()
+        is_current = bool(row.get("is_current", True))
+
+        is_closed = bool(
+            row.get("is_closed_result")
+            or row.get("valid_closed")
+            or estado == "closed"
+            or res in ("✓", "X")
+        )
+
+        edad_s = None
+        for k in ("edad_s", "age_s", "ack_age_s", "edad_seg", "age"):
+            try:
+                if row.get(k) is not None:
+                    edad_s = float(row.get(k))
+                    break
+            except Exception:
+                pass
+
+        if edad_s is None:
+            edad_txt = str(row.get("edad") or row.get("age_txt") or "").strip().lower()
+            try:
+                if edad_txt.endswith("ms"):
+                    edad_s = float(edad_txt[:-2]) / 1000.0
+                elif edad_txt.endswith("s"):
+                    edad_s = float(edad_txt[:-1])
+                elif edad_txt.endswith("m"):
+                    edad_s = float(edad_txt[:-1]) * 60.0
+            except Exception:
+                edad_s = None
+
+        if edad_s is None:
+            # Si no sabemos la edad exacta, por seguridad visual no damos señal de inversión.
+            return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
+
+        window_s = float(globals().get("ROUND_LIVE_INVEST_WINDOW_S", 45) or 45)
+
+        if is_current and is_closed and 0.0 <= float(edad_s) <= window_s:
+            return Fore.RED + Style.BRIGHT + "🔴 ES HORA DE INVERTIR" + Style.RESET_ALL
+
+        return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
+
+    except Exception:
+        return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
+
+
 def _ack_live_format_lines(snapshot):
     rows_pack = _ack_live_build_rows()
     summary = _ack_live_calc_summary(rows_pack)
@@ -3909,7 +4020,7 @@ def _ack_live_format_lines(snapshot):
     lines.append(
         f"⚡ ROUND LIVE | obj=#{obj_round} | rel=#{released_round} | cerrados={closed_count}/{expected_count} | faltan={faltan_count} | lag={lag_txt}"
     )
-    lines.append("BOT      ACK   GAP  RES  EDAD   CICLO  ESTADO")
+    lines.append("BOT      ACK   GAP  RES  EDAD   CICLO  DECISIÓN")
 
     for row in list(rows)[:6]:
         bot = str(row.get("bot", "--"))[:7]
@@ -3934,8 +4045,9 @@ def _ack_live_format_lines(snapshot):
             else:
                 ciclo_txt = "--"
 
-        estado_txt = str(row.get("estado_visual", row.get("estado", "--")))[:10]
-        lines.append(f"{bot:<7}  {ack_txt:<5} {gap_txt:<4} {res_txt:<4} {age_txt:<6} {ciclo_txt:<6} {estado_txt:<10}")
+        estado_fmt = _round_live_estado_display(row if isinstance(row, dict) else {})
+        estado_txt = _ack_tape_pad_visible(estado_fmt, 24)
+        lines.append(f"{bot:<7}  {ack_txt:<5} {gap_txt:<4} {res_txt:<4} {age_txt:<6} {ciclo_txt:<6} {estado_txt}")
 
     botx = summary.get("bot_x_actual") or "-"
     resumen = (
@@ -5168,6 +5280,10 @@ def limpiar_orden_real(bot: str):
             os.remove(p)
     except Exception:
         pass
+    try:
+        reconciliar_real_owner_ui("limpiar_orden_real")
+    except Exception:
+        pass
 
 def _set_ui_token_holder(holder: str | None):
     """
@@ -5353,8 +5469,14 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
 
         # 2) Estado interno inmediato (HUD)
         _set_ui_token_holder(bot)
+        estado_bots[bot]["token"] = "REAL"
         estado_bots[bot]["trigger_real"] = True
         estado_bots[bot]["ciclo_actual"] = ciclo_obj
+        estado_bots[bot]["real_activado_en"] = now
+        estado_bots[bot]["modo_real_anunciado"] = True
+        if str(globals().get("_REAL_ROUTE_SOURCE", "")).upper() == "MANUAL" or str(origen).lower() == "manual":
+            estado_bots[bot]["fuente"] = "MANUAL"
+            _set_real_manual_alert(bot, ciclo_obj, "MANUAL")
 
         # Congelar probabilidad de señal al entrar REAL (si no estaba ya fijada)
         # para evitar divergencia visual/ACK durante toda la operación.
@@ -5512,6 +5634,8 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY") -> bool
         allow_sources.add(allow_5v1x)
     if bool(globals().get("LXV_4V2X_ENABLE", False)):
         allow_sources.add(allow_4v2x)
+    if bool(globals().get("MANUAL_REAL_ROUTE_ENABLE", False)):
+        allow_sources.add("MANUAL")
     if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and src not in allow_sources:
         agregar_evento(
             f"🧊 REAL source rechazada: {src} (permitidas={','.join(sorted(allow_sources))})."
@@ -5672,6 +5796,77 @@ def refrescar_ia_ack_desde_hud(intervalo_s: float = 1.0):
             continue
 
     _LAST_IA_ACK_HEARTBEAT_TS = now
+
+
+def _leer_token_linea_raw() -> str:
+    try:
+        if not os.path.exists(TOKEN_FILE):
+            return ""
+        with open(TOKEN_FILE, "r", encoding="utf-8", errors="replace") as f:
+            return str((f.read() or "").strip())
+    except Exception:
+        return ""
+
+
+def reconciliar_real_owner_ui(reason: str = "tick"):
+    global REAL_OWNER_LOCK, REAL_UI_RECON_LOG_TS
+    try:
+        token_raw = _leer_token_linea_raw()
+        owner_file = None
+        if token_raw.startswith("REAL:"):
+            val = token_raw.split(":", 1)[1].strip()
+            if val in BOT_NAMES:
+                owner_file = val
+
+        owner_mem = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+        now = float(time.time())
+
+        def _log_recon(msg: str):
+            global REAL_UI_RECON_LOG_TS
+            if (now - float(REAL_UI_RECON_LOG_TS or 0.0)) >= 20.0:
+                REAL_UI_RECON_LOG_TS = now
+                try:
+                    agregar_evento(msg)
+                except Exception:
+                    pass
+
+        if owner_file is None:
+            if owner_mem in BOT_NAMES:
+                try:
+                    estado_bots[owner_mem]["token"] = "DEMO"
+                    estado_bots[owner_mem]["trigger_real"] = False
+                    estado_bots[owner_mem]["fuente"] = None
+                    estado_bots[owner_mem]["real_activado_en"] = 0.0
+                except Exception:
+                    pass
+                _log_recon(f"⚠️ REAL UI reconcile: memoria decía REAL:{owner_mem} pero token_actual no confirma. HUD limpiado.")
+            REAL_OWNER_LOCK = None
+            try:
+                _set_real_manual_alert(None)
+            except Exception:
+                pass
+            return
+
+        if owner_file in BOT_NAMES:
+            if owner_mem != owner_file:
+                _log_recon(f"⚠️ REAL UI reconcile: token_actual confirma REAL:{owner_file} pero memoria no. HUD sincronizado.")
+            REAL_OWNER_LOCK = owner_file
+            try:
+                estado_bots[owner_file]["token"] = "REAL"
+                estado_bots[owner_file]["trigger_real"] = True
+                if not estado_bots[owner_file].get("fuente"):
+                    estado_bots[owner_file]["fuente"] = "MANUAL" if REAL_MANUAL_ALERT.get("bot") == owner_file else "LXV"
+            except Exception:
+                pass
+            for b in BOT_NAMES:
+                if b != owner_file:
+                    try:
+                        estado_bots[b]["token"] = "DEMO"
+                        estado_bots[b]["trigger_real"] = False
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 # Leer token actual
 def leer_token_actual():
     """
@@ -11316,6 +11511,37 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
     except Exception:
         pass
 
+    try:
+        _set_real_manual_alert(None)
+    except Exception:
+        pass
+
+    try:
+        if isinstance(REAL_MANUAL_ALERT, dict):
+            REAL_MANUAL_ALERT.update({
+                "active": False,
+                "bot": None,
+                "ciclo": None,
+                "source": None,
+                "ts": 0.0,
+                "msg": "",
+            })
+    except Exception:
+        pass
+
+    try:
+        for b in BOT_NAMES:
+            if b != bot and estado_bots.get(b, {}).get("token") == "REAL":
+                estado_bots[b]["token"] = "DEMO"
+                estado_bots[b]["trigger_real"] = False
+    except Exception:
+        pass
+
+    try:
+        reconciliar_real_owner_ui("cerrar_por_fin_de_ciclo")
+    except Exception:
+        pass
+
     # Forzar refresco del loop principal
     try:
         reinicio_forzado.set()
@@ -15160,6 +15386,8 @@ def mostrar_ia_resumen_compacto():
 
 
 def mostrar_panel_lateral_compacto():
+    if not bool(globals().get("HUD_SHOW_CONTROL_PANEL", False)):
+        return []
     token_file = leer_token_actual()
     token_hud = "DEMO" if (token_file in (None, "none")) else f"REAL:{token_file}"
     activo_real = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
@@ -15244,6 +15472,10 @@ def mostrar_panel_teclado_activo(bot, rest_s, max_ciclos, ciclo_actual="C1", fue
     rest = max(0, int(rest_s or 0))
     ciclo_txt = str(ciclo_actual or "C1")
     src_txt = str(fuente or "--")
+    if not bool(globals().get("HUD_SHOW_CONTROL_PANEL", False)):
+        return [
+            f"⌨️ MANUAL REAL | Bot={bot_txt.upper()} | Elige ciclo [1..{int(max_ciclos)}] | Luego confirma Y/S o cancela N/ESC | {rest}s"
+        ]
     estado_txt = f"Tiempo para decidir : {rest:>3}s" if rest > 0 else "Estado            : decisión cerrada / orden enviada"
     return [
         "╔══════════════════════════════════════════════╗",
@@ -15275,8 +15507,26 @@ def mostrar_panel_real_activo():
         return []
     owner_txt = str(owner)
     st = estado_bots.get(owner_txt, {}) if isinstance(estado_bots, dict) else {}
+    token_line = _leer_token_linea_raw()
+    token_confirma = (token_line == f"REAL:{owner_txt}")
+    activo_elapsed = int(max(0, time.time() - float(st.get("real_activado_en", 0.0) or 0.0)))
+    if (not token_confirma) and activo_elapsed > 180:
+        try:
+            reconciliar_real_owner_ui("panel_real_timeout")
+            _set_real_manual_alert(None)
+        except Exception:
+            pass
+        return []
     ciclo = st.get("ciclo_actual", 1)
-    fuente = st.get("fuente", "AUTO")
+    fuente = st.get("fuente")
+    if not fuente:
+        if REAL_MANUAL_ALERT.get("bot") == owner_txt:
+            fuente = REAL_MANUAL_ALERT.get("source") or "MANUAL"
+        elif REAL_OWNER_LOCK == owner_txt:
+            fuente = "LXV"
+        else:
+            fuente = "--"
+    fuente = str(fuente).upper()
     token_txt = f"REAL:{owner_txt}"
     estado_txt = "ORDEN REAL ESCRITA ✅"
     hhmmss = "--"
@@ -15328,6 +15578,12 @@ def mostrar_panel():
     HUD principal: muestra estado de los bots, saldos, IA y eventos recientes.
     """
     global meta_mostrada
+
+    # Respetar ventana de limpieza (para mensajes especiales)
+    try:
+        reconciliar_real_owner_ui("mostrar_panel")
+    except Exception:
+        pass
 
     # Respetar ventana de limpieza (para mensajes especiales)
     if time.time() < LIMPIEZA_PANEL_HASTA:
@@ -15840,6 +16096,27 @@ def mostrar_panel():
     try:
         if bool(globals().get("HUD_MARTINGALA_LIVE_ENABLE", True)):
             print(_marti_hud_render_line())
+            owner_live = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+            token_raw = _leer_token_linea_raw()
+            token_confirma = bool(owner_live in BOT_NAMES and token_raw == f"REAL:{owner_live}")
+            if not token_confirma:
+                try:
+                    _set_real_manual_alert(None)
+                except Exception:
+                    pass
+            if token_confirma and owner_live in BOT_NAMES:
+                st_live = estado_bots.get(owner_live, {}) if isinstance(estado_bots, dict) else {}
+                fuente_live = str(st_live.get("fuente") or REAL_MANUAL_ALERT.get("source") or "--").upper()
+                if fuente_live in ("", "--", "NONE") and REAL_MANUAL_ALERT.get("bot") == owner_live:
+                    fuente_live = str(REAL_MANUAL_ALERT.get("source") or "MANUAL").upper()
+                ciclo_live = int(st_live.get("ciclo_actual", REAL_MANUAL_ALERT.get("ciclo") or 1) or 1)
+                base_ts = float(st_live.get("real_activado_en", REAL_MANUAL_ALERT.get("ts") or time.time()) or time.time())
+                elapsed = int(max(0, time.time() - base_ts))
+                print(
+                    Fore.GREEN + Style.BRIGHT
+                    + f"🟢 REAL ACTIVO | BOT={owner_live.upper()} | CICLO=C{ciclo_live} | FUENTE={fuente_live} | ACTIVO={elapsed}s"
+                    + Style.RESET_ALL
+                )
     except Exception as e:
         agregar_evento(f"⚠ martingala HUD error: {str(e)[:80]}")
 
@@ -15891,8 +16168,10 @@ def mostrar_panel():
 
         # Token + origen
         token_text = token
-        token_color = Fore.GREEN if token_text.startswith("REAL") else Fore.CYAN
-        token_text = token_color + token_text + Fore.RESET
+        if token_text.startswith("REAL"):
+            token_text = Fore.GREEN + Style.BRIGHT + "REAL" + Style.RESET_ALL
+        else:
+            token_text = Fore.CYAN + token_text + Fore.RESET
 
         fallback = estado_bots.get(bot, {}).get("resultados", [])
         col_resultados = _ack_tape_render_bot(
@@ -16370,7 +16649,9 @@ def mostrar_panel():
     if HUD_VISIBLE and (not bool(globals().get("HUD_MERGE_SIDE_PANELS", True))):
         dibujar_hud_gatewin(len(panel_lines), HUD_LAYOUT)
     def _strip_ansi(s: str) -> str:
-        return re.sub(r'\x1b\[[0-9;]*m', '', s)
+        return re.sub(r'\x1b\[[0-9;]*m', '', str(s))
+    if not panel_lines:
+        return
     panel_width = max(len(_strip_ansi(l)) for l in panel_lines)
     panel_height = len(panel_lines)
     try:
@@ -16628,6 +16909,15 @@ VENTANA_DECISION_IA_S = 30
 PENDIENTE_FORZAR_BOT = None
 PENDIENTE_FORZAR_INICIO = 0.0
 PENDIENTE_FORZAR_EXPIRA = 0.0
+MANUAL_REAL_ALWAYS_CONFIRM = True
+MANUAL_CONFIRM_TIMEOUT_S = 20
+PENDIENTE_CONFIRMAR_REAL = {
+    "active": False,
+    "bot": None,
+    "ciclo": None,
+    "ts": 0.0,
+    "expira": 0.0,
+}
 
 FORZAR_LOCK = threading.Lock()
 
@@ -16643,6 +16933,112 @@ def condiciones_seguras_para(bot: str) -> bool:
         return False
     return (n >= ORACULO_N_MIN) and (prob >= thr) and (dec in (EMBUDO_FINAL_REAL_NORMAL, EMBUDO_FINAL_REAL_MICRO))
 
+
+def _set_real_manual_alert(bot: str | None, ciclo: int | None = None, source: str = "MANUAL"):
+    try:
+        if bot in BOT_NAMES:
+            ciclo_val = int(ciclo or estado_bots.get(bot, {}).get("ciclo_actual", 1) or 1)
+            source_val = str(source or "MANUAL").upper()
+            REAL_MANUAL_ALERT.update({
+                "active": True,
+                "bot": str(bot),
+                "ciclo": ciclo_val,
+                "source": source_val,
+                "ts": float(time.time()),
+                "msg": f"🟢 REAL ACTIVO | BOT={str(bot).upper()} | CICLO=C{ciclo_val} | FUENTE={source_val}",
+            })
+        else:
+            REAL_MANUAL_ALERT.update({
+                "active": False,
+                "bot": None,
+                "ciclo": None,
+                "source": None,
+                "ts": 0.0,
+                "msg": "",
+            })
+    except Exception:
+        pass
+
+
+def _clear_manual_confirm():
+    try:
+        PENDIENTE_CONFIRMAR_REAL.update({
+            "active": False,
+            "bot": None,
+            "ciclo": None,
+            "ts": 0.0,
+            "expira": 0.0,
+        })
+    except Exception:
+        pass
+
+
+def _manual_confirm_active() -> bool:
+    try:
+        return bool(PENDIENTE_CONFIRMAR_REAL.get("active"))
+    except Exception:
+        return False
+
+
+def _manual_confirm_remaining() -> int:
+    try:
+        expira = float(PENDIENTE_CONFIRMAR_REAL.get("expira") or 0.0)
+        return max(0, int(expira - time.time()))
+    except Exception:
+        return 0
+
+
+def mostrar_panel_confirmacion_manual(bot: str, ciclo: int, restante: int | None = None):
+    try:
+        bot_txt = str(bot or "--").upper()
+        ciclo_txt = f"C{int(ciclo)}"
+        rest_txt = f"{int(max(0, restante or 0))}s" if restante is not None else "--"
+        lines = [
+            "╔════════════════════════════════════════════════════════════╗",
+            "║ 🚨 CONFIRMAR INVERSIÓN MANUAL EN REAL                     ║",
+            "╠════════════════════════════════════════════════════════════╣",
+            f"║ Bot elegido : {bot_txt:<43}║",
+            f"║ Ciclo       : {ciclo_txt:<43}║",
+            "║                                                            ║",
+            "║ ¿DESEA INVERTIR AHORA EN CUENTA REAL?                     ║",
+            "║                                                            ║",
+            "║ Confirmar: [Y] o [S]                                      ║",
+            "║ Cancelar : [N] o [ESC]                                    ║",
+            f"║ Tiempo    : {rest_txt:<43}║",
+            "╚════════════════════════════════════════════════════════════╝",
+        ]
+        for ln in lines:
+            print(Fore.YELLOW + Style.BRIGHT + ln + Style.RESET_ALL)
+    except Exception:
+        pass
+
+
+def _start_manual_confirm(bot: str, ciclo: int):
+    try:
+        now = time.time()
+        PENDIENTE_CONFIRMAR_REAL.update({
+            "active": True,
+            "bot": str(bot),
+            "ciclo": int(ciclo),
+            "ts": now,
+            "expira": now + float(MANUAL_CONFIRM_TIMEOUT_S),
+        })
+        agregar_evento(
+            f"⚠️ CONFIRMAR REAL: {str(bot).upper()} C{int(ciclo)}. "
+            f"Presiona Y/S para invertir o N/ESC para cancelar."
+        )
+        try:
+            limpiar_consola()
+        except Exception:
+            pass
+        mostrar_panel_confirmacion_manual(str(bot), int(ciclo), int(MANUAL_CONFIRM_TIMEOUT_S))
+    except Exception as e:
+        try:
+            agregar_evento(f"⚠️ No se pudo abrir confirmación manual: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+
+
 # forzar_real_manual
 def forzar_real_manual(bot: str, ciclo: int):
     if not FORZAR_LOCK.acquire(blocking=False):
@@ -16651,8 +17047,10 @@ def forzar_real_manual(bot: str, ciclo: int):
     try:
         ciclo = max(1, min(int(ciclo), MAX_CICLOS))
 
-        # Añadido: Confirmación en rojo si no es seguro (para evitar cierres forzados por malas decisiones)
-        CONFIRMAR_EN_ROJO = True  # Activado por defecto para seguridad
+        # Confirmación ya fue hecha antes por teclado.
+        CONFIRMAR_EN_ROJO = False
+        if not condiciones_seguras_para(bot):
+            agregar_evento(f"⚠️ MANUAL REAL override: {bot.upper()} C{int(ciclo)} forzado por teclado aunque condiciones_seguras=no.")
         if CONFIRMAR_EN_ROJO and HAVE_MSVCRT and not condiciones_seguras_para(bot):
             global MODAL_ACTIVO
             MODAL_ACTIVO = True
@@ -16700,15 +17098,18 @@ def forzar_real_manual(bot: str, ciclo: int):
                 pass
 
 
-        if not emitir_real_autorizado(bot, ciclo, source="MANUAL"):
-            agregar_evento(f"🔒 Forzar REAL bloqueado para {bot.upper()}: ya hay otro bot en REAL.")
-            return
-
         estado_bots[bot]["reintentar_ciclo"] = True
         estado_bots[bot]["ciclo_actual"] = ciclo
+        estado_bots[bot]["fuente"] = "MANUAL"
         global marti_paso
         marti_paso = ciclo - 1
-        estado_bots[bot]["fuente"] = "MANUAL"
+        _set_real_manual_alert(bot, ciclo, "MANUAL")
+        agregar_evento(f"🟢 MANUAL REAL CONFIRMADO: {bot.upper()} entra a REAL en C{int(ciclo)}.")
+
+        if not emitir_real_autorizado(bot, ciclo, source="MANUAL"):
+            _set_real_manual_alert(None)
+            agregar_evento(f"🔒 Forzar REAL bloqueado para {bot.upper()}: ya hay otro bot en REAL.")
+            return
 
         requerido = float(MARTI_ESCALADO[ciclo - 1])
         val = obtener_valor_saldo()
@@ -16717,8 +17118,7 @@ def forzar_real_manual(bot: str, ciclo: int):
 
         # escribir_orden_real(...) ya dejó token+HUD sincronizados; evitamos doble token_sync.
         agregar_evento(f"⚡ Forzar REAL: {bot} → ciclo #{ciclo} (fuente=MANUAL)")
-        with RENDER_LOCK:
-            mostrar_panel()
+        _safe_render_keyboard_panel()
     except Exception as e:
         agregar_evento(f"⛔ Forzar REAL falló en {bot}: {e}")
     finally:
@@ -18745,12 +19145,26 @@ async def cargar_datos_bot(bot, token_actual):
 
             # Cierre especial para REAL manual: SIEMPRE 1 sola operación
             if (
-                MODO_REAL_MANUAL
-                and estado_bots[bot].get("fuente") == "MANUAL"
+                str(estado_bots[bot].get("fuente") or "").upper() == "MANUAL"
                 and resultado in ("GANANCIA", "PÉRDIDA")
             ):
                 reason = f"REAL manual: {resultado} → una operación y regreso a DEMO"
                 cerrar_por_fin_de_ciclo(bot, reason)
+                try:
+                    _set_real_manual_alert(None)
+                except Exception:
+                    pass
+                try:
+                    REAL_MANUAL_ALERT.update({
+                        "active": False,
+                        "bot": None,
+                        "ciclo": None,
+                        "source": None,
+                        "ts": 0.0,
+                        "msg": "",
+                    })
+                except Exception:
+                    pass
                 agregar_evento(f"✅ REAL MANUAL cerrado para {bot.upper()} tras {resultado}. Volviendo a DEMO.")
 
             # --- Contadores de IA: SOLO cuando llega un cierre real ---
@@ -18844,6 +19258,18 @@ def inicializar_saldo_real(valor):
     SALDO_INICIAL = round(valor, 2)
     META = round(SALDO_INICIAL * 1.20, 2)
 
+
+def _safe_render_keyboard_panel():
+    try:
+        with RENDER_LOCK:
+            mostrar_panel()
+    except Exception as e:
+        try:
+            agregar_evento(f"⚠️ Teclado/HUD: render omitido por error recuperado: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+
+
 # Escuchar teclas
 def escuchar_teclas():
     global pausado, salir, reinicio_manual, LIMPIEZA_PANEL_HASTA, HUD_VISIBLE
@@ -18853,83 +19279,146 @@ def escuchar_teclas():
     last_key_time = 0  # debounce 200 ms
 
     while True:
-        if MODAL_ACTIVO:
-            time.sleep(0.1); continue
+        try:
+            if MODAL_ACTIVO:
+                time.sleep(0.1); continue
 
-        now = time.time()
-        if HAVE_MSVCRT and msvcrt.kbhit():
-            if now - last_key_time < 0.2:
-                time.sleep(0.05); continue
-            last_key_time = now
+            if _manual_confirm_active():
+                bot_conf = PENDIENTE_CONFIRMAR_REAL.get("bot")
+                ciclo_conf = int(PENDIENTE_CONFIRMAR_REAL.get("ciclo") or 1)
+                restante = _manual_confirm_remaining()
+                if restante <= 0:
+                    agregar_evento(f"⏱️ CONFIRMACIÓN REAL expirada: {str(bot_conf).upper()} C{ciclo_conf}. Cancelado.")
+                    _clear_manual_confirm()
+                    _safe_render_keyboard_panel()
+                    time.sleep(0.05)
+                    continue
 
-            try:
-                k = msvcrt.getch()
-                if k in (b'\x00', b'\xe0'):  
-                    msvcrt.getch(); continue
-                k = k.decode("utf-8", errors="ignore").lower()
-            except:
-                continue
+            now = time.time()
+            if HAVE_MSVCRT and msvcrt.kbhit():
+                if now - last_key_time < 0.2:
+                    time.sleep(0.05); continue
+                last_key_time = now
 
-            if k == "s":
-                print("\n\n🔴 Saliendo del programa..."); salir = True; break
-            elif k == "p":
-                pausado = True; print("\n⏸️ Programa pausado. Presiona [C] para continuar.")
-            elif k == "c":
-                pausado = False; print("\n▶️ Programa reanudado.")
-            elif k == "r":
-                reinicio_manual = True; print("\n🔁 Reinicio de Martingala solicitado.")
-            elif k == "t":
-                tok = leer_token_actual(); print(f"\n🔍 TOKEN ACTUAL: {tok or 'none'}")
-            elif k == "l":
-                LIMPIEZA_PANEL_HASTA = time.time() + 15; print("\n🎹 Limpieza visual…")
-            elif k == "d":
-                reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True); print("\n🧽 Limpieza dura ejecutada.")
-            elif k == "g":
-                reproducir_evento("test", es_demo=True, dentro_gatewin=True); print("\n🎵 Test de audio…")
-            elif k == "e":
                 try:
-                    # Cooldown anti-repetición (Windows repite tecla y entrena 2 veces)
-                    if "LAST_MANUAL_RETRAIN_TS" not in globals():
-                        globals()["LAST_MANUAL_RETRAIN_TS"] = 0.0
-                    nowt = time.time()
-                    if (nowt - float(globals()["LAST_MANUAL_RETRAIN_TS"])) < 30.0:
-                        agregar_evento("🧠 Entrenamiento ignorado (cooldown 30s).")
-                    else:
-                        globals()["LAST_MANUAL_RETRAIN_TS"] = nowt
-                        maybe_retrain(force=True)
-                        print("\n🧠 Entrenamiento forzado.")
-                except Exception as e:
-                    print(f"\n⚠️ No se pudo entrenar: {e}")
+                    k = msvcrt.getch()
+                    if k in (b'\x00', b'\xe0'):
+                        msvcrt.getch(); continue
+                    k = k.decode("utf-8", errors="ignore").lower()
+                except:
+                    continue
 
-            elif k in bot_map:
-                PENDIENTE_FORZAR_BOT = bot_map[k]
-                PENDIENTE_FORZAR_INICIO = time.time()
-                PENDIENTE_FORZAR_EXPIRA = PENDIENTE_FORZAR_INICIO + VENTANA_DECISION_IA_S
-                agregar_evento(f"🎯 Bot seleccionado: {PENDIENTE_FORZAR_BOT}. Elige ciclo [1..{MAX_CICLOS}] o ESC.")
-                with RENDER_LOCK:
-                    mostrar_panel()
+                if _manual_confirm_active():
+                    bot_conf = PENDIENTE_CONFIRMAR_REAL.get("bot")
+                    ciclo_conf = int(PENDIENTE_CONFIRMAR_REAL.get("ciclo") or 1)
+                    restante = _manual_confirm_remaining()
 
-            elif PENDIENTE_FORZAR_BOT and k.isdigit() and k in [str(i) for i in range(1, MAX_CICLOS+1)]:
-                ciclo = int(k)
-                bot_sel = PENDIENTE_FORZAR_BOT
-                PENDIENTE_FORZAR_BOT = None
-                PENDIENTE_FORZAR_INICIO = 0.0
-                PENDIENTE_FORZAR_EXPIRA = 0.0
-                forzar_real_manual(bot_sel, ciclo)
+                    if k in ("y", "s"):
+                        agregar_evento(f"✅ CONFIRMADO: invirtiendo en REAL {str(bot_conf).upper()} C{ciclo_conf}.")
+                        _clear_manual_confirm()
+                        forzar_real_manual(str(bot_conf), int(ciclo_conf))
+                        continue
 
-            elif PENDIENTE_FORZAR_BOT and k == "\x1b":  # ESC
-                agregar_evento("❎ Forzar REAL cancelado.")
-                PENDIENTE_FORZAR_BOT = None
-                PENDIENTE_FORZAR_INICIO = 0.0
-                PENDIENTE_FORZAR_EXPIRA = 0.0
-                with RENDER_LOCK:
-                    mostrar_panel()
+                    if k in ("n", "\x1b"):
+                        agregar_evento(f"❎ CANCELADO: inversión manual REAL {str(bot_conf).upper()} C{ciclo_conf}.")
+                        _clear_manual_confirm()
+                        _safe_render_keyboard_panel()
+                        continue
 
-        else:
-            time.sleep(0.05)
+                    agregar_evento(f"⚠️ Confirmación pendiente: Y/S confirma, N/ESC cancela. Restan {restante}s.")
+                    try:
+                        limpiar_consola()
+                    except Exception:
+                        pass
+                    mostrar_panel_confirmacion_manual(str(bot_conf), int(ciclo_conf), restante)
+                    continue
 
-if sys.stdout.isatty():
-    threading.Thread(target=escuchar_teclas, daemon=True).start()
+                if k == "s":
+                    print("\n\n🔴 Saliendo del programa..."); salir = True; break
+                elif k == "p":
+                    pausado = True; print("\n⏸️ Programa pausado. Presiona [C] para continuar.")
+                elif k == "c":
+                    pausado = False; print("\n▶️ Programa reanudado.")
+                elif k == "r":
+                    reinicio_manual = True; print("\n🔁 Reinicio de Martingala solicitado.")
+                elif k == "t":
+                    tok = leer_token_actual(); print(f"\n🔍 TOKEN ACTUAL: {tok or 'none'}")
+                elif k == "l":
+                    LIMPIEZA_PANEL_HASTA = time.time() + 15; print("\n🎹 Limpieza visual…")
+                elif k == "d":
+                    reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True); print("\n🧽 Limpieza dura ejecutada.")
+                elif k == "g":
+                    reproducir_evento("test", es_demo=True, dentro_gatewin=True); print("\n🎵 Test de audio…")
+                elif k == "e":
+                    try:
+                        # Cooldown anti-repetición (Windows repite tecla y entrena 2 veces)
+                        if "LAST_MANUAL_RETRAIN_TS" not in globals():
+                            globals()["LAST_MANUAL_RETRAIN_TS"] = 0.0
+                        nowt = time.time()
+                        if (nowt - float(globals()["LAST_MANUAL_RETRAIN_TS"])) < 30.0:
+                            agregar_evento("🧠 Entrenamiento ignorado (cooldown 30s).")
+                        else:
+                            globals()["LAST_MANUAL_RETRAIN_TS"] = nowt
+                            maybe_retrain(force=True)
+                            print("\n🧠 Entrenamiento forzado.")
+                    except Exception as e:
+                        print(f"\n⚠️ No se pudo entrenar: {e}")
+
+                elif k in bot_map:
+                    PENDIENTE_FORZAR_BOT = bot_map[k]
+                    PENDIENTE_FORZAR_INICIO = time.time()
+                    PENDIENTE_FORZAR_EXPIRA = PENDIENTE_FORZAR_INICIO + VENTANA_DECISION_IA_S
+                    agregar_evento(
+                        f"🎯 BOT ELEGIDO PARA REAL: {PENDIENTE_FORZAR_BOT.upper()}. "
+                        f"Ahora elige ciclo [1..{MAX_CICLOS}] o ESC."
+                    )
+                    _safe_render_keyboard_panel()
+
+                elif PENDIENTE_FORZAR_BOT and k.isdigit() and k in [str(i) for i in range(1, MAX_CICLOS+1)]:
+                    ciclo = int(k)
+                    bot_sel = PENDIENTE_FORZAR_BOT
+                    PENDIENTE_FORZAR_BOT = None
+                    PENDIENTE_FORZAR_INICIO = 0.0
+                    PENDIENTE_FORZAR_EXPIRA = 0.0
+                    agregar_evento(
+                        f"⚠️ CICLO ELEGIDO: {bot_sel.upper()} C{ciclo}. "
+                        f"Falta confirmar Y/S para invertir en REAL."
+                    )
+                    _start_manual_confirm(bot_sel, ciclo)
+                    continue
+
+                elif PENDIENTE_FORZAR_BOT and k == "\x1b":  # ESC
+                    agregar_evento("❎ Selección manual REAL cancelada.")
+                    PENDIENTE_FORZAR_BOT = None
+                    PENDIENTE_FORZAR_INICIO = 0.0
+                    PENDIENTE_FORZAR_EXPIRA = 0.0
+                    _safe_render_keyboard_panel()
+                    continue
+
+            else:
+                time.sleep(0.05)
+        except Exception as e:
+            try:
+                agregar_evento(f"⚠️ Teclado recuperado tras error: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            time.sleep(0.20)
+
+if _keyboard_can_start():
+    try:
+        _windows_console_input_safe_mode()
+        threading.Thread(
+            target=escuchar_teclas,
+            daemon=True,
+            name="maestro-keyboard-listener",
+        ).start()
+        if KEYBOARD_DEBUG:
+            agregar_evento("⌨️ Teclado maestro activo.")
+    except Exception as e:
+        try:
+            agregar_evento(f"⚠️ Teclado maestro no pudo iniciar: {e}")
+        except Exception:
+            pass
 
 # Main - Añadida pasada inicial para sincronizar HUD con CSV existentes
 DIAGNOSTIC_MODE = ("--diagnostico" in sys.argv) or (os.getenv("MAESTRO_DIAGNOSTICO", "0") == "1")
@@ -19215,6 +19704,7 @@ async def main():
             try:  
                 set_etapa("TICK_01")
                 token_actual_loop = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else (leer_token_actual() or next((b for b in BOT_NAMES if estado_bots.get(b, {}).get("token") == "REAL"), None))
+                reconciliar_real_owner_ui("tick_pre_hud")
 
                 # Reconciliación anti-desincronía maestro↔bots:
                 # si memoria dice REAL pero token_actual.txt ya está en none por varios segundos,
@@ -19264,6 +19754,7 @@ async def main():
                             # No mostrar_panel inmediato; dejar al tick
                             break
                         await cargar_datos_bot(bot, token_actual_loop)
+                        reconciliar_real_owner_ui("post_csv_close")
                         # Evita desincronizar REAL por inactividad normal durante contrato.
                         # El owner REAL se vigila en TICK_02 (watchdog sin salida a DEMO).
                         if time.time() - last_update_time[bot] > 60:
