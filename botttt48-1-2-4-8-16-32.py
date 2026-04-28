@@ -180,8 +180,10 @@ PAUSA_POST_OPERACION_S = 2  # Pausa uniforme tras cada operación con resultado 
 # Objetivo: dar tiempo al MAESTRO + humano para decidir pasar a REAL ANTES del BUY.
 # Ventana corta de decisión IA para evitar freno excesivo del ciclo.
 # (0 para desactivar)
-VENTANA_DECISION_IA_S = 6         # segundos (alineado con maestro)
-VENTANA_DECISION_IA_POLL_S = 0.10 # granularidad de espera
+VENTANA_DECISION_IA_S = 35        # segundos (alineado con maestro)
+# Debe estar alineado con MANUAL_REAL_DECISION_WINDOW_S del maestro.
+# Si es menor, la orden manual REAL puede llegar tarde y cortar contrato DEMO.
+VENTANA_DECISION_IA_POLL_S = 0.25 # granularidad de espera
 # === Filtro avanzado (sin cambiar 13 features) ===
 SCORE_MIN = 2.35            # score mínimo para aceptar un setup
 SCORE_DROP_MAX = 0.70       # caída máxima tolerada al revalidar pre-buy
@@ -440,6 +442,32 @@ except Exception:
     pass
 
 
+_ORDER_REAL_OLD_WARN_LAST_TS = 0.0
+
+
+def _orden_real_payload_vivo(data: dict | None) -> bool:
+    try:
+        d = data if isinstance(data, dict) else {}
+        ts = float(d.get("created_ts") or d.get("ts") or 0.0)
+        ttl = float(d.get("ttl_s") or d.get("ttl") or 45.0)
+        if ts <= 0:
+            return False
+        return (time.time() - ts) <= max(1.0, ttl)
+    except Exception:
+        return False
+
+
+def _warn_stale_real_order_cooldown():
+    global _ORDER_REAL_OLD_WARN_LAST_TS
+    try:
+        now = float(time.time())
+        if (now - float(_ORDER_REAL_OLD_WARN_LAST_TS or 0.0)) >= 6.0:
+            _ORDER_REAL_OLD_WARN_LAST_TS = now
+            print(Fore.YELLOW + Style.BRIGHT + "⏱️ Orden REAL vieja ignorada por TTL." + Style.RESET_ALL)
+    except Exception:
+        pass
+
+
 def leer_orden_real(bot: str):
     """
     Devuelve (ciclo, ts, quiet, src) si existe orden fresca, o (None, None, 0, None) si no.
@@ -455,13 +483,16 @@ def leer_orden_real(bot: str):
             os.remove(tmp)
             if data.get("bot") != bot:
                 return None, None, 0, None
+            if bool(data.get("consumed", False)):
+                return None, None, 0, None
             cyc = int(data.get("ciclo", 1))
-            ts = float(data.get("ts", 0.0))
-            ttl = int(data.get("ttl", 120))
+            ts = float(data.get("created_ts") or data.get("ts") or 0.0)
+            ttl = float(data.get("ttl_s") or data.get("ttl") or 45.0)
             quiet = 1 if int(data.get("quiet", 0)) == 1 else 0
-            src = str(data.get("src", "") or "").upper() or None
-            lim = max(30, min(ttl, 300))  # margen seguro
-            if time.time() - ts > lim:
+            src = str(data.get("source") or data.get("src") or "").upper() or None
+            lim = max(1.0, ttl)
+            if (not _orden_real_payload_vivo(data)) or (time.time() - ts > lim):
+                _warn_stale_real_order_cooldown()
                 return None, None, 0, None
             ciclo_norm = max(1, min(cyc, MAX_CICLOS))
             if cyc != ciclo_norm:
@@ -1617,7 +1648,7 @@ async def check_token_and_reconnect(ws, current_token):
             if not estado_bot.get("token_msg_mostrado", False):
                 if not (MODO_SILENCIOSO and estado_bot.get("modo_manual")):
                     print(Fore.MAGENTA + Style.BRIGHT + "Cambio de token detectado: cortando ciclo y aplicando de inmediato.")
-                    print(Fore.YELLOW + Style.BRIGHT + "⚠️ REAL llegó mientras había contrato anterior abierto. Esperando cierre seguro antes de comprar en REAL.")
+                    print(Fore.YELLOW + Style.BRIGHT + "⚠️ REAL/DEMO cambió mientras había contrato abierto. Esperando cierre seguro antes de nueva compra." + Style.RESET_ALL)
                 estado_bot["token_msg_mostrado"] = True
             estado_bot["interrumpir_ciclo"] = True
             reinicio_forzado.set()
@@ -1799,7 +1830,7 @@ async def vigilar_token():
                 if not estado_bot.get("token_msg_mostrado", False):
                     if not (MODO_SILENCIOSO and estado_bot.get("modo_manual")):
                         print(Fore.MAGENTA + Style.BRIGHT + "Cambio de token detectado: cortando ciclo y aplicando de inmediato.")
-                        print(Fore.YELLOW + Style.BRIGHT + "⚠️ REAL llegó mientras había contrato anterior abierto. Esperando cierre seguro antes de comprar en REAL.")
+                        print(Fore.YELLOW + Style.BRIGHT + "⚠️ REAL/DEMO cambió mientras había contrato abierto. Esperando cierre seguro antes de nueva compra." + Style.RESET_ALL)
                     estado_bot["token_msg_mostrado"] = True
                 estado_bot["interrumpir_ciclo"] = True
                 reinicio_forzado.set()
@@ -2323,6 +2354,7 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
 
         try:
             _clear_pending_contract_resolution(reason="bg_resolved")
+            print(Fore.GREEN + Style.BRIGHT + "✅ Fence contrato incierto liberado (bg_resolved)." + Style.RESET_ALL)
         except Exception:
             pass
 
