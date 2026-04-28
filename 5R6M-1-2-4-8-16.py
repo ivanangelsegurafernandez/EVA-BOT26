@@ -246,6 +246,40 @@ HUD_TABLE_COMPACT_WIDTH = True
 HUD_SIDE_PANEL_INLINE = True
 HUD_SHOW_SALDO_DEBUG = False
 HUD_EVENT_MAX_CHARS = 150
+HUD_SHOW_CONTROL_PANEL = False
+KEYBOARD_ENABLE = True
+KEYBOARD_DEBUG = False
+
+
+def _keyboard_can_start():
+    try:
+        return bool(KEYBOARD_ENABLE and HAVE_MSVCRT and os.name == "nt")
+    except Exception:
+        return False
+
+
+def _windows_console_input_safe_mode():
+    """
+    Best-effort para consola Windows:
+    desactiva QuickEdit para evitar congelamientos por selección accidental.
+    """
+    try:
+        if os.name != "nt":
+            return
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        h_stdin = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        if h_stdin in (None, 0):
+            return
+        mode = ctypes.c_uint()
+        if not kernel32.GetConsoleMode(h_stdin, ctypes.byref(mode)):
+            return
+        ENABLE_QUICK_EDIT_MODE = 0x0040
+        ENABLE_EXTENDED_FLAGS = 0x0080
+        new_mode = (mode.value | ENABLE_EXTENDED_FLAGS) & ~ENABLE_QUICK_EDIT_MODE
+        kernel32.SetConsoleMode(h_stdin, new_mode)
+    except Exception:
+        pass
 
 # --- Objetivos / umbrales globales de IA ---
 IA_OBJETIVO_REAL_THR = 0.75   # objetivo de calidad REAL (meta: 75% aprox)
@@ -3888,6 +3922,21 @@ def _ack_live_calc_summary(rows_pack):
     }
 
 
+def _fmt_estado_round_live(estado_visual: str, estado_base: str = "") -> str:
+    try:
+        ev = str(estado_visual or "").strip()
+        eb = str(estado_base or "").strip().lower()
+        evl = ev.lower()
+        alert_closed = evl.startswith("closed⚠") or evl.startswith("closed‼")
+        if (not alert_closed) and (eb == "closed") and (("⚠" in ev) or ("‼" in ev)):
+            alert_closed = True
+        if alert_closed:
+            return Fore.RED + Style.BRIGHT + "\033[5m🔴 ES HORA DE INVERTIR\033[0m" + Style.RESET_ALL
+        return ev if ev else str(estado_base or "--")
+    except Exception:
+        return str(estado_visual or estado_base or "--")
+
+
 def _ack_live_format_lines(snapshot):
     rows_pack = _ack_live_build_rows()
     summary = _ack_live_calc_summary(rows_pack)
@@ -3934,8 +3983,10 @@ def _ack_live_format_lines(snapshot):
             else:
                 ciclo_txt = "--"
 
-        estado_txt = str(row.get("estado_visual", row.get("estado", "--")))[:10]
-        lines.append(f"{bot:<7}  {ack_txt:<5} {gap_txt:<4} {res_txt:<4} {age_txt:<6} {ciclo_txt:<6} {estado_txt:<10}")
+        estado_raw = str(row.get("estado_visual", row.get("estado", "--")))
+        estado_fmt = _fmt_estado_round_live(estado_raw, str(row.get("estado", "--")))
+        estado_txt = _ack_tape_pad_visible(estado_fmt, 24)
+        lines.append(f"{bot:<7}  {ack_txt:<5} {gap_txt:<4} {res_txt:<4} {age_txt:<6} {ciclo_txt:<6} {estado_txt}")
 
     botx = summary.get("bot_x_actual") or "-"
     resumen = (
@@ -15160,6 +15211,8 @@ def mostrar_ia_resumen_compacto():
 
 
 def mostrar_panel_lateral_compacto():
+    if not bool(globals().get("HUD_SHOW_CONTROL_PANEL", False)):
+        return []
     token_file = leer_token_actual()
     token_hud = "DEMO" if (token_file in (None, "none")) else f"REAL:{token_file}"
     activo_real = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
@@ -15240,6 +15293,8 @@ def mostrar_bloque_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--
 
 
 def mostrar_panel_teclado_activo(bot, rest_s, max_ciclos, ciclo_actual="C1", fuente="--"):
+    if not bool(globals().get("HUD_SHOW_CONTROL_PANEL", False)):
+        return []
     bot_txt = str(bot or "--")
     rest = max(0, int(rest_s or 0))
     ciclo_txt = str(ciclo_actual or "C1")
@@ -18928,8 +18983,21 @@ def escuchar_teclas():
         else:
             time.sleep(0.05)
 
-if sys.stdout.isatty():
-    threading.Thread(target=escuchar_teclas, daemon=True).start()
+if _keyboard_can_start():
+    try:
+        _windows_console_input_safe_mode()
+        threading.Thread(
+            target=escuchar_teclas,
+            daemon=True,
+            name="maestro-keyboard-listener",
+        ).start()
+        if KEYBOARD_DEBUG:
+            agregar_evento("⌨️ Teclado maestro activo.")
+    except Exception as e:
+        try:
+            agregar_evento(f"⚠️ Teclado maestro no pudo iniciar: {e}")
+        except Exception:
+            pass
 
 # Main - Añadida pasada inicial para sincronizar HUD con CSV existentes
 DIAGNOSTIC_MODE = ("--diagnostico" in sys.argv) or (os.getenv("MAESTRO_DIAGNOSTICO", "0") == "1")
