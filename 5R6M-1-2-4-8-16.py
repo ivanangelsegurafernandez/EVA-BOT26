@@ -3944,6 +3944,37 @@ def _fmt_estado_round_live(estado_visual: str, estado_base: str = "") -> str:
     return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
 
 
+def _sync_round_manual_status() -> dict:
+    try:
+        st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+        rows_pack = _ack_live_build_rows()
+        summary = _ack_live_calc_summary(rows_pack)
+
+        obj_round = int(summary.get("obj_round", st.get("round_id", 1)) or 1)
+        released_round = int(summary.get("released_round", st.get("released_round", obj_round)) or obj_round)
+        closed_count = int(summary.get("closed_count", 0) or 0)
+        expected_count = int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
+        faltan_count = int(summary.get("faltan_count", max(0, expected_count - closed_count)) or 0)
+
+        return {
+            "obj_round": obj_round,
+            "released_round": released_round,
+            "closed_count": closed_count,
+            "expected_count": expected_count,
+            "faltan_count": faltan_count,
+            "released_ok": released_round >= obj_round,
+        }
+    except Exception:
+        return {
+            "obj_round": 0,
+            "released_round": 0,
+            "closed_count": 0,
+            "expected_count": len(BOT_NAMES),
+            "faltan_count": len(BOT_NAMES),
+            "released_ok": False,
+        }
+
+
 def _round_live_estado_display(row: dict) -> str:
     """
     ROUND LIVE solo muestra 2 estados visuales:
@@ -5423,7 +5454,11 @@ def _escribir_orden_real_raw(bot: str, ciclo: int):
     Escritura RAW de orden_real (sin activar_real_inmediato, sin recursión).
     """
     ciclo = max(1, min(int(ciclo), MAX_CICLOS))
-    payload = {"bot": bot, "ciclo": ciclo, "source": str(globals().get("_REAL_ROUTE_SOURCE", "LEGACY") or "LEGACY"), "ts": time.time(), "created_ts": time.time(), "ttl_s": REAL_ORDER_TTL_S, "order_id": None, "consumed": False}
+    source_val = str(globals().get("_REAL_ROUTE_SOURCE", "LEGACY") or "LEGACY").upper()
+    payload = {"bot": bot, "ciclo": ciclo, "source": source_val, "ts": time.time(), "created_ts": time.time(), "ttl_s": REAL_ORDER_TTL_S, "order_id": None, "consumed": False}
+    if source_val == "MANUAL":
+        payload["manual_override"] = True
+        payload["force_exit_sync_wait"] = True
     try:
         try:
             payload["order_id"] = str(payload.get("order_id") or f"{payload.get('source', 'LEGACY')}:{bot}:C{ciclo}:{int(time.time()*1000)}")
@@ -17245,7 +17280,7 @@ def _manual_status_lines() -> list[str]:
             restante = _manual_confirm_remaining()
             tecla = str(MANUAL_KEYBOARD_STATUS.get("last_key") or "").strip()
             tecla_txt = tecla if tecla else "?"
-            return [
+            lines = [
                 Fore.YELLOW + Style.BRIGHT +
                 f"🚨 TECLA PRESIONADA: {tecla_txt} | BOT={bot} | CICLO=C{ciclo} | RESTAN={restante}s"
                 + Style.RESET_ALL,
@@ -17253,6 +17288,22 @@ def _manual_status_lines() -> list[str]:
                 "👉 ¿PASAR A REAL? [Y/S]=SÍ | [N/ESC]=NO"
                 + Style.RESET_ALL
             ]
+            try:
+                ss = _sync_round_manual_status()
+                closed = int(ss.get("closed_count", 0) or 0)
+                expected = int(ss.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
+                faltan = int(ss.get("faltan_count", max(0, expected - closed)) or 0)
+                if faltan > 0:
+                    lines.append(
+                        Fore.YELLOW + Style.BRIGHT +
+                        f"⚠️ SYNC: esperando liberación | cerrados={closed}/{expected} | faltan={faltan}"
+                        + Style.RESET_ALL
+                    )
+                else:
+                    lines.append(Fore.GREEN + Style.BRIGHT + "✅ SYNC: liberado" + Style.RESET_ALL)
+            except Exception:
+                pass
+            return lines[:3]
 
         st = MANUAL_KEYBOARD_STATUS if isinstance(MANUAL_KEYBOARD_STATUS, dict) else {}
         if st.get("active") and now <= float(st.get("expires") or 0):
@@ -17264,9 +17315,35 @@ def _manual_status_lines() -> list[str]:
             if phase == "cancelado":
                 return [Fore.YELLOW + Style.BRIGHT + f"❎ {msg}" + Style.RESET_ALL]
             if phase == "enviando":
-                return [Fore.CYAN + Style.BRIGHT + f"⏳ {msg}" + Style.RESET_ALL]
+                out = [Fore.CYAN + Style.BRIGHT + f"⏳ {msg}" + Style.RESET_ALL]
+                try:
+                    ss = _sync_round_manual_status()
+                    closed = int(ss.get("closed_count", 0) or 0)
+                    expected = int(ss.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
+                    faltan = int(ss.get("faltan_count", max(0, expected - closed)) or 0)
+                    out.append(
+                        (Fore.YELLOW + Style.BRIGHT + f"⚠️ SYNC: esperando liberación | cerrados={closed}/{expected} | faltan={faltan}" + Style.RESET_ALL)
+                        if faltan > 0 else
+                        (Fore.GREEN + Style.BRIGHT + "✅ SYNC: liberado" + Style.RESET_ALL)
+                    )
+                except Exception:
+                    pass
+                return out[:3]
             if phase == "orden_enviada":
-                return [Fore.GREEN + Style.BRIGHT + f"✅ {msg}" + Style.RESET_ALL]
+                out = [Fore.GREEN + Style.BRIGHT + f"✅ {msg}" + Style.RESET_ALL]
+                try:
+                    ss = _sync_round_manual_status()
+                    closed = int(ss.get("closed_count", 0) or 0)
+                    expected = int(ss.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
+                    faltan = int(ss.get("faltan_count", max(0, expected - closed)) or 0)
+                    out.append(
+                        (Fore.YELLOW + Style.BRIGHT + f"⚠️ SYNC: esperando liberación | cerrados={closed}/{expected} | faltan={faltan}" + Style.RESET_ALL)
+                        if faltan > 0 else
+                        (Fore.GREEN + Style.BRIGHT + "✅ SYNC: liberado" + Style.RESET_ALL)
+                    )
+                except Exception:
+                    pass
+                return out[:3]
             if msg:
                 return [Fore.CYAN + Style.BRIGHT + f"⌨️ {msg}" + Style.RESET_ALL]
         return []
@@ -17370,6 +17447,13 @@ def forzar_real_manual(bot: str, ciclo: int):
         marti_paso = ciclo - 1
         _set_real_manual_alert(bot, ciclo, "MANUAL")
         agregar_evento(f"🟢 MANUAL REAL CONFIRMADO: {bot.upper()} entra a REAL en C{int(ciclo)}.")
+        try:
+            _sync_round_tick_maestro()
+        except Exception as e:
+            try:
+                agregar_evento(f"⚠️ Manual REAL: no se pudo refrescar sync antes de orden: {type(e).__name__}: {e}")
+            except Exception:
+                pass
 
         if not emitir_real_autorizado(bot, ciclo, source="MANUAL"):
             _set_real_manual_alert(None)
@@ -17463,7 +17547,15 @@ def _manual_send_real_order_worker(bot: str, ciclo: int, key: str = ""):
             last_key=key,
         )
         _request_hud_refresh("manual_send_start")
+        try:
+            _sync_round_tick_maestro()
+        except Exception:
+            pass
         ok = forzar_real_manual(str(bot), int(ciclo))
+        try:
+            _sync_round_tick_maestro()
+        except Exception:
+            pass
         if ok:
             _manual_status_set(
                 "orden_enviada",

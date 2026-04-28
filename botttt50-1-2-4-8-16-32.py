@@ -427,6 +427,18 @@ async def _sync_round_wait_release(round_id: int) -> int:
             last_released = released
             last_state_ts = state_ts
             first_wait_tick = False
+        if _manual_real_order_targets_this_bot():
+            estado_bot["sync_wait"] = False
+            try:
+                _sync_round_write_release_heartbeat(rid, next_round)
+            except Exception:
+                pass
+            print(
+                Fore.GREEN + Style.BRIGHT +
+                f"🟢 MANUAL REAL override: {NOMBRE_BOT} sale de standby sync ronda #{rid} → #{next_round}."
+                + Style.RESET_ALL
+            )
+            return next_round
         if _print_once(f"sync-standby-{rid}", ttl=6.0):
             print(Fore.CYAN + f"… standby columna {NOMBRE_BOT}: ronda #{rid}, released_round={released}")
         await asyncio.sleep(SYNC_WAIT_POLL_S)
@@ -457,6 +469,47 @@ def _orden_real_payload_vivo(data: dict | None) -> bool:
         return False
 
 
+
+
+def _manual_real_order_targets_this_bot() -> bool:
+    try:
+        p = "orden_real.json"
+        if not os.path.exists(p):
+            return False
+        with open(p, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            return False
+
+        bot = str(payload.get("bot") or payload.get("owner") or "").strip()
+        source = str(payload.get("source") or "").upper().strip()
+        manual_override = bool(payload.get("manual_override") or payload.get("force_exit_sync_wait"))
+
+        if bot != NOMBRE_BOT:
+            return False
+        if source != "MANUAL":
+            return False
+        if not manual_override:
+            return False
+
+        ts = float(payload.get("created_ts") or payload.get("ts") or 0.0)
+        ttl = float(payload.get("ttl_s") or 45.0)
+        if ts <= 0:
+            return False
+        if (time.time() - ts) > ttl:
+            return False
+
+        try:
+            tok = leer_token_actual()
+            tok_s = str(tok or "").strip()
+            if tok_s not in (NOMBRE_BOT, f"REAL:{NOMBRE_BOT}"):
+                pass
+        except Exception:
+            pass
+
+        return True
+    except Exception:
+        return False
 def _warn_stale_real_order_cooldown():
     global _ORDER_REAL_OLD_WARN_LAST_TS
     try:
