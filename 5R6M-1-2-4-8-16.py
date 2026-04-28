@@ -16186,9 +16186,21 @@ def mostrar_panel():
             except Exception:
                 pass
             try:
-                alive_age = time.time() - float(globals().get("KEYBOARD_LISTENER_ALIVE_TS", 0.0) or 0.0)
-                if alive_age > 5:
-                    print(Fore.RED + Style.BRIGHT + f"⌨️ TECLADO INACTIVO | listener sin latido {alive_age:.1f}s" + Style.RESET_ALL)
+                alive_ts = float(globals().get("KEYBOARD_LISTENER_ALIVE_TS", 0.0) or 0.0)
+                if alive_ts <= 0:
+                    print(Fore.YELLOW + Style.BRIGHT + "⌨️ TECLADO INICIANDO..." + Style.RESET_ALL)
+                else:
+                    alive_age = time.time() - alive_ts
+                    if alive_age > 5:
+                        print(Fore.RED + Style.BRIGHT + f"⌨️ TECLADO INACTIVO | listener sin latido {alive_age:.1f}s" + Style.RESET_ALL)
+            except Exception:
+                pass
+            try:
+                k_last = str(globals().get("KEYBOARD_LAST_KEY", "") or "")
+                k_ts = float(globals().get("KEYBOARD_LAST_KEY_TS", 0.0) or 0.0)
+                if k_last and k_ts > 0 and bool(globals().get("KEYBOARD_DEBUG", False)):
+                    k_age = max(0.0, time.time() - k_ts)
+                    print(Fore.CYAN + f"⌨️ Última tecla={k_last} hace {k_age:.2f}s")
             except Exception:
                 pass
             owner_live = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
@@ -17006,6 +17018,10 @@ PENDIENTE_FORZAR_INICIO = 0.0
 PENDIENTE_FORZAR_EXPIRA = 0.0
 MANUAL_REAL_ALWAYS_CONFIRM = True
 KEYBOARD_LISTENER_ALIVE_TS = 0.0
+KEYBOARD_LAST_KEY_TS = 0.0
+KEYBOARD_LAST_KEY = ""
+HUD_REFRESH_REQUEST_TS = 0.0
+HUD_REFRESH_REQUEST_REASON = ""
 PENDIENTE_CONFIRMAR_REAL = {
     "active": False,
     "bot": None,
@@ -17122,6 +17138,15 @@ def _manual_key_audit(msg: str):
         pass
 
 
+def _request_hud_refresh(reason: str = "keyboard"):
+    global HUD_REFRESH_REQUEST_TS, HUD_REFRESH_REQUEST_REASON
+    try:
+        HUD_REFRESH_REQUEST_TS = time.time()
+        HUD_REFRESH_REQUEST_REASON = str(reason or "keyboard")
+    except Exception:
+        pass
+
+
 def _manual_confirm_active() -> bool:
     try:
         return bool(PENDIENTE_CONFIRMAR_REAL.get("active"))
@@ -17221,7 +17246,7 @@ def _start_manual_confirm(bot: str, ciclo: int):
             f"Pulsa Y/S para invertir o N/ESC para cancelar."
         )
         _manual_key_audit(f"confirm_start bot={str(bot)} ciclo={int(ciclo)}")
-        _safe_render_keyboard_panel()
+        _request_hud_refresh("confirm_start")
     except Exception as e:
         try:
             agregar_evento(f"⚠️ No se pudo activar confirmación manual: {type(e).__name__}: {e}")
@@ -17316,7 +17341,7 @@ def forzar_real_manual(bot: str, ciclo: int):
         # escribir_orden_real(...) ya dejó token+HUD sincronizados; evitamos doble token_sync.
         agregar_evento(f"⚡ Forzar REAL: {bot} → ciclo #{ciclo} (fuente=MANUAL)")
         _manual_key_audit(f"forzar_real_manual success bot={bot} ciclo={ciclo}")
-        _safe_render_keyboard_panel()
+        _request_hud_refresh("forzar_real_manual")
         return True
     except Exception as e:
         agregar_evento(f"⛔ Forzar REAL falló en {bot}: {e}")
@@ -17364,6 +17389,61 @@ def _manual_verify_real_order(bot: str, ciclo: int, delay_s: float = 1.0):
         try:
             agregar_evento(f"⚠️ Manual verify falló: {type(e).__name__}: {e}")
             _manual_key_audit(f"verify_exception bot={bot} ciclo={ciclo} err={type(e).__name__}:{e}")
+        except Exception:
+            pass
+
+
+def _manual_send_real_order_worker(bot: str, ciclo: int, key: str = ""):
+    try:
+        _manual_status_set(
+            "enviando",
+            bot=bot,
+            ciclo=ciclo,
+            msg=f"ENVIANDO ORDEN REAL | BOT={bot.upper()} | CICLO=C{ciclo}",
+            ttl_s=8,
+            last_key=key,
+        )
+        _request_hud_refresh("manual_send_start")
+        ok = forzar_real_manual(str(bot), int(ciclo))
+        if ok:
+            _manual_status_set(
+                "orden_enviada",
+                bot=bot,
+                ciclo=ciclo,
+                msg=f"ORDEN REAL ENVIADA | BOT={bot.upper()} | CICLO=C{ciclo}",
+                ttl_s=10,
+                last_key=key,
+            )
+            threading.Thread(
+                target=_manual_verify_real_order,
+                args=(str(bot), int(ciclo), 1.0),
+                daemon=True,
+                name="manual-real-verify",
+            ).start()
+        else:
+            _manual_status_set(
+                "error",
+                bot=bot,
+                ciclo=ciclo,
+                error=f"NO SE ENVIÓ ORDEN REAL | BOT={bot.upper()} | CICLO=C{ciclo}",
+                ttl_s=12,
+                last_key=key,
+            )
+        _manual_key_audit(f"send_done ok={ok} bot={bot} ciclo={ciclo}")
+        _request_hud_refresh("manual_send_done")
+    except Exception as e:
+        try:
+            _manual_status_set(
+                "error",
+                bot=bot,
+                ciclo=ciclo,
+                error=f"ERROR MANUAL REAL: {type(e).__name__}: {e}",
+                ttl_s=12,
+                last_key=key,
+            )
+            agregar_evento(f"⛔ Manual REAL worker falló: {type(e).__name__}: {e}")
+            _manual_key_audit(f"send_done ok=False bot={bot} ciclo={ciclo} err={type(e).__name__}:{e}")
+            _request_hud_refresh("manual_send_error")
         except Exception:
             pass
 
@@ -19503,20 +19583,22 @@ def inicializar_saldo_real(valor):
 
 
 def _safe_render_keyboard_panel():
+    """
+    IMPORTANTE:
+    El hilo de teclado NO debe renderizar el HUD directamente.
+    Solo marca solicitud de refresco para que el loop principal lo pinte.
+    """
     try:
-        with RENDER_LOCK:
-            mostrar_panel()
-    except Exception as e:
-        try:
-            agregar_evento(f"⚠️ Teclado/HUD: render omitido por error recuperado: {type(e).__name__}: {e}")
-        except Exception:
-            pass
+        _request_hud_refresh("keyboard")
+    except Exception:
+        pass
 
 
 # Escuchar teclas
 def escuchar_teclas():
     global pausado, salir, reinicio_manual, LIMPIEZA_PANEL_HASTA, HUD_VISIBLE
-    global PENDIENTE_FORZAR_BOT, PENDIENTE_FORZAR_INICIO, PENDIENTE_FORZAR_EXPIRA, KEYBOARD_LISTENER_ALIVE_TS
+    global PENDIENTE_FORZAR_BOT, PENDIENTE_FORZAR_INICIO, PENDIENTE_FORZAR_EXPIRA
+    global KEYBOARD_LISTENER_ALIVE_TS, KEYBOARD_LAST_KEY_TS, KEYBOARD_LAST_KEY
 
     bot_map = {'5': 'fulll45', '6': 'fulll46', '7': 'fulll47', '8': 'fulll48', '9': 'fulll49', '0': 'fulll50'}
     last_key_time = 0  # debounce 200 ms
@@ -19525,7 +19607,24 @@ def escuchar_teclas():
         try:
             KEYBOARD_LISTENER_ALIVE_TS = time.time()
             if MODAL_ACTIVO:
-                time.sleep(0.1); continue
+                KEYBOARD_LISTENER_ALIVE_TS = time.time()
+                time.sleep(0.01)
+                continue
+
+            if PENDIENTE_FORZAR_BOT and float(PENDIENTE_FORZAR_EXPIRA or 0) > 0 and time.time() > float(PENDIENTE_FORZAR_EXPIRA):
+                bot_exp = PENDIENTE_FORZAR_BOT
+                agregar_evento(f"⏱️ Selección manual REAL expirada: {str(bot_exp).upper()}.")
+                _manual_status_set(
+                    "expirado",
+                    bot=bot_exp,
+                    msg=f"Selección expirada BOT={str(bot_exp).upper()}",
+                    ttl_s=6,
+                )
+                _manual_key_audit(f"pending_bot_expired bot={bot_exp}")
+                PENDIENTE_FORZAR_BOT = None
+                PENDIENTE_FORZAR_INICIO = 0.0
+                PENDIENTE_FORZAR_EXPIRA = 0.0
+                _safe_render_keyboard_panel()
 
             if PENDIENTE_FORZAR_BOT and float(PENDIENTE_FORZAR_EXPIRA or 0) > 0 and time.time() > float(PENDIENTE_FORZAR_EXPIRA):
                 bot_exp = PENDIENTE_FORZAR_BOT
@@ -19558,7 +19657,7 @@ def escuchar_teclas():
                     _manual_key_audit(f"confirm_expired bot={bot_conf} ciclo={ciclo_conf}")
                     _clear_manual_confirm()
                     _safe_render_keyboard_panel()
-                    time.sleep(0.05)
+                    time.sleep(0.01)
                     continue
 
             now = time.time()
@@ -19574,7 +19673,11 @@ def escuchar_teclas():
                     k = k.decode("utf-8", errors="ignore").lower()
                 except:
                     continue
-                _manual_key_audit(f"key_read={repr(k)} confirm={_manual_confirm_active()} pending_bot={PENDIENTE_FORZAR_BOT}")
+                KEYBOARD_LAST_KEY_TS = time.time()
+                KEYBOARD_LAST_KEY = repr(k)
+                dt_since_last = max(0.0, KEYBOARD_LAST_KEY_TS - float(globals().get("KEYBOARD_LAST_KEY_TS_PREV", 0.0) or 0.0))
+                globals()["KEYBOARD_LAST_KEY_TS_PREV"] = KEYBOARD_LAST_KEY_TS
+                _manual_key_audit(f"key_read key={repr(k)} confirm={_manual_confirm_active()} pending_bot={PENDIENTE_FORZAR_BOT} dt_since_last={dt_since_last:.4f}")
 
                 if _manual_confirm_active():
                     bot_conf = PENDIENTE_CONFIRMAR_REAL.get("bot")
@@ -19583,49 +19686,39 @@ def escuchar_teclas():
 
                     if k in ("y", "s"):
                         agregar_evento(f"✅ CONFIRMADO: invirtiendo en REAL {str(bot_conf).upper()} C{ciclo_conf}.")
-                        _manual_key_audit(f"confirm_yes key={k} bot={bot_conf} ciclo={ciclo_conf}")
+                        delay_ms = int(max(0.0, (time.time() - float(PENDIENTE_CONFIRMAR_REAL.get("ts") or time.time())) * 1000.0))
+                        _manual_key_audit(f"confirm_yes key={repr(k)} bot={bot_conf} ciclo={ciclo_conf} delay_ms={delay_ms}")
                         _clear_manual_confirm()
-                        ok = forzar_real_manual(str(bot_conf), int(ciclo_conf))
-                        _manual_key_audit(f"confirm_result ok={ok} bot={bot_conf} ciclo={ciclo_conf}")
-                        if ok:
-                            _manual_status_set(
-                                "orden_enviada",
-                                bot=str(bot_conf),
-                                ciclo=int(ciclo_conf),
-                                msg=f"ORDEN REAL ENVIADA | BOT={str(bot_conf).upper()} | CICLO=C{ciclo_conf}",
-                                ttl_s=12,
-                                last_key=k,
-                            )
-                            threading.Thread(
-                                target=_manual_verify_real_order,
-                                args=(str(bot_conf), int(ciclo_conf), 1.0),
-                                daemon=True,
-                                name="manual-real-verify",
-                            ).start()
-                        else:
-                            _manual_status_set(
-                                "error",
-                                bot=str(bot_conf),
-                                ciclo=int(ciclo_conf),
-                                error=f"NO SE ENVIÓ ORDEN REAL | BOT={str(bot_conf).upper()} | CICLO=C{ciclo_conf}",
-                                ttl_s=15,
-                                last_key=k,
-                            )
+                        _manual_status_set(
+                            "enviando",
+                            bot=str(bot_conf),
+                            ciclo=int(ciclo_conf),
+                            msg=f"ENVIANDO ORDEN REAL | BOT={str(bot_conf).upper()} | CICLO=C{ciclo_conf}",
+                            ttl_s=5,
+                            last_key=k,
+                        )
                         _safe_render_keyboard_panel()
+                        threading.Thread(
+                            target=_manual_send_real_order_worker,
+                            args=(str(bot_conf), int(ciclo_conf), k),
+                            daemon=True,
+                            name="manual-real-order-worker",
+                        ).start()
                         continue
 
                     if k in ("n", "\x1b"):
                         agregar_evento(f"❎ CANCELADO: inversión manual REAL {str(bot_conf).upper()} C{ciclo_conf}.")
-                        _manual_key_audit(f"confirm_cancel key={repr(k)} bot={bot_conf} ciclo={ciclo_conf}")
+                        delay_ms = int(max(0.0, (time.time() - float(PENDIENTE_CONFIRMAR_REAL.get("ts") or time.time())) * 1000.0))
+                        _manual_key_audit(f"confirm_cancel key={repr(k)} bot={bot_conf} ciclo={ciclo_conf} delay_ms={delay_ms}")
+                        _clear_manual_confirm()
                         _manual_status_set(
                             "cancelado",
                             bot=str(bot_conf),
                             ciclo=int(ciclo_conf),
-                            msg=f"Cancelado BOT={str(bot_conf).upper()} C{ciclo_conf}",
-                            ttl_s=6,
+                            msg=f"CANCELADO | BOT={str(bot_conf).upper()} | CICLO=C{ciclo_conf}",
+                            ttl_s=3,
                             last_key=k,
                         )
-                        _clear_manual_confirm()
                         _safe_render_keyboard_panel()
                         continue
 
@@ -19745,7 +19838,7 @@ def escuchar_teclas():
                     continue
 
             else:
-                time.sleep(0.05)
+                time.sleep(0.01)
         except Exception as e:
             try:
                 agregar_evento(f"⚠️ Teclado recuperado tras error: {type(e).__name__}: {e}")
@@ -20676,6 +20769,11 @@ async def main():
 
                     set_etapa("TICK_04")
                     await refresh_saldo_real()
+                    try:
+                        if float(HUD_REFRESH_REQUEST_TS or 0.0) > 0:
+                            pass
+                    except Exception:
+                        pass
                     if meta_mostrada and not pausado and not MODAL_ACTIVO:
                         mostrar_advertencia_meta()
                     if not MODAL_ACTIVO:
@@ -20685,7 +20783,13 @@ async def main():
                 set_etapa("TICK_04", f"Error: {str(e)}")
                 agregar_evento(f"⚠️ Error en loop principal: {str(e)}")
                 await asyncio.sleep(1)  
-            await asyncio.sleep(2)
+            try:
+                sleep_s = 2.0
+                if (time.time() - float(HUD_REFRESH_REQUEST_TS or 0.0)) < 1.0:
+                    sleep_s = 0.2
+                await asyncio.sleep(sleep_s)
+            except Exception:
+                await asyncio.sleep(2)
     except Exception as e:
         set_etapa("STOP", f"Error en main: {str(e)}", anunciar=True)
         agregar_evento(f"⛔ Error en main: {str(e)}")
