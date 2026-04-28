@@ -538,7 +538,14 @@ def leer_orden_real(bot: str):
                 return None, None, 0, None
             if bool(data.get("consumed", False)):
                 return None, None, 0, None
-            cyc = int(data.get("ciclo", 1))
+            raw_ciclo = (
+                data.get("ciclo")
+                or data.get("ciclo_orden")
+                or data.get("ciclo_forzado")
+                or data.get("marti_ciclo")
+                or 1
+            )
+            cyc = int(raw_ciclo)
             ts = float(data.get("created_ts") or data.get("ts") or 0.0)
             ttl = float(data.get("ttl_s") or data.get("ttl") or 45.0)
             quiet = 1 if int(data.get("quiet", 0)) == 1 else 0
