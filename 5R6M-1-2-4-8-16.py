@@ -247,6 +247,7 @@ HUD_SIDE_PANEL_INLINE = True
 HUD_SHOW_SALDO_DEBUG = False
 HUD_EVENT_MAX_CHARS = 150
 HUD_SHOW_CONTROL_PANEL = False
+ROUND_LIVE_INVEST_WINDOW_S = 45
 KEYBOARD_ENABLE = True
 KEYBOARD_DEBUG = False
 
@@ -3936,43 +3937,66 @@ def _ack_live_calc_summary(rows_pack):
 
 
 def _fmt_estado_round_live(estado_visual: str, estado_base: str = "") -> str:
-    try:
-        ev = str(estado_visual or "").strip()
-        eb = str(estado_base or "").strip().lower()
-        evl = ev.lower()
-        alert_closed = evl.startswith("closed⚠") or evl.startswith("closed‼")
-        if (not alert_closed) and (eb == "closed") and (("⚠" in ev) or ("‼" in ev)):
-            alert_closed = True
-        if alert_closed:
-            return Fore.RED + Style.BRIGHT + "\033[5m🔴 ES HORA DE INVERTIR\033[0m" + Style.RESET_ALL
-        return ev if ev else str(estado_base or "--")
-    except Exception:
-        return str(estado_visual or estado_base or "--")
+    return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
 
 
 def _round_live_estado_display(row: dict) -> str:
+    """
+    ROUND LIVE solo muestra 2 estados visuales:
+    1) waiting
+    2) 🔴 ES HORA DE INVERTIR
+
+    Esta función NO modifica datos internos.
+    Solo transforma la fila en texto visual.
+    """
     try:
-        res = str(row.get("res") or row.get("symbol") or "")
-        estado = str(row.get("estado") or row.get("status") or "")
+        row = row if isinstance(row, dict) else {}
+
+        estado = str(row.get("estado") or row.get("status") or "").strip().lower()
+        res = str(row.get("res") or row.get("symbol") or "").strip()
         is_current = bool(row.get("is_current", True))
-        is_closed = bool(row.get("is_closed_result") or row.get("valid_closed") or estado == "closed")
 
-        if is_current and is_closed and res == "X":
+        is_closed = bool(
+            row.get("is_closed_result")
+            or row.get("valid_closed")
+            or estado == "closed"
+            or res in ("✓", "X")
+        )
+
+        edad_s = None
+        for k in ("edad_s", "age_s", "ack_age_s", "edad_seg", "age"):
+            try:
+                if row.get(k) is not None:
+                    edad_s = float(row.get(k))
+                    break
+            except Exception:
+                pass
+
+        if edad_s is None:
+            edad_txt = str(row.get("edad") or row.get("age_txt") or "").strip().lower()
+            try:
+                if edad_txt.endswith("ms"):
+                    edad_s = float(edad_txt[:-2]) / 1000.0
+                elif edad_txt.endswith("s"):
+                    edad_s = float(edad_txt[:-1])
+                elif edad_txt.endswith("m"):
+                    edad_s = float(edad_txt[:-1]) * 60.0
+            except Exception:
+                edad_s = None
+
+        if edad_s is None:
+            # Si no sabemos la edad exacta, por seguridad visual no damos señal de inversión.
+            return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
+
+        window_s = float(globals().get("ROUND_LIVE_INVEST_WINDOW_S", 45) or 45)
+
+        if is_current and is_closed and 0.0 <= float(edad_s) <= window_s:
             return Fore.RED + Style.BRIGHT + "🔴 ES HORA DE INVERTIR" + Style.RESET_ALL
-        if is_current and is_closed and res == "✓":
-            return Fore.GREEN + Style.BRIGHT + "✅ CERRADO VERDE" + Style.RESET_ALL
 
-        visual = str(row.get("estado_visual") or estado or "--")
-        vlow = visual.lower()
-        if vlow.startswith("waiting"):
-            return Fore.YELLOW + "waiting⚠" + Style.RESET_ALL
-        if vlow.startswith("missing"):
-            return Fore.YELLOW + "missing" + Style.RESET_ALL
-        if vlow.startswith("open"):
-            return Fore.CYAN + "open" + Style.RESET_ALL
-        return visual
+        return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
+
     except Exception:
-        return str((row or {}).get("estado_visual") or (row or {}).get("estado") or "--")
+        return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
 
 
 def _ack_live_format_lines(snapshot):
@@ -3996,7 +4020,7 @@ def _ack_live_format_lines(snapshot):
     lines.append(
         f"⚡ ROUND LIVE | obj=#{obj_round} | rel=#{released_round} | cerrados={closed_count}/{expected_count} | faltan={faltan_count} | lag={lag_txt}"
     )
-    lines.append("BOT      ACK   GAP  RES  EDAD   CICLO  ESTADO")
+    lines.append("BOT      ACK   GAP  RES  EDAD   CICLO  DECISIÓN")
 
     for row in list(rows)[:6]:
         bot = str(row.get("bot", "--"))[:7]
@@ -15450,7 +15474,7 @@ def mostrar_panel_teclado_activo(bot, rest_s, max_ciclos, ciclo_actual="C1", fue
     src_txt = str(fuente or "--")
     if not bool(globals().get("HUD_SHOW_CONTROL_PANEL", False)):
         return [
-            f"⌨️ MANUAL REAL | Bot={bot_txt} | Ciclo sugerido={ciclo_txt} | Fuente={src_txt} | Elige ciclo [1..{int(max_ciclos)}] | ESC cancela | {rest}s"
+            f"⌨️ MANUAL REAL | Bot={bot_txt.upper()} | Elige ciclo [1..{int(max_ciclos)}] | Luego confirma Y/S o cancela N/ESC | {rest}s"
         ]
     estado_txt = f"Tiempo para decidir : {rest:>3}s" if rest > 0 else "Estado            : decisión cerrada / orden enviada"
     return [
@@ -16885,6 +16909,15 @@ VENTANA_DECISION_IA_S = 30
 PENDIENTE_FORZAR_BOT = None
 PENDIENTE_FORZAR_INICIO = 0.0
 PENDIENTE_FORZAR_EXPIRA = 0.0
+MANUAL_REAL_ALWAYS_CONFIRM = True
+MANUAL_CONFIRM_TIMEOUT_S = 20
+PENDIENTE_CONFIRMAR_REAL = {
+    "active": False,
+    "bot": None,
+    "ciclo": None,
+    "ts": 0.0,
+    "expira": 0.0,
+}
 
 FORZAR_LOCK = threading.Lock()
 
@@ -16927,6 +16960,85 @@ def _set_real_manual_alert(bot: str | None, ciclo: int | None = None, source: st
         pass
 
 
+def _clear_manual_confirm():
+    try:
+        PENDIENTE_CONFIRMAR_REAL.update({
+            "active": False,
+            "bot": None,
+            "ciclo": None,
+            "ts": 0.0,
+            "expira": 0.0,
+        })
+    except Exception:
+        pass
+
+
+def _manual_confirm_active() -> bool:
+    try:
+        return bool(PENDIENTE_CONFIRMAR_REAL.get("active"))
+    except Exception:
+        return False
+
+
+def _manual_confirm_remaining() -> int:
+    try:
+        expira = float(PENDIENTE_CONFIRMAR_REAL.get("expira") or 0.0)
+        return max(0, int(expira - time.time()))
+    except Exception:
+        return 0
+
+
+def mostrar_panel_confirmacion_manual(bot: str, ciclo: int, restante: int | None = None):
+    try:
+        bot_txt = str(bot or "--").upper()
+        ciclo_txt = f"C{int(ciclo)}"
+        rest_txt = f"{int(max(0, restante or 0))}s" if restante is not None else "--"
+        lines = [
+            "╔════════════════════════════════════════════════════════════╗",
+            "║ 🚨 CONFIRMAR INVERSIÓN MANUAL EN REAL                     ║",
+            "╠════════════════════════════════════════════════════════════╣",
+            f"║ Bot elegido : {bot_txt:<43}║",
+            f"║ Ciclo       : {ciclo_txt:<43}║",
+            "║                                                            ║",
+            "║ ¿DESEA INVERTIR AHORA EN CUENTA REAL?                     ║",
+            "║                                                            ║",
+            "║ Confirmar: [Y] o [S]                                      ║",
+            "║ Cancelar : [N] o [ESC]                                    ║",
+            f"║ Tiempo    : {rest_txt:<43}║",
+            "╚════════════════════════════════════════════════════════════╝",
+        ]
+        for ln in lines:
+            print(Fore.YELLOW + Style.BRIGHT + ln + Style.RESET_ALL)
+    except Exception:
+        pass
+
+
+def _start_manual_confirm(bot: str, ciclo: int):
+    try:
+        now = time.time()
+        PENDIENTE_CONFIRMAR_REAL.update({
+            "active": True,
+            "bot": str(bot),
+            "ciclo": int(ciclo),
+            "ts": now,
+            "expira": now + float(MANUAL_CONFIRM_TIMEOUT_S),
+        })
+        agregar_evento(
+            f"⚠️ CONFIRMAR REAL: {str(bot).upper()} C{int(ciclo)}. "
+            f"Presiona Y/S para invertir o N/ESC para cancelar."
+        )
+        try:
+            limpiar_consola()
+        except Exception:
+            pass
+        mostrar_panel_confirmacion_manual(str(bot), int(ciclo), int(MANUAL_CONFIRM_TIMEOUT_S))
+    except Exception as e:
+        try:
+            agregar_evento(f"⚠️ No se pudo abrir confirmación manual: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+
+
 # forzar_real_manual
 def forzar_real_manual(bot: str, ciclo: int):
     if not FORZAR_LOCK.acquire(blocking=False):
@@ -16935,8 +17047,8 @@ def forzar_real_manual(bot: str, ciclo: int):
     try:
         ciclo = max(1, min(int(ciclo), MAX_CICLOS))
 
-        # Confirmación opcional para MANUAL (override configurable)
-        CONFIRMAR_EN_ROJO = bool(globals().get("MANUAL_REAL_REQUIRE_CONFIRM_RISK", False))
+        # Confirmación ya fue hecha antes por teclado.
+        CONFIRMAR_EN_ROJO = False
         if not condiciones_seguras_para(bot):
             agregar_evento(f"⚠️ MANUAL REAL override: {bot.upper()} C{int(ciclo)} forzado por teclado aunque condiciones_seguras=no.")
         if CONFIRMAR_EN_ROJO and HAVE_MSVCRT and not condiciones_seguras_para(bot):
@@ -19171,6 +19283,17 @@ def escuchar_teclas():
             if MODAL_ACTIVO:
                 time.sleep(0.1); continue
 
+            if _manual_confirm_active():
+                bot_conf = PENDIENTE_CONFIRMAR_REAL.get("bot")
+                ciclo_conf = int(PENDIENTE_CONFIRMAR_REAL.get("ciclo") or 1)
+                restante = _manual_confirm_remaining()
+                if restante <= 0:
+                    agregar_evento(f"⏱️ CONFIRMACIÓN REAL expirada: {str(bot_conf).upper()} C{ciclo_conf}. Cancelado.")
+                    _clear_manual_confirm()
+                    _safe_render_keyboard_panel()
+                    time.sleep(0.05)
+                    continue
+
             now = time.time()
             if HAVE_MSVCRT and msvcrt.kbhit():
                 if now - last_key_time < 0.2:
@@ -19183,6 +19306,31 @@ def escuchar_teclas():
                         msvcrt.getch(); continue
                     k = k.decode("utf-8", errors="ignore").lower()
                 except:
+                    continue
+
+                if _manual_confirm_active():
+                    bot_conf = PENDIENTE_CONFIRMAR_REAL.get("bot")
+                    ciclo_conf = int(PENDIENTE_CONFIRMAR_REAL.get("ciclo") or 1)
+                    restante = _manual_confirm_remaining()
+
+                    if k in ("y", "s"):
+                        agregar_evento(f"✅ CONFIRMADO: invirtiendo en REAL {str(bot_conf).upper()} C{ciclo_conf}.")
+                        _clear_manual_confirm()
+                        forzar_real_manual(str(bot_conf), int(ciclo_conf))
+                        continue
+
+                    if k in ("n", "\x1b"):
+                        agregar_evento(f"❎ CANCELADO: inversión manual REAL {str(bot_conf).upper()} C{ciclo_conf}.")
+                        _clear_manual_confirm()
+                        _safe_render_keyboard_panel()
+                        continue
+
+                    agregar_evento(f"⚠️ Confirmación pendiente: Y/S confirma, N/ESC cancela. Restan {restante}s.")
+                    try:
+                        limpiar_consola()
+                    except Exception:
+                        pass
+                    mostrar_panel_confirmacion_manual(str(bot_conf), int(ciclo_conf), restante)
                     continue
 
                 if k == "s":
@@ -19220,24 +19368,32 @@ def escuchar_teclas():
                     PENDIENTE_FORZAR_BOT = bot_map[k]
                     PENDIENTE_FORZAR_INICIO = time.time()
                     PENDIENTE_FORZAR_EXPIRA = PENDIENTE_FORZAR_INICIO + VENTANA_DECISION_IA_S
-                    agregar_evento(f"⌨️ MANUAL REAL: seleccionado {PENDIENTE_FORZAR_BOT.upper()}. Ahora presiona ciclo [1..{MAX_CICLOS}] o ESC.")
+                    agregar_evento(
+                        f"🎯 BOT ELEGIDO PARA REAL: {PENDIENTE_FORZAR_BOT.upper()}. "
+                        f"Ahora elige ciclo [1..{MAX_CICLOS}] o ESC."
+                    )
                     _safe_render_keyboard_panel()
 
                 elif PENDIENTE_FORZAR_BOT and k.isdigit() and k in [str(i) for i in range(1, MAX_CICLOS+1)]:
                     ciclo = int(k)
                     bot_sel = PENDIENTE_FORZAR_BOT
-                    agregar_evento(f"⌨️ MANUAL REAL: enviando {bot_sel.upper()} a REAL en C{ciclo}.")
                     PENDIENTE_FORZAR_BOT = None
                     PENDIENTE_FORZAR_INICIO = 0.0
                     PENDIENTE_FORZAR_EXPIRA = 0.0
-                    forzar_real_manual(bot_sel, ciclo)
+                    agregar_evento(
+                        f"⚠️ CICLO ELEGIDO: {bot_sel.upper()} C{ciclo}. "
+                        f"Falta confirmar Y/S para invertir en REAL."
+                    )
+                    _start_manual_confirm(bot_sel, ciclo)
+                    continue
 
                 elif PENDIENTE_FORZAR_BOT and k == "\x1b":  # ESC
-                    agregar_evento("❎ Forzar REAL cancelado.")
+                    agregar_evento("❎ Selección manual REAL cancelada.")
                     PENDIENTE_FORZAR_BOT = None
                     PENDIENTE_FORZAR_INICIO = 0.0
                     PENDIENTE_FORZAR_EXPIRA = 0.0
                     _safe_render_keyboard_panel()
+                    continue
 
             else:
                 time.sleep(0.05)
