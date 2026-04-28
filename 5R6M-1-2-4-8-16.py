@@ -246,6 +246,40 @@ HUD_TABLE_COMPACT_WIDTH = True
 HUD_SIDE_PANEL_INLINE = True
 HUD_SHOW_SALDO_DEBUG = False
 HUD_EVENT_MAX_CHARS = 150
+HUD_SHOW_CONTROL_PANEL = False
+KEYBOARD_ENABLE = True
+KEYBOARD_DEBUG = False
+
+
+def _keyboard_can_start():
+    try:
+        return bool(KEYBOARD_ENABLE and HAVE_MSVCRT and os.name == "nt")
+    except Exception:
+        return False
+
+
+def _windows_console_input_safe_mode():
+    """
+    Best-effort para consola Windows:
+    desactiva QuickEdit para evitar congelamientos por selección accidental.
+    """
+    try:
+        if os.name != "nt":
+            return
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        h_stdin = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        if h_stdin in (None, 0):
+            return
+        mode = ctypes.c_uint()
+        if not kernel32.GetConsoleMode(h_stdin, ctypes.byref(mode)):
+            return
+        ENABLE_QUICK_EDIT_MODE = 0x0040
+        ENABLE_EXTENDED_FLAGS = 0x0080
+        new_mode = (mode.value | ENABLE_EXTENDED_FLAGS) & ~ENABLE_QUICK_EDIT_MODE
+        kernel32.SetConsoleMode(h_stdin, new_mode)
+    except Exception:
+        pass
 
 # --- Objetivos / umbrales globales de IA ---
 IA_OBJETIVO_REAL_THR = 0.75   # objetivo de calidad REAL (meta: 75% aprox)
@@ -299,6 +333,8 @@ LXV_4V2X_ENABLE = True
 LXV_4V2X_REAL_SOURCE = "LXV_4V2X"
 LXV_4V2X_REQUIRE_DATA_QUALITY_OK = True
 LXV_4V2X_REQUIRE_ROUND_COMPLETE = True
+MANUAL_REAL_ROUTE_ENABLE = True
+MANUAL_REAL_REQUIRE_CONFIRM_RISK = False
 
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
 # Esto es lo que querías: contar cierres desde 60% sin afectar la operativa.
@@ -665,6 +701,8 @@ def _purificacion_real_activa() -> bool:
             allowed_sources.add(allow_5v1x)
         if bool(globals().get("LXV_4V2X_ENABLE", False)):
             allowed_sources.add(allow_4v2x)
+        if bool(globals().get("MANUAL_REAL_ROUTE_ENABLE", False)):
+            allowed_sources.add("MANUAL")
         if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and route_src in allowed_sources:
             try:
                 _lxv_5v1x_event_cooldown(
@@ -3888,6 +3926,21 @@ def _ack_live_calc_summary(rows_pack):
     }
 
 
+def _fmt_estado_round_live(estado_visual: str, estado_base: str = "") -> str:
+    try:
+        ev = str(estado_visual or "").strip()
+        eb = str(estado_base or "").strip().lower()
+        evl = ev.lower()
+        alert_closed = evl.startswith("closed⚠") or evl.startswith("closed‼")
+        if (not alert_closed) and (eb == "closed") and (("⚠" in ev) or ("‼" in ev)):
+            alert_closed = True
+        if alert_closed:
+            return Fore.RED + Style.BRIGHT + "\033[5m🔴 ES HORA DE INVERTIR\033[0m" + Style.RESET_ALL
+        return ev if ev else str(estado_base or "--")
+    except Exception:
+        return str(estado_visual or estado_base or "--")
+
+
 def _ack_live_format_lines(snapshot):
     rows_pack = _ack_live_build_rows()
     summary = _ack_live_calc_summary(rows_pack)
@@ -3934,8 +3987,10 @@ def _ack_live_format_lines(snapshot):
             else:
                 ciclo_txt = "--"
 
-        estado_txt = str(row.get("estado_visual", row.get("estado", "--")))[:10]
-        lines.append(f"{bot:<7}  {ack_txt:<5} {gap_txt:<4} {res_txt:<4} {age_txt:<6} {ciclo_txt:<6} {estado_txt:<10}")
+        estado_raw = str(row.get("estado_visual", row.get("estado", "--")))
+        estado_fmt = _fmt_estado_round_live(estado_raw, str(row.get("estado", "--")))
+        estado_txt = _ack_tape_pad_visible(estado_fmt, 24)
+        lines.append(f"{bot:<7}  {ack_txt:<5} {gap_txt:<4} {res_txt:<4} {age_txt:<6} {ciclo_txt:<6} {estado_txt}")
 
     botx = summary.get("bot_x_actual") or "-"
     resumen = (
@@ -5512,6 +5567,8 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY") -> bool
         allow_sources.add(allow_5v1x)
     if bool(globals().get("LXV_4V2X_ENABLE", False)):
         allow_sources.add(allow_4v2x)
+    if bool(globals().get("MANUAL_REAL_ROUTE_ENABLE", False)):
+        allow_sources.add("MANUAL")
     if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and src not in allow_sources:
         agregar_evento(
             f"🧊 REAL source rechazada: {src} (permitidas={','.join(sorted(allow_sources))})."
@@ -15160,6 +15217,8 @@ def mostrar_ia_resumen_compacto():
 
 
 def mostrar_panel_lateral_compacto():
+    if not bool(globals().get("HUD_SHOW_CONTROL_PANEL", False)):
+        return []
     token_file = leer_token_actual()
     token_hud = "DEMO" if (token_file in (None, "none")) else f"REAL:{token_file}"
     activo_real = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else next((b for b in BOT_NAMES if estado_bots[b]["token"] == "REAL"), None)
@@ -15244,6 +15303,10 @@ def mostrar_panel_teclado_activo(bot, rest_s, max_ciclos, ciclo_actual="C1", fue
     rest = max(0, int(rest_s or 0))
     ciclo_txt = str(ciclo_actual or "C1")
     src_txt = str(fuente or "--")
+    if not bool(globals().get("HUD_SHOW_CONTROL_PANEL", False)):
+        return [
+            f"⌨️ MANUAL REAL | Bot={bot_txt} | Ciclo sugerido={ciclo_txt} | Fuente={src_txt} | Elige ciclo [1..{int(max_ciclos)}] | ESC cancela | {rest}s"
+        ]
     estado_txt = f"Tiempo para decidir : {rest:>3}s" if rest > 0 else "Estado            : decisión cerrada / orden enviada"
     return [
         "╔══════════════════════════════════════════════╗",
@@ -16370,7 +16433,9 @@ def mostrar_panel():
     if HUD_VISIBLE and (not bool(globals().get("HUD_MERGE_SIDE_PANELS", True))):
         dibujar_hud_gatewin(len(panel_lines), HUD_LAYOUT)
     def _strip_ansi(s: str) -> str:
-        return re.sub(r'\x1b\[[0-9;]*m', '', s)
+        return re.sub(r'\x1b\[[0-9;]*m', '', str(s))
+    if not panel_lines:
+        return
     panel_width = max(len(_strip_ansi(l)) for l in panel_lines)
     panel_height = len(panel_lines)
     try:
@@ -16651,8 +16716,10 @@ def forzar_real_manual(bot: str, ciclo: int):
     try:
         ciclo = max(1, min(int(ciclo), MAX_CICLOS))
 
-        # Añadido: Confirmación en rojo si no es seguro (para evitar cierres forzados por malas decisiones)
-        CONFIRMAR_EN_ROJO = True  # Activado por defecto para seguridad
+        # Confirmación opcional para MANUAL (override configurable)
+        CONFIRMAR_EN_ROJO = bool(globals().get("MANUAL_REAL_REQUIRE_CONFIRM_RISK", False))
+        if not condiciones_seguras_para(bot):
+            agregar_evento(f"⚠️ MANUAL REAL override: {bot.upper()} C{int(ciclo)} forzado por teclado aunque condiciones_seguras=no.")
         if CONFIRMAR_EN_ROJO and HAVE_MSVCRT and not condiciones_seguras_para(bot):
             global MODAL_ACTIVO
             MODAL_ACTIVO = True
@@ -16717,8 +16784,7 @@ def forzar_real_manual(bot: str, ciclo: int):
 
         # escribir_orden_real(...) ya dejó token+HUD sincronizados; evitamos doble token_sync.
         agregar_evento(f"⚡ Forzar REAL: {bot} → ciclo #{ciclo} (fuente=MANUAL)")
-        with RENDER_LOCK:
-            mostrar_panel()
+        _safe_render_keyboard_panel()
     except Exception as e:
         agregar_evento(f"⛔ Forzar REAL falló en {bot}: {e}")
     finally:
@@ -18844,6 +18910,18 @@ def inicializar_saldo_real(valor):
     SALDO_INICIAL = round(valor, 2)
     META = round(SALDO_INICIAL * 1.20, 2)
 
+
+def _safe_render_keyboard_panel():
+    try:
+        with RENDER_LOCK:
+            mostrar_panel()
+    except Exception as e:
+        try:
+            agregar_evento(f"⚠️ Teclado/HUD: render omitido por error recuperado: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+
+
 # Escuchar teclas
 def escuchar_teclas():
     global pausado, salir, reinicio_manual, LIMPIEZA_PANEL_HASTA, HUD_VISIBLE
@@ -18853,83 +18931,102 @@ def escuchar_teclas():
     last_key_time = 0  # debounce 200 ms
 
     while True:
-        if MODAL_ACTIVO:
-            time.sleep(0.1); continue
+        try:
+            if MODAL_ACTIVO:
+                time.sleep(0.1); continue
 
-        now = time.time()
-        if HAVE_MSVCRT and msvcrt.kbhit():
-            if now - last_key_time < 0.2:
-                time.sleep(0.05); continue
-            last_key_time = now
+            now = time.time()
+            if HAVE_MSVCRT and msvcrt.kbhit():
+                if now - last_key_time < 0.2:
+                    time.sleep(0.05); continue
+                last_key_time = now
 
-            try:
-                k = msvcrt.getch()
-                if k in (b'\x00', b'\xe0'):  
-                    msvcrt.getch(); continue
-                k = k.decode("utf-8", errors="ignore").lower()
-            except:
-                continue
-
-            if k == "s":
-                print("\n\n🔴 Saliendo del programa..."); salir = True; break
-            elif k == "p":
-                pausado = True; print("\n⏸️ Programa pausado. Presiona [C] para continuar.")
-            elif k == "c":
-                pausado = False; print("\n▶️ Programa reanudado.")
-            elif k == "r":
-                reinicio_manual = True; print("\n🔁 Reinicio de Martingala solicitado.")
-            elif k == "t":
-                tok = leer_token_actual(); print(f"\n🔍 TOKEN ACTUAL: {tok or 'none'}")
-            elif k == "l":
-                LIMPIEZA_PANEL_HASTA = time.time() + 15; print("\n🎹 Limpieza visual…")
-            elif k == "d":
-                reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True); print("\n🧽 Limpieza dura ejecutada.")
-            elif k == "g":
-                reproducir_evento("test", es_demo=True, dentro_gatewin=True); print("\n🎵 Test de audio…")
-            elif k == "e":
                 try:
-                    # Cooldown anti-repetición (Windows repite tecla y entrena 2 veces)
-                    if "LAST_MANUAL_RETRAIN_TS" not in globals():
-                        globals()["LAST_MANUAL_RETRAIN_TS"] = 0.0
-                    nowt = time.time()
-                    if (nowt - float(globals()["LAST_MANUAL_RETRAIN_TS"])) < 30.0:
-                        agregar_evento("🧠 Entrenamiento ignorado (cooldown 30s).")
-                    else:
-                        globals()["LAST_MANUAL_RETRAIN_TS"] = nowt
-                        maybe_retrain(force=True)
-                        print("\n🧠 Entrenamiento forzado.")
-                except Exception as e:
-                    print(f"\n⚠️ No se pudo entrenar: {e}")
+                    k = msvcrt.getch()
+                    if k in (b'\x00', b'\xe0'):
+                        msvcrt.getch(); continue
+                    k = k.decode("utf-8", errors="ignore").lower()
+                except:
+                    continue
 
-            elif k in bot_map:
-                PENDIENTE_FORZAR_BOT = bot_map[k]
-                PENDIENTE_FORZAR_INICIO = time.time()
-                PENDIENTE_FORZAR_EXPIRA = PENDIENTE_FORZAR_INICIO + VENTANA_DECISION_IA_S
-                agregar_evento(f"🎯 Bot seleccionado: {PENDIENTE_FORZAR_BOT}. Elige ciclo [1..{MAX_CICLOS}] o ESC.")
-                with RENDER_LOCK:
-                    mostrar_panel()
+                if k == "s":
+                    print("\n\n🔴 Saliendo del programa..."); salir = True; break
+                elif k == "p":
+                    pausado = True; print("\n⏸️ Programa pausado. Presiona [C] para continuar.")
+                elif k == "c":
+                    pausado = False; print("\n▶️ Programa reanudado.")
+                elif k == "r":
+                    reinicio_manual = True; print("\n🔁 Reinicio de Martingala solicitado.")
+                elif k == "t":
+                    tok = leer_token_actual(); print(f"\n🔍 TOKEN ACTUAL: {tok or 'none'}")
+                elif k == "l":
+                    LIMPIEZA_PANEL_HASTA = time.time() + 15; print("\n🎹 Limpieza visual…")
+                elif k == "d":
+                    reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=True); print("\n🧽 Limpieza dura ejecutada.")
+                elif k == "g":
+                    reproducir_evento("test", es_demo=True, dentro_gatewin=True); print("\n🎵 Test de audio…")
+                elif k == "e":
+                    try:
+                        # Cooldown anti-repetición (Windows repite tecla y entrena 2 veces)
+                        if "LAST_MANUAL_RETRAIN_TS" not in globals():
+                            globals()["LAST_MANUAL_RETRAIN_TS"] = 0.0
+                        nowt = time.time()
+                        if (nowt - float(globals()["LAST_MANUAL_RETRAIN_TS"])) < 30.0:
+                            agregar_evento("🧠 Entrenamiento ignorado (cooldown 30s).")
+                        else:
+                            globals()["LAST_MANUAL_RETRAIN_TS"] = nowt
+                            maybe_retrain(force=True)
+                            print("\n🧠 Entrenamiento forzado.")
+                    except Exception as e:
+                        print(f"\n⚠️ No se pudo entrenar: {e}")
 
-            elif PENDIENTE_FORZAR_BOT and k.isdigit() and k in [str(i) for i in range(1, MAX_CICLOS+1)]:
-                ciclo = int(k)
-                bot_sel = PENDIENTE_FORZAR_BOT
-                PENDIENTE_FORZAR_BOT = None
-                PENDIENTE_FORZAR_INICIO = 0.0
-                PENDIENTE_FORZAR_EXPIRA = 0.0
-                forzar_real_manual(bot_sel, ciclo)
+                elif k in bot_map:
+                    PENDIENTE_FORZAR_BOT = bot_map[k]
+                    PENDIENTE_FORZAR_INICIO = time.time()
+                    PENDIENTE_FORZAR_EXPIRA = PENDIENTE_FORZAR_INICIO + VENTANA_DECISION_IA_S
+                    agregar_evento(f"⌨️ MANUAL REAL: seleccionado {PENDIENTE_FORZAR_BOT.upper()}. Ahora presiona ciclo [1..{MAX_CICLOS}] o ESC.")
+                    _safe_render_keyboard_panel()
 
-            elif PENDIENTE_FORZAR_BOT and k == "\x1b":  # ESC
-                agregar_evento("❎ Forzar REAL cancelado.")
-                PENDIENTE_FORZAR_BOT = None
-                PENDIENTE_FORZAR_INICIO = 0.0
-                PENDIENTE_FORZAR_EXPIRA = 0.0
-                with RENDER_LOCK:
-                    mostrar_panel()
+                elif PENDIENTE_FORZAR_BOT and k.isdigit() and k in [str(i) for i in range(1, MAX_CICLOS+1)]:
+                    ciclo = int(k)
+                    bot_sel = PENDIENTE_FORZAR_BOT
+                    agregar_evento(f"⌨️ MANUAL REAL: enviando {bot_sel.upper()} a REAL en C{ciclo}.")
+                    PENDIENTE_FORZAR_BOT = None
+                    PENDIENTE_FORZAR_INICIO = 0.0
+                    PENDIENTE_FORZAR_EXPIRA = 0.0
+                    forzar_real_manual(bot_sel, ciclo)
 
-        else:
-            time.sleep(0.05)
+                elif PENDIENTE_FORZAR_BOT and k == "\x1b":  # ESC
+                    agregar_evento("❎ Forzar REAL cancelado.")
+                    PENDIENTE_FORZAR_BOT = None
+                    PENDIENTE_FORZAR_INICIO = 0.0
+                    PENDIENTE_FORZAR_EXPIRA = 0.0
+                    _safe_render_keyboard_panel()
 
-if sys.stdout.isatty():
-    threading.Thread(target=escuchar_teclas, daemon=True).start()
+            else:
+                time.sleep(0.05)
+        except Exception as e:
+            try:
+                agregar_evento(f"⚠️ Teclado recuperado tras error: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            time.sleep(0.20)
+
+if _keyboard_can_start():
+    try:
+        _windows_console_input_safe_mode()
+        threading.Thread(
+            target=escuchar_teclas,
+            daemon=True,
+            name="maestro-keyboard-listener",
+        ).start()
+        if KEYBOARD_DEBUG:
+            agregar_evento("⌨️ Teclado maestro activo.")
+    except Exception as e:
+        try:
+            agregar_evento(f"⚠️ Teclado maestro no pudo iniciar: {e}")
+        except Exception:
+            pass
 
 # Main - Añadida pasada inicial para sincronizar HUD con CSV existentes
 DIAGNOSTIC_MODE = ("--diagnostico" in sys.argv) or (os.getenv("MAESTRO_DIAGNOSTICO", "0") == "1")
