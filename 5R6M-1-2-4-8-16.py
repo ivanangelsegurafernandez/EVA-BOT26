@@ -248,6 +248,10 @@ HUD_SHOW_SALDO_DEBUG = False
 HUD_EVENT_MAX_CHARS = 150
 HUD_SHOW_CONTROL_PANEL = False
 ROUND_LIVE_INVEST_WINDOW_S = 45
+MANUAL_CONFIRM_TIMEOUT_S = 20
+MANUAL_REAL_DECISION_WINDOW_S = 35
+REAL_ORDER_TTL_S = 45
+REAL_CLOSE_MAX_AGE_S = 45
 KEYBOARD_ENABLE = True
 KEYBOARD_DEBUG = False
 
@@ -5194,7 +5198,14 @@ def _sync_round_tick_maestro():
             )
             if int(_LXV_LAST_EMITTED_ROUND or 0) != int(round_id):
                 ok_emit = False
-                if str(patron).upper() == "4V/2X" and bool(globals().get("LXV_4V2X_ENABLE", False)):
+                candidate_age = float(pick.get("edad_s") or pick.get("ack_age_s") or pick.get("age_s") or 0.0)
+                if not _real_candidate_age_ok({"edad_s": candidate_age}):
+                    _lxv_5v1x_event_cooldown(
+                        key=f"real_age_block:{round_id}",
+                        msg="⏱️ REAL bloqueado: cierre fuera de ventana útil (>45s).",
+                        cooldown_s=8.0,
+                    )
+                elif str(patron).upper() == "4V/2X" and bool(globals().get("LXV_4V2X_ENABLE", False)):
                     round_row, feat_row = _lxv_5v1x_get_exported_rows(int(round_id))
                     candidate = _lxv_4v2x_candidate_from_round(round_row, feat_row)
                     gate_ok, gate_reason = _lxv_4v2x_gate_ok(candidate)
@@ -5269,21 +5280,67 @@ def _sync_round_tick_maestro():
 
 _last_real_push_ts = {bot: 0.0 for bot in BOT_NAMES}
 
-def limpiar_orden_real(bot: str):
+def _orden_real_viva(payload: dict) -> bool:
+    try:
+        ts = float(payload.get("created_ts") or payload.get("ts") or 0.0)
+        ttl = float(payload.get("ttl_s") or REAL_ORDER_TTL_S)
+        if ts <= 0:
+            return False
+        return (time.time() - ts) <= ttl
+    except Exception:
+        return False
+
+
+def limpiar_orden_real(bot: str | None = None, reason: str = "manual_clear"):
     """
     Evita re-entradas fantasma:
     si se liberó REAL, la orden ya no debe quedar viva.
     """
-    try:
-        p = path_orden(bot)
-        if os.path.exists(p):
-            os.remove(p)
-    except Exception:
-        pass
+    targets = []
+    if bot in BOT_NAMES:
+        targets = [str(bot)]
+    else:
+        targets = [str(b) for b in BOT_NAMES]
+
+    for b in targets:
+        try:
+            payload = {
+                "bot": None,
+                "ciclo": None,
+                "source": None,
+                "created_ts": 0,
+                "ttl_s": REAL_ORDER_TTL_S,
+                "consumed": True,
+                "reason": reason,
+                "order_id": None,
+            }
+            _atomic_write(path_orden(b), json.dumps(payload, ensure_ascii=False, indent=2))
+        except Exception:
+            pass
     try:
         reconciliar_real_owner_ui("limpiar_orden_real")
     except Exception:
         pass
+
+
+def limpiar_orden_real_vencida(reason="ttl_vencido"):
+    try:
+        owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+        limpiar_orden_real(owner if owner in BOT_NAMES else None, reason=reason)
+    except Exception:
+        try:
+            for b in BOT_NAMES:
+                _atomic_write(path_orden(b), json.dumps({
+                    "bot": None,
+                    "ciclo": None,
+                    "source": None,
+                    "created_ts": 0,
+                    "ttl_s": REAL_ORDER_TTL_S,
+                    "consumed": True,
+                    "reason": reason,
+                }, ensure_ascii=False, indent=2))
+        except Exception:
+            pass
 
 def _set_ui_token_holder(holder: str | None):
     """
@@ -5358,9 +5415,13 @@ def _escribir_orden_real_raw(bot: str, ciclo: int):
     Escritura RAW de orden_real (sin activar_real_inmediato, sin recursión).
     """
     ciclo = max(1, min(int(ciclo), MAX_CICLOS))
-    payload = {"bot": bot, "ciclo": ciclo, "ts": time.time()}
+    payload = {"bot": bot, "ciclo": ciclo, "source": str(globals().get("_REAL_ROUTE_SOURCE", "LEGACY") or "LEGACY"), "ts": time.time(), "created_ts": time.time(), "ttl_s": REAL_ORDER_TTL_S, "order_id": None, "consumed": False}
     try:
-        _atomic_write(path_orden(bot), json.dumps(payload, ensure_ascii=False))
+        try:
+            payload["order_id"] = str(payload.get("order_id") or f"{payload.get('source', 'LEGACY')}:{bot}:C{ciclo}:{int(time.time()*1000)}")
+        except Exception:
+            payload["order_id"] = None
+        _atomic_write(path_orden(bot), json.dumps(payload, ensure_ascii=False, indent=2))
         agregar_evento(f"📝 Orden REAL escrita para {bot}: ciclo #{ciclo}")
     except Exception as e:
         try:
@@ -5402,7 +5463,7 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
                 pass
             try:
                 if origen == "orden_real":
-                    limpiar_orden_real(bot)
+                    limpiar_orden_real(bot, reason="real_cerrado")
             except Exception:
                 pass
             return False
@@ -5450,7 +5511,7 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
                     agregar_evento("⚠️ Token REAL no escrito: lock real.lock ocupado. Se evita activar sin exclusión.")
                     try:
                         if origen == "orden_real":
-                            limpiar_orden_real(bot)
+                            limpiar_orden_real(bot, reason="real_cerrado")
                     except Exception:
                         pass
                     return False
@@ -5459,7 +5520,7 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
                     agregar_evento("⚠️ Token REAL no escrito: fallo de persistencia en token_actual.txt.")
                     try:
                         if origen == "orden_real":
-                            limpiar_orden_real(bot)
+                            limpiar_orden_real(bot, reason="real_cerrado")
                     except Exception:
                         pass
                     return False
@@ -5620,12 +5681,34 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
     return ok
 # === FIN PATCH REAL INMEDIATO ===
 
+def _real_candidate_age_ok(row_or_candidate) -> bool:
+    try:
+        age = None
+        if isinstance(row_or_candidate, dict):
+            for k in ("edad_s", "age_s", "ack_age_s", "close_age_s"):
+                if row_or_candidate.get(k) is not None:
+                    age = float(row_or_candidate.get(k))
+                    break
+        if age is None:
+            return False
+        return 0.0 <= float(age) <= float(globals().get("REAL_CLOSE_MAX_AGE_S", 45))
+    except Exception:
+        return False
+
+
 def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY") -> bool:
     """
     Ruta única de emisión REAL cuando LXV_SYNC_REAL_ROUTE_ENABLE está activo.
     Conserva la infraestructura existente (orden_real/token/HUD), pero restringe la decisión.
     """
     src = str(source or "LEGACY").strip().upper()
+    try:
+        prev_payload = _sync_round_safe_read_json(path_orden(str(bot))) or {}
+        if isinstance(prev_payload, dict) and prev_payload and (not _orden_real_viva(prev_payload)):
+            limpiar_orden_real_vencida(reason="ttl_vencido")
+            agregar_evento("⏱️ Orden REAL vieja ignorada por TTL.")
+    except Exception:
+        pass
     allow_sync = str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper()
     allow_5v1x = str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X")).upper()
     allow_4v2x = str(globals().get("LXV_4V2X_REAL_SOURCE", "LXV_4V2X")).upper()
@@ -6018,7 +6101,7 @@ def cerrar_por_win(bot: str, reason: str):
 
     # Limpiar orden REAL para evitar re-entradas fantasma
     try:
-        limpiar_orden_real(bot)
+        limpiar_orden_real(bot, reason="real_cerrado")
     except Exception:
         pass
 
@@ -11489,7 +11572,7 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
 
     # Limpiar orden REAL para evitar re-entradas fantasma (igual que cerrar_por_win)
     try:
-        limpiar_orden_real(bot)
+        limpiar_orden_real(bot, reason="real_cerrado")
     except Exception:
         pass
 
@@ -11531,9 +11614,10 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
 
     try:
         for b in BOT_NAMES:
-            if b != bot and estado_bots.get(b, {}).get("token") == "REAL":
-                estado_bots[b]["token"] = "DEMO"
+            if b != bot:
                 estado_bots[b]["trigger_real"] = False
+                if estado_bots[b].get("token") == "REAL":
+                    estado_bots[b]["token"] = "DEMO"
     except Exception:
         pass
 
@@ -16904,13 +16988,12 @@ def set_main_loop(loop):
 
 # ==================== VENTANA DE DECISIÓN IA ====================
 # Debe empatar con el BOT (VENTANA_DECISION_IA_S) para que el humano alcance a elegir ciclo.
-VENTANA_DECISION_IA_S = 30
+VENTANA_DECISION_IA_S = 35
 
 PENDIENTE_FORZAR_BOT = None
 PENDIENTE_FORZAR_INICIO = 0.0
 PENDIENTE_FORZAR_EXPIRA = 0.0
 MANUAL_REAL_ALWAYS_CONFIRM = True
-MANUAL_CONFIRM_TIMEOUT_S = 20
 PENDIENTE_CONFIRMAR_REAL = {
     "active": False,
     "bot": None,
@@ -19367,7 +19450,7 @@ def escuchar_teclas():
                 elif k in bot_map:
                     PENDIENTE_FORZAR_BOT = bot_map[k]
                     PENDIENTE_FORZAR_INICIO = time.time()
-                    PENDIENTE_FORZAR_EXPIRA = PENDIENTE_FORZAR_INICIO + VENTANA_DECISION_IA_S
+                    PENDIENTE_FORZAR_EXPIRA = PENDIENTE_FORZAR_INICIO + MANUAL_REAL_DECISION_WINDOW_S
                     agregar_evento(
                         f"🎯 BOT ELEGIDO PARA REAL: {PENDIENTE_FORZAR_BOT.upper()}. "
                         f"Ahora elige ciclo [1..{MAX_CICLOS}] o ESC."
@@ -20246,7 +20329,7 @@ async def main():
                                     agregar_evento(f"🧠 Embudo IA (manual): ganador único={mejor_bot} | p_oper={prob*100:.1f}% | risk={emb.get('risk_mode','--')}")
                                     PENDIENTE_FORZAR_BOT = mejor_bot
                                     PENDIENTE_FORZAR_INICIO = ahora
-                                    PENDIENTE_FORZAR_EXPIRA = ahora + VENTANA_DECISION_IA_S
+                                    PENDIENTE_FORZAR_EXPIRA = ahora + MANUAL_REAL_DECISION_WINDOW_S
 
                                     # marcamos señal pendiente (sirve para contabilidad IA luego)
                                     estado_bots[mejor_bot]["ia_senal_pendiente"] = True
@@ -20254,7 +20337,7 @@ async def main():
 
                                     agregar_evento(
                                         f"🟢 Señal IA en {mejor_bot} ({prob*100:.1f}%). "
-                                        f"Tienes {VENTANA_DECISION_IA_S}s para elegir ciclo [1..{MAX_CICLOS}] o ESC."
+                                        f"Tienes {MANUAL_REAL_DECISION_WINDOW_S}s para elegir ciclo [1..{MAX_CICLOS}] o ESC."
                                     )
                         # ==================== /AUTO-PRESELECCIÓN ====================
 
@@ -20295,7 +20378,16 @@ async def main():
                                     if owner_prev and owner_prev != mejor_bot and ciclo_auto > 1:
                                         cerrar_por_fin_de_ciclo(owner_prev, f"Handoff rotación C{ciclo_auto}→{mejor_bot}")
 
-                                    ok_real = emitir_real_autorizado(mejor_bot, ciclo_auto, source="IA_AUTO")
+                                    age_ok = _real_candidate_age_ok({"edad_s": float(ev_lb or 0.0)})
+                                    if not age_ok:
+                                        _lxv_5v1x_event_cooldown(
+                                            key="real_age_block:auto",
+                                            msg="⏱️ REAL bloqueado: cierre fuera de ventana útil (>45s).",
+                                            cooldown_s=8.0,
+                                        )
+                                        ok_real = False
+                                    else:
+                                        ok_real = emitir_real_autorizado(mejor_bot, ciclo_auto, source="IA_AUTO")
                                     if ok_real:
                                         if estado_real == "SHADOW":
                                             try:
