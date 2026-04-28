@@ -340,6 +340,12 @@ LXV_4V2X_REQUIRE_DATA_QUALITY_OK = True
 LXV_4V2X_REQUIRE_ROUND_COMPLETE = True
 MANUAL_REAL_ROUTE_ENABLE = True
 MANUAL_REAL_REQUIRE_CONFIRM_RISK = False
+MANUAL_REAL_FORCE_BYPASS_FASE_ZV = False
+LXV_FASE_ZONA_VERDE_ENABLE = True
+LXV_FASE_MIN_COLUMNS = 3
+LXV_FASE_MAX_STREAK_VERDE_TEMPRANO = 3
+LXV_FASE_STREAK_VERDE_MADURO = 4
+LXV_FASE_LOG_COOLDOWN_S = 20.0
 
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
 # Esto es lo que querías: contar cierres desde 60% sin afectar la operativa.
@@ -2668,6 +2674,8 @@ _MARTI_HUD_DEMO_IGNORED_TS = {}
 _MATRIZ_STRICT_MODE_ANNOUNCED = False
 _FOLLOWUP_5V1X_EVENT_TS = {}
 _FOLLOWUP_5V1X_LAST_APPLIED = {}
+_LXV_FASE_ZV_EVENT_TS = {}
+_LXV_FASE_ZV_LAST_INFO = {"fase": "INSUFICIENTE", "allow_real": False, "g0": 0.0, "g1": 0.0, "g2": 0.0, "verdes0": 0, "verdes1": 0, "verdes2": 0, "streak_verde": 0, "motivo": "init"}
 MATRIZ_COLUMNAS_LXV_CSV = "matriz_columnas_lxv.csv"
 MATRIZ_CELDAS_LXV_CSV = "matriz_celdas_lxv.csv"
 MATRIZ_FOLLOWUP_5V1X_CSV = "matriz_followup_5v1x.csv"
@@ -4690,6 +4698,8 @@ def _lxv_4v2x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         msg=f"🎯 4V2X detectado | ronda #{rid} | X débil={bot_pick} | REAL habilitado",
         cooldown_s=8.0,
     )
+    if not _fase_zv_gate_allow_real("LXV_4V2X", rid):
+        return False
     return bool(emitir_real_autorizado(
         bot_pick,
         int(ciclo_pick),
@@ -4994,6 +5004,83 @@ def _lxv_5v1x_mrv_gate_ok(candidate):
         PATTERN_COL_LAST_STATE["pattern_state"] = info["estado"]
         return False, "mrv_5v1x_error_seguro", info
 
+def evaluar_fase_zona_verde_lxv(rows=None):
+    base = {"fase": "INSUFICIENTE", "allow_real": False, "g0": 0.0, "g1": 0.0, "g2": 0.0, "verdes0": 0, "verdes1": 0, "verdes2": 0, "streak_verde": 0, "motivo": "insuficiente"}
+    try:
+        src_rows = list(rows) if isinstance(rows, list) else _lxv_5v1x_load_recent_matrix_rows(max_rows=40)
+        cols = []
+        for rr in src_rows:
+            if not isinstance(rr, dict):
+                continue
+            if not bool(rr.get("round_complete", False)):
+                continue
+            dq = str(rr.get("data_quality", "") or "").strip().lower()
+            if dq and dq != "ok":
+                continue
+            v = _mrv_5v1x_to_int(rr.get("n_verdes", -1), -1)
+            r = _mrv_5v1x_to_int(rr.get("n_rojos", -1), -1)
+            if v < 0 or r < 0 or (v + r) < 6:
+                continue
+            cols.append((v, r, float(v) / 6.0))
+        if len(cols) < int(globals().get("LXV_FASE_MIN_COLUMNS", 3)):
+            return dict(base)
+        v0,r0,g0 = cols[-1]
+        v1,r1,g1 = cols[-2]
+        v2,r2,g2 = cols[-3]
+        d01 = g0 - g1
+        d12 = g1 - g2
+        streak=0
+        for v,r,g in reversed(cols):
+            if g >= (4.0/6.0): streak +=1
+            else: break
+        out = dict(base)
+        out.update({"g0":g0,"g1":g1,"g2":g2,"verdes0":v0,"verdes1":v1,"verdes2":v2,"streak_verde":int(streak),"fase":"NEUTRO","motivo":"neutral"})
+        if g0 >= (4.0/6.0) and g0 > g1 and (g1 <= (3.0/6.0) or g2 <= (3.0/6.0)):
+            out.update({"fase":"ENTRANDO_VERDE","allow_real":True,"motivo":"transicion_hacia_verde"})
+        elif (g1 >= (5.0/6.0) and g0 <= (4.0/6.0) and d01 < 0) or (g2 >= (5.0/6.0) and g1 >= (4.0/6.0) and g0 <= (4.0/6.0) and d01 < 0) or ((r0-r1)>=2 and g1 >= (4.0/6.0) and d01 < 0):
+            out.update({"fase":"SALIDA_VERDE","allow_real":False,"motivo":"saliendo_de_verde"})
+        elif (g0 <= (3.0/6.0) and d01 < 0) or (d01 < 0 and d12 < 0):
+            out.update({"fase":"ROJO_INICIANDO","allow_real":False,"motivo":"pendiente_roja"})
+        elif streak >= int(globals().get("LXV_FASE_STREAK_VERDE_MADURO", 4)) or (g0 >= (4.0/6.0) and d01 <= 0 and streak >= int(globals().get("LXV_FASE_MAX_STREAK_VERDE_TEMPRANO", 3))):
+            out.update({"fase":"VERDE_MADURO","allow_real":False,"motivo":"verde_cansado"})
+        elif g0 >= (4.0/6.0) and g1 >= (4.0/6.0) and d01 >= 0 and streak <= int(globals().get("LXV_FASE_MAX_STREAK_VERDE_TEMPRANO", 3)):
+            out.update({"fase":"VERDE_TEMPRANO","allow_real":True,"motivo":"verde_temprano"})
+        return out
+    except Exception as e:
+        base["fase"] = "NEUTRO"
+        base["motivo"] = f"error:{type(e).__name__}"
+        return base
+
+def _fase_zv_gate_allow_real(origen="LXV", rid=0):
+    global _LXV_FASE_ZV_LAST_INFO
+    info = evaluar_fase_zona_verde_lxv()
+    _LXV_FASE_ZV_LAST_INFO = dict(info)
+    if not bool(globals().get("LXV_FASE_ZONA_VERDE_ENABLE", True)):
+        return True
+    gtxt = f"g0={int(info.get('verdes0',0))}/6 g1={int(info.get('verdes1',0))}/6 g2={int(info.get('verdes2',0))}/6"
+    if bool(info.get("allow_real", False)):
+        _lxv_5v1x_event_cooldown(key=f"fasezv_ok:{origen}:{rid}:{info.get('fase')}", msg=f"✅ FASE_ZV OK: {info.get('fase')} {gtxt}", cooldown_s=float(globals().get("LXV_FASE_LOG_COOLDOWN_S", 20.0)))
+        return True
+    msg = f"⛔ FASE_ZV BLOQUEA REAL: {info.get('fase')} {gtxt}"
+    if str(info.get('fase')) == 'VERDE_MADURO':
+        msg = f"⛔ FASE_ZV BLOQUEA REAL: VERDE_MADURO streak={int(info.get('streak_verde',0))}"
+    _lxv_5v1x_event_cooldown(key=f"fasezv_block:{origen}:{rid}:{info.get('fase')}", msg=msg, cooldown_s=float(globals().get("LXV_FASE_LOG_COOLDOWN_S", 20.0)))
+    return False
+
+def _debug_test_fase_zona_verde_lxv():
+    if not bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False)):
+        return
+    cases = [
+        ([(2,4),(3,3),(4,2)], True),
+        ([(3,3),(4,2),(5,1)], True),
+        ([(6,0),(5,1),(4,2)], False),
+        ([(5,1),(4,2),(3,3)], False),
+        ([(4,2),(4,2),(4,2),(4,2)], False),
+    ]
+    for i,(vals,allow) in enumerate(cases,1):
+        rows=[{"round_complete":True,"data_quality":"ok","n_verdes":v,"n_rojos":r} for v,r in vals]
+        got=evaluar_fase_zona_verde_lxv(rows)
+        _lxv_5v1x_event_cooldown(key=f"fasezv_test:{i}", msg=f"🧪 FASE_ZV TEST{i}: fase={got.get('fase')} allow={got.get('allow_real')}", cooldown_s=60.0)
 def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     bot_pick = _lxv_5v1x_pick_real_bot(candidate)
     if not bot_pick:
@@ -5057,6 +5144,8 @@ def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         msg=f"🎯 5V1X detectado | ronda #{rid} | X única={bot_pick} | REAL habilitado",
         cooldown_s=8.0,
     )
+    if not _fase_zv_gate_allow_real("LXV_5V1X", rid):
+        return False
     return bool(emitir_real_autorizado(
         bot_pick,
         int(ciclo_pick),
@@ -5273,7 +5362,7 @@ def _sync_round_tick_maestro():
                         )
                         ok_emit = False
                 else:
-                    ok_emit = emitir_real_autorizado(bot_pick, ciclo_pick, source=LXV_SYNC_REAL_SOURCE)
+                    ok_emit = bool(_fase_zv_gate_allow_real("LXV_SYNC", round_id)) and emitir_real_autorizado(bot_pick, ciclo_pick, source=LXV_SYNC_REAL_SOURCE)
                 _LXV_LAST_EMITTED_ROUND = int(round_id) if ok_emit else int(_LXV_LAST_EMITTED_ROUND or 0)
                 if ok_emit:
                     try:
@@ -15850,6 +15939,13 @@ def mostrar_panel():
         top_lines = list(_resumen_top_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str) or [])
         for _line in top_lines[1:]:
             print(padding + Fore.CYAN + _line)
+        fi = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
+        fase = str(fi.get("fase", "INSUFICIENTE"))
+        v0 = int(fi.get("verdes0", 0) or 0)
+        arrow = "↑" if bool(fi.get("allow_real", False)) else "↓"
+        bloq = "" if bool(fi.get("allow_real", False)) else " BLOQ"
+        ftxt = f"FASE ZV: {fase} {v0}/6 {arrow}{bloq}"
+        print(padding + Fore.CYAN + ftxt[:35])
     except Exception:
         pass
 
@@ -17471,6 +17567,12 @@ def forzar_real_manual(bot: str, ciclo: int):
         global marti_paso
         marti_paso = ciclo - 1
         _set_real_manual_alert(bot, ciclo, "MANUAL")
+        if bool(globals().get("MANUAL_REAL_ROUTE_ENABLE", True)) and (not bool(globals().get("MANUAL_REAL_FORCE_BYPASS_FASE_ZV", False))):
+            if not _fase_zv_gate_allow_real("MANUAL", 0):
+                fi = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
+                agregar_evento(f"⛔ REAL BLOQUEADO por FASE_ZV: fase={fi.get('fase')} g0={int(fi.get('verdes0',0))}/6 g1={int(fi.get('verdes1',0))}/6 motivo={fi.get('motivo')}")
+                _set_real_manual_alert(None)
+                return False
         agregar_evento(f"🟢 MANUAL REAL CONFIRMADO: {bot.upper()} entra a REAL en C{int(ciclo)}.")
         try:
             _sync_round_tick_maestro()
