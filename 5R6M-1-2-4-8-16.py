@@ -4165,14 +4165,37 @@ def _ack_live_format_lines(snapshot):
         lines.append("Los símbolos LIVE ACK 80 son historial; REAL solo evalúa ROUND LIVE cerrado.")
     else:
         lines.append(f"✅ Columna objetivo lista #{obj_round}: evaluando patrón LXV")
+        info_fase = {}
+        try:
+            info_fase = evaluar_fase_zona_verde_lxv(round_id_objetivo=obj_round) or {}
+        except Exception:
+            info_fase = {}
+        fase = str(info_fase.get("fase", "DESCONOCIDA"))
+        allow = bool(info_fase.get("allow_real", False))
+        motivo = str(info_fase.get("motivo", "sin_motivo"))
+        cols_ok = int(info_fase.get("cols_ok", 0) or 0)
+        cols_need = int(info_fase.get("cols_need", 3) or 3)
+        if fase == "INSUFICIENTE":
+            fase_line = (
+                f"FASE_ZV ahora: {fase} | allow={'SI' if allow else 'NO'} | "
+                f"cols={cols_ok}/{cols_need} | g0={int(info_fase.get('verdes0',0))}/6 | motivo={motivo}"
+            )
+        else:
+            fase_line = (
+                f"FASE_ZV ahora: {fase} | allow={'SI' if allow else 'NO'} | "
+                f"g0={int(info_fase.get('verdes0',0))}/6 g1={int(info_fase.get('verdes1',0))}/6 "
+                f"g2={int(info_fase.get('verdes2',0))}/6 | motivo={motivo}"
+            )
         if parcial_txt == "5V1X" and botx != "-":
-            lines.append(f"🎯 5V1X listo: única X={botx} | esperando FASE_ZV")
+            lines.append(f"🎯 5V1X listo: única X={botx}")
+            lines.append(fase_line)
         elif parcial_txt == "4V2X":
             x_bots = [str(r.get("bot") or "") for r in rows if bool(r.get("is_current")) and str(r.get("res")) == "X"]
             rojos_rows = [{"bot": b} for b in x_bots if b in BOT_NAMES]
             pick = _lxv_pick_bot_x_debil(rojos_rows) if rojos_rows else None
             bot_pick = str((pick or {}).get("bot", "") or (x_bots[0] if x_bots else "-"))
-            lines.append(f"🎯 4V2X listo: X menor Prob IA={bot_pick} | esperando FASE_ZV")
+            lines.append(f"🎯 4V2X listo: X menor Prob IA={bot_pick}")
+            lines.append(fase_line)
 
     if summary.get("all_prev_waiting", False) and bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False)):
         lines.append("↳ Esperando cierres de ronda objetivo; los ACK visibles aún pertenecen a ronda previa.")
@@ -5547,6 +5570,16 @@ def _sync_round_tick_maestro():
     if not expected:
         expected = list(BOT_NAMES)
 
+    hold_status = str(st.get("status", "")).strip().lower()
+    hold_bot = str(st.get("real_pending_bot", "")).strip()
+    if hold_status == "holding_real_result" and hold_bot in BOT_NAMES:
+        _lxv_5v1x_event_cooldown(
+            key=f"sync_hold_real:{round_id}:{hold_bot}",
+            msg=f"⏸️ ROUND HOLD: esperando cierre REAL de {hold_bot} en ronda #{round_id}",
+            cooldown_s=8.0,
+        )
+        return
+
     if _SYNC_ROUND_LAST_ANNOUNCED != round_id:
         agregar_evento(f"🧭 LXV_SYNC_COLUMN ronda #{round_id} iniciada ({len(expected)} bots esperados).")
         _SYNC_ROUND_LAST_ANNOUNCED = round_id
@@ -5633,27 +5666,26 @@ def _sync_round_tick_maestro():
     completed_normal = bool(n_closed >= len(expected))
     completed_failsafe = bool(stale_ignored and n_closed >= effective_need)
     completed = bool(completed_normal or completed_failsafe)
-    next_round = round_id + 1 if completed else round_id
-    next_released = max(released_round, next_round if completed else released_round)
-
     payload = {
-        "round_id": next_round if completed else round_id,
-        "released_round": next_released,
+        "round_id": round_id,
+        "released_round": released_round,
         "expected_bots": expected,
         "expected_bots_effective": effective_expected,
         "closed_bots": closed,
         "completed": completed,
-        "status": "released_failsafe" if completed_failsafe else ("released" if completed else "waiting_closures"),
-        "reason": "failsafe_stale_or_timeout" if completed_failsafe else ("all_bots_closed" if completed else "waiting_bots"),
+        "status": "waiting_closures",
+        "reason": "waiting_bots",
         "bots_missing": missing,
         "bots_stale_ignored": stale_ignored,
         "round_wait_s": float(wait_s),
-        "started_at": float(time.time()) if completed else float(started_at),
+        "started_at": float(started_at),
         "ts": time.time(),
     }
-    _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+    real_emitido = False
+    real_hold_bot = None
 
     if completed:
+        next_round = round_id + 1
         if completed_failsafe and stale_ignored:
             agregar_evento(f"🟠 LXV_SYNC_COLUMN failsafe: liberando ronda #{round_id} sin {stale_ignored} por stale/timeout.")
         agregar_evento(f"✅ LXV_SYNC_COLUMN columna/ronda #{round_id} COMPLETA.")
@@ -5661,7 +5693,6 @@ def _sync_round_tick_maestro():
         # Esto NO habilita REAL con columna parcial; los gates 5V1X/4V2X siguen exigiendo ronda completa/calidad ok.
         expected_for_cache = effective_expected if completed_failsafe else expected
         _lxv_fase_cache_add(round_id, closed, expected_for_cache)
-        agregar_evento(f"🚀 LXV_SYNC_COLUMN ronda #{next_round} LIBERADA.")
         _lxv_export_round_snapshot(
             round_id=int(round_id),
             ts_round=float(now_ts),
@@ -5797,6 +5828,8 @@ def _sync_round_tick_maestro():
                 if ok_emit:
                     _lxv_mark_real_round_emitted(round_id)
                 if ok_emit:
+                    real_emitido = True
+                    real_hold_bot = str(bot_pick)
                     try:
                         estado_bots[bot_pick]["ciclo_actual"] = int(ciclo_pick)
                     except Exception:
@@ -5818,7 +5851,59 @@ def _sync_round_tick_maestro():
                     _sync_round_write_json_atomic(ack_path, ack_cur)
             except Exception:
                 pass
+    if completed:
+        if real_emitido and real_hold_bot in BOT_NAMES:
+            payload["round_id"] = round_id
+            payload["released_round"] = round_id
+            payload["completed"] = True
+            payload["status"] = "holding_real_result"
+            payload["reason"] = "waiting_real_result"
+            payload["real_pending_bot"] = real_hold_bot
+            payload["real_pending_round"] = round_id
+            payload["real_pending_since"] = float(time.time())
+            payload["ts"] = time.time()
+            _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+            agregar_evento(f"⏸️ LXV_SYNC_COLUMN HOLD: REAL activo en {real_hold_bot}; esperando resultado antes de liberar ronda #{next_round}")
+        else:
+            payload["round_id"] = next_round
+            payload["released_round"] = next_round
+            payload["completed"] = True
+            payload["status"] = "released_failsafe" if completed_failsafe else "released"
+            payload["reason"] = "failsafe_stale_or_timeout" if completed_failsafe else "all_bots_closed_no_real"
+            payload["started_at"] = float(time.time())
+            payload["ts"] = time.time()
+            _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+            agregar_evento(f"🚀 LXV_SYNC_COLUMN ronda #{next_round} LIBERADA.")
+    else:
+        _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
 # === /LXV_SYNC_COLUMN ===
+
+def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") -> None:
+    st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+    if str(st.get("status", "")).strip().lower() != "holding_real_result":
+        return
+    try:
+        old_round = max(1, int(st.get("round_id", 1) or 1))
+    except Exception:
+        old_round = 1
+    next_round = old_round + 1
+    payload = {
+        "round_id": next_round,
+        "released_round": next_round,
+        "expected_bots": list(BOT_NAMES),
+        "expected_bots_effective": list(BOT_NAMES),
+        "closed_bots": {},
+        "completed": False,
+        "status": "released_after_real_result",
+        "reason": str(reason or "real_closed"),
+        "real_pending_bot": None,
+        "real_pending_round": old_round,
+        "real_released_after_bot": str(bot),
+        "started_at": float(time.time()),
+        "ts": float(time.time()),
+    }
+    _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+    agregar_evento(f"🚀 ROUND LIVE liberado tras cierre REAL: bot={bot} -> ronda #{next_round}")
 
 # === PATCH: REAL INMEDIATO EN HUD AL EMITIR ORDEN (sin esperar compra) ===
 # Objetivo:
@@ -20956,6 +21041,7 @@ async def main():
                                 elif (ahora - first_warn) > REAL_STUCK_FORCE_RELEASE_S:
                                     agregar_evento(f"🧯 Timeout REAL en {bot}: sin cierre confirmado. Liberando a DEMO sin avanzar martingala.")
                                     cerrar_por_fin_de_ciclo(bot, "Timeout sin cierre")
+                                    _sync_round_release_after_real_close(bot, reason="real_timeout")
                                     activo_real = None
                                     break
 
@@ -21010,6 +21096,7 @@ async def main():
                                         cerrar_por_fin_de_ciclo(bot, "Ganancia en REAL (fin de turno)")
                                     else:
                                         cerrar_por_fin_de_ciclo(bot, "Pérdida en REAL (fin de turno)")
+                                    _sync_round_release_after_real_close(bot, reason=f"real_{str(res).lower()}")
                                     activo_real = None
                                     break
 
