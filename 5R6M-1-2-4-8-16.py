@@ -3988,9 +3988,9 @@ def _sync_round_manual_status() -> dict:
 
 def _round_live_estado_display(row: dict) -> str:
     """
-    ROUND LIVE solo muestra 2 estados visuales:
+    ROUND LIVE muestra estados visuales de cierre/espera:
     1) waiting
-    2) 🔴 ES HORA DE INVERTIR
+    2) cierre reciente (✓/X/cerrado)
 
     Esta función NO modifica datos internos.
     Solo transforma la fila en texto visual.
@@ -4037,7 +4037,11 @@ def _round_live_estado_display(row: dict) -> str:
         window_s = float(globals().get("ROUND_LIVE_INVEST_WINDOW_S", 45) or 45)
 
         if is_current and is_closed and 0.0 <= float(edad_s) <= window_s:
-            return Fore.RED + Style.BRIGHT + "🔴 ES HORA DE INVERTIR" + Style.RESET_ALL
+            if res == "X":
+                return Fore.RED + Style.BRIGHT + "X reciente" + Style.RESET_ALL
+            if res == "✓":
+                return Fore.GREEN + Style.BRIGHT + "✓ reciente" + Style.RESET_ALL
+            return Fore.CYAN + Style.BRIGHT + "cerrado reciente" + Style.RESET_ALL
 
         return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
 
