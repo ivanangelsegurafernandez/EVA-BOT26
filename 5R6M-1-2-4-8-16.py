@@ -339,6 +339,7 @@ LXV_4V2X_ENABLE = True
 LXV_4V2X_REAL_SOURCE = "LXV_4V2X"
 LXV_4V2X_REQUIRE_DATA_QUALITY_OK = True
 LXV_4V2X_REQUIRE_ROUND_COMPLETE = True
+LXV_BOTX_MAX_AGE_S = 90
 MANUAL_REAL_ROUTE_ENABLE = True
 MANUAL_REAL_REQUIRE_CONFIRM_RISK = False
 MANUAL_REAL_FORCE_BYPASS_FASE_ZV = True
@@ -4801,6 +4802,17 @@ def _lxv_4v2x_pick_real_bot(candidate: dict | None) -> str | None:
     bot = str((candidate or {}).get("bot_x_debil", "") or "").strip()
     return bot if bot in BOT_NAMES else None
 
+def _lxv_fmt_prob_pct(p) -> str:
+    try:
+        x = float(p)
+        if not math.isfinite(x):
+            return "--"
+        if 0.0 <= x <= 1.0:
+            x *= 100.0
+        return f"{x:.1f}%"
+    except Exception:
+        return "--"
+
 def _lxv_4v2x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     bot_pick = _lxv_4v2x_pick_real_bot(candidate)
     rid = int((candidate or {}).get("round_id", 0) or 0)
@@ -4823,7 +4835,7 @@ def _lxv_4v2x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         key=f"4v2x_pick:{rid}",
         msg=(
             f"🎯 4V2X candidato | ronda #{rid} | "
-            f"Xs: {(candidate or {}).get('bot_x1')}={float(p1):.1f}%, {(candidate or {}).get('bot_x2')}={float(p2):.1f}% | "
+            f"Xs: {(candidate or {}).get('bot_x1')}={_lxv_fmt_prob_pct(p1)}, {(candidate or {}).get('bot_x2')}={_lxv_fmt_prob_pct(p2)} | "
             f"elegida={bot_pick} | esperando FASE_ZV"
         ) if (p1 is not None and p2 is not None) else f"🎯 4V2X candidato | ronda #{rid} | X débil={bot_pick} | esperando FASE_ZV",
         cooldown_s=8.0,
@@ -5645,7 +5657,10 @@ def _sync_round_tick_maestro():
         if completed_failsafe and stale_ignored:
             agregar_evento(f"🟠 LXV_SYNC_COLUMN failsafe: liberando ronda #{round_id} sin {stale_ignored} por stale/timeout.")
         agregar_evento(f"✅ LXV_SYNC_COLUMN columna/ronda #{round_id} COMPLETA.")
-        _lxv_fase_cache_add(round_id, closed, expected)
+        # FASE_ZV puede usar effective_expected para tendencia en rondas failsafe.
+        # Esto NO habilita REAL con columna parcial; los gates 5V1X/4V2X siguen exigiendo ronda completa/calidad ok.
+        expected_for_cache = effective_expected if completed_failsafe else expected
+        _lxv_fase_cache_add(round_id, closed, expected_for_cache)
         agregar_evento(f"🚀 LXV_SYNC_COLUMN ronda #{next_round} LIBERADA.")
         _lxv_export_round_snapshot(
             round_id=int(round_id),
@@ -5701,11 +5716,13 @@ def _sync_round_tick_maestro():
                         msg=f"⏱️ REAL bloqueado: edad BotX no calculable | bot={bot_pick}",
                         cooldown_s=8.0,
                     )
-                elif not _real_candidate_age_ok({"edad_s": candidate_age}):
-                    motivo_no_emit = "botx_viejo"
+                elif not _real_candidate_age_ok_lxv({"edad_s": candidate_age}):
+                    max_age = float(globals().get("LXV_BOTX_MAX_AGE_S", REAL_CLOSE_MAX_AGE_S))
+                    motivo_no_emit = f"botx_viejo_{float(candidate_age):.1f}s_max{max_age:.0f}s"
+                    LXV_REAL_AUDIT["ultimo_bloqueo"] = motivo_no_emit
                     _lxv_5v1x_event_cooldown(
                         key=f"real_age_block:{round_id}",
-                        msg=f"⏱️ REAL bloqueado: BotX viejo edad={float(candidate_age):.1f}s | bot={bot_pick}",
+                        msg=f"⏱️ REAL bloqueado: BotX viejo edad={float(candidate_age):.1f}s max={max_age:.0f}s | bot={bot_pick}",
                         cooldown_s=8.0,
                     )
                 else:
@@ -5733,7 +5750,6 @@ def _sync_round_tick_maestro():
                                     fase = str(fi.get("fase", ""))
                                     if fase:
                                         motivo_no_emit = f"fase_zv_{fase}_{fi.get('motivo','')}"
-                                        LXV_REAL_AUDIT["fase_bloq"] = int(LXV_REAL_AUDIT.get("fase_bloq", 0) or 0) + 1
                                         LXV_REAL_AUDIT["ultimo_bloqueo"] = motivo_no_emit
                                     else:
                                         motivo_no_emit = "escribir_orden_real_fail"
@@ -5756,7 +5772,6 @@ def _sync_round_tick_maestro():
                                     fase = str(fi.get("fase", ""))
                                     if fase:
                                         motivo_no_emit = f"fase_zv_{fase}_{fi.get('motivo','')}"
-                                        LXV_REAL_AUDIT["fase_bloq"] = int(LXV_REAL_AUDIT.get("fase_bloq", 0) or 0) + 1
                                         LXV_REAL_AUDIT["ultimo_bloqueo"] = motivo_no_emit
                                     else:
                                         motivo_no_emit = "escribir_orden_real_fail"
@@ -5773,7 +5788,6 @@ def _sync_round_tick_maestro():
                             if not fase_sync_ok:
                                 fi = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
                                 motivo_no_emit = f"fase_zv_{fi.get('fase','INSUFICIENTE')}_{fi.get('motivo','sin_motivo')}"
-                                LXV_REAL_AUDIT["fase_bloq"] = int(LXV_REAL_AUDIT.get("fase_bloq", 0) or 0) + 1
                                 LXV_REAL_AUDIT["ultimo_bloqueo"] = motivo_no_emit
                             else:
                                 ok_emit = bool(emitir_real_autorizado(bot_pick, ciclo_pick, source=LXV_SYNC_REAL_SOURCE))
@@ -6254,6 +6268,13 @@ def _real_candidate_age_ok(row_or_candidate) -> bool:
         if age is None:
             return False
         return 0.0 <= float(age) <= float(globals().get("REAL_CLOSE_MAX_AGE_S", 45))
+    except Exception:
+        return False
+
+def _real_candidate_age_ok_lxv(pick: dict) -> bool:
+    try:
+        edad = float((pick or {}).get("edad_s", 0.0) or 0.0)
+        return edad <= float(globals().get("LXV_BOTX_MAX_AGE_S", REAL_CLOSE_MAX_AGE_S))
     except Exception:
         return False
 
@@ -18009,15 +18030,18 @@ def forzar_real_manual(bot: str, ciclo: int):
             except Exception:
                 pass
 
-        if not emitir_real_autorizado(bot, ciclo, source="MANUAL"):
+        ok_emit = bool(emitir_real_autorizado(bot, ciclo, source="MANUAL"))
+        if not ok_emit:
             _set_real_manual_alert(None)
-            agregar_evento(f"🔒 Forzar REAL bloqueado para {bot.upper()}: ya hay otro bot en REAL.")
-        _manual_key_audit(f"forzar_real_manual blocked_emit bot={bot} ciclo={ciclo}")
-        return False
+            agregar_evento(
+                f"🔒 Forzar REAL bloqueado para {bot.upper()}: ya hay otro bot en REAL o falló emisión."
+            )
+            _manual_key_audit(f"forzar_real_manual blocked_emit bot={bot} ciclo={ciclo}")
+            return False
 
         _set_real_manual_alert(bot, ciclo, "MANUAL")
         try:
-            REAL_OWNER_LOCK = bot
+            globals()["REAL_OWNER_LOCK"] = bot
         except Exception:
             pass
         try:
