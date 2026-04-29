@@ -4002,6 +4002,7 @@ def _ack_live_calc_summary(rows_pack):
         "reason_state": str(st.get("reason", "") or ""),
         "completed_state": bool(st.get("completed", False)),
         "real_pending_bot": str(st.get("real_pending_bot", "") or ""),
+        "real_pending_cycle": int(st.get("real_pending_cycle", 0) or 0),
     }
 
 
@@ -4127,6 +4128,7 @@ def _ack_live_format_lines(snapshot):
     lines.append(
         f"SYNC STATE | status={summary.get('status_state','')} | round={obj_round} | released={released_round} | completed={bool(summary.get('completed_state', False))} | reason={summary.get('reason_state','')} | pending={summary.get('real_pending_bot', '')}"
     )
+    lines.append(f"SYNC/HOLD | status={summary.get('status_state','')} | round={obj_round} | released={released_round} | real_bot={summary.get('real_pending_bot','')} | ciclo={summary.get('real_pending_cycle','')} | motivo={summary.get('reason_state','')}")
     lines.append("BOT      ACK   GAP  RES  EDAD   CICLO  DECISIÓN")
 
     for row in list(rows)[:6]:
@@ -5570,6 +5572,12 @@ def _sync_real_hold_valido(bot: str) -> tuple[bool, str]:
     if token_raw == f'REAL:{b}':
         return (True, 'owner/token/orden')
     try:
+        ui_holder = reconciliar_token_real_visual('sync_hold_valido')
+    except Exception:
+        ui_holder = None
+    if ui_holder == b:
+        return (True, 'owner/token/orden')
+    try:
         orden = _read_json(path_orden(b), default={})
     except Exception:
         orden = {}
@@ -5609,6 +5617,15 @@ def _sync_round_release_next_round(old_round: int, reason: str, extra: dict | No
         agregar_evento(f'🚀 ROUND RELEASE: #{rid} -> #{next_round} | reason={reason}')
     return bool(ok)
 
+
+
+def _sync_real_turn_activo() -> tuple[bool, str | None, str]:
+    for b in BOT_NAMES:
+        ok, _ = _sync_real_hold_valido(b)
+        if ok:
+            return (True, b, 'owner/token/orden')
+    return (False, None, 'sin_real_activo')
+
 def _sync_round_tick_maestro():
     global _SYNC_ROUND_LAST_ANNOUNCED, _LXV_LAST_EMITTED_ROUND
     _sync_round_bootstrap_state(force=False)
@@ -5638,12 +5655,17 @@ def _sync_round_tick_maestro():
 
     hold_status = str(st.get("status", "")).strip().lower()
     hold_bot = str(st.get("real_pending_bot", "")).strip()
-    if hold_status == "holding_real_result" and hold_bot in BOT_NAMES:
-        _lxv_5v1x_event_cooldown(
-            key=f"sync_hold_real:{round_id}:{hold_bot}",
-            msg=f"⏸️ ROUND HOLD: esperando cierre REAL de {hold_bot} en ronda #{round_id}",
-            cooldown_s=8.0,
-        )
+    if hold_status in ("holding_real_result", "holding_real_turn"):
+        real_on, real_bot, _mot = _sync_real_turn_activo()
+        if real_on and real_bot in BOT_NAMES:
+            _lxv_5v1x_event_cooldown(
+                key=f"sync_hold_real:{round_id}:{real_bot}:{hold_status}",
+                msg=f"⏸️ ROUND HOLD REAL: esperando turno REAL bot={real_bot} | status={hold_status}",
+                cooldown_s=8.0,
+            )
+            return
+        agregar_evento(f"🧯 HOLD cancelado: no hay REAL activo real; liberando ronda #{round_id + 1}")
+        _sync_round_release_next_round(round_id, "recovery_hold_sin_real_activo")
         return
 
     st_completed = bool(st.get("completed", False))
@@ -5652,9 +5674,7 @@ def _sync_round_tick_maestro():
         elapsed = (time.time() - t0) if t0 > 0 else 0.0
         pending_bot = str(st.get("real_pending_bot", "") or "").strip()
         hold_any = False
-        if pending_bot in BOT_NAMES:
-            hold_any = _sync_real_hold_valido(pending_bot)[0]
-        if (not hold_any) and elapsed > 10.0:
+        if (pending_bot not in BOT_NAMES) and elapsed > 10.0:
             for b in BOT_NAMES:
                 if _sync_real_hold_valido(b)[0]:
                     hold_any = True
@@ -5708,6 +5728,16 @@ def _sync_round_tick_maestro():
             if (now_ts - last_s) >= 20.0:
                 _SYNC_STALE_WARN_TS[bot] = now_ts
                 agregar_evento(f"🧹 LXV_SYNC_COLUMN: ACK con timestamp futuro ignorado para {bot}.")
+            continue
+        ack_mode = str(ack.get("mode", "")).upper().strip()
+        ack_source = str(ack.get("source", "")).upper().strip()
+        ack_token = str(ack.get("token", "")).upper().strip()
+        if ack_mode == "REAL" or ack_source == "ORDEN_REAL" or ack_token.startswith("REAL:"):
+            _lxv_5v1x_event_cooldown(
+                key=f"ack_real_ignore:{bot}:{round_id}",
+                msg=f"ℹ️ ACK REAL ignorado para columna DEMO: bot={bot} round={round_id}",
+                cooldown_s=12.0,
+            )
             continue
         res = str(ack.get("resultado", "")).upper().strip()
         if res not in ("GANANCIA", "PÉRDIDA"):
@@ -5769,6 +5799,7 @@ def _sync_round_tick_maestro():
     }
     real_emitido = False
     real_hold_bot = None
+    motivo_no_real = ""
 
     if completed:
         next_round = round_id + 1
@@ -5923,6 +5954,7 @@ def _sync_round_tick_maestro():
                     LXV_REAL_AUDIT["real_emitidos"] = int(LXV_REAL_AUDIT.get("real_emitidos", 0) or 0) + 1
                     agregar_evento(f"🚨 LXV REAL emitido: ronda #{round_id} -> {bot_pick} ciclo_global C{ciclo_pick}.")
                 else:
+                    motivo_no_real = str(motivo_no_emit or '')
                     agregar_evento(f"⚠️ LXV REAL no emitido rid={int(round_id)} | patron={patron} | bot={bot_pick} | motivo={motivo_no_emit or 'desconocido'}")
         else:
             agregar_evento(f"ℹ️ LXV columna #{round_id}: {patron} → {motivo}.")
@@ -5954,6 +5986,8 @@ def _sync_round_tick_maestro():
         if real_emitido and (not hold_valido):
             release_reason = f"real_emitido_sin_hold_valido_{hold_motivo}"
             agregar_evento(f"⚠️ HOLD cancelado: real_emitido=True pero {hold_motivo}; liberando #{round_id + 1}")
+        elif motivo_no_real:
+            release_reason = f"no_real_{motivo_no_real}"
         _sync_round_release_next_round(round_id, release_reason)
         return
     else:
@@ -21176,9 +21210,27 @@ async def main():
                                         pass
                                     if res == "GANANCIA":
                                         cerrar_por_fin_de_ciclo(bot, "Ganancia en REAL (fin de turno)")
-                                    else:
-                                        cerrar_por_fin_de_ciclo(bot, "Pérdida en REAL (fin de turno)")
-                                    _sync_round_release_after_real_close(bot, reason=f"real_{str(res).lower()}")
+                                        _sync_round_release_after_real_close(bot, reason="real_ganancia")
+                                        activo_real = None
+                                        break
+                                    if int(ciclo or 0) < int(MAX_CICLOS):
+                                        st_sync = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+                                        rid_sync = int(st_sync.get("round_id", 1) or 1)
+                                        payload = dict(st_sync) if isinstance(st_sync, dict) else {}
+                                        payload["round_id"] = rid_sync
+                                        payload["released_round"] = rid_sync
+                                        payload["status"] = "holding_real_turn"
+                                        payload["reason"] = "real_loss_continue_next_cycle"
+                                        payload["real_pending_bot"] = bot
+                                        payload["real_pending_round"] = rid_sync
+                                        payload["real_pending_cycle"] = int(ciclo or 0) + 1
+                                        payload["ts"] = time.time()
+                                        _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+                                        agregar_evento(f"⏸️ REAL continúa: {bot} perdió C{int(ciclo or 0)} -> C{int(ciclo or 0)+1}; DEMO sigue en HOLD")
+                                        activo_real = bot
+                                        break
+                                    cerrar_por_fin_de_ciclo(bot, "Pérdida en REAL (fin de turno)")
+                                    _sync_round_release_after_real_close(bot, reason="real_loss_max_cycle")
                                     activo_real = None
                                     break
 

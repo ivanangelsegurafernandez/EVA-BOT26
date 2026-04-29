@@ -312,6 +312,23 @@ def _sync_round_resolve_start_round() -> int:
         released = 1
     return max(1, released)
 
+def _sync_bot_es_owner_real() -> bool:
+    try:
+        tok = str(leer_token_actual() or '').strip().upper()
+    except Exception:
+        tok = ''
+    if tok == f"REAL:{NOMBRE_BOT}".upper():
+        return True
+    try:
+        data = _leer_orden_real_actual() or {}
+        ts = float(data.get('created_ts') or data.get('ts') or 0.0)
+        ttl = float(data.get('ttl_s') or 45.0)
+        if str(data.get('bot','')).strip() == NOMBRE_BOT and ts > 0 and (time.time() - ts) <= max(1.0, ttl):
+            return True
+    except Exception:
+        pass
+    return False
+
 def _sync_round_emit_close_ack(round_id: int, resultado: str, contract_id=None, asset=None, ciclo=None) -> bool:
     res = str(resultado or "").upper().strip()
     if res not in ("GANANCIA", "PÉRDIDA"):
@@ -324,6 +341,7 @@ def _sync_round_emit_close_ack(round_id: int, resultado: str, contract_id=None, 
         prev_round = 0
     if prev_round > rid:
         return False
+    mode_sync = "REAL" if _sync_bot_es_owner_real() else "DEMO"
     payload = {
         "bot": NOMBRE_BOT,
         "round_id": rid,
@@ -333,6 +351,9 @@ def _sync_round_emit_close_ack(round_id: int, resultado: str, contract_id=None, 
         "asset": asset,
         "ciclo": ciclo,
         "status": "closed",
+        "mode": mode_sync,
+        "source": "ORDEN_REAL" if mode_sync == "REAL" else "SYNC_DEMO",
+        "token": str(leer_token_actual() or ""),
     }
     ok = _sync_round_write_json_atomic(_sync_round_ack_path(), payload)
     if ok:
@@ -406,6 +427,10 @@ async def _sync_round_wait_release(round_id: int) -> int:
         if first_wait_tick or (released != last_released) or (state_ts > 0 and state_ts != last_state_ts):
             last_progress_ts = now_ts
         should_write = first_wait_tick or (released != last_released) or ((now_ts - last_hb_ts) >= SYNC_WAIT_HEARTBEAT_S)
+        if _sync_bot_es_owner_real():
+            estado_bot["sync_wait"] = False
+            print(Fore.GREEN + f"🔓 SYNC REAL OWNER: {NOMBRE_BOT} sale de standby para continuar REAL; DEMO sigue bloqueado")
+            return rid
         if released >= next_round:
             estado_bot["sync_wait"] = False
             _sync_round_write_release_heartbeat(rid, next_round)
