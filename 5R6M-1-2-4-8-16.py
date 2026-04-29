@@ -4795,10 +4795,10 @@ def _lxv_4v2x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     _lxv_5v1x_event_cooldown(
         key=f"4v2x_pick:{rid}",
         msg=(
-            f"🎯 4V2X detectado | ronda #{rid} | "
+            f"🎯 4V2X candidato | ronda #{rid} | "
             f"Xs: {(candidate or {}).get('bot_x1')}={float(p1):.1f}%, {(candidate or {}).get('bot_x2')}={float(p2):.1f}% | "
-            f"elegida={bot_pick} menor Prob IA | REAL habilitado"
-        ) if (p1 is not None and p2 is not None) else f"🎯 4V2X detectado | ronda #{rid} | X débil={bot_pick} | REAL habilitado",
+            f"elegida={bot_pick} | esperando FASE_ZV"
+        ) if (p1 is not None and p2 is not None) else f"🎯 4V2X candidato | ronda #{rid} | X débil={bot_pick} | esperando FASE_ZV",
         cooldown_s=8.0,
     )
     try:
@@ -4820,6 +4820,11 @@ def _lxv_4v2x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
             cooldown_s=8.0,
         )
         return False
+    _lxv_5v1x_event_cooldown(
+        key=f"4v2x_real_ok:{rid}",
+        msg=f"✅ 4V2X REAL habilitado por FASE_ZV | ronda #{rid} | bot={bot_pick}",
+        cooldown_s=8.0,
+    )
     return bool(emitir_real_autorizado(
         bot_pick,
         int(ciclo_pick),
@@ -5144,9 +5149,11 @@ def _lxv_mark_real_round_emitted(rid):
         pass
 
 def evaluar_fase_zona_verde_lxv(rows=None, round_id_objetivo=None):
-    base = {"fase": "INSUFICIENTE", "allow_real": False, "g0": 0.0, "g1": 0.0, "g2": 0.0, "verdes0": 0, "verdes1": 0, "verdes2": 0, "streak_verde": 0, "motivo": "insuficiente"}
+    base = {"fase": "INSUFICIENTE", "allow_real": False, "g0": 0.0, "g1": 0.0, "g2": 0.0, "verdes0": 0, "verdes1": 0, "verdes2": 0, "rojos0": 0, "rojos1": 0, "rojos2": 0, "cols_usadas": 0, "cols_requeridas": int(globals().get("LXV_FASE_MIN_COLUMNS", 3) or 3), "streak_verde": 0, "motivo": "insuficiente"}
     try:
-        src_rows = list(rows) if isinstance(rows, list) else _lxv_5v1x_load_recent_matrix_rows(max_rows=40)
+        src_rows = list(rows) if isinstance(rows, list) else []
+        if len(src_rows) <= 0:
+            src_rows = _lxv_5v1x_load_recent_matrix_rows(max_rows=40)
         target_rid = None
         if round_id_objetivo is not None:
             try:
@@ -5181,6 +5188,23 @@ def evaluar_fase_zona_verde_lxv(rows=None, round_id_objetivo=None):
             if v < 0 or r < 0 or (v + r) < 6:
                 continue
             cols.append((rid, v, r, float(v) / 6.0))
+        if (target_rid is not None) and (not found_target):
+            try:
+                live_summary = _ack_live_calc_summary(_ack_live_build_rows())
+            except Exception:
+                live_summary = {}
+            rid_live = _mrv_5v1x_to_int((live_summary or {}).get("obj_round", 0), 0)
+            v_live = _mrv_5v1x_to_int((live_summary or {}).get("verdes_count", -1), -1)
+            r_live = _mrv_5v1x_to_int((live_summary or {}).get("rojas_count", -1), -1)
+            faltan_live = _mrv_5v1x_to_int((live_summary or {}).get("faltan_count", 99), 99)
+            dq_live = str((live_summary or {}).get("data_quality", "") or "").strip().lower()
+            complete_live = bool((live_summary or {}).get("complete", False))
+            if rid_live == target_rid and v_live >= 0 and r_live >= 0 and (v_live + r_live) >= 6 and (faltan_live == 0 or complete_live) and ((not dq_live) or dq_live == "ok"):
+                found_target = True
+                target_complete = True
+                target_dq_ok = True
+                cols.append((rid_live, v_live, r_live, float(v_live) / 6.0))
+        cols = sorted(cols, key=lambda t: int(t[0]))
         if target_rid is not None:
             if not found_target:
                 out = dict(base)
@@ -5201,13 +5225,27 @@ def evaluar_fase_zona_verde_lxv(rows=None, round_id_objetivo=None):
                 out["motivo"] = "round_id_no_encontrado"
                 return out
             cols = cols[:idx_target + 1]
-        if len(cols) < int(globals().get("LXV_FASE_MIN_COLUMNS", 3)):
+        cols_req = int(globals().get("LXV_FASE_MIN_COLUMNS", 3))
+        cols_used = len(cols)
+        if cols_used >= 1:
+            _, v0, r0, g0 = cols[-1]
+        else:
+            v0 = r0 = 0
+            g0 = 0.0
+        if cols_used >= 2:
+            _, v1, r1, g1 = cols[-2]
+        else:
+            v1 = r1 = 0
+            g1 = 0.0
+        if cols_used >= 3:
+            _, v2, r2, g2 = cols[-3]
+        else:
+            v2 = r2 = 0
+            g2 = 0.0
+        if cols_used < cols_req:
             out = dict(base)
-            out["motivo"] = "menos_de_3_columnas" if target_rid is not None else out.get("motivo", "insuficiente")
+            out.update({"g0": g0, "g1": g1, "g2": g2, "verdes0": v0, "verdes1": v1, "verdes2": v2, "rojos0": r0, "rojos1": r1, "rojos2": r2, "cols_usadas": int(cols_used), "cols_requeridas": int(cols_req), "motivo": "historial_insuficiente"})
             return out
-        _, v0,r0,g0 = cols[-1]
-        _, v1,r1,g1 = cols[-2]
-        _, v2,r2,g2 = cols[-3]
         d01 = g0 - g1
         d12 = g1 - g2
         streak=0
@@ -5215,7 +5253,7 @@ def evaluar_fase_zona_verde_lxv(rows=None, round_id_objetivo=None):
             if g >= (4.0/6.0): streak +=1
             else: break
         out = dict(base)
-        out.update({"g0":g0,"g1":g1,"g2":g2,"verdes0":v0,"verdes1":v1,"verdes2":v2,"streak_verde":int(streak),"fase":"NEUTRO","motivo":"neutral"})
+        out.update({"g0":g0,"g1":g1,"g2":g2,"verdes0":v0,"verdes1":v1,"verdes2":v2,"rojos0":r0,"rojos1":r1,"rojos2":r2,"cols_usadas":int(cols_used),"cols_requeridas":int(cols_req),"streak_verde":int(streak),"fase":"NEUTRO","motivo":"neutro"})
         if g0 >= (4.0/6.0) and g0 > g1 and (g1 <= (3.0/6.0) or g2 <= (3.0/6.0)):
             out.update({"fase":"ENTRANDO_VERDE","allow_real":True,"motivo":"transicion_hacia_verde"})
         elif (g1 >= (5.0/6.0) and g0 <= (4.0/6.0) and d01 < 0) or (g2 >= (5.0/6.0) and g1 >= (4.0/6.0) and g0 <= (4.0/6.0) and d01 < 0) or ((r0-r1)>=2 and g1 >= (4.0/6.0) and d01 < 0):
@@ -5265,7 +5303,8 @@ def _fase_zv_gate_allow_real(origen="LXV", rid=0):
     if bool(info.get("allow_real", False)):
         _lxv_5v1x_event_cooldown(key=f"fasezv_ok:{origen_txt}:{rid_int}:{info.get('fase')}", msg=f"✅ FASE_ZV OK: origen={origen_txt} rid={rid_int} fase={info.get('fase')} {gtxt}", cooldown_s=float(globals().get("LXV_FASE_LOG_COOLDOWN_S", 20.0)))
         return True
-    msg = f"⛔ FASE_ZV BLOQUEA REAL: origen={origen_txt} rid={rid_int} fase={info.get('fase')} {gtxt} motivo={info.get('motivo')}"
+    cols_txt = f"cols={int(info.get('cols_usadas',0))}/{int(info.get('cols_requeridas', int(globals().get('LXV_FASE_MIN_COLUMNS',3))))}"
+    msg = f"⛔ FASE_ZV BLOQUEA REAL: origen={origen_txt} rid={rid_int} fase={info.get('fase')} {cols_txt} {gtxt} motivo={info.get('motivo')}"
     if str(info.get('fase')) == 'VERDE_MADURO':
         msg = f"⛔ FASE_ZV BLOQUEA REAL: origen={origen_txt} rid={rid_int} fase=VERDE_MADURO streak={int(info.get('streak_verde',0))} motivo={info.get('motivo')}"
     _lxv_5v1x_event_cooldown(key=f"fasezv_block:{origen_txt}:{rid_int}:{info.get('fase')}", msg=msg, cooldown_s=float(globals().get("LXV_FASE_LOG_COOLDOWN_S", 20.0)))
@@ -5334,7 +5373,7 @@ def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     )
     _lxv_5v1x_event_cooldown(
         key=f"pick:{rid}",
-        msg=f"🎯 5V1X detectado | ronda #{rid} | X única={bot_pick} | REAL habilitado",
+        msg=f"🎯 5V1X candidato | ronda #{rid} | X única={bot_pick} | esperando FASE_ZV",
         cooldown_s=8.0,
     )
     try:
@@ -5356,6 +5395,11 @@ def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
             cooldown_s=8.0,
         )
         return False
+    _lxv_5v1x_event_cooldown(
+        key=f"5v1x_real_ok:{rid}",
+        msg=f"✅ 5V1X REAL habilitado por FASE_ZV | ronda #{rid} | bot={bot_pick}",
+        cooldown_s=8.0,
+    )
     return bool(emitir_real_autorizado(
         bot_pick,
         int(ciclo_pick),
@@ -16176,9 +16220,18 @@ def mostrar_panel():
         fi = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
         fase = str(fi.get("fase", "INSUFICIENTE"))
         v0 = int(fi.get("verdes0", 0) or 0)
+        v1 = int(fi.get("verdes1", 0) or 0)
+        cols_used = int(fi.get("cols_usadas", 0) or 0)
+        cols_req = int(fi.get("cols_requeridas", int(globals().get("LXV_FASE_MIN_COLUMNS", 3)) or 3) or 3)
         arrow = "↑" if bool(fi.get("allow_real", False)) else "↓"
         bloq = "" if bool(fi.get("allow_real", False)) else " BLOQ"
-        ftxt = f"FASE ZV: {fase} {v0}/6 {arrow}{bloq}"
+        if fase == "INSUFICIENTE":
+            if cols_used >= 2:
+                ftxt = f"FASE ZV: {fase} cols={cols_used}/{cols_req} g0={v0}/6 g1={v1}/6 {arrow}{bloq}"
+            else:
+                ftxt = f"FASE ZV: {fase} cols={cols_used}/{cols_req} g0={v0}/6 {arrow}{bloq}"
+        else:
+            ftxt = f"FASE ZV: {fase} g0={v0}/6 {arrow}{bloq}"
         print(padding + Fore.CYAN + ftxt[:35])
     except Exception:
         pass
