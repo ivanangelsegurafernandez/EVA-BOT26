@@ -2681,6 +2681,15 @@ _FOLLOWUP_5V1X_EVENT_TS = {}
 _FOLLOWUP_5V1X_LAST_APPLIED = {}
 _LXV_FASE_ZV_EVENT_TS = {}
 _LXV_FASE_ZV_LAST_INFO = {"fase": "INSUFICIENTE", "allow_real": False, "g0": 0.0, "g1": 0.0, "g2": 0.0, "verdes0": 0, "verdes1": 0, "verdes2": 0, "streak_verde": 0, "motivo": "init"}
+LXV_FASE_COLUMNS_CACHE = deque(maxlen=80)
+LXV_REAL_AUDIT = {
+    "patrones_5v1x": 0,
+    "patrones_4v2x": 0,
+    "fase_ok": 0,
+    "fase_bloq": 0,
+    "real_emitidos": 0,
+    "ultimo_bloqueo": "",
+}
 MATRIZ_COLUMNAS_LXV_CSV = "matriz_columnas_lxv.csv"
 MATRIZ_CELDAS_LXV_CSV = "matriz_celdas_lxv.csv"
 MATRIZ_FOLLOWUP_5V1X_CSV = "matriz_followup_5v1x.csv"
@@ -5166,12 +5175,60 @@ def _lxv_mark_real_round_emitted(rid):
     except Exception:
         pass
 
+def _lxv_fase_cache_add(round_id: int, closed: dict, expected: list[str]) -> None:
+    try:
+        rid = int(round_id or 0)
+    except Exception:
+        rid = 0
+    if rid <= 0:
+        return
+    closed_map = dict(closed or {})
+    expected_bots = [b for b in list(expected or []) if b in BOT_NAMES]
+    if not expected_bots:
+        expected_bots = list(BOT_NAMES)
+    expected_set = set(expected_bots)
+    present = [b for b in expected_bots if b in closed_map]
+    n_verdes = 0
+    n_rojos = 0
+    recognized = 0
+    for bot in present:
+        res = normalizar_resultado((closed_map.get(bot) or {}).get("resultado"))
+        if res == "GANANCIA":
+            n_verdes += 1
+            recognized += 1
+        elif res == "PÉRDIDA":
+            n_rojos += 1
+            recognized += 1
+    round_complete = bool(len(set(present)) == len(expected_set))
+    data_quality = "ok" if (round_complete and recognized == len(expected_set)) else "partial"
+    patron = "OTHER"
+    if n_verdes == 5 and n_rojos == 1:
+        patron = "5V1X"
+    elif n_verdes == 4 and n_rojos == 2:
+        patron = "4V2X"
+    row = {
+        "round_id": rid,
+        "ts_round": float(time.time()),
+        "n_verdes": int(n_verdes),
+        "n_rojos": int(n_rojos),
+        "round_complete": round_complete,
+        "data_quality": data_quality,
+        "patron_lxv": patron,
+        "source": "sync_round_live_cache",
+    }
+    updated = False
+    for i, old in enumerate(LXV_FASE_COLUMNS_CACHE):
+        if int((old or {}).get("round_id", 0) or 0) == rid:
+            LXV_FASE_COLUMNS_CACHE[i] = row
+            updated = True
+            break
+    if not updated:
+        LXV_FASE_COLUMNS_CACHE.append(row)
+
 def evaluar_fase_zona_verde_lxv(rows=None, round_id_objetivo=None):
     base = {"fase": "INSUFICIENTE", "allow_real": False, "g0": 0.0, "g1": 0.0, "g2": 0.0, "verdes0": 0, "verdes1": 0, "verdes2": 0, "rojos0": 0, "rojos1": 0, "rojos2": 0, "cols_usadas": 0, "cols_requeridas": int(globals().get("LXV_FASE_MIN_COLUMNS", 3) or 3), "streak_verde": 0, "motivo": "insuficiente"}
     try:
         src_rows = list(rows) if isinstance(rows, list) else []
-        if len(src_rows) <= 0:
-            src_rows = _lxv_5v1x_load_recent_matrix_rows(max_rows=40)
         target_rid = None
         if round_id_objetivo is not None:
             try:
@@ -5180,6 +5237,28 @@ def evaluar_fase_zona_verde_lxv(rows=None, round_id_objetivo=None):
                     target_rid = None
             except Exception:
                 target_rid = None
+        if len(src_rows) <= 0:
+            src_rows = list(LXV_FASE_COLUMNS_CACHE)
+            cache_has_target = True if target_rid is None else any(int((x or {}).get("round_id", 0) or 0) == target_rid for x in src_rows)
+            if (not src_rows) or ((target_rid is not None) and (not cache_has_target)):
+                src_rows = _lxv_5v1x_load_recent_matrix_rows(max_rows=40)
+                matrix_has_target = True if target_rid is None else any(_mrv_5v1x_to_int((x or {}).get("round_id", 0), 0) == target_rid for x in src_rows)
+                if target_rid is not None and not matrix_has_target:
+                    try:
+                        rows_pack = _ack_live_build_rows()
+                        fb = _ack_live_calc_summary(rows_pack)
+                        rid_fb = _mrv_5v1x_to_int((fb or {}).get("obj_round", 0), 0)
+                        if rid_fb == target_rid:
+                            src_rows.append({
+                                "round_id": rid_fb,
+                                "n_verdes": int((fb or {}).get("verdes_count", 0) or 0),
+                                "n_rojos": int((fb or {}).get("rojas_count", 0) or 0),
+                                "round_complete": bool((fb or {}).get("complete", False)),
+                                "data_quality": str((fb or {}).get("data_quality", "") or ""),
+                                "source": "ack_live_summary",
+                            })
+                    except Exception:
+                        pass
         cols = []
         found_target = False
         target_complete = False
@@ -5278,7 +5357,7 @@ def evaluar_fase_zona_verde_lxv(rows=None, round_id_objetivo=None):
             out.update({"fase":"SALIDA_VERDE","allow_real":False,"motivo":"saliendo_de_verde"})
         elif (g0 <= (3.0/6.0) and d01 < 0) or (d01 < 0 and d12 < 0):
             out.update({"fase":"ROJO_INICIANDO","allow_real":False,"motivo":"pendiente_roja"})
-        elif streak >= int(globals().get("LXV_FASE_STREAK_VERDE_MADURO", 4)) or (g0 >= (4.0/6.0) and d01 <= 0 and streak >= int(globals().get("LXV_FASE_MAX_STREAK_VERDE_TEMPRANO", 3))):
+        elif streak >= int(globals().get("LXV_FASE_STREAK_VERDE_MADURO", 4)) or (g0 >= (4.0/6.0) and d01 <= 0 and streak > int(globals().get("LXV_FASE_MAX_STREAK_VERDE_TEMPRANO", 3))):
             out.update({"fase":"VERDE_MADURO","allow_real":False,"motivo":"verde_cansado"})
         elif g0 >= (4.0/6.0) and g1 >= (4.0/6.0) and d01 >= 0 and streak <= int(globals().get("LXV_FASE_MAX_STREAK_VERDE_TEMPRANO", 3)):
             out.update({"fase":"VERDE_TEMPRANO","allow_real":True,"motivo":"verde_temprano"})
@@ -5319,12 +5398,15 @@ def _fase_zv_gate_allow_real(origen="LXV", rid=0):
         return True
     gtxt = f"g0={int(info.get('verdes0',0))}/6 g1={int(info.get('verdes1',0))}/6 g2={int(info.get('verdes2',0))}/6"
     if bool(info.get("allow_real", False)):
+        LXV_REAL_AUDIT["fase_ok"] = int(LXV_REAL_AUDIT.get("fase_ok", 0) or 0) + 1
         _lxv_5v1x_event_cooldown(key=f"fasezv_ok:{origen_txt}:{rid_int}:{info.get('fase')}", msg=f"✅ FASE_ZV OK: origen={origen_txt} rid={rid_int} fase={info.get('fase')} {gtxt}", cooldown_s=float(globals().get("LXV_FASE_LOG_COOLDOWN_S", 20.0)))
         return True
     cols_txt = f"cols={int(info.get('cols_usadas',0))}/{int(info.get('cols_requeridas', int(globals().get('LXV_FASE_MIN_COLUMNS',3))))}"
     msg = f"⛔ FASE_ZV BLOQUEA REAL: origen={origen_txt} rid={rid_int} fase={info.get('fase')} {cols_txt} {gtxt} motivo={info.get('motivo')}"
     if str(info.get('fase')) == 'VERDE_MADURO':
         msg = f"⛔ FASE_ZV BLOQUEA REAL: origen={origen_txt} rid={rid_int} fase=VERDE_MADURO streak={int(info.get('streak_verde',0))} motivo={info.get('motivo')}"
+    LXV_REAL_AUDIT["fase_bloq"] = int(LXV_REAL_AUDIT.get("fase_bloq", 0) or 0) + 1
+    LXV_REAL_AUDIT["ultimo_bloqueo"] = f"fase_zv_{info.get('fase')}_{info.get('motivo')}"
     _lxv_5v1x_event_cooldown(key=f"fasezv_block:{origen_txt}:{rid_int}:{info.get('fase')}", msg=msg, cooldown_s=float(globals().get("LXV_FASE_LOG_COOLDOWN_S", 20.0)))
     return False
 
@@ -5561,6 +5643,7 @@ def _sync_round_tick_maestro():
         if completed_failsafe and stale_ignored:
             agregar_evento(f"🟠 LXV_SYNC_COLUMN failsafe: liberando ronda #{round_id} sin {stale_ignored} por stale/timeout.")
         agregar_evento(f"✅ LXV_SYNC_COLUMN columna/ronda #{round_id} COMPLETA.")
+        _lxv_fase_cache_add(round_id, closed, expected)
         agregar_evento(f"🚀 LXV_SYNC_COLUMN ronda #{next_round} LIBERADA.")
         _lxv_export_round_snapshot(
             round_id=int(round_id),
@@ -5588,8 +5671,13 @@ def _sync_round_tick_maestro():
                 f"🧠 LXV columna #{round_id}: {patron} → candidato REAL {bot_pick} ({motivo}) "
                 f"| snapshot=C{ciclo_snapshot} | global=C{ciclo_pick}"
             )
+            if patron == "5V1X":
+                LXV_REAL_AUDIT["patrones_5v1x"] = int(LXV_REAL_AUDIT.get("patrones_5v1x", 0) or 0) + 1
+            elif patron == "4V2X":
+                LXV_REAL_AUDIT["patrones_4v2x"] = int(LXV_REAL_AUDIT.get("patrones_4v2x", 0) or 0) + 1
             if int(_LXV_LAST_EMITTED_ROUND or 0) != int(round_id):
                 ok_emit = False
+                motivo_no_emit = ""
                 candidate_age = None
                 for k in ("edad_s", "ack_age_s", "age_s"):
                     if pick.get(k) is not None:
@@ -5605,12 +5693,14 @@ def _sync_round_tick_maestro():
                     except Exception:
                         candidate_age = None
                 if candidate_age is None:
+                    motivo_no_emit = "edad_no_calculable"
                     _lxv_5v1x_event_cooldown(
                         key=f"real_age_missing:{round_id}",
                         msg=f"⏱️ REAL bloqueado: edad BotX no calculable | bot={bot_pick}",
                         cooldown_s=8.0,
                     )
                 elif not _real_candidate_age_ok({"edad_s": candidate_age}):
+                    motivo_no_emit = "botx_viejo"
                     _lxv_5v1x_event_cooldown(
                         key=f"real_age_block:{round_id}",
                         msg=f"⏱️ REAL bloqueado: BotX viejo edad={float(candidate_age):.1f}s | bot={bot_pick}",
@@ -5623,6 +5713,7 @@ def _sync_round_tick_maestro():
                         cooldown_s=8.0,
                     )
                     if _lxv_real_round_already_emitted(round_id):
+                        motivo_no_emit = "lxv_duplicado"
                         _lxv_5v1x_event_cooldown(
                             key=f"dup_emit:{round_id}",
                             msg=f"⛔ LXV duplicado evitado rid={int(round_id)}",
@@ -5635,7 +5726,17 @@ def _sync_round_tick_maestro():
                             gate_ok_4v2x, gate_reason_4v2x = _lxv_4v2x_gate_ok(candidate_4v2x)
                             if gate_ok_4v2x:
                                 ok_emit = bool(_lxv_4v2x_apply_real_route(candidate_4v2x, ciclo_pick))
+                                if not ok_emit:
+                                    fi = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
+                                    fase = str(fi.get("fase", ""))
+                                    if fase:
+                                        motivo_no_emit = f"fase_zv_{fase}_{fi.get('motivo','')}"
+                                        LXV_REAL_AUDIT["fase_bloq"] = int(LXV_REAL_AUDIT.get("fase_bloq", 0) or 0) + 1
+                                        LXV_REAL_AUDIT["ultimo_bloqueo"] = motivo_no_emit
+                                    else:
+                                        motivo_no_emit = "escribir_orden_real_fail"
                             else:
+                                motivo_no_emit = f"4v2x_gate_{gate_reason_4v2x}"
                                 _lxv_5v1x_event_cooldown(
                                     key=f"4v2x_gate_no:{round_id}",
                                     msg=f"⏸️ 4V2X gate OFF ronda #{round_id}: {gate_reason_4v2x}",
@@ -5648,7 +5749,17 @@ def _sync_round_tick_maestro():
                             gate_ok_5v1x, gate_reason_5v1x = _lxv_5v1x_gate_ok(candidate_5v1x)
                             if gate_ok_5v1x:
                                 ok_emit = bool(_lxv_5v1x_apply_real_route(candidate_5v1x, ciclo_pick))
+                                if not ok_emit:
+                                    fi = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
+                                    fase = str(fi.get("fase", ""))
+                                    if fase:
+                                        motivo_no_emit = f"fase_zv_{fase}_{fi.get('motivo','')}"
+                                        LXV_REAL_AUDIT["fase_bloq"] = int(LXV_REAL_AUDIT.get("fase_bloq", 0) or 0) + 1
+                                        LXV_REAL_AUDIT["ultimo_bloqueo"] = motivo_no_emit
+                                    else:
+                                        motivo_no_emit = "escribir_orden_real_fail"
                             else:
+                                motivo_no_emit = f"5v1x_gate_{gate_reason_5v1x}"
                                 _lxv_5v1x_event_cooldown(
                                     key=f"gate_no:{round_id}",
                                     msg=f"⏸️ 5V1X gate OFF ronda #{round_id}: {gate_reason_5v1x}",
@@ -5656,9 +5767,16 @@ def _sync_round_tick_maestro():
                                 )
 
                         if (not ok_emit) and bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)):
-                            ok_emit = bool(_fase_zv_gate_allow_real("LXV_SYNC", round_id)) and bool(
-                                emitir_real_autorizado(bot_pick, ciclo_pick, source=LXV_SYNC_REAL_SOURCE)
-                            )
+                            fase_sync_ok = bool(_fase_zv_gate_allow_real("LXV_SYNC", round_id))
+                            if not fase_sync_ok:
+                                fi = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
+                                motivo_no_emit = f"fase_zv_{fi.get('fase','INSUFICIENTE')}_{fi.get('motivo','sin_motivo')}"
+                                LXV_REAL_AUDIT["fase_bloq"] = int(LXV_REAL_AUDIT.get("fase_bloq", 0) or 0) + 1
+                                LXV_REAL_AUDIT["ultimo_bloqueo"] = motivo_no_emit
+                            else:
+                                ok_emit = bool(emitir_real_autorizado(bot_pick, ciclo_pick, source=LXV_SYNC_REAL_SOURCE))
+                                if not ok_emit and (not motivo_no_emit):
+                                    motivo_no_emit = "escribir_orden_real_fail"
                 _LXV_LAST_EMITTED_ROUND = int(round_id) if ok_emit else int(_LXV_LAST_EMITTED_ROUND or 0)
                 if ok_emit:
                     _lxv_mark_real_round_emitted(round_id)
@@ -5667,9 +5785,10 @@ def _sync_round_tick_maestro():
                         estado_bots[bot_pick]["ciclo_actual"] = int(ciclo_pick)
                     except Exception:
                         pass
+                    LXV_REAL_AUDIT["real_emitidos"] = int(LXV_REAL_AUDIT.get("real_emitidos", 0) or 0) + 1
                     agregar_evento(f"🚨 LXV REAL emitido: ronda #{round_id} -> {bot_pick} ciclo_global C{ciclo_pick}.")
                 else:
-                    agregar_evento(f"⚠️ LXV REAL no emitido rid={int(round_id)} | patron={patron} | bot={bot_pick} | motivo=orden_real_fail")
+                    agregar_evento(f"⚠️ LXV REAL no emitido rid={int(round_id)} | patron={patron} | bot={bot_pick} | motivo={motivo_no_emit or 'desconocido'}")
         else:
             agregar_evento(f"ℹ️ LXV columna #{round_id}: {patron} → {motivo}.")
         # Higiene mínima: baja "sync_wait" en bots ya contabilizados
@@ -16251,6 +16370,8 @@ def mostrar_panel():
         else:
             ftxt = f"FASE ZV: {fase} g0={v0}/6 {arrow}{bloq}"
         print(padding + Fore.CYAN + ftxt[:35])
+        aud = dict(globals().get("LXV_REAL_AUDIT", {}) or {})
+        print(padding + Fore.CYAN + (f"LXV AUDIT | 5V1X={int(aud.get('patrones_5v1x',0) or 0)} | 4V2X={int(aud.get('patrones_4v2x',0) or 0)} | FASE_OK={int(aud.get('fase_ok',0) or 0)} | BLOQ={int(aud.get('fase_bloq',0) or 0)} | REAL={int(aud.get('real_emitidos',0) or 0)} | último={str(aud.get('ultimo_bloqueo','') or '-')}")[:140])
     except Exception:
         pass
 
@@ -21439,3 +21560,25 @@ if __name__ == "__main__":
 #
 # Esta organización no cambia la lógica original, solo la hace más mantenible.
 # === FIN BLOQUE 99 ===
+        if len(src_rows) <= 0:
+            src_rows = list(LXV_FASE_COLUMNS_CACHE)
+            cache_has_target = True if target_rid is None else any(int((x or {}).get("round_id", 0) or 0) == target_rid for x in src_rows)
+            if (not src_rows) or ((target_rid is not None) and (not cache_has_target)):
+                src_rows = _lxv_5v1x_load_recent_matrix_rows(max_rows=40)
+                matrix_has_target = True if target_rid is None else any(_mrv_5v1x_to_int((x or {}).get("round_id", 0), 0) == target_rid for x in src_rows)
+                if target_rid is not None and not matrix_has_target:
+                    try:
+                        rows_pack = _ack_live_build_rows()
+                        fb = _ack_live_calc_summary(rows_pack)
+                        rid_fb = _mrv_5v1x_to_int((fb or {}).get("obj_round", 0), 0)
+                        if rid_fb == target_rid:
+                            src_rows.append({
+                                "round_id": rid_fb,
+                                "n_verdes": int((fb or {}).get("verdes_count", 0) or 0),
+                                "n_rojos": int((fb or {}).get("rojas_count", 0) or 0),
+                                "round_complete": bool((fb or {}).get("complete", False)),
+                                "data_quality": str((fb or {}).get("data_quality", "") or ""),
+                                "source": "ack_live_summary",
+                            })
+                    except Exception:
+                        pass
