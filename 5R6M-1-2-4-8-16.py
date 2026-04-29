@@ -5996,7 +5996,8 @@ def _sync_round_tick_maestro():
 
 def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") -> None:
     st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
-    if str(st.get("status", "")).strip().lower() != "holding_real_result":
+    status = str(st.get("status", "")).strip().lower()
+    if status not in ("holding_real_result", "holding_real_turn"):
         return
     try:
         old_round = max(1, int(st.get("round_id", 1) or 1))
@@ -6013,6 +6014,7 @@ def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") 
         "status": "released_after_real_result",
         "reason": str(reason or "real_closed"),
         "real_pending_bot": None,
+        "real_pending_cycle": None,
         "real_pending_round": old_round,
         "real_released_after_bot": str(bot),
         "started_at": float(time.time()),
