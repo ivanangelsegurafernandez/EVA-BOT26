@@ -416,6 +416,11 @@ async def _sync_round_wait_release(round_id: int) -> int:
         idle_s = now_ts - last_progress_ts
         total_wait_s = now_ts - wait_start_ts
         if (idle_s >= SYNC_WAIT_MAX_IDLE_S) and (stale_state or total_wait_s >= (SYNC_WAIT_STALE_S + SYNC_WAIT_MAX_IDLE_S)):
+            if released <= rid:
+                print(Fore.YELLOW + f"⏳ SYNC watchdog: sigo esperando liberación real de #{rid + 1}; no opero de nuevo en ronda #{rid}")
+                last_progress_ts = now_ts
+                await asyncio.sleep(SYNC_WAIT_POLL_S)
+                continue
             estado_bot["sync_wait"] = False
             _sync_round_write_release_heartbeat(rid, next_round)
             safe_round = max(rid, _sync_round_resolve_start_round())
