@@ -4145,6 +4145,24 @@ def _ack_live_format_lines(snapshot):
         f"{'BotX=' + botx + ' | ' if botx != '-' else ''}Calidad={summary.get('data_quality', 'missing')}"
     )
     lines.append(resumen)
+    lines.append("ℹ️ DECISIÓN REAL USA: ROUND LIVE, no la cinta histórica.")
+    dq_txt = str(summary.get("data_quality", "missing") or "").strip().lower()
+    parcial_txt = str(summary.get("partial_pattern", "0V0X") or "0V0X").strip().upper()
+    columna_lista = bool(closed_count >= expected_count and faltan_count <= 0 and dq_txt == "ok")
+    if (not columna_lista) or parcial_txt == "0V0X":
+        lines.append(f"⏳ Esperando columna objetivo #{obj_round}: cerrados={closed_count}/{expected_count} faltan={faltan_count}")
+        lines.append("⏳ Aún no se evalúa REAL: columna objetivo incompleta.")
+        lines.append("Los símbolos LIVE ACK 80 son historial; REAL solo evalúa ROUND LIVE cerrado.")
+    else:
+        lines.append(f"✅ Columna objetivo lista #{obj_round}: evaluando patrón LXV")
+        if parcial_txt == "5V1X" and botx != "-":
+            lines.append(f"🎯 5V1X listo: única X={botx} | esperando FASE_ZV")
+        elif parcial_txt == "4V2X":
+            x_bots = [str(r.get("bot") or "") for r in rows if bool(r.get("is_current")) and str(r.get("res")) == "X"]
+            rojos_rows = [{"bot": b} for b in x_bots if b in BOT_NAMES]
+            pick = _lxv_pick_bot_x_debil(rojos_rows) if rojos_rows else None
+            bot_pick = str((pick or {}).get("bot", "") or (x_bots[0] if x_bots else "-"))
+            lines.append(f"🎯 4V2X listo: X menor Prob IA={bot_pick} | esperando FASE_ZV")
 
     if summary.get("all_prev_waiting", False) and bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False)):
         lines.append("↳ Esperando cierres de ronda objetivo; los ACK visibles aún pertenecen a ronda previa.")
@@ -16724,13 +16742,13 @@ def mostrar_panel():
     )
     mid_line = top_line.replace("┌", "├").replace("┐", "┤").replace("─", "─")
     total_inner = len(_ack_tape_strip_ansi(top_line)) - 2
-    bot_title_line = f"│ {'⚡ BOTS · LIVE ACK 80 · RENDIMIENTO':<{total_inner}}│"
+    bot_title_line = f"│ {'⚡ BOTS · HISTORIAL LIVE ACK 80 · RENDIMIENTO':<{total_inner}}│"
     print(padding + Fore.CYAN + top_line)
     print(padding + Fore.CYAN + Style.BRIGHT + bot_title_line + Style.RESET_ALL)
     print(padding + Fore.CYAN + mid_line)
     print(
         padding + Fore.CYAN
-        + f"│ {'BOT':<{BOT_W}} │ {'LIVE ACK 80':<{LIVE_W}} │ {'Token':<{TOKEN_W}} │ {'G':>{G_W}} │ {'P':>{P_W}} │ {'%':<{EXITO_W}} │ {'ProbIA':<{PROB_W}} │ {'Modo':<{MODO_W}} │"
+        + f"│ {'BOT':<{BOT_W}} │ {'HISTORIAL LIVE ACK 80':<{LIVE_W}} │ {'Token':<{TOKEN_W}} │ {'G':>{G_W}} │ {'P':>{P_W}} │ {'%':<{EXITO_W}} │ {'ProbIA':<{PROB_W}} │ {'Modo':<{MODO_W}} │"
     )
     print(padding + Fore.CYAN + mid_line)
 
