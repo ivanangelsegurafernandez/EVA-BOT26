@@ -5346,9 +5346,11 @@ def evaluar_fase_zona_verde_lxv(rows=None, round_id_objetivo=None):
         d01 = g0 - g1
         d12 = g1 - g2
         streak=0
-        for v,r,g in reversed(cols):
-            if g >= (4.0/6.0): streak +=1
-            else: break
+        for _rid, v, r, g in reversed(cols):
+            if g >= (4.0 / 6.0):
+                streak += 1
+            else:
+                break
         out = dict(base)
         out.update({"g0":g0,"g1":g1,"g2":g2,"verdes0":v0,"verdes1":v1,"verdes2":v2,"rojos0":r0,"rojos1":r1,"rojos2":r2,"cols_usadas":int(cols_used),"cols_requeridas":int(cols_req),"streak_verde":int(streak),"fase":"NEUTRO","motivo":"neutro"})
         if g0 >= (4.0/6.0) and g0 > g1 and (g1 <= (3.0/6.0) or g2 <= (3.0/6.0)):
