@@ -5664,17 +5664,28 @@ def _sync_round_collect_closed_acks(round_id: int) -> tuple[dict, dict]:
         if ack_ts > (now_ts + float(ACK_SYNC_ROUND_FUTURE_DRIFT_S)):
             reasons[bot] = "ack_future"
             continue
-        ack_mode = str(ack.get("mode", "")).upper().strip()
-        ack_source = str(ack.get("source", "")).upper().strip()
-        ack_token = str(ack.get("token", "")).upper().strip()
-        if ack_mode == "REAL" or ack_source == "ORDEN_REAL" or ack_token.startswith("REAL:"):
+        ack_mode = str(ack.get("mode", "") or "").strip().upper()
+        ack_source = str(ack.get("source", "") or "").strip().upper()
+        ack_token = str(ack.get("token", "") or "").strip().upper()
+        explicit_real_ack = (
+            ack_mode == "REAL"
+            or ack_source in ("ORDEN_REAL", "REAL", "REAL_ORDER")
+        )
+        explicit_demo_ack = (
+            ack_mode == "DEMO"
+            or ack_source in ("SYNC_DEMO", "DEMO", "LXV_SYNC")
+        )
+        if explicit_real_ack and not explicit_demo_ack:
             reasons[bot] = "ack_real_ignored"
             continue
+        if explicit_demo_ack and ack_token.startswith("REAL:"):
+            reasons[bot] = "stale_token_in_demo_ack"
         res = str(ack.get("resultado", "")).upper().strip()
         if res not in ("GANANCIA", "PÉRDIDA"):
             reasons[bot] = f"resultado_invalid_{res or 'empty'}"
             continue
-        reasons[bot] = "ok"
+        if reasons.get(bot) != "stale_token_in_demo_ack":
+            reasons[bot] = "ok"
         closed[bot] = {
             "resultado": res,
             "ts": ack_ts,
@@ -5771,6 +5782,12 @@ def _sync_round_tick_maestro():
             _lxv_5v1x_event_cooldown(
                 key=f"ack_real_ignore:{bot}:{round_id}",
                 msg=f"ℹ️ ACK REAL ignorado para columna DEMO: bot={bot} round={round_id}",
+                cooldown_s=12.0,
+            )
+        elif reason_bot == "stale_token_in_demo_ack":
+            _lxv_5v1x_event_cooldown(
+                key=f"ack_stale_token_demo:{bot}:{round_id}",
+                msg=f"🟡 ACK DEMO aceptado con token REAL stale: bot={bot} round={round_id}",
                 cooldown_s=12.0,
             )
 
