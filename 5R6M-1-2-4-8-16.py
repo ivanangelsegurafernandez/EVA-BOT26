@@ -4803,14 +4803,23 @@ def _lxv_4v2x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     )
     try:
         fase_ok = _fase_zv_gate_allow_real("LXV_4V2X", rid)
-        if not fase_ok:
-            _lxv_5v1x_event_cooldown(
-                key=f"fasezv_telemetry_4v2x:{rid}",
-                msg=f"🟡 FASE_ZV telemetría: NO bloquea LXV_4V2X rid={rid}",
-                cooldown_s=8.0,
-            )
     except Exception:
-        pass
+        fase_ok = False
+    if not fase_ok:
+        fi = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
+        _lxv_5v1x_event_cooldown(
+            key=f"fasezv_block_real_4v2x:{rid}",
+            msg=(
+                f"⛔ 4V2X BLOQUEADO por FASE_ZV | rid={rid} "
+                f"fase={fi.get('fase')} "
+                f"g0={int(fi.get('verdes0',0))}/6 "
+                f"g1={int(fi.get('verdes1',0))}/6 "
+                f"g2={int(fi.get('verdes2',0))}/6 "
+                f"motivo={fi.get('motivo')}"
+            ),
+            cooldown_s=8.0,
+        )
+        return False
     return bool(emitir_real_autorizado(
         bot_pick,
         int(ciclo_pick),
@@ -5330,14 +5339,23 @@ def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     )
     try:
         fase_ok = _fase_zv_gate_allow_real("LXV_5V1X", rid)
-        if not fase_ok:
-            _lxv_5v1x_event_cooldown(
-                key=f"fasezv_telemetry_5v1x:{rid}",
-                msg=f"🟡 FASE_ZV telemetría: NO bloquea LXV_5V1X rid={rid}",
-                cooldown_s=8.0,
-            )
     except Exception:
-        pass
+        fase_ok = False
+    if not fase_ok:
+        fi = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
+        _lxv_5v1x_event_cooldown(
+            key=f"fasezv_block_real_5v1x:{rid}",
+            msg=(
+                f"⛔ 5V1X BLOQUEADO por FASE_ZV | rid={rid} "
+                f"fase={fi.get('fase')} "
+                f"g0={int(fi.get('verdes0',0))}/6 "
+                f"g1={int(fi.get('verdes1',0))}/6 "
+                f"g2={int(fi.get('verdes2',0))}/6 "
+                f"motivo={fi.get('motivo')}"
+            ),
+            cooldown_s=8.0,
+        )
+        return False
     return bool(emitir_real_autorizado(
         bot_pick,
         int(ciclo_pick),
