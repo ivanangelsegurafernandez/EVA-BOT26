@@ -5424,13 +5424,16 @@ def evaluar_fase_zona_verde_lxv(rows=None, round_id_objetivo=None):
                 break
         out = dict(base)
         out.update({"g0":g0,"g1":g1,"g2":g2,"verdes0":v0,"verdes1":v1,"verdes2":v2,"rojos0":r0,"rojos1":r1,"rojos2":r2,"cols_usadas":int(cols_used),"cols_requeridas":int(cols_req),"streak_verde":int(streak),"fase":"NEUTRO","motivo":"neutro"})
-        if g0 >= (4.0/6.0) and g0 > g1 and (g1 <= (3.0/6.0) or g2 <= (3.0/6.0)):
+        if g0 >= (4.0/6.0) and g1 >= (5.0/6.0) and g2 <= (3.0/6.0):
+            out.update({"fase":"VERDE_TEMPRANO","allow_real":True,"motivo":"verde_temprano_post_impulso"})
+            return out
+        if g0 >= (4.0/6.0) and (g1 <= (3.0/6.0) or g2 <= (3.0/6.0)):
             out.update({"fase":"ENTRANDO_VERDE","allow_real":True,"motivo":"transicion_hacia_verde"})
-        elif (g1 >= (5.0/6.0) and g0 <= (4.0/6.0) and d01 < 0) or (g2 >= (5.0/6.0) and g1 >= (4.0/6.0) and g0 <= (4.0/6.0) and d01 < 0) or ((r0-r1)>=2 and g1 >= (4.0/6.0) and d01 < 0):
-            out.update({"fase":"SALIDA_VERDE","allow_real":False,"motivo":"saliendo_de_verde"})
+        elif ((g1 >= (5.0/6.0) and g0 <= (4.0/6.0) and d01 < 0) and (g2 >= (4.0/6.0) and g1 >= (5.0/6.0))) or (g2 >= (5.0/6.0) and g1 >= (4.0/6.0) and g0 <= (4.0/6.0) and d01 < 0) or ((r0-r1)>=2 and g1 >= (4.0/6.0) and d01 < 0 and g2 >= (4.0/6.0)):
+            out.update({"fase":"SALIDA_VERDE","allow_real":False,"motivo":"saliendo_de_verde_maduro"})
         elif (g0 <= (3.0/6.0) and d01 < 0) or (d01 < 0 and d12 < 0):
             out.update({"fase":"ROJO_INICIANDO","allow_real":False,"motivo":"pendiente_roja"})
-        elif streak >= int(globals().get("LXV_FASE_STREAK_VERDE_MADURO", 4)) or (g0 >= (4.0/6.0) and d01 <= 0 and streak > int(globals().get("LXV_FASE_MAX_STREAK_VERDE_TEMPRANO", 3))):
+        elif streak > int(globals().get("LXV_FASE_MAX_STREAK_VERDE_TEMPRANO", 3)) or streak >= int(globals().get("LXV_FASE_STREAK_VERDE_MADURO", 4)) or (g0 >= (4.0/6.0) and d01 <= 0 and streak > int(globals().get("LXV_FASE_MAX_STREAK_VERDE_TEMPRANO", 3))):
             out.update({"fase":"VERDE_MADURO","allow_real":False,"motivo":"verde_cansado"})
         elif g0 >= (4.0/6.0) and g1 >= (4.0/6.0) and d01 >= 0 and streak <= int(globals().get("LXV_FASE_MAX_STREAK_VERDE_TEMPRANO", 3)):
             out.update({"fase":"VERDE_TEMPRANO","allow_real":True,"motivo":"verde_temprano"})
@@ -5960,33 +5963,63 @@ def _sync_round_tick_maestro():
         else:
             pick, patron, motivo = _lxv_evaluar_columna(round_id, snapshot)
         if round_live_complete:
-            patron = partial_pattern or patron
             ok_emit = False
             emit_bot = None
-            motivo_exec = "sin_patron_lxv"
+            motivo_exec = ""
+            motivo_no_real = ""
+            real_emitido = False
+            real_hold_bot = None
+            fase_ok = False
+            fase_info = {}
+            patron = str(partial_pattern or patron or "").upper()
             ciclo_pick = ciclo_martingala_siguiente()
-            if patron == "5V1X":
-                bot_pick = str(summary.get("bot_x_actual") or "").strip()
-                row_pick = next((r for r in rows_live if str((r or {}).get("bot", "")).strip() == bot_pick), {}) if bot_pick else {}
-                edad_s = (row_pick or {}).get("age_s")
-                ciclo_pick = int((row_pick or {}).get("ciclo", ciclo_pick) or ciclo_pick)
-                if bot_pick in BOT_NAMES:
-                    lxv_payload = {"round_id": round_id, "rid": round_id, "bot": bot_pick, "bot_pick": bot_pick, "bot_x": bot_pick, "bot_x_actual": bot_pick, "bot_x1": bot_pick, "bot_x_fuerte": bot_pick, "x_unica": True, "round_complete": True, "data_quality": "ok", "edad_s": edad_s, "ciclo": ciclo_pick, "partial_pattern": "5V1X", "patron_lxv": "5V1X", "source": "LXV_5V1X"}
-                    ok_emit = bool(_lxv_5v1x_apply_real_route(lxv_payload, int(ciclo_pick)))
+            try:
+                if patron == "5V1X":
+                    bot_pick = str(summary.get("bot_x_actual") or "").strip()
+                    row_pick = next((r for r in rows_live if str((r or {}).get("bot", "")).strip() == bot_pick), {}) if bot_pick else {}
+                    edad_s = (row_pick or {}).get("age_s")
+                    ciclo_pick = int((row_pick or {}).get("ciclo", ciclo_pick) or ciclo_pick)
                     emit_bot = bot_pick
-                    motivo_exec = "emit_ok" if ok_emit else _lxv_emit_fail_reason(bot_pick, "LXV_5V1X")
+                    if bot_pick in BOT_NAMES:
+                        lxv_payload = {"round_id": round_id, "rid": round_id, "bot": bot_pick, "bot_pick": bot_pick, "bot_x": bot_pick, "bot_x_actual": bot_pick, "bot_x1": bot_pick, "bot_x_fuerte": bot_pick, "x_unica": True, "round_complete": True, "data_quality": "ok", "edad_s": edad_s, "ciclo": ciclo_pick, "partial_pattern": "5V1X", "patron_lxv": "5V1X", "source": "LXV_5V1X"}
+                        ok_emit = bool(_lxv_5v1x_apply_real_route(lxv_payload, int(ciclo_pick)))
+                        fase_info = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
+                        fase_ok = bool(fase_info.get("allow_real", False))
+                        motivo_exec = "emit_ok" if ok_emit else _lxv_emit_fail_reason(bot_pick, "LXV_5V1X")
+                    else:
+                        motivo_exec = "bot_pick_invalido"
+                elif patron == "4V2X":
+                    lxv_payload = {"round_id": round_id, "rid": round_id, "summary": summary, "rows": rows_live, "round_complete": True, "data_quality": "ok", "partial_pattern": "4V2X", "patron_lxv": "4V2X", "source": "LXV_4V2X"}
+                    round_row, feat_row = _lxv_5v1x_get_exported_rows(int(round_id))
+                    cand = _lxv_4v2x_candidate_from_round(round_row, feat_row)
+                    if isinstance(cand, dict):
+                        lxv_payload.update(cand)
+                        emit_bot = str(cand.get("bot_x_debil") or "").strip()
+                    ok_emit = bool(_lxv_4v2x_apply_real_route(lxv_payload, int(ciclo_pick)))
+                    fase_info = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
+                    fase_ok = bool(fase_info.get("allow_real", False))
+                    motivo_exec = "emit_ok" if ok_emit else _lxv_emit_fail_reason(emit_bot, "LXV_4V2X")
                 else:
-                    motivo_exec = "bot_x_actual_invalido"
-            elif patron == "4V2X":
-                lxv_payload = {"round_id": round_id, "rid": round_id, "summary": summary, "rows": rows_live, "round_complete": True, "data_quality": "ok", "partial_pattern": "4V2X", "patron_lxv": "4V2X", "source": "LXV_4V2X"}
-                round_row, feat_row = _lxv_5v1x_get_exported_rows(int(round_id))
-                cand = _lxv_4v2x_candidate_from_round(round_row, feat_row)
-                if isinstance(cand, dict):
-                    lxv_payload.update(cand)
-                    emit_bot = str(cand.get("bot_x_debil") or "").strip()
-                ok_emit = bool(_lxv_4v2x_apply_real_route(lxv_payload, int(ciclo_pick)))
-                motivo_exec = "emit_ok" if ok_emit else _lxv_emit_fail_reason(emit_bot, "LXV_4V2X")
-            agregar_evento(f"🧪 LXV EXEC CHECK: round={round_id} partial={patron} bot={emit_bot or '-'} fase_ok={'SI' if bool(dict(globals().get('_LXV_FASE_ZV_LAST_INFO', {})).get('allow_real', False)) else 'NO'} emit={'SI' if ok_emit else 'NO'} motivo={motivo_exec}")
+                    motivo_exec = f"sin_patron_lxv_{patron}"
+            except NameError as e:
+                err_name = getattr(e, "name", "") or str(e)
+                motivo_exec = f"exception_NameError_{err_name}"
+                agregar_evento(f"❌ LXV NO_REAL EXCEPTION: NameError variable={err_name} | round={round_id} | partial={partial_pattern}")
+                traceback.print_exc()
+                ok_emit = False
+                real_emitido = False
+            except Exception as e:
+                motivo_exec = f"exception_{type(e).__name__}"
+                agregar_evento(f"❌ LXV NO_REAL EXCEPTION: {type(e).__name__}: {e} | round={round_id} | partial={partial_pattern}")
+                traceback.print_exc()
+                ok_emit = False
+                real_emitido = False
+            fase_info = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {})) if not fase_info else fase_info
+            fase_name = str(fase_info.get("fase", ""))
+            fase_ok = bool(fase_info.get("allow_real", False))
+            agregar_evento(f"🧪 LXV EXEC CHECK: round={round_id} partial={patron} bot={emit_bot or '-'} fase={fase_name or '-'} allow={'SI' if fase_ok else 'NO'} emit={'SI' if ok_emit else 'NO'} motivo={motivo_exec or 'sin_motivo'}")
+            if (not ok_emit) and fase_ok and patron in ("5V1X", "4V2X"):
+                agregar_evento(f"❌ LXV REAL NO EMITIDO: round={round_id} patron={patron} bot={emit_bot or '-'} fase={fase_name or '-'} allow=SI motivo={motivo_exec or 'orden_real_fail'}")
             if ok_emit:
                 real_emitido = True
                 real_hold_bot = str(emit_bot or "")
