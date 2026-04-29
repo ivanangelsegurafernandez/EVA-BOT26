@@ -5774,8 +5774,15 @@ def _sync_round_tick_maestro():
                 cooldown_s=12.0,
             )
 
+    status_now = str(st.get("status", "")).strip().lower()
     n_closed = len(closed)
     missing = [b for b in expected if b not in closed]
+    if n_closed == len(expected) and int(released_round) == int(round_id) and status_now == "waiting_closures":
+        _lxv_5v1x_event_cooldown(
+            key=f"sync_invariant_diag:{round_id}",
+            msg="⚠️ SYNC INVARIANT: 6/6 cerrado pero state sigue waiting_closures; debe liberar.",
+            cooldown_s=8.0,
+        )
     if missing:
         miss_txt = ", ".join(f"{b}:{sync_debug_missing.get(b, 'ack_missing')}" for b in missing)
         _lxv_5v1x_event_cooldown(
@@ -5809,7 +5816,6 @@ def _sync_round_tick_maestro():
         _SYNC_ROUND_LAST_CLOSED_COUNT[round_id] = n_closed
         agregar_evento(f"🧩 LXV_SYNC_COLUMN cierres ronda #{round_id}: {n_closed}/{len(expected)}.")
 
-    status_now = str(st.get("status", "")).strip().lower()
     closed_direct, reasons_direct = {}, {}
     if status_now in ("waiting_closures", "released", "released_after_real_result", "released_recovery_completed_without_real_stuck"):
         closed_direct, reasons_direct = _sync_round_collect_closed_acks(round_id)
@@ -5822,6 +5828,15 @@ def _sync_round_tick_maestro():
     completed_normal = bool(n_closed >= len(expected))
     completed_failsafe = bool(stale_ignored and n_closed >= effective_need)
     completed = bool(completed_normal or completed_failsafe)
+    if n_closed >= len(expected):
+        completed = True
+        completed_normal = True
+        completed_failsafe = False
+        missing = []
+        sync_debug_missing = {b: "ok" for b in expected}
+        agregar_evento(
+            f"✅ SYNC FORCE COMPLETE: ronda #{round_id} cerrados={n_closed}/{len(expected)}; evaluando/liberando."
+        )
     real_on_now, _, _ = _sync_real_turn_activo()
     elapsed_started = max(0.0, float(time.time()) - float(started_at))
     if status_now == "waiting_closures" and int(released_round) == int(round_id) and elapsed_started > 20.0 and len(closed_direct) == len(BOT_NAMES) and (not real_on_now):
@@ -5877,6 +5892,10 @@ def _sync_round_tick_maestro():
             pick, patron, motivo = None, f"{len([x for x in snapshot if x.get('resultado') == 'GANANCIA'])}V/{len([x for x in snapshot if x.get('resultado') == 'PÉRDIDA'])}X", "masa mínima insuficiente para evaluar LXV_REAL"
         else:
             pick, patron, motivo = _lxv_evaluar_columna(round_id, snapshot)
+        if patron not in ("5V1X", "4V2X"):
+            motivo_no_real = f"sin_patron_lxv_{patron}"
+            agregar_evento(f"🚀 RELEASE sin patrón LXV: ronda #{round_id} parcial={patron} -> libera #{round_id + 1}")
+            pick = None
         if pick:
             bot_pick = str(pick.get("bot"))
             ciclo_snapshot = int(
@@ -6045,8 +6064,11 @@ def _sync_round_tick_maestro():
         agregar_evento(f"🚀 RELEASE normal: ronda #{round_id} completa sin HOLD válido -> libera #{round_id + 1}")
         _sync_round_release_next_round(round_id, release_reason)
         return
-    else:
-        _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+    if completed:
+        agregar_evento("🧯 SYNC invariant recovery: completed=True sin HOLD/RELEASE; liberando next_round")
+        _sync_round_release_next_round(round_id, "sync_invariant_completed_no_release")
+        return
+    _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
 # === /LXV_SYNC_COLUMN ===
 
 def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") -> None:
