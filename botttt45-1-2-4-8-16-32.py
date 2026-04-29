@@ -470,6 +470,26 @@ def _sync_round_state_ts(st: dict) -> float:
 
 
 async def _sync_round_wait_release(round_id: int) -> int:
+    def _sync_bot_es_owner_real() -> bool:
+        try:
+            tok = str(leer_token_actual() or '').strip().upper()
+        except Exception:
+            tok = ''
+        if tok == f"REAL:{NOMBRE_BOT}".upper():
+            return True
+        try:
+            p = os.path.join(ORDEN_DIR, f"{NOMBRE_BOT}.json")
+            data = _sync_round_safe_read_json(p) or {}
+            if bool(data.get('consumed', False)):
+                return False
+            ts = float(data.get('created_ts') or data.get('ts') or 0.0)
+            ttl = float(data.get('ttl_s') or 45.0)
+            if str(data.get('bot', '')).strip() == NOMBRE_BOT and ts > 0 and (time.time() - ts) <= max(1.0, ttl):
+                return True
+        except Exception:
+            pass
+        return False
+
     rid = max(1, int(round_id or 1))
     next_round = rid + 1
     print(Fore.YELLOW + Style.BRIGHT + f"⏸️ LXV_SYNC_COLUMN standby columna: {NOMBRE_BOT} ronda #{rid} esperando liberación #{next_round}...")
