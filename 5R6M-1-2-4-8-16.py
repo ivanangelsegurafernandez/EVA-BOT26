@@ -3768,6 +3768,43 @@ def _ack_tape_render_bot(bot, fallback_resultados=None, width=None):
     colored = "".join(_ack_tape_color_symbol(_ack_tape_symbol_plain(s)) for s in symbols[-w:])
     return _ack_tape_pad_visible(colored, w)
 
+def _hud_get_gp_stats(bot):
+    st = estado_bots.get(bot, {}) if isinstance(estado_bots.get(bot, {}), dict) else {}
+    g_state = int(st.get("ganancias", 0) or 0)
+    p_state = int(st.get("perdidas", 0) or 0)
+    total_state = max(0, g_state + p_state, int(st.get("tamano_muestra", 0) or 0))
+
+    tape = list((ACK_LIVE_TAPE.get(bot, []) if isinstance(globals().get("ACK_LIVE_TAPE"), dict) else []) or [])
+    g_ack = 0
+    p_ack = 0
+    for item in tape:
+        sym = _ack_tape_symbol_plain(item)
+        if sym == "✓":
+            g_ack += 1
+        elif sym == "X":
+            p_ack += 1
+    total_ack = g_ack + p_ack
+
+    g_fb = 0
+    p_fb = 0
+    for item in list(st.get("resultados", []) or []):
+        tok = str(item or "").strip().upper()
+        if tok in ("GANANCIA", "✓", "WIN", "CHECK"):
+            g_fb += 1
+        elif tok in ("PÉRDIDA", "PERDIDA", "X", "✗", "LOSS"):
+            p_fb += 1
+    total_fb = g_fb + p_fb
+
+    if total_ack > total_state:
+        g, p, total = g_ack, p_ack, total_ack
+    elif total_state > 0:
+        g, p, total = g_state, p_state, total_state
+    else:
+        g, p, total = g_fb, p_fb, total_fb
+
+    porc = (float(g) / float(total) * 100.0) if total > 0 else None
+    return int(g), int(p), porc, int(total)
+
 
 def _ack_live_build_rows():
     state = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
@@ -4471,13 +4508,18 @@ def _lxv_round_snapshot(round_id: int, closed: dict) -> list[dict]:
         if not isinstance(c, dict):
             continue
         st = estado_bots.get(bot, {})
+        ts_val = float(c.get("ts", 0.0) or 0.0)
+        age_s = max(0.0, float(time.time()) - ts_val) if ts_val > 0 else None
         out.append({
             "bot": bot,
             "round_id": int(round_id),
             "resultado": str(c.get("resultado", "")).upper().strip(),
             "ciclo": int(c.get("ciclo", st.get("ciclo_actual", 1)) or 1),
             "asset": c.get("asset"),
-            "ts": float(c.get("ts", 0.0) or 0.0),
+            "ts": ts_val,
+            "age_s": age_s,
+            "edad_s": age_s,
+            "ack_age_s": age_s,
             "prob_ia_oper": st.get("prob_ia_oper"),
             "prob_ia": st.get("prob_ia"),
             "score_senal": st.get("ia_score_hibrido", st.get("ia_regime_score")),
@@ -4587,20 +4629,48 @@ def _lxv_4v2x_candidate_from_round(round_row: dict | None, feat_row: dict | None
         round_id = int((row.get("round_id", feat.get("round_id", 0)) or 0))
     except Exception:
         round_id = 0
+    x_bots = [b for b in (bot_x1, bot_x2) if b]
     rojos_snapshot = []
-    for b in (bot_x1, bot_x2):
+    x_probs = {}
+    fallback_runtime = False
+    for b in x_bots:
         if not b:
             continue
         st = estado_bots.get(b, {}) if isinstance(estado_bots.get(b, {}), dict) else {}
+        prob_keys = (
+            f"{b}_prob_ia_oper", f"prob_ia_oper_{b}",
+            f"{b}_prob_ia", f"prob_ia_{b}",
+        )
+        prob_src = None
+        for k in prob_keys:
+            if k in src and str(src.get(k, "")).strip() != "":
+                prob_src = src.get(k)
+                break
+            if k in row and str(row.get(k, "")).strip() != "":
+                prob_src = row.get(k)
+                break
+        if prob_src is None:
+            prob_src = st.get("prob_ia_oper", st.get("prob_ia"))
+            fallback_runtime = True
+        try:
+            x_probs[b] = float(prob_src)
+        except Exception:
+            x_probs[b] = None
         rojos_snapshot.append({
             "bot": b,
-            "prob_ia_oper": st.get("prob_ia_oper"),
-            "prob_ia": st.get("prob_ia"),
+            "prob_ia_oper": x_probs[b],
+            "prob_ia": x_probs[b],
             "score_senal": st.get("ia_score_hibrido", st.get("ia_regime_score")),
             "payout": src.get("payout", ""),
             "winrate": st.get("porcentaje_exito"),
             "ts": src.get("ts_round", row.get("ts_round", 0.0)),
         })
+    if fallback_runtime:
+        _lxv_5v1x_event_cooldown(
+            key=f"4v2x_prob_fallback:{round_id}",
+            msg=f"🟡 4V2X usando Prob IA fallback runtime rid={round_id}",
+            cooldown_s=8.0,
+        )
     pick = _lxv_pick_bot_x_debil(rojos_snapshot)
     candidate = {
         "round_id": round_id,
@@ -4608,6 +4678,10 @@ def _lxv_4v2x_candidate_from_round(round_row: dict | None, feat_row: dict | None
         "bot_x1": bot_x1,
         "bot_x2": bot_x2,
         "bot_x_debil": str((pick or {}).get("bot", "") or ""),
+        "prob_x_debil": (pick or {}).get("prob_ia_oper"),
+        "x_bots_4v2x": list(x_bots),
+        "x_probs_4v2x": dict(x_probs),
+        "criterio_4v2x": "menor_prob_ia_columna_cerrada",
         "round_complete": bool(src.get("round_complete", row.get("round_complete", False))),
         "data_quality": str(src.get("data_quality", row.get("data_quality", "")) or ""),
     }
@@ -4669,6 +4743,19 @@ def _lxv_4v2x_gate_ok(candidate: dict | None) -> tuple[bool, str]:
     if patron_norm != "4V2X":
         return False, "patron_no_4v2x"
     bot = str(c.get("bot_x_debil", "") or "").strip()
+    x_bots = [str(x or "").strip() for x in list(c.get("x_bots_4v2x", []) or []) if str(x or "").strip()]
+    x_probs = c.get("x_probs_4v2x", {}) if isinstance(c.get("x_probs_4v2x", {}), dict) else {}
+    if len(x_bots) != 2 or any(x not in BOT_NAMES for x in x_bots):
+        return False, "sin_2_x_validas"
+    if bot not in x_bots:
+        return False, "bot_x_debil_fuera_de_dupla"
+    if len(x_probs) != 2:
+        return False, "prob_ia_incompleta"
+    for xb in x_bots:
+        try:
+            float(x_probs.get(xb))
+        except Exception:
+            return False, "prob_ia_incompleta"
     if not bot:
         return False, "bot_x_debil_vacio"
     if bot not in BOT_NAMES:
@@ -4702,13 +4789,28 @@ def _lxv_4v2x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         msg=f"🧪 REAL route activa: {str(globals().get('LXV_4V2X_REAL_SOURCE', 'LXV_4V2X'))}",
         cooldown_s=8.0,
     )
+    x_probs = dict((candidate or {}).get("x_probs_4v2x", {}) or {})
+    p1 = x_probs.get((candidate or {}).get("bot_x1"))
+    p2 = x_probs.get((candidate or {}).get("bot_x2"))
     _lxv_5v1x_event_cooldown(
         key=f"4v2x_pick:{rid}",
-        msg=f"🎯 4V2X detectado | ronda #{rid} | X débil={bot_pick} | REAL habilitado",
+        msg=(
+            f"🎯 4V2X detectado | ronda #{rid} | "
+            f"Xs: {(candidate or {}).get('bot_x1')}={float(p1):.1f}%, {(candidate or {}).get('bot_x2')}={float(p2):.1f}% | "
+            f"elegida={bot_pick} menor Prob IA | REAL habilitado"
+        ) if (p1 is not None and p2 is not None) else f"🎯 4V2X detectado | ronda #{rid} | X débil={bot_pick} | REAL habilitado",
         cooldown_s=8.0,
     )
-    if not _fase_zv_gate_allow_real("LXV_4V2X", rid):
-        return False
+    try:
+        fase_ok = _fase_zv_gate_allow_real("LXV_4V2X", rid)
+        if not fase_ok:
+            _lxv_5v1x_event_cooldown(
+                key=f"fasezv_telemetry_4v2x:{rid}",
+                msg=f"🟡 FASE_ZV telemetría: NO bloquea LXV_4V2X rid={rid}",
+                cooldown_s=8.0,
+            )
+    except Exception:
+        pass
     return bool(emitir_real_autorizado(
         bot_pick,
         int(ciclo_pick),
@@ -5197,26 +5299,15 @@ def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         green_txt = f"{float(green_mrv):.4f}" if green_mrv is not None else "None"
         rebote_txt = f"{float(rebote_mrv):.4f}" if rebote_mrv is not None else "None"
         if not ok_mrv:
-            if estado_mrv == "ERROR_SEGURO":
-                _lxv_5v1x_event_cooldown(
-                    key=f"mrv_error:{rid}:{estado_mrv}",
-                    msg=(
-                        f"🔴 MRV_5V1X ERROR SEGURO | bot={bot_pick} | round={rid} | "
-                        f"error={str((info_mrv or {}).get('error', reason_mrv))}"
-                    ),
-                    cooldown_s=float(globals().get("MRV_5V1X_LOG_COOLDOWN_S", 20.0)),
-                )
             _lxv_5v1x_event_cooldown(
-                key=f"mrv_block:{rid}:{estado_mrv}",
+                key=f"mrv_telemetry:{rid}:{estado_mrv}",
                 msg=(
-                    f"🟠 MRV_5V1X BLOQUEA | bot={bot_pick} | round={rid} | "
-                    f"estado={estado_mrv} | reason={reason_mrv} | "
-                    f"green={green_txt} | rebote={rebote_txt} | samples={samples_mrv} | "
-                    f"streak80={streak80_mrv} | streak90={streak90_mrv} | prev90={prev90_mrv}"
+                    f"🟠 MRV_5V1X TELEMETRÍA: no bloquea REAL | bot={bot_pick} | round={rid} | "
+                    f"estado={estado_mrv} | reason={reason_mrv} | green={green_txt} | rebote={rebote_txt} | "
+                    f"samples={samples_mrv} | streak80={streak80_mrv} | streak90={streak90_mrv} | prev90={prev90_mrv}"
                 ),
                 cooldown_s=float(globals().get("MRV_5V1X_LOG_COOLDOWN_S", 20.0)),
             )
-            return False
         _lxv_5v1x_event_cooldown(
             key=f"mrv_allow:{rid}:{estado_mrv}",
             msg=(
@@ -5237,8 +5328,16 @@ def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         msg=f"🎯 5V1X detectado | ronda #{rid} | X única={bot_pick} | REAL habilitado",
         cooldown_s=8.0,
     )
-    if not _fase_zv_gate_allow_real("LXV_5V1X", rid):
-        return False
+    try:
+        fase_ok = _fase_zv_gate_allow_real("LXV_5V1X", rid)
+        if not fase_ok:
+            _lxv_5v1x_event_cooldown(
+                key=f"fasezv_telemetry_5v1x:{rid}",
+                msg=f"🟡 FASE_ZV telemetría: NO bloquea LXV_5V1X rid={rid}",
+                cooldown_s=8.0,
+            )
+    except Exception:
+        pass
     return bool(emitir_real_autorizado(
         bot_pick,
         int(ciclo_pick),
@@ -5411,14 +5510,38 @@ def _sync_round_tick_maestro():
             )
             if int(_LXV_LAST_EMITTED_ROUND or 0) != int(round_id):
                 ok_emit = False
-                candidate_age = float(pick.get("edad_s") or pick.get("ack_age_s") or pick.get("age_s") or 0.0)
-                if not _real_candidate_age_ok({"edad_s": candidate_age}):
+                candidate_age = None
+                for k in ("edad_s", "ack_age_s", "age_s"):
+                    if pick.get(k) is not None:
+                        try:
+                            candidate_age = float(pick.get(k))
+                            break
+                        except Exception:
+                            candidate_age = None
+                if candidate_age is None:
+                    try:
+                        ts_pick = float(pick.get("ts", 0.0) or 0.0)
+                        candidate_age = max(0.0, time.time() - ts_pick) if ts_pick > 0 else None
+                    except Exception:
+                        candidate_age = None
+                if candidate_age is None:
+                    _lxv_5v1x_event_cooldown(
+                        key=f"real_age_missing:{round_id}",
+                        msg=f"⏱️ REAL bloqueado: edad BotX no calculable | bot={bot_pick}",
+                        cooldown_s=8.0,
+                    )
+                elif not _real_candidate_age_ok({"edad_s": candidate_age}):
                     _lxv_5v1x_event_cooldown(
                         key=f"real_age_block:{round_id}",
-                        msg="⏱️ REAL bloqueado: cierre fuera de ventana útil (>45s).",
+                        msg=f"⏱️ REAL bloqueado: BotX viejo edad={float(candidate_age):.1f}s | bot={bot_pick}",
                         cooldown_s=8.0,
                     )
                 else:
+                    _lxv_5v1x_event_cooldown(
+                        key=f"real_age_ok:{round_id}:{bot_pick}",
+                        msg=f"⏱️ Frescura BotX OK: bot={bot_pick} edad={float(candidate_age):.1f}s",
+                        cooldown_s=8.0,
+                    )
                     if _lxv_real_round_already_emitted(round_id):
                         _lxv_5v1x_event_cooldown(
                             key=f"dup_emit:{round_id}",
@@ -5464,13 +5587,9 @@ def _sync_round_tick_maestro():
                         estado_bots[bot_pick]["ciclo_actual"] = int(ciclo_pick)
                     except Exception:
                         pass
-                    agregar_evento(
-                        f"🚨 LXV_SYNC REAL emitido: ronda #{round_id} -> {bot_pick} ciclo_global C{ciclo_pick}."
-                    )
+                    agregar_evento(f"🚨 LXV REAL emitido: ronda #{round_id} -> {bot_pick} ciclo_global C{ciclo_pick}.")
                 else:
-                    agregar_evento(
-                        f"⚠️ LXV_SYNC REAL no emitido en ronda #{round_id} (lock/purificación/estado)."
-                    )
+                    agregar_evento(f"⚠️ LXV REAL no emitido rid={int(round_id)} | patron={patron} | bot={bot_pick} | motivo=orden_real_fail")
         else:
             agregar_evento(f"ℹ️ LXV columna #{round_id}: {patron} → {motivo}.")
         # Higiene mínima: baja "sync_wait" en bots ya contabilizados
@@ -16580,12 +16699,9 @@ def mostrar_panel():
         )
 
         # Ganancias / Pérdidas / % éxito
-        g = estado_bots[bot]["ganancias"]
-        p = estado_bots[bot]["perdidas"]
+        g, p, porc, total = _hud_get_gp_stats(bot)
         ganancias = Fore.GREEN + f"{g}"
         perdidas = Fore.RED + f"{p}"
-        porc = estado_bots[bot].get("porcentaje_exito")
-        total = estado_bots[bot].get("tamano_muestra", 0)
 
         if porc is not None:
             exito = f"{porc:.1f}% (n={total})"
