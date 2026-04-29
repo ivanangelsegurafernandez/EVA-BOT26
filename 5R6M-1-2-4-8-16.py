@@ -341,7 +341,7 @@ LXV_4V2X_REQUIRE_DATA_QUALITY_OK = True
 LXV_4V2X_REQUIRE_ROUND_COMPLETE = True
 MANUAL_REAL_ROUTE_ENABLE = True
 MANUAL_REAL_REQUIRE_CONFIRM_RISK = False
-MANUAL_REAL_FORCE_BYPASS_FASE_ZV = False
+MANUAL_REAL_FORCE_BYPASS_FASE_ZV = True
 LXV_FASE_ZONA_VERDE_ENABLE = True
 LXV_FASE_MIN_COLUMNS = 3
 LXV_FASE_MAX_STREAK_VERDE_TEMPRANO = 3
@@ -708,14 +708,16 @@ def _purificacion_real_activa() -> bool:
         allow_sync = str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper()
         allow_5v1x = str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X")).upper()
         allow_4v2x = str(globals().get("LXV_4V2X_REAL_SOURCE", "LXV_4V2X")).upper()
-        allowed_sources = {allow_sync}
-        if bool(globals().get("LXV_5V1X_ENABLE", False)) or bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)):
+        allowed_sources = set()
+        if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)):
+            allowed_sources.add(allow_sync)
+        if bool(globals().get("LXV_5V1X_ENABLE", False)):
             allowed_sources.add(allow_5v1x)
         if bool(globals().get("LXV_4V2X_ENABLE", False)):
             allowed_sources.add(allow_4v2x)
         if bool(globals().get("MANUAL_REAL_ROUTE_ENABLE", False)):
             allowed_sources.add("MANUAL")
-        if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and route_src in allowed_sources:
+        if route_src in allowed_sources:
             try:
                 _lxv_5v1x_event_cooldown(
                     key=f"purif:allow:{route_src}",
@@ -4641,7 +4643,7 @@ def _lxv_5v1x_gate_ok(candidate: dict | None) -> tuple[bool, str]:
     if str(c.get("patron_lxv", "")).upper() != "5V1X":
         return False, "patron_no_5v1x"
     if not bool(c.get("x_unica", False)):
-        return False, "x_no_unica"
+        return False, "sin_unica_x_valida"
     bot = str(c.get("bot_x_fuerte", "") or "").strip()
     if not bot:
         return False, "bot_x_fuerte_vacio"
@@ -4651,7 +4653,7 @@ def _lxv_5v1x_gate_ok(candidate: dict | None) -> tuple[bool, str]:
         return False, "round_incomplete"
     dq = str(c.get("data_quality", "") or "").strip().lower()
     if bool(globals().get("LXV_5V1X_REQUIRE_DATA_QUALITY_OK", True)) and dq != "ok":
-        return False, "data_quality_no_ok"
+        return False, "data_quality_bad"
     return True, "ok"
 
 def _lxv_5v1x_pick_real_bot(candidate: dict | None) -> str | None:
@@ -4675,7 +4677,7 @@ def _lxv_4v2x_gate_ok(candidate: dict | None) -> tuple[bool, str]:
         return False, "round_incomplete"
     dq = str(c.get("data_quality", "") or "").strip().lower()
     if bool(globals().get("LXV_4V2X_REQUIRE_DATA_QUALITY_OK", True)) and dq != "ok":
-        return False, "data_quality_no_ok"
+        return False, "data_quality_bad"
     return True, "ok"
 
 def _lxv_4v2x_pick_real_bot(candidate: dict | None) -> str | None:
@@ -5437,7 +5439,7 @@ def _sync_round_tick_maestro():
                                     cooldown_s=8.0,
                                 )
 
-                        if (not ok_emit) and (bool(globals().get("LXV_5V1X_ENABLE", False)) or bool(globals().get("LXV_5V1X_ONLY_ENABLE", False))):
+                        if (not ok_emit) and bool(globals().get("LXV_5V1X_ENABLE", False)):
                             round_row, feat_row = _lxv_5v1x_get_exported_rows(int(round_id))
                             candidate_5v1x = _lxv_5v1x_candidate_from_round(round_row, feat_row)
                             gate_ok_5v1x, gate_reason_5v1x = _lxv_5v1x_gate_ok(candidate_5v1x)
@@ -5952,14 +5954,16 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY") -> bool
     allow_sync = str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper()
     allow_5v1x = str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X")).upper()
     allow_4v2x = str(globals().get("LXV_4V2X_REAL_SOURCE", "LXV_4V2X")).upper()
-    allow_sources = {allow_sync}
-    if bool(globals().get("LXV_5V1X_ENABLE", False)) or bool(globals().get("LXV_5V1X_ONLY_ENABLE", False)):
+    allow_sources = set()
+    if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)):
+        allow_sources.add(allow_sync)
+    if bool(globals().get("LXV_5V1X_ENABLE", False)):
         allow_sources.add(allow_5v1x)
     if bool(globals().get("LXV_4V2X_ENABLE", False)):
         allow_sources.add(allow_4v2x)
     if bool(globals().get("MANUAL_REAL_ROUTE_ENABLE", False)):
         allow_sources.add("MANUAL")
-    if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and src not in allow_sources:
+    if src not in allow_sources:
         agregar_evento(
             f"🧊 REAL source rechazada: {src} (permitidas={','.join(sorted(allow_sources))})."
         )
@@ -17660,8 +17664,10 @@ def forzar_real_manual(bot: str, ciclo: int):
         global marti_paso
         marti_paso = ciclo - 1
         _set_real_manual_alert(bot, ciclo, "MANUAL")
-        if bool(globals().get("MANUAL_REAL_ROUTE_ENABLE", True)) and (not bool(globals().get("MANUAL_REAL_FORCE_BYPASS_FASE_ZV", False))):
-            if not _fase_zv_gate_allow_real("MANUAL", 0):
+        if bool(globals().get("MANUAL_REAL_ROUTE_ENABLE", True)):
+            if bool(globals().get("MANUAL_REAL_FORCE_BYPASS_FASE_ZV", False)):
+                agregar_evento("🟢 MANUAL REAL: bypass FASE_ZV activo")
+            elif not _fase_zv_gate_allow_real("MANUAL", 0):
                 fi = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
                 agregar_evento(f"⛔ REAL BLOQUEADO por FASE_ZV: fase={fi.get('fase')} g0={int(fi.get('verdes0',0))}/6 g1={int(fi.get('verdes1',0))}/6 motivo={fi.get('motivo')}")
                 _set_real_manual_alert(None)
@@ -17678,8 +17684,8 @@ def forzar_real_manual(bot: str, ciclo: int):
         if not emitir_real_autorizado(bot, ciclo, source="MANUAL"):
             _set_real_manual_alert(None)
             agregar_evento(f"🔒 Forzar REAL bloqueado para {bot.upper()}: ya hay otro bot en REAL.")
-            _manual_key_audit(f"forzar_real_manual blocked_emit bot={bot} ciclo={ciclo}")
-            return False
+        _manual_key_audit(f"forzar_real_manual blocked_emit bot={bot} ciclo={ciclo}")
+        return False
 
         _set_real_manual_alert(bot, ciclo, "MANUAL")
         try:
