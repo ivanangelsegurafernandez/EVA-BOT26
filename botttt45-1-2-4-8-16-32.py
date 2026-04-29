@@ -304,6 +304,28 @@ def _sync_round_write_json_atomic(path: str, payload: dict) -> bool:
 def _sync_round_ack_path() -> str:
     return os.path.join(SYNC_ROUND_DIR, f"{NOMBRE_BOT}.json")
 
+def leer_token_actual():
+    """
+    Lee token_actual.txt de forma segura.
+    Devuelve contenido crudo o "DEMO" si no está disponible.
+    """
+    try:
+        base_dir = globals().get("script_dir", os.path.dirname(os.path.abspath(__file__)))
+        token_path = (
+            globals().get("ARCHIVO_TOKEN")
+            or globals().get("TOKEN_FILE")
+            or globals().get("TOKEN_ACTUAL_FILE")
+            or os.path.join(base_dir, "token_actual.txt")
+        )
+        token_path = os.path.abspath(str(token_path))
+        if not os.path.exists(token_path):
+            return "DEMO"
+        with open(token_path, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+        return raw if raw else "DEMO"
+    except Exception:
+        return "DEMO"
+
 def _sync_round_resolve_start_round() -> int:
     st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
     try:
@@ -313,20 +335,55 @@ def _sync_round_resolve_start_round() -> int:
     return max(1, released)
 
 def _sync_bot_es_owner_real() -> bool:
+    """
+    True solo si este bot es dueño REAL real.
+    """
     try:
-        tok = str(leer_token_actual() or '').strip().upper()
-    except Exception:
-        tok = ''
-    if tok == f"REAL:{NOMBRE_BOT}".upper():
-        return True
-    try:
-        data = _leer_orden_real_actual() or {}
-        ts = float(data.get('created_ts') or data.get('ts') or 0.0)
-        ttl = float(data.get('ttl_s') or 45.0)
-        if str(data.get('bot','')).strip() == NOMBRE_BOT and ts > 0 and (time.time() - ts) <= max(1.0, ttl):
+        tok = str(leer_token_actual() or "").strip()
+        if tok.upper() == f"REAL:{str(NOMBRE_BOT).upper()}":
             return True
     except Exception:
         pass
+
+    try:
+        base_dir = globals().get("script_dir", os.path.dirname(os.path.abspath(__file__)))
+        orden_dir = os.path.join(base_dir, "orden_real")
+        orden_path = os.path.join(orden_dir, f"{NOMBRE_BOT}.json")
+        if os.path.exists(orden_path):
+            with open(orden_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            bot = str(
+                data.get("bot")
+                or data.get("target_bot")
+                or data.get("owner_bot")
+                or ""
+            ).strip()
+
+            if bot and bot.lower() != str(NOMBRE_BOT).lower():
+                return False
+
+            if bool(data.get("consumed", False)):
+                return False
+
+            ts = float(
+                data.get("ts")
+                or data.get("created_ts")
+                or data.get("created_at")
+                or 0.0
+            )
+            ttl = float(
+                data.get("ttl_s")
+                or data.get("ttl")
+                or globals().get("REAL_ORDER_TTL_S", 45)
+                or 45
+            )
+
+            if ts > 0 and (time.time() - ts) <= max(10.0, ttl):
+                return True
+    except Exception:
+        pass
+
     return False
 
 def _sync_round_emit_close_ack(round_id: int, resultado: str, contract_id=None, asset=None, ciclo=None) -> bool:
@@ -341,7 +398,14 @@ def _sync_round_emit_close_ack(round_id: int, resultado: str, contract_id=None, 
         prev_round = 0
     if prev_round > rid:
         return False
-    mode_sync = "REAL" if _sync_bot_es_owner_real() else "DEMO"
+    try:
+        es_real_owner_ack = _sync_bot_es_owner_real()
+    except Exception:
+        es_real_owner_ack = False
+    if es_real_owner_ack:
+        print(Fore.CYAN + f"ℹ️ ACK SYNC omitido: operación REAL de {NOMBRE_BOT}; no contamina columna DEMO.")
+        return False
+    mode_sync = "DEMO"
     payload = {
         "bot": NOMBRE_BOT,
         "round_id": rid,
@@ -449,7 +513,14 @@ async def _sync_round_wait_release(round_id: int) -> int:
         should_write = first_wait_tick or (released != last_released) or ((now_ts - last_hb_ts) >= SYNC_WAIT_HEARTBEAT_S)
         if _sync_bot_es_owner_real():
             estado_bot["sync_wait"] = False
-            print(Fore.GREEN + f"🔓 SYNC REAL OWNER: {NOMBRE_BOT} sale de standby para continuar REAL; DEMO sigue en HOLD")
+            try:
+                _sync_round_write_release_heartbeat(rid, next_round)
+            except Exception:
+                pass
+            print(
+                Fore.GREEN + Style.BRIGHT +
+                f"🔓 SYNC REAL OWNER: {NOMBRE_BOT} sale de standby para continuar REAL en ronda #{rid}; DEMO sigue en HOLD."
+            )
             return rid
         if released >= next_round:
             estado_bot["sync_wait"] = False
@@ -460,17 +531,34 @@ async def _sync_round_wait_release(round_id: int) -> int:
         stale_state = (state_ts > 0) and ((now_ts - state_ts) >= SYNC_WAIT_STALE_S)
         idle_s = now_ts - last_progress_ts
         total_wait_s = now_ts - wait_start_ts
-        if (idle_s >= SYNC_WAIT_MAX_IDLE_S) and (stale_state or total_wait_s >= (SYNC_WAIT_STALE_S + SYNC_WAIT_MAX_IDLE_S)):
-            if released < next_round and not _sync_bot_es_owner_real():
-                print(Fore.YELLOW + f"⏳ SYNC watchdog: sigo esperando liberación real de #{next_round}; no opero de nuevo en ronda #{rid}")
-                last_progress_ts = time.time()
-                await asyncio.sleep(SYNC_WAIT_POLL_S)
-                continue
-            estado_bot["sync_wait"] = False
-            _sync_round_write_release_heartbeat(rid, next_round)
-            safe_round = max(rid, _sync_round_resolve_start_round())
-            print(Fore.YELLOW + f"⚠️ LXV_SYNC_COLUMN watchdog recovery: {NOMBRE_BOT} ronda #{rid} sin progreso {idle_s:.0f}s, re-sync -> #{safe_round}")
-            return safe_round
+        if (idle_s >= SYNC_WAIT_MAX_IDLE_S) and (
+            stale_state or total_wait_s >= (SYNC_WAIT_STALE_S + SYNC_WAIT_MAX_IDLE_S)
+        ):
+            if _sync_bot_es_owner_real():
+                estado_bot["sync_wait"] = False
+                try:
+                    _sync_round_write_release_heartbeat(rid, next_round)
+                except Exception:
+                    pass
+                print(
+                    Fore.GREEN + Style.BRIGHT +
+                    f"🔓 SYNC REAL OWNER watchdog: {NOMBRE_BOT} continúa REAL en ronda #{rid}."
+                )
+                return rid
+
+            print(
+                Fore.YELLOW +
+                f"⏳ SYNC watchdog: sigo esperando liberación real de #{next_round}; "
+                f"no opero de nuevo en ronda #{rid}."
+            )
+            print(
+                Fore.YELLOW +
+                f"⏳ SYNC DEMO HOLD: {NOMBRE_BOT} espera released_round >= {next_round}; actual={released}; no recompra ronda {rid}"
+            )
+            last_progress_ts = time.time()
+            first_wait_tick = True
+            await asyncio.sleep(1.0)
+            continue
         if should_write:
             _sync_round_write_wait_heartbeat(rid, next_round)
             last_hb_ts = now_ts
