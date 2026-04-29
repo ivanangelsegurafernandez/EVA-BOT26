@@ -406,6 +406,26 @@ def _sync_round_state_ts(st: dict) -> float:
 
 
 async def _sync_round_wait_release(round_id: int) -> int:
+    def _sync_bot_es_owner_real() -> bool:
+        try:
+            tok = str(leer_token_actual() or '').strip().upper()
+        except Exception:
+            tok = ''
+        if tok == f"REAL:{NOMBRE_BOT}".upper():
+            return True
+        try:
+            p = os.path.join(ORDEN_DIR, f"{NOMBRE_BOT}.json")
+            data = _sync_round_safe_read_json(p) or {}
+            if bool(data.get('consumed', False)):
+                return False
+            ts = float(data.get('created_ts') or data.get('ts') or 0.0)
+            ttl = float(data.get('ttl_s') or 45.0)
+            if str(data.get('bot', '')).strip() == NOMBRE_BOT and ts > 0 and (time.time() - ts) <= max(1.0, ttl):
+                return True
+        except Exception:
+            pass
+        return False
+
     rid = max(1, int(round_id or 1))
     next_round = rid + 1
     print(Fore.YELLOW + Style.BRIGHT + f"⏸️ LXV_SYNC_COLUMN standby columna: {NOMBRE_BOT} ronda #{rid} esperando liberación #{next_round}...")
@@ -429,7 +449,7 @@ async def _sync_round_wait_release(round_id: int) -> int:
         should_write = first_wait_tick or (released != last_released) or ((now_ts - last_hb_ts) >= SYNC_WAIT_HEARTBEAT_S)
         if _sync_bot_es_owner_real():
             estado_bot["sync_wait"] = False
-            print(Fore.GREEN + f"🔓 SYNC REAL OWNER: {NOMBRE_BOT} sale de standby para continuar REAL; DEMO sigue bloqueado")
+            print(Fore.GREEN + f"🔓 SYNC REAL OWNER: {NOMBRE_BOT} sale de standby para continuar REAL; DEMO sigue en HOLD")
             return rid
         if released >= next_round:
             estado_bot["sync_wait"] = False
@@ -441,9 +461,9 @@ async def _sync_round_wait_release(round_id: int) -> int:
         idle_s = now_ts - last_progress_ts
         total_wait_s = now_ts - wait_start_ts
         if (idle_s >= SYNC_WAIT_MAX_IDLE_S) and (stale_state or total_wait_s >= (SYNC_WAIT_STALE_S + SYNC_WAIT_MAX_IDLE_S)):
-            if released <= rid:
-                print(Fore.YELLOW + f"⏳ SYNC watchdog: sigo esperando liberación real de #{rid + 1}; no opero de nuevo en ronda #{rid}")
-                last_progress_ts = now_ts
+            if released < next_round and not _sync_bot_es_owner_real():
+                print(Fore.YELLOW + f"⏳ SYNC watchdog: sigo esperando liberación real de #{next_round}; no opero de nuevo en ronda #{rid}")
+                last_progress_ts = time.time()
                 await asyncio.sleep(SYNC_WAIT_POLL_S)
                 continue
             estado_bot["sync_wait"] = False
