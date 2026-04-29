@@ -4173,8 +4173,8 @@ def _ack_live_format_lines(snapshot):
         fase = str(info_fase.get("fase", "DESCONOCIDA"))
         allow = bool(info_fase.get("allow_real", False))
         motivo = str(info_fase.get("motivo", "sin_motivo"))
-        cols_ok = int(info_fase.get("cols_ok", 0) or 0)
-        cols_need = int(info_fase.get("cols_need", 3) or 3)
+        cols_ok = int(info_fase.get("cols_usadas", info_fase.get("cols_ok", 0)) or 0)
+        cols_need = int(info_fase.get("cols_requeridas", info_fase.get("cols_need", 3)) or 3)
         if fase == "INSUFICIENTE":
             fase_line = (
                 f"FASE_ZV ahora: {fase} | allow={'SI' if allow else 'NO'} | "
