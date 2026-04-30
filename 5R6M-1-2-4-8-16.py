@@ -5023,6 +5023,16 @@ def _lxv_4v2x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         cooldown_s=8.0,
     )
     source_real = str(globals().get("LXV_4V2X_REAL_SOURCE", "LXV_4V2X"))
+    ciclo_local_bot = 0
+    try:
+        ciclo_local_bot = int((candidate or {}).get("ciclo", 0) or 0)
+    except Exception:
+        ciclo_local_bot = 0
+    _lxv_5v1x_event_cooldown(
+        key=f"real_cycle_global:{source_real}:{rid}:{bot_pick}",
+        msg=f"REAL CICLO GLOBAL: source={source_real} bot={bot_pick} ciclo_global=C{int(ciclo_pick)} ciclo_local_bot=C{int(ciclo_local_bot)}",
+        cooldown_s=8.0,
+    )
     ok_emit = bool(emitir_real_autorizado(bot_pick, int(ciclo_pick), source=source_real))
     if ok_emit:
         LXV_REAL_AUDIT["real_emitidos"] = int(LXV_REAL_AUDIT.get("real_emitidos", 0) or 0) + 1
@@ -5683,6 +5693,16 @@ def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         cooldown_s=8.0,
     )
     source_real = str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X"))
+    ciclo_local_bot = 0
+    try:
+        ciclo_local_bot = int((candidate or {}).get("ciclo", 0) or 0)
+    except Exception:
+        ciclo_local_bot = 0
+    _lxv_5v1x_event_cooldown(
+        key=f"real_cycle_global:{source_real}:{rid}:{bot_pick}",
+        msg=f"REAL CICLO GLOBAL: source={source_real} bot={bot_pick} ciclo_global=C{int(ciclo_pick)} ciclo_local_bot=C{int(ciclo_local_bot)}",
+        cooldown_s=8.0,
+    )
     ok_emit = bool(emitir_real_autorizado(bot_pick, int(ciclo_pick), source=source_real))
     if ok_emit:
         LXV_REAL_AUDIT["real_emitidos"] = int(LXV_REAL_AUDIT.get("real_emitidos", 0) or 0) + 1
@@ -6082,10 +6102,14 @@ def _sync_round_tick_maestro():
                     bot_pick = str(summary.get("bot_x_actual") or "").strip()
                     row_pick = next((r for r in rows_live if str((r or {}).get("bot", "")).strip() == bot_pick), {}) if bot_pick else {}
                     edad_s = (row_pick or {}).get("age_s")
-                    ciclo_pick = int((row_pick or {}).get("ciclo", ciclo_pick) or ciclo_pick)
+                    ciclo_local_bot = 0
+                    try:
+                        ciclo_local_bot = int((row_pick or {}).get("ciclo", 0) or 0)
+                    except Exception:
+                        ciclo_local_bot = 0
                     emit_bot = bot_pick
                     if bot_pick in BOT_NAMES:
-                        lxv_payload = {"round_id": round_id, "rid": round_id, "bot": bot_pick, "bot_pick": bot_pick, "bot_x": bot_pick, "bot_x_actual": bot_pick, "bot_x1": bot_pick, "bot_x_fuerte": bot_pick, "x_unica": True, "round_complete": True, "data_quality": "ok", "edad_s": edad_s, "ciclo": ciclo_pick, "partial_pattern": "5V1X", "patron_lxv": "5V1X", "source": "LXV_5V1X"}
+                        lxv_payload = {"round_id": round_id, "rid": round_id, "bot": bot_pick, "bot_pick": bot_pick, "bot_x": bot_pick, "bot_x_actual": bot_pick, "bot_x1": bot_pick, "bot_x_fuerte": bot_pick, "x_unica": True, "round_complete": True, "data_quality": "ok", "edad_s": edad_s, "ciclo": ciclo_local_bot, "partial_pattern": "5V1X", "patron_lxv": "5V1X", "source": "LXV_5V1X"}
                         ok_emit = bool(_lxv_5v1x_apply_real_route(lxv_payload, int(ciclo_pick)))
                         fase_info = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
                         fase_ok = bool(fase_info.get("allow_real", False))
