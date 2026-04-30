@@ -12890,19 +12890,19 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
         if bot in BOT_NAMES and bot not in bots_usados_en_esta_marti:
             bots_usados_en_esta_marti.append(bot)
 
-        # Robustez anti-desincronización:
-        # si conocemos el ciclo realmente operado, el próximo estado de pérdidas
-        # debe ser al menos ese ciclo (p.ej. perder en C2 => pérdidas=2 => próximo C3).
+        # Regla oficial:
+        # - pérdida en C1..C4 => próximo C2..C5 (marti_ciclos_perdidos = ciclo_operado)
+        # - pérdida en C5      => reinicio a C1
+        # Se prioriza el ciclo realmente operado para evitar reinicios o saltos erróneos.
         try:
             ciclo_ref = int(ciclo_operado) if ciclo_operado is not None else 0
         except Exception:
             ciclo_ref = 0
-        marti_ciclos_perdidos = min(
-            MAX_CICLOS,
-            max(int(marti_ciclos_perdidos) + 1, max(0, ciclo_ref))
-        )
-        # Si ya culminó C{MAX_CICLOS}, reinicia a C1 para el siguiente turno.
-        if int(marti_ciclos_perdidos) >= int(MAX_CICLOS):
+
+        if 1 <= int(ciclo_ref) < int(MAX_CICLOS):
+            marti_ciclos_perdidos = int(ciclo_ref)
+            marti_paso = min(MAX_CICLOS - 1, int(marti_ciclos_perdidos))
+        elif int(ciclo_ref) >= int(MAX_CICLOS):
             marti_ciclos_perdidos = 0
             marti_paso = 0
             bots_usados_en_esta_marti = []
@@ -12916,7 +12916,18 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
             except Exception:
                 pass
         else:
-            marti_paso = min(MAX_CICLOS - 1, int(marti_ciclos_perdidos))
+            # Fallback defensivo cuando ciclo_operado no viene informado:
+            # avanzar un ciclo sin sobrepasar C{MAX_CICLOS}, y reiniciar al tocar tope.
+            marti_ciclos_perdidos = min(int(MAX_CICLOS), max(0, int(marti_ciclos_perdidos)) + 1)
+            if int(marti_ciclos_perdidos) >= int(MAX_CICLOS):
+                marti_ciclos_perdidos = 0
+                marti_paso = 0
+                bots_usados_en_esta_marti = []
+                _marti_audit_record("cierre_tope", ciclo=ciclo_operado, bot=bot, detalle=f"tope=C{int(MAX_CICLOS)}_fallback")
+                marti_audit_run_id = int(marti_audit_run_id) + 1
+                marti_audit_ultimo_ciclo_ordenado = None
+            else:
+                marti_paso = min(MAX_CICLOS - 1, int(marti_ciclos_perdidos))
     else:
         return
 
