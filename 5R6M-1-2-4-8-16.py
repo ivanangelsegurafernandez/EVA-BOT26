@@ -4506,6 +4506,67 @@ def _hud_marti_live_lines():
         return []
 
 
+def render_cuadro_martingala_visible():
+    try:
+        snap = _marti_hud_snapshot() if "_marti_hud_snapshot" in globals() else {}
+        escala = list(globals().get("MARTI_ESCALADO", []) or [])
+        max_c = int(globals().get("MAX_CICLOS", len(escala) or 1) or 1)
+        prox = int(ciclo_martingala_siguiente() or 1)
+        prox = max(1, min(max_c, prox))
+        ciclo_act = int(snap.get("ciclo_actual", prox) or prox)
+        ciclo_act = max(1, min(max_c, ciclo_act))
+        owner = reconciliar_token_real_visual("render_cuadro_martingala_visible") or (REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else "")
+        real_on = owner in BOT_NAMES
+        bot_real = owner if real_on else "ninguno"
+        estado_txt = "REAL ACTIVO" if real_on else "DEMO | ESPERANDO SEÑAL"
+        is_final_loss = bool(str(snap.get("estado", "")).upper() == "FIN_C5")
+        highlight_cycle = prox if not real_on else ciclo_act
+
+        def _clr(name, default=""):
+            return globals().get(name, default)
+        fb, fc, fy, fr = _clr("Fore", type("F", (), {"BLUE":"", "CYAN":"", "YELLOW":"", "RED":"", "RESET":""})).BLUE, _clr("Fore", type("F", (), {"BLUE":"", "CYAN":"", "YELLOW":"", "RED":"", "RESET":""})).CYAN, _clr("Fore", type("F", (), {"BLUE":"", "CYAN":"", "YELLOW":"", "RED":"", "RESET":""})).YELLOW, _clr("Fore", type("F", (), {"BLUE":"", "CYAN":"", "YELLOW":"", "RED":"", "RESET":""})).RED
+        frs = _clr("Fore", type("F", (), {"RESET":""})).RESET
+        sb = _clr("Style", type("S", (), {"BRIGHT":"", "RESET_ALL":""})).BRIGHT
+        srs = _clr("Style", type("S", (), {"BRIGHT":"", "RESET_ALL":""})).RESET_ALL
+        border = fb + sb
+        title_c = fc + sb
+        hi = fy + sb
+        al = fr + sb
+        st = (fy + sb) if real_on else (fc + sb)
+
+        cycle_parts = []
+        for i in range(1, max_c + 1):
+            amount = escala[i - 1] if (i - 1) < len(escala) else ""
+            lbl = f"C{i} [{amount:g}]" if isinstance(amount, (int, float)) else f"C{i} [{amount}]"
+            if i == highlight_cycle:
+                lbl = f"🟨 {lbl} 🟨"
+                lbl = hi + lbl + srs
+            cycle_parts.append(lbl)
+        cycles_line = "   ".join(cycle_parts)
+
+        lines = []
+        lines.append("")
+        lines.append(border + "╔════════════════════════════════════════════════════════════╗" + srs)
+        lines.append(border + "║ " + title_c + "                🔁 MARTINGALA REAL - CICLOS               " + border + " ║" + srs)
+        lines.append(border + "╠════════════════════════════════════════════════════════════╣" + srs)
+        lines.append(border + f"║ {cycles_line:<58} ║" + srs)
+        lines.append(border + "╠════════════════════════════════════════════════════════════╣" + srs)
+        lines.append(border + f"║   CICLO ACTUAL : {hi}C{ciclo_act}{srs}{border}                                       ║" + srs)
+        lines.append(border + f"║   PRÓXIMA REAL : {hi}C{prox}{srs}{border}                                       ║" + srs)
+        lines.append(border + f"║   ESTADO       : {st}{estado_txt}{srs}{border}                   ║" + srs)
+        lines.append(border + f"║   BOT REAL     : {(hi if real_on else fc)}{bot_real}{srs}{border}                                  ║" + srs)
+        if is_final_loss:
+            lines.append(border + f"║   ALERTA       : {al}PÉRDIDA FINAL C5 -> REINICIO C1{srs}{border}            ║" + srs)
+        lines.append(border + "╚════════════════════════════════════════════════════════════╝" + srs)
+        lines.append("")
+        return lines
+    except Exception:
+        try:
+            return ["", "🔁 MARTINGALA REAL - CICLOS | visual no disponible", ""]
+        except Exception:
+            return []
+
+
 def _sync_round_write_json_atomic(path: str, payload: dict) -> bool:
     try:
         _atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2))
@@ -17239,6 +17300,8 @@ def mostrar_panel():
 
     try:
         if bool(globals().get("HUD_MARTINGALA_LIVE_ENABLE", True)):
+            for _ml in render_cuadro_martingala_visible():
+                print(_ml)
             print(_marti_hud_render_line())
             try:
                 for _ln in _manual_status_lines():
@@ -21421,30 +21484,22 @@ async def main():
                                     except Exception:
                                         pass
                                     if res == "GANANCIA":
-                                        cerrar_por_fin_de_ciclo(bot, "Ganancia en REAL (fin de turno)")
-                                        _sync_round_release_after_real_close(bot, reason="real_ganancia")
+                                        prox = int(ciclo_martingala_siguiente() or 1)
+                                        agregar_evento(f"✅ REAL WIN: {bot} C{int(ciclo or 0)} -> DEMO | próximo ciclo C{prox}")
+                                        cerrar_por_fin_de_ciclo(bot, "Ganancia REAL cerrada; vuelve a DEMO")
+                                        _sync_round_release_after_real_close(bot, reason="real_win")
                                         activo_real = None
                                         break
-                                    if int(ciclo or 0) < int(MAX_CICLOS):
-                                        st_sync = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
-                                        rid_sync = int(st_sync.get("round_id", 1) or 1)
-                                        payload = dict(st_sync) if isinstance(st_sync, dict) else {}
-                                        payload["round_id"] = rid_sync
-                                        payload["released_round"] = rid_sync
-                                        payload["status"] = "holding_real_turn"
-                                        payload["reason"] = "real_loss_continue_next_cycle"
-                                        payload["real_pending_bot"] = bot
-                                        payload["real_pending_round"] = rid_sync
-                                        payload["real_pending_cycle"] = int(ciclo or 0) + 1
-                                        payload["ts"] = time.time()
-                                        _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
-                                        agregar_evento(f"⏸️ REAL continúa: {bot} perdió C{int(ciclo or 0)} -> C{int(ciclo or 0)+1}; DEMO sigue en HOLD")
-                                        activo_real = bot
+                                    if res == "PÉRDIDA":
+                                        prox = int(ciclo_martingala_siguiente() or 1)
+                                        if int(ciclo or 0) >= int(MAX_CICLOS):
+                                            agregar_evento(f"❌ REAL LOSS FINAL: {bot} C{int(ciclo or 0)} -> DEMO | reinicio próximo ciclo C{prox}")
+                                        else:
+                                            agregar_evento(f"❌ REAL LOSS: {bot} C{int(ciclo or 0)} -> DEMO | próximo ciclo C{prox}")
+                                        cerrar_por_fin_de_ciclo(bot, f"Pérdida REAL C{int(ciclo or 0)}; vuelve a DEMO; próximo ciclo C{prox}")
+                                        _sync_round_release_after_real_close(bot, reason="real_loss_next_cycle")
+                                        activo_real = None
                                         break
-                                    cerrar_por_fin_de_ciclo(bot, "Pérdida en REAL (fin de turno)")
-                                    _sync_round_release_after_real_close(bot, reason="real_loss_max_cycle")
-                                    activo_real = None
-                                    break
 
                     if (not activo_real) and (not pausa_maestro_activa):
                         set_etapa("TICK_03")
