@@ -247,6 +247,9 @@ HUD_SIDE_PANEL_INLINE = True
 HUD_SHOW_SALDO_DEBUG = False
 HUD_EVENT_MAX_CHARS = 150
 HUD_SHOW_CONTROL_PANEL = False
+HUD_MARTI_CLEAN_LAYOUT = True
+HUD_BOX_WIDTH = 92
+HUD_TABLE_WIDTH = 132
 ROUND_LIVE_INVEST_WINDOW_S = 45
 MANUAL_CONFIRM_TIMEOUT_S = 20
 MANUAL_REAL_DECISION_WINDOW_S = 35
@@ -3757,6 +3760,45 @@ def _ack_tape_pad_visible(text, width):
     return txt
 
 
+def hud_strip_ansi(text):
+    return _ack_tape_strip_ansi(text)
+
+
+def hud_visible_len(text):
+    return len(hud_strip_ansi(text))
+
+
+def hud_pad(text, width):
+    return _ack_tape_pad_visible(text, width)
+
+
+def hud_border_top(width=HUD_BOX_WIDTH):
+    inner = max(1, int(width or HUD_BOX_WIDTH))
+    return "╔" + ("═" * inner) + "╗"
+
+
+def hud_border_mid(width=HUD_BOX_WIDTH):
+    inner = max(1, int(width or HUD_BOX_WIDTH))
+    return "╠" + ("═" * inner) + "╣"
+
+
+def hud_border_bottom(width=HUD_BOX_WIDTH):
+    inner = max(1, int(width or HUD_BOX_WIDTH))
+    return "╚" + ("═" * inner) + "╝"
+
+
+def hud_box_line(text="", width=HUD_BOX_WIDTH, color=None):
+    inner = max(1, int(width or HUD_BOX_WIDTH))
+    payload = hud_pad(str(text or ""), inner)
+    line = f"║{payload}║"
+    if color:
+        try:
+            return f"{color}{line}{Style.RESET_ALL}"
+        except Exception:
+            return f"{color}{line}"
+    return line
+
+
 def _ack_tape_render_bot(bot, fallback_resultados=None, width=None):
     _ack_tape_init()
     try:
@@ -4537,27 +4579,28 @@ def render_cuadro_martingala_visible():
         cycle_parts = []
         for i in range(1, max_c + 1):
             amount = escala[i - 1] if (i - 1) < len(escala) else ""
-            lbl = f"C{i} [{amount:g}]" if isinstance(amount, (int, float)) else f"C{i} [{amount}]"
+            lbl = f"[C{i} ${amount:g}]" if isinstance(amount, (int, float)) else f"[C{i} ${amount}]"
             if i == highlight_cycle:
-                lbl = f"🟨 {lbl} 🟨"
                 lbl = hi + lbl + srs
+            else:
+                lbl = fc + lbl + srs
             cycle_parts.append(lbl)
         cycles_line = "   ".join(cycle_parts)
 
         lines = []
         lines.append("")
-        lines.append(border + "╔════════════════════════════════════════════════════════════╗" + srs)
-        lines.append(border + "║ " + title_c + "                🔁 MARTINGALA REAL - CICLOS               " + border + " ║" + srs)
-        lines.append(border + "╠════════════════════════════════════════════════════════════╣" + srs)
-        lines.append(border + f"║ {cycles_line:<58} ║" + srs)
-        lines.append(border + "╠════════════════════════════════════════════════════════════╣" + srs)
-        lines.append(border + f"║   CICLO ACTUAL : {hi}C{ciclo_act}{srs}{border}                                       ║" + srs)
-        lines.append(border + f"║   PRÓXIMA REAL : {hi}C{prox}{srs}{border}                                       ║" + srs)
-        lines.append(border + f"║   ESTADO       : {st}{estado_txt}{srs}{border}                   ║" + srs)
-        lines.append(border + f"║   BOT REAL     : {(hi if real_on else fc)}{bot_real}{srs}{border}                                  ║" + srs)
+        lines.append(border + hud_border_top(HUD_BOX_WIDTH) + srs)
+        lines.append(border + hud_box_line(hud_pad(title_c + "MARTINGALA REAL - CICLOS" + srs, HUD_BOX_WIDTH), HUD_BOX_WIDTH) + srs)
+        lines.append(border + hud_border_mid(HUD_BOX_WIDTH) + srs)
+        lines.append(border + hud_box_line("   " + hud_pad(cycles_line, HUD_BOX_WIDTH - 3), HUD_BOX_WIDTH) + srs)
+        lines.append(border + hud_border_mid(HUD_BOX_WIDTH) + srs)
+        lines.append(border + hud_box_line(f"   CICLO ACTUAL : {hi}C{ciclo_act}{srs}{border}", HUD_BOX_WIDTH) + srs)
+        lines.append(border + hud_box_line(f"   PROXIMA REAL : {hi}C{prox}{srs}{border}", HUD_BOX_WIDTH) + srs)
+        lines.append(border + hud_box_line(f"   ESTADO       : {st}{estado_txt}{srs}{border}", HUD_BOX_WIDTH) + srs)
+        lines.append(border + hud_box_line(f"   BOT REAL     : {(hi if real_on else fc)}{bot_real}{srs}{border}", HUD_BOX_WIDTH) + srs)
         if is_final_loss:
-            lines.append(border + f"║   ALERTA       : {al}PÉRDIDA FINAL C5 -> REINICIO C1{srs}{border}            ║" + srs)
-        lines.append(border + "╚════════════════════════════════════════════════════════════╝" + srs)
+            lines.append(border + hud_box_line(f"   ALERTA       : {al}PERDIDA FINAL C5 -> REINICIO C1{srs}{border}", HUD_BOX_WIDTH) + srs)
+        lines.append(border + hud_border_bottom(HUD_BOX_WIDTH) + srs)
         lines.append("")
         return lines
     except Exception:
@@ -16601,22 +16644,22 @@ def mostrar_bloque_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--
         meta_tag = f"META={meta_v}"
         l1_plain = f"💰 {saldo_tag:<22} 🎯 {meta_tag:<22}"
         l2_plain = f"MODO={modo_v} | TOKEN={token_v} | FALTA={falta_v} | AVANCE={avance_v} | R={refresh_v}"
-        w = max(76, len(_ack_tape_strip_ansi(l1_plain)), len(_ack_tape_strip_ansi(l2_plain)))
+        w = int(HUD_BOX_WIDTH)
         try:
             s_col = Fore.LIGHTGREEN_EX + Style.BRIGHT + saldo_tag + Style.RESET_ALL
             m_col = Fore.LIGHTMAGENTA_EX + Style.BRIGHT + meta_tag + Style.RESET_ALL
-            l1_col = f"💰 {s_col:<22} 🎯 {m_col:<22}"
-            l2_col = (
-                Fore.CYAN + f"MODO={modo_v} | TOKEN={token_v} | " + Fore.WHITE
-                + f"FALTA={falta_v} | AVANCE={avance_v} | R={refresh_v}" + Fore.RESET
-            )
+            l1_col = f"  $ {s_col}    META {m_col}"
+            l2_col = Fore.CYAN + f"  MODO={modo_v}    TOKEN={token_v}" + Fore.RESET
+            l3_col = Fore.WHITE + f"  FALTA={falta_v}    AVANCE={avance_v}    R={refresh_v}" + Fore.RESET
         except Exception:
             l1_col = l1_plain
             l2_col = l2_plain
-        print(padding + Fore.CYAN + "╔" + "═" * (w + 2) + "╗")
-        print(padding + Fore.CYAN + f"║ {_ack_tape_pad_visible(l1_col, w)} ║")
-        print(padding + Fore.CYAN + f"║ {_ack_tape_pad_visible(l2_col, w)} ║")
-        print(padding + Fore.CYAN + "╚" + "═" * (w + 2) + "╝")
+            l3_col = f"  FALTA={falta_v}    AVANCE={avance_v}    R={refresh_v}"
+        print(padding + Fore.CYAN + hud_border_top(w))
+        print(padding + Fore.CYAN + hud_box_line(hud_pad(l1_col, w), w))
+        print(padding + Fore.CYAN + hud_box_line(hud_pad(l2_col, w), w))
+        print(padding + Fore.CYAN + hud_box_line(hud_pad(l3_col, w), w))
+        print(padding + Fore.CYAN + hud_border_bottom(w))
 
     try:
         owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
@@ -16642,10 +16685,10 @@ def mostrar_bloque_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--
         l2 = _ack_tape_strip_ansi(
             src2.replace("🎯 ", "📈 ").replace("Base=", "BASE=").replace("Estado=", "ESTADO=").replace("Marti C1-C5=", "MARTI C1-C5=").replace("Cobertura=", "COBERTURA=")
         )
-        w2 = max(76, len(l2))
-        print(padding + Fore.BLUE + f"╭{'─' * (w2 + 2)}╮")
-        print(padding + Fore.BLUE + f"│ {l2:<{w2}} │")
-        print(padding + Fore.BLUE + f"╰{'─' * (w2 + 2)}╯")
+        w2 = int(HUD_BOX_WIDTH)
+        print(padding + Fore.BLUE + hud_border_top(w2))
+        print(padding + Fore.BLUE + hud_box_line(hud_pad(l2, w2), w2))
+        print(padding + Fore.BLUE + hud_border_bottom(w2))
     except Exception:
         print(padding + Fore.CYAN + "💰 Saldo/Meta: --")
 
@@ -16851,29 +16894,30 @@ def mostrar_panel():
         top_lines = list(_resumen_top_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str) or [])
         for _line in top_lines[1:]:
             print(padding + Fore.CYAN + _line)
-        fi = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
-        fase = str(fi.get("fase", "INSUFICIENTE"))
-        v0 = int(fi.get("verdes0", 0) or 0)
-        v1 = int(fi.get("verdes1", 0) or 0)
-        cols_used = int(fi.get("cols_usadas", 0) or 0)
-        cols_req = int(fi.get("cols_requeridas", int(globals().get("LXV_FASE_MIN_COLUMNS", 3)) or 3) or 3)
-        arrow = "↑" if bool(fi.get("allow_real", False)) else "↓"
-        bloq = "" if bool(fi.get("allow_real", False)) else " BLOQ"
-        if fase == "INSUFICIENTE":
-            if cols_used >= 2:
-                ftxt = f"FASE ZV: {fase} cols={cols_used}/{cols_req} g0={v0}/6 g1={v1}/6 {arrow}{bloq}"
+        if not bool(globals().get("HUD_MARTI_CLEAN_LAYOUT", True)):
+            fi = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
+            fase = str(fi.get("fase", "INSUFICIENTE"))
+            v0 = int(fi.get("verdes0", 0) or 0)
+            v1 = int(fi.get("verdes1", 0) or 0)
+            cols_used = int(fi.get("cols_usadas", 0) or 0)
+            cols_req = int(fi.get("cols_requeridas", int(globals().get("LXV_FASE_MIN_COLUMNS", 3)) or 3) or 3)
+            arrow = "↑" if bool(fi.get("allow_real", False)) else "↓"
+            bloq = "" if bool(fi.get("allow_real", False)) else " BLOQ"
+            if fase == "INSUFICIENTE":
+                if cols_used >= 2:
+                    ftxt = f"FASE ZV: {fase} cols={cols_used}/{cols_req} g0={v0}/6 g1={v1}/6 {arrow}{bloq}"
+                else:
+                    ftxt = f"FASE ZV: {fase} cols={cols_used}/{cols_req} g0={v0}/6 {arrow}{bloq}"
             else:
-                ftxt = f"FASE ZV: {fase} cols={cols_used}/{cols_req} g0={v0}/6 {arrow}{bloq}"
-        else:
-            ftxt = f"FASE ZV: {fase} g0={v0}/6 {arrow}{bloq}"
-        print(padding + Fore.CYAN + ftxt[:35])
-        aud = dict(globals().get("LXV_REAL_AUDIT", {}) or {})
-        print(padding + Fore.CYAN + (f"LXV AUDIT | 5V1X={int(aud.get('patrones_5v1x',0) or 0)} | 4V2X={int(aud.get('patrones_4v2x',0) or 0)} | FASE_OK={int(aud.get('fase_ok',0) or 0)} | BLOQ={int(aud.get('fase_bloq',0) or 0)} | REAL={int(aud.get('real_emitidos',0) or 0)} | último={str(aud.get('ultimo_bloqueo','') or '-')}")[:140])
+                ftxt = f"FASE ZV: {fase} g0={v0}/6 {arrow}{bloq}"
+            print(padding + Fore.CYAN + ftxt[:35])
+            aud = dict(globals().get("LXV_REAL_AUDIT", {}) or {})
+            print(padding + Fore.CYAN + (f"LXV AUDIT | 5V1X={int(aud.get('patrones_5v1x',0) or 0)} | 4V2X={int(aud.get('patrones_4v2x',0) or 0)} | FASE_OK={int(aud.get('fase_ok',0) or 0)} | BLOQ={int(aud.get('fase_bloq',0) or 0)} | REAL={int(aud.get('real_emitidos',0) or 0)} | último={str(aud.get('ultimo_bloqueo','') or '-')}")[:140])
     except Exception:
         pass
 
     # Bloques técnicos extensos (solo verbose/debug)
-    if bool(globals().get("HUD_SHOW_VERBOSE_TOP", False)) or (not bool(globals().get("HUD_MINIMAL_MODE", True))):
+    if (not bool(globals().get("HUD_MARTI_CLEAN_LAYOUT", True))) and (bool(globals().get("HUD_SHOW_VERBOSE_TOP", False)) or (not bool(globals().get("HUD_MINIMAL_MODE", True)))):
         # Resumen rápido para que el HUD no se vea "vacío"
         try:
             bots_con_prob = 0
@@ -17302,7 +17346,8 @@ def mostrar_panel():
         if bool(globals().get("HUD_MARTINGALA_LIVE_ENABLE", True)):
             for _ml in render_cuadro_martingala_visible():
                 print(_ml)
-            print(_marti_hud_render_line())
+            if not bool(globals().get("HUD_MARTI_CLEAN_LAYOUT", True)):
+                print(_marti_hud_render_line())
             try:
                 for _ln in _manual_status_lines():
                     print(_ln)
@@ -18108,11 +18153,24 @@ def _hud_trim_line(txt: str, max_chars: int | None = None) -> str:
 def mostrar_eventos():
     if eventos_recentes:
         print(Fore.MAGENTA + "Eventos recientes:")
-        max_ev = int(HUD_EVENTS_MAX)
+        max_ev = 3 if bool(globals().get("HUD_MARTI_CLEAN_LAYOUT", True)) else int(HUD_EVENTS_MAX)
         if bool(globals().get("HUD_SHOW_VERBOSE_EVENTS", False)):
             max_ev = max(max_ev, len(list(eventos_recentes)))
-        for ev in list(eventos_recentes)[-max_ev:]:
-            print(Fore.MAGENTA + " - " + _hud_trim_line(ev, HUD_EVENT_MAX_CHARS))
+        raw_events = list(eventos_recentes)
+        if bool(globals().get("HUD_MARTI_CLEAN_LAYOUT", True)):
+            filtered = []
+            skip_tokens = ("ia audit tick", "orphan_rate", "why=", "gate=", "trigger=", "lxv audit", "fase_zv")
+            for ev in raw_events:
+                low = str(ev or "").lower()
+                if any(tok in low for tok in skip_tokens):
+                    continue
+                filtered.append(ev)
+            raw_events = filtered[-max_ev:]
+        else:
+            raw_events = raw_events[-max_ev:]
+        max_chars = 90 if bool(globals().get("HUD_MARTI_CLEAN_LAYOUT", True)) else HUD_EVENT_MAX_CHARS
+        for ev in raw_events:
+            print(Fore.MAGENTA + " - " + _hud_trim_line(ev, max_chars))
 # === FIN BLOQUE 11 ===
 
 # === BLOQUE 12 — CONTROL MANUAL REAL Y CONDICIONES SEGURAS ===
