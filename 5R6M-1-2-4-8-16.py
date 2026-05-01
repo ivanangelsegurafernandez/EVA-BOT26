@@ -3841,23 +3841,23 @@ def hud_pad(text, width):
     return _ack_tape_pad_visible(text, width)
 
 
-def hud_border_top(width=HUD_BOX_WIDTH):
-    inner = max(1, int(width or HUD_BOX_WIDTH))
+def hud_border_top(width=box_w):
+    inner = max(1, int(width or box_w))
     return "╔" + ("═" * inner) + "╗"
 
 
-def hud_border_mid(width=HUD_BOX_WIDTH):
-    inner = max(1, int(width or HUD_BOX_WIDTH))
+def hud_border_mid(width=box_w):
+    inner = max(1, int(width or box_w))
     return "╠" + ("═" * inner) + "╣"
 
 
-def hud_border_bottom(width=HUD_BOX_WIDTH):
-    inner = max(1, int(width or HUD_BOX_WIDTH))
+def hud_border_bottom(width=box_w):
+    inner = max(1, int(width or box_w))
     return "╚" + ("═" * inner) + "╝"
 
 
 def hud_box_line(text="", width=HUD_BOX_WIDTH, color=None):
-    inner = max(1, int(width or HUD_BOX_WIDTH))
+    inner = max(1, int(width or box_w))
     payload = hud_pad(str(text or ""), inner)
     line = f"║{payload}║"
     if color:
@@ -4153,27 +4153,14 @@ def _sync_round_manual_status() -> dict:
 
 
 def _round_live_estado_display(row: dict) -> str:
-    """
-    ROUND LIVE muestra estados visuales de cierre/espera:
-    1) waiting
-    2) cierre reciente (✓/X/cerrado)
-
-    Esta función NO modifica datos internos.
-    Solo transforma la fila en texto visual.
-    """
     try:
         row = row if isinstance(row, dict) else {}
 
-        estado = str(row.get("estado") or row.get("status") or "").strip().lower()
         res = str(row.get("res") or row.get("symbol") or "").strip()
-        is_current = bool(row.get("is_current", True))
-
-        is_closed = bool(
-            row.get("is_closed_result")
-            or row.get("valid_closed")
-            or estado == "closed"
-            or res in ("✓", "X")
-        )
+        estado = str(row.get("estado") or row.get("status") or "").strip().lower()
+        ack_round = int(row.get("ack_round", row.get("ack", 0)) or 0)
+        gap = row.get("gap", 0)
+        is_current = bool(row.get("is_current", row.get("current", True)))
 
         edad_s = None
         for k in ("edad_s", "age_s", "ack_age_s", "edad_seg", "age"):
@@ -4196,23 +4183,48 @@ def _round_live_estado_display(row: dict) -> str:
             except Exception:
                 edad_s = None
 
+        loss_values = ("X", "✗", "PÉRDIDA", "PERDIDA", "LOSS")
+        win_values = ("✓", "GANANCIA", "WIN")
+        res_up = res.upper()
+        is_loss = res_up in loss_values or res in ("X", "✗")
+        is_win = res_up in win_values or res == "✓"
+        is_closed = is_loss or is_win or bool(row.get("is_closed_result")) or bool(row.get("valid_closed")) or estado == "closed"
+
+        if ack_round <= 0:
+            return Fore.YELLOW + Style.BRIGHT + "pendiente_ack" + Style.RESET_ALL
+
+        if (not res) or (res in (".", "-", "--", "None", "null")):
+            return Fore.YELLOW + Style.BRIGHT + "pendiente_resultado" + Style.RESET_ALL
+
+        try:
+            gap_n = float(gap)
+        except Exception:
+            gap_n = 0.0
+        if gap_n != 0.0:
+            return Fore.YELLOW + Style.BRIGHT + "ronda_no_actual" + Style.RESET_ALL
+
         if edad_s is None:
-            # Si no sabemos la edad exacta, por seguridad visual no damos señal de inversión.
-            return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
+            if is_closed:
+                return Fore.YELLOW + Style.BRIGHT + "cerrado_sin_edad" + Style.RESET_ALL
+            return Fore.YELLOW + Style.BRIGHT + "pendiente_resultado" + Style.RESET_ALL
 
         window_s = float(globals().get("ROUND_LIVE_INVEST_WINDOW_S", 45) or 45)
+        if is_current and is_closed and 0 <= edad_s <= window_s:
+            if is_loss:
+                return Fore.RED + Style.BRIGHT + "X_reciente" + Style.RESET_ALL
+            if is_win:
+                return Fore.GREEN + Style.BRIGHT + "✓_reciente" + Style.RESET_ALL
+            return Fore.CYAN + Style.BRIGHT + "cerrado_reciente" + Style.RESET_ALL
 
-        if is_current and is_closed and 0.0 <= float(edad_s) <= window_s:
-            if res == "X":
-                return Fore.RED + Style.BRIGHT + "X reciente" + Style.RESET_ALL
-            if res == "✓":
-                return Fore.GREEN + Style.BRIGHT + "✓ reciente" + Style.RESET_ALL
-            return Fore.CYAN + Style.BRIGHT + "cerrado reciente" + Style.RESET_ALL
+        if is_current and is_closed and edad_s > window_s:
+            return Fore.WHITE + Style.BRIGHT + "cerrado_fuera_ventana" + Style.RESET_ALL
 
-        return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
+        if is_current and not is_closed:
+            return Fore.YELLOW + Style.BRIGHT + "esperando_cierre" + Style.RESET_ALL
 
+        return Fore.YELLOW + Style.BRIGHT + "esperando" + Style.RESET_ALL
     except Exception:
-        return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
+        return Fore.RED + Style.BRIGHT + "estado_error" + Style.RESET_ALL
 
 
 def _ack_live_format_lines(snapshot):
@@ -4617,8 +4629,10 @@ def _hud_marti_live_lines():
         return []
 
 
-def render_cuadro_martingala_visible():
+def render_cuadro_martingala_visible(width=None):
     try:
+        box_w = int(width or HUD_BOX_WIDTH)
+        box_w = max(54, min(box_w, HUD_BOX_WIDTH))
         snap = _marti_hud_snapshot() if "_marti_hud_snapshot" in globals() else {}
         escala = list(globals().get("MARTI_ESCALADO", []) or [])
         max_c = int(globals().get("MAX_CICLOS", len(escala) or 1) or 1)
@@ -4658,18 +4672,18 @@ def render_cuadro_martingala_visible():
 
         lines = []
         lines.append("")
-        lines.append(border + hud_border_top(HUD_BOX_WIDTH) + srs)
-        lines.append(border + hud_box_line(hud_pad(title_c + "MARTINGALA REAL - CICLOS" + srs, HUD_BOX_WIDTH), HUD_BOX_WIDTH) + srs)
-        lines.append(border + hud_border_mid(HUD_BOX_WIDTH) + srs)
-        lines.append(border + hud_box_line("   " + hud_pad(cycles_line, HUD_BOX_WIDTH - 3), HUD_BOX_WIDTH) + srs)
-        lines.append(border + hud_border_mid(HUD_BOX_WIDTH) + srs)
-        lines.append(border + hud_box_line(f"   CICLO ACTUAL : {hi}C{ciclo_act}{srs}{border}", HUD_BOX_WIDTH) + srs)
-        lines.append(border + hud_box_line(f"   PROXIMA REAL : {hi}C{prox}{srs}{border}", HUD_BOX_WIDTH) + srs)
-        lines.append(border + hud_box_line(f"   ESTADO       : {st}{estado_txt}{srs}{border}", HUD_BOX_WIDTH) + srs)
-        lines.append(border + hud_box_line(f"   BOT REAL     : {(hi if real_on else fc)}{bot_real}{srs}{border}", HUD_BOX_WIDTH) + srs)
+        lines.append(border + hud_border_top(box_w) + srs)
+        lines.append(border + hud_box_line(hud_pad(title_c + "MARTINGALA REAL - CICLOS" + srs, box_w), box_w) + srs)
+        lines.append(border + hud_border_mid(box_w) + srs)
+        lines.append(border + hud_box_line("   " + hud_pad(cycles_line, box_w - 3), box_w) + srs)
+        lines.append(border + hud_border_mid(box_w) + srs)
+        lines.append(border + hud_box_line(f"   CICLO ACTUAL : {hi}C{ciclo_act}{srs}{border}", box_w) + srs)
+        lines.append(border + hud_box_line(f"   PROXIMA REAL : {hi}C{prox}{srs}{border}", box_w) + srs)
+        lines.append(border + hud_box_line(f"   ESTADO       : {st}{estado_txt}{srs}{border}", box_w) + srs)
+        lines.append(border + hud_box_line(f"   BOT REAL     : {(hi if real_on else fc)}{bot_real}{srs}{border}", box_w) + srs)
         if is_final_loss:
-            lines.append(border + hud_box_line(f"   ALERTA       : {al}PERDIDA FINAL C5 -> REINICIO C1{srs}{border}", HUD_BOX_WIDTH) + srs)
-        lines.append(border + hud_border_bottom(HUD_BOX_WIDTH) + srs)
+            lines.append(border + hud_box_line(f"   ALERTA       : {al}PERDIDA FINAL C5 -> REINICIO C1{srs}{border}", box_w) + srs)
+        lines.append(border + hud_border_bottom(box_w) + srs)
         lines.append("")
         return lines
     except Exception:
@@ -4677,6 +4691,18 @@ def render_cuadro_martingala_visible():
             return ["", "🔁 MARTINGALA REAL - CICLOS | visual no disponible", ""]
         except Exception:
             return []
+
+
+def _hud_martingala_real_lines(width=None):
+    try:
+        out = render_cuadro_martingala_visible(width=width or 60)
+        if isinstance(out, list):
+            return out
+        if isinstance(out, str):
+            return str(out).splitlines()
+        return []
+    except Exception:
+        return []
 
 
 def _sync_round_write_json_atomic(path: str, payload: dict) -> bool:
@@ -17033,7 +17059,7 @@ def mostrar_bloque_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--
         meta_tag = f"META={meta_v}"
         l1_plain = f"💰 {saldo_tag:<22} 🎯 {meta_tag:<22}"
         l2_plain = f"MODO={modo_v} | TOKEN={token_v} | FALTA={falta_v} | AVANCE={avance_v} | R={refresh_v}"
-        w = int(HUD_BOX_WIDTH)
+        w = int(box_w)
         try:
             s_col = Fore.LIGHTGREEN_EX + Style.BRIGHT + saldo_tag + Style.RESET_ALL
             m_col = Fore.LIGHTMAGENTA_EX + Style.BRIGHT + meta_tag + Style.RESET_ALL
@@ -17074,7 +17100,7 @@ def mostrar_bloque_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--
         l2 = _ack_tape_strip_ansi(
             src2.replace("🎯 ", "📈 ").replace("Base=", "BASE=").replace("Estado=", "ESTADO=").replace("Marti C1-C5=", "MARTI C1-C5=").replace("Cobertura=", "COBERTURA=")
         )
-        w2 = int(HUD_BOX_WIDTH)
+        w2 = int(box_w)
         print(padding + Fore.BLUE + hud_border_top(w2))
         print(padding + Fore.BLUE + hud_box_line(hud_pad(l2, w2), w2))
         print(padding + Fore.BLUE + hud_border_bottom(w2))
