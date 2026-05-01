@@ -2742,6 +2742,19 @@ _FOLLOWUP_5V1X_LAST_APPLIED = {}
 _LXV_FASE_ZV_EVENT_TS = {}
 _LXV_FASE_ZV_LAST_INFO = {"fase": "INSUFICIENTE", "allow_real": False, "g0": 0.0, "g1": 0.0, "g2": 0.0, "verdes0": 0, "verdes1": 0, "verdes2": 0, "streak_verde": 0, "motivo": "init"}
 LXV_FASE_COLUMNS_CACHE = deque(maxlen=80)
+LXV_ZONA_MIN_COLUMNS = 3
+LXV_ZONA_GREEN_MIN = 4
+LXV_ZONA_GREEN_STRONG = 5
+LXV_ZONA_RED_STRONG = 4
+LXV_ZONA_FULL_GREEN_MIN = 3
+try:
+    ZONA_SI_INVERTIR
+except NameError:
+    ZONA_SI_INVERTIR = "SI_INVERTIR"
+try:
+    ZONA_NO_INVERTIR
+except NameError:
+    ZONA_NO_INVERTIR = "NO_INVERTIR"
 LXV_REAL_AUDIT = {
     "patrones_5v1x": 0,
     "patrones_4v2x": 0,
@@ -5661,156 +5674,128 @@ def _lxv_fase_cache_add(round_id: int, closed: dict, expected: list[str]) -> Non
     if not updated:
         LXV_FASE_COLUMNS_CACHE.append(row)
 
-def evaluar_fase_zona_verde_lxv(rows=None, round_id_objetivo=None):
-    base = {"fase": "INSUFICIENTE", "allow_real": False, "g0": 0.0, "g1": 0.0, "g2": 0.0, "verdes0": 0, "verdes1": 0, "verdes2": 0, "rojos0": 0, "rojos1": 0, "rojos2": 0, "cols_usadas": 0, "cols_requeridas": int(globals().get("LXV_FASE_MIN_COLUMNS", 3) or 3), "streak_verde": 0, "motivo": "insuficiente"}
+def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
+    base = {"zona":"INSUFICIENTE","fase":"INSUFICIENTE","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"GRAY","emoji":"⬜","motivo":"historial_insuficiente","g0":0.0,"g1":0.0,"g2":0.0,"verdes0":0,"rojos0":0,"verdes1":0,"rojos1":0,"verdes2":0,"rojos2":0,"streak_verde":0,"prev_full_green_streak":0,"round_id":None,"source":"none","ok":True,"cols_usadas":0,"cols_requeridas":int(globals().get("LXV_ZONA_MIN_COLUMNS",3) or 3)}
     try:
-        src_rows = list(rows) if isinstance(rows, list) else []
+        target_rid = int(round_id_objetivo) if round_id_objetivo is not None else None
+        if target_rid is not None and target_rid <= 0:
+            target_rid = None
+    except Exception:
         target_rid = None
-        if round_id_objetivo is not None:
-            try:
-                target_rid = int(round_id_objetivo)
-                if target_rid <= 0:
-                    target_rid = None
-            except Exception:
-                target_rid = None
-        if len(src_rows) <= 0:
-            src_rows = list(LXV_FASE_COLUMNS_CACHE)
-            cache_has_target = True if target_rid is None else any(int((x or {}).get("round_id", 0) or 0) == target_rid for x in src_rows)
-            if (not src_rows) or ((target_rid is not None) and (not cache_has_target)):
-                src_rows = _lxv_5v1x_load_recent_matrix_rows(max_rows=40)
-                matrix_has_target = True if target_rid is None else any(_mrv_5v1x_to_int((x or {}).get("round_id", 0), 0) == target_rid for x in src_rows)
-                if target_rid is not None and not matrix_has_target:
-                    try:
-                        rows_pack = _ack_live_build_rows()
-                        fb = _ack_live_calc_summary(rows_pack)
-                        rid_fb = _mrv_5v1x_to_int((fb or {}).get("obj_round", 0), 0)
-                        if rid_fb == target_rid:
-                            src_rows.append({
-                                "round_id": rid_fb,
-                                "n_verdes": int((fb or {}).get("verdes_count", 0) or 0),
-                                "n_rojos": int((fb or {}).get("rojas_count", 0) or 0),
-                                "round_complete": bool((fb or {}).get("complete", False)),
-                                "data_quality": str((fb or {}).get("data_quality", "") or ""),
-                                "source": "ack_live_summary",
-                            })
-                    except Exception:
-                        pass
-        cols = []
-        found_target = False
-        target_complete = False
-        target_dq_ok = False
+    try:
+        src_rows = list(rows) if isinstance(rows, list) and rows else []
+        source = "rows" if src_rows else "none"
+        if not src_rows:
+            src_rows = list(globals().get("LXV_FASE_COLUMNS_CACHE", []) or [])
+            source = "cache" if src_rows else "none"
+        if not src_rows:
+            loader = globals().get("_lxv_5v1x_load_recent_matrix_rows") or globals().get("_lxv_load_recent_columns_for_gate")
+            if callable(loader):
+                src_rows = list(loader(max_rows=80) if loader.__name__ == "_lxv_5v1x_load_recent_matrix_rows" else loader())
+                source = "csv" if src_rows else "none"
+        base["source"] = source
+        norm=[]
         for rr in src_rows:
             if not isinstance(rr, dict):
                 continue
-            rid = _mrv_5v1x_to_int(rr.get("round_id", 0), 0)
-            if target_rid is not None:
-                if rid == target_rid:
-                    found_target = True
-                    target_complete = bool(rr.get("round_complete", False))
-                    dq_target = str(rr.get("data_quality", "") or "").strip().lower()
-                    target_dq_ok = (not dq_target) or (dq_target == "ok")
-                if rid <= 0 or rid > target_rid:
-                    continue
-            if not bool(rr.get("round_complete", False)):
+            rid = _mrv_5v1x_to_int(rr.get("round_id", rr.get("rid", rr.get("ronda", 0))), 0)
+            v = _mrv_5v1x_to_int(rr.get("n_verdes", rr.get("verdes", rr.get("total_verdes", -1))), -1)
+            r = _mrv_5v1x_to_int(rr.get("n_rojos", rr.get("rojos", rr.get("total_rojos", -1))), -1)
+            complete = bool(rr.get("round_complete", rr.get("complete", False)))
+            dq = str(rr.get("data_quality", rr.get("quality", "")) or "").strip().lower()
+            if not complete or (dq and dq != "ok") or v < 0 or r < 0 or (v+r) > 6:
                 continue
-            dq = str(rr.get("data_quality", "") or "").strip().lower()
-            if dq and dq != "ok":
-                continue
-            v = _mrv_5v1x_to_int(rr.get("n_verdes", -1), -1)
-            r = _mrv_5v1x_to_int(rr.get("n_rojos", -1), -1)
-            if v < 0 or r < 0 or (v + r) < 6:
-                continue
-            cols.append((rid, v, r, float(v) / 6.0))
-        if (target_rid is not None) and (not found_target):
-            try:
-                live_summary = _ack_live_calc_summary(_ack_live_build_rows())
-            except Exception:
-                live_summary = {}
-            rid_live = _mrv_5v1x_to_int((live_summary or {}).get("obj_round", 0), 0)
-            v_live = _mrv_5v1x_to_int((live_summary or {}).get("verdes_count", -1), -1)
-            r_live = _mrv_5v1x_to_int((live_summary or {}).get("rojas_count", -1), -1)
-            faltan_live = _mrv_5v1x_to_int((live_summary or {}).get("faltan_count", 99), 99)
-            dq_live = str((live_summary or {}).get("data_quality", "") or "").strip().lower()
-            complete_live = bool((live_summary or {}).get("complete", False))
-            if rid_live == target_rid and v_live >= 0 and r_live >= 0 and (v_live + r_live) >= 6 and (faltan_live == 0 or complete_live) and ((not dq_live) or dq_live == "ok"):
-                found_target = True
-                target_complete = True
-                target_dq_ok = True
-                cols.append((rid_live, v_live, r_live, float(v_live) / 6.0))
-        cols = sorted(cols, key=lambda t: int(t[0]))
+            norm.append({"round_id":rid,"n_verdes":v,"n_rojos":r,"round_complete":True,"data_quality":"ok"})
+        norm = sorted(norm, key=lambda x: int(x.get("round_id", 0)))
         if target_rid is not None:
-            if not found_target:
-                out = dict(base)
-                out["motivo"] = "round_id_no_encontrado"
-                return out
-            if not target_complete:
-                out = dict(base)
-                out["motivo"] = "round_no_completo"
-                return out
-            if not target_dq_ok:
-                out = dict(base)
-                out["motivo"] = "data_quality_no_ok"
-                return out
-            cols = [c for c in cols if int(c[0]) <= int(target_rid)]
-            idx_target = next((i for i, c in enumerate(cols) if int(c[0]) == int(target_rid)), -1)
-            if idx_target < 0:
-                out = dict(base)
-                out["motivo"] = "round_id_no_encontrado"
-                return out
-            cols = cols[:idx_target + 1]
-        cols_req = int(globals().get("LXV_FASE_MIN_COLUMNS", 3))
-        cols_used = len(cols)
-        if cols_used >= 1:
-            _, v0, r0, g0 = cols[-1]
-        else:
-            v0 = r0 = 0
-            g0 = 0.0
-        if cols_used >= 2:
-            _, v1, r1, g1 = cols[-2]
-        else:
-            v1 = r1 = 0
-            g1 = 0.0
-        if cols_used >= 3:
-            _, v2, r2, g2 = cols[-3]
-        else:
-            v2 = r2 = 0
-            g2 = 0.0
-        if cols_used < cols_req:
-            out = dict(base)
-            out.update({"g0": g0, "g1": g1, "g2": g2, "verdes0": v0, "verdes1": v1, "verdes2": v2, "rojos0": r0, "rojos1": r1, "rojos2": r2, "cols_usadas": int(cols_used), "cols_requeridas": int(cols_req), "motivo": "historial_insuficiente"})
+            norm = [x for x in norm if int(x["round_id"]) <= target_rid]
+        if len(norm) < int(globals().get("LXV_ZONA_MIN_COLUMNS", 3) or 3):
+            out=dict(base); out.update({"ok":True,"source":source,"motivo":"historial_insuficiente","cols_usadas":len(norm)})
             return out
-        d01 = g0 - g1
-        d12 = g1 - g2
+        curr = norm[-1]
+        rid0 = int(curr["round_id"])
+        if target_rid is not None:
+            idx = next((i for i,x in enumerate(norm) if int(x["round_id"]) == target_rid), -1)
+            if idx >= 0:
+                norm = norm[:idx+1]
+                curr = norm[-1]
+                rid0 = int(curr["round_id"])
+        if len(norm) < 3:
+            out=dict(base); out.update({"source":source,"round_id":rid0,"cols_usadas":len(norm)})
+            return out
+        c0,c1,c2 = norm[-1], norm[-2], norm[-3]
+        v0,r0 = int(c0["n_verdes"]), int(c0["n_rojos"])
+        v1,r1 = int(c1["n_verdes"]), int(c1["n_rojos"])
+        v2,r2 = int(c2["n_verdes"]), int(c2["n_rojos"])
+        g0,g1,g2 = v0/6.0,v1/6.0,v2/6.0
+        d01,d12 = g0-g1,g1-g2
         streak=0
-        for _rid, v, r, g in reversed(cols):
-            if g >= (4.0 / 6.0):
-                streak += 1
-            else:
-                break
-        out = dict(base)
-        out.update({"g0":g0,"g1":g1,"g2":g2,"verdes0":v0,"verdes1":v1,"verdes2":v2,"rojos0":r0,"rojos1":r1,"rojos2":r2,"cols_usadas":int(cols_used),"cols_requeridas":int(cols_req),"streak_verde":int(streak),"fase":"NEUTRO","motivo":"neutro"})
-        if g0 >= (4.0/6.0) and g1 >= (5.0/6.0) and g2 <= (3.0/6.0):
-            out.update({"fase":"VERDE_TEMPRANO","allow_real":True,"motivo":"verde_temprano_post_impulso"})
-            return out
-        if g0 >= (4.0/6.0) and (g1 <= (3.0/6.0) or g2 <= (3.0/6.0)):
-            out.update({"fase":"ENTRANDO_VERDE","allow_real":True,"motivo":"transicion_hacia_verde"})
-        elif ((g1 >= (5.0/6.0) and g0 <= (4.0/6.0) and d01 < 0) and (g2 >= (4.0/6.0) and g1 >= (5.0/6.0))) or (g2 >= (5.0/6.0) and g1 >= (4.0/6.0) and g0 <= (4.0/6.0) and d01 < 0) or ((r0-r1)>=2 and g1 >= (4.0/6.0) and d01 < 0 and g2 >= (4.0/6.0)):
-            out.update({"fase":"SALIDA_VERDE","allow_real":False,"motivo":"saliendo_de_verde_maduro"})
-        elif (g0 <= (3.0/6.0) and d01 < 0) or (d01 < 0 and d12 < 0):
-            out.update({"fase":"ROJO_INICIANDO","allow_real":False,"motivo":"pendiente_roja"})
-        elif streak > int(globals().get("LXV_FASE_MAX_STREAK_VERDE_TEMPRANO", 3)) or streak >= int(globals().get("LXV_FASE_STREAK_VERDE_MADURO", 4)) or (g0 >= (4.0/6.0) and d01 <= 0 and streak > int(globals().get("LXV_FASE_MAX_STREAK_VERDE_TEMPRANO", 3))):
-            out.update({"fase":"VERDE_MADURO","allow_real":True,"motivo":"verde_maduro_no_bloqueante"})
-        elif g0 >= (4.0/6.0) and g1 >= (4.0/6.0) and d01 >= 0 and streak <= int(globals().get("LXV_FASE_MAX_STREAK_VERDE_TEMPRANO", 3)):
-            out.update({"fase":"VERDE_TEMPRANO","allow_real":True,"motivo":"verde_temprano"})
-        if target_rid is not None and target_rid > 0:
-            streak_prev = _lxv_prev_full_green_streak(target_rid, lookback=max(int(globals().get("LXV_GREEN_EXHAUSTION_LOOKBACK", 12) or 12), int(globals().get("LXV_GREEN_EXHAUSTION_PREV_FULL_GREEN_MIN", 3) or 3) + 2))
-            if int(streak_prev) >= int(globals().get("LXV_GREEN_EXHAUSTION_PREV_FULL_GREEN_MIN", 3) or 3):
-                out.update({"fase":"VERDE_SATURADO_TARDIO","allow_real":False,"motivo":"prev_full_green_streak","prev_full_green_streak":int(streak_prev)})
+        for x in reversed(norm):
+            if int(x["n_verdes"]) >= int(globals().get("LXV_ZONA_GREEN_MIN",4) or 4): streak += 1
+            else: break
+        prev_streak = 0
+        if source == "rows":
+            prev_streak = _lxv_prev_full_green_streak_from_norm_rows(norm, rid0)
+        else:
+            streak_fn = globals().get("_lxv_prev_full_green_streak")
+            if callable(streak_fn) and rid0 > 0:
+                try: prev_streak = int(streak_fn(rid0) or 0)
+                except Exception: prev_streak = 0
+        out=dict(base); out.update({"g0":g0,"g1":g1,"g2":g2,"verdes0":v0,"rojos0":r0,"verdes1":v1,"rojos1":r1,"verdes2":v2,"rojos2":r2,"streak_verde":streak,"prev_full_green_streak":prev_streak,"round_id":rid0,"source":source,"cols_usadas":len(norm)})
+        if prev_streak >= int(globals().get("LXV_ZONA_FULL_GREEN_MIN",3) or 3) and (target_rid is not None or rid0 > 0):
+            out.update({"zona":"VERDE_SATURADO_TARDIO","fase":"VERDE_SATURADO_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"prev_full_green_streak"}); return out
+        if r0 >= int(globals().get("LXV_ZONA_RED_STRONG",4) or 4) or (g0 <= 0.5 and d01 < 0) or (d01 < 0 and d12 < 0 and g0 <= 0.5):
+            out.update({"zona":"ROJA_TEMPRANO","fase":"ROJA_TEMPRANO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_ORANGE","emoji":"🟥","motivo":"inicio_rojo"}); return out
+        if (streak >= 4 and d01 < 0) or (g1 >= (5/6) and g0 <= (4/6) and d01 < 0) or (g2 >= (5/6) and g1 >= (4/6) and g0 <= (4/6)) or (r0 > r1 and g0 <= g1 and streak >= 3):
+            out.update({"zona":"VERDE_TARDIO","fase":"VERDE_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"ORANGE","emoji":"🟧","motivo":"verde_perdiendo_fuerza"}); return out
+        if (g0 >= (4/6) and g1 <= (3/6)) or (g0 >= (4/6) and g1 >= (4/6) and d01 > 0 and streak <= 3) or (g0 >= (4/6) and g1 >= (5/6) and g2 <= (3/6)):
+            out.update({"zona":"VERDE_TEMPRANO","fase":"VERDE_TEMPRANO","decision":ZONA_SI_INVERTIR,"allow_real":True,"color_key":"GREEN_BRIGHT","emoji":"🟩","motivo":"transicion_hacia_verde"}); return out
+        if g0 >= (4/6) and v0 > r0:
+            out.update({"zona":"VERDE_MADURO","fase":"VERDE_MADURO","decision":ZONA_SI_INVERTIR,"allow_real":True,"color_key":"GREEN_YELLOW","emoji":"🟨","motivo":"predominio_verde_maduro"}); return out
+        out.update({"zona":"NEUTRO","fase":"NEUTRO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"GRAY","emoji":"⬜","motivo":"sin_predominio_claro"})
         return out
-    except Exception as e:
-        base["fase"] = "NEUTRO"
-        base["motivo"] = f"error:{type(e).__name__}"
-        return base
+    except Exception:
+        out=dict(base); out.update({"zona":"NEUTRO","fase":"NEUTRO","decision":ZONA_NO_INVERTIR,"allow_real":False,"motivo":"zona_error_fail_closed","ok":False})
+        return out
+
+def _lxv_prev_full_green_streak_from_norm_rows(norm_rows, round_id):
+    try:
+        rid_obj = int(round_id or 0)
+        if rid_obj <= 1:
+            return 0
+        rows = list(norm_rows or [])
+        if not rows:
+            return 0
+        by_rid = {}
+        for rr in rows:
+            if not isinstance(rr, dict):
+                continue
+            rid = _mrv_5v1x_to_int(rr.get("round_id", 0), 0)
+            if rid > 0:
+                by_rid[rid] = rr
+        streak = 0
+        esperado = rid_obj - 1
+        while esperado > 0:
+            col = by_rid.get(esperado)
+            if not isinstance(col, dict):
+                break
+            v = _mrv_5v1x_to_int(col.get("n_verdes", -1), -1)
+            r = _mrv_5v1x_to_int(col.get("n_rojos", -1), -1)
+            if v == 6 and r == 0:
+                streak += 1
+                esperado -= 1
+                continue
+            break
+        return int(streak)
+    except Exception:
+        return 0
+
+def evaluar_fase_zona_verde_lxv(rows=None, round_id_objetivo=None):
+    global _LXV_FASE_ZV_LAST_INFO
+    info = clasificar_zona_operativa_lxv(round_id_objetivo=round_id_objetivo, rows=rows)
+    _LXV_FASE_ZV_LAST_INFO = dict(info)
+    return info
+
 
 def _fase_zv_gate_allow_real(origen="LXV", rid=0):
     global _LXV_FASE_ZV_LAST_INFO
@@ -5842,12 +5827,13 @@ def _fase_zv_gate_allow_real(origen="LXV", rid=0):
     if not bool(globals().get("LXV_FASE_ZONA_VERDE_ENABLE", True)):
         return True
     gtxt = f"g0={int(info.get('verdes0',0))}/6 g1={int(info.get('verdes1',0))}/6 g2={int(info.get('verdes2',0))}/6"
-    if bool(info.get("allow_real", False)):
+    allow = bool(info.get("allow_real")) and str(info.get("decision")) == ZONA_SI_INVERTIR
+    if allow:
         LXV_REAL_AUDIT["fase_ok"] = int(LXV_REAL_AUDIT.get("fase_ok", 0) or 0) + 1
-        _lxv_5v1x_event_cooldown(key=f"fasezv_ok:{origen_txt}:{rid_int}:{info.get('fase')}", msg=f"✅ FASE_ZV OK: fase={info.get('fase')} motivo={info.get('motivo')}", cooldown_s=float(globals().get("LXV_FASE_LOG_COOLDOWN_S", 20.0)))
+        _lxv_5v1x_event_cooldown(key=f"fasezv_ok:{origen_txt}:{rid_int}:{info.get('fase')}", msg=f"✅ ZONA LXV OK: zona={info.get('zona',info.get('fase'))} decision=SI_INVERTIR motivo={info.get('motivo')} g0={int(info.get('verdes0',0))}/6 g1={int(info.get('verdes1',0))}/6 g2={int(info.get('verdes2',0))}/6", cooldown_s=float(globals().get("LXV_FASE_LOG_COOLDOWN_S", 20.0)))
         return True
     cols_txt = f"cols={int(info.get('cols_usadas',0))}/{int(info.get('cols_requeridas', int(globals().get('LXV_FASE_MIN_COLUMNS',3))))}"
-    msg = f"⛔ FASE_ZV BLOQUEA REAL: origen={origen_txt} rid={rid_int} fase={info.get('fase')} {cols_txt} {gtxt} motivo={info.get('motivo')}"
+    msg = f"⛔ ZONA LXV NO INVERTIR: zona={info.get('zona',info.get('fase'))} decision=NO_INVERTIR motivo={info.get('motivo')} g0={int(info.get('verdes0',0))}/6 g1={int(info.get('verdes1',0))}/6 g2={int(info.get('verdes2',0))}/6"
     if str(info.get('fase')) == 'VERDE_SATURADO_TARDIO':
         msg = f"⛔ FASE_ZV BLOQUEA REAL: VERDE_SATURADO_TARDIO | rid={rid_int} | streak={int(info.get('prev_full_green_streak',0))}"
     LXV_REAL_AUDIT["fase_bloq"] = int(LXV_REAL_AUDIT.get("fase_bloq", 0) or 0) + 1
@@ -5855,20 +5841,30 @@ def _fase_zv_gate_allow_real(origen="LXV", rid=0):
     _lxv_5v1x_event_cooldown(key=f"fasezv_block:{origen_txt}:{rid_int}:{info.get('fase')}", msg=msg, cooldown_s=float(globals().get("LXV_FASE_LOG_COOLDOWN_S", 20.0)))
     return False
 
-def _debug_test_fase_zona_verde_lxv():
+def _debug_test_zona_operativa_lxv():
     if not bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False)):
         return
     cases = [
-        ("C1", [(97,6,0),(98,6,0),(99,6,0),(100,5,1)], "5V1X", False),
-        ("C2", [(98,6,0),(99,6,0),(100,5,1)], "5V1X", True),
-        ("C3", [(97,6,0),(98,5,1),(99,6,0),(100,4,2)], "4V2X", True),
-        ("C4", [(97,6,0),(98,6,0),(99,6,0),(100,4,2)], "4V2X", False),
-        ("C5", [(97,5,1),(98,4,2),(99,5,1),(100,5,1)], "5V1X", True),
+        ("A_VERDE_TEMPRANO", [{"round_id":1,"n_verdes":2,"n_rojos":4,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":3,"n_rojos":3,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"}], None, "VERDE_TEMPRANO", ZONA_SI_INVERTIR),
+        ("B_VERDE_MADURO", [{"round_id":1,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"}], None, "VERDE_MADURO", ZONA_SI_INVERTIR),
+        ("C_VERDE_TARDIO", [{"round_id":1,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"}], None, "VERDE_TARDIO", ZONA_NO_INVERTIR),
+        ("D_ROJA_TEMPRANO", [{"round_id":1,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":3,"n_rojos":3,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":2,"n_rojos":4,"round_complete":True,"data_quality":"ok"}], None, "ROJA_TEMPRANO", ZONA_NO_INVERTIR),
+        ("E_SATURADO", [{"round_id":1,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},{"round_id":4,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"}], 4, "VERDE_SATURADO_TARDIO", ZONA_NO_INVERTIR),
+        ("F_SOLO2_FULL", [{"round_id":1,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"}], 3, "NOT_VERDE_SATURADO_TARDIO", None),
     ]
-    for name, vals, pat, expected_ok in cases:
-        rows=[{"round_id":rid, "round_complete":True,"data_quality":"ok","n_verdes":v,"n_rojos":r, "patron_lxv":pat if rid==100 else "OTHER"} for rid,v,r in vals]
-        ok_exh, reason_exh, info_exh = _lxv_green_exhaustion_gate_ok(100, pat)
-        _lxv_5v1x_event_cooldown(key=f"fasezv_test:{name}", msg=f"🧪 FASE_ZV TEST {name}: ok={ok_exh} expected={expected_ok} reason={reason_exh} streak={info_exh.get('prev_full_green_streak',0)}", cooldown_s=60.0)
+    for name, rows_case, rid_obj, expected_zona, expected_dec in cases:
+        info = clasificar_zona_operativa_lxv(round_id_objetivo=rid_obj, rows=rows_case)
+        ok = (info.get("zona") != "VERDE_SATURADO_TARDIO") if expected_zona == "NOT_VERDE_SATURADO_TARDIO" else (info.get("zona") == expected_zona and info.get("decision") == expected_dec)
+        if name == "E_SATURADO":
+            ok = ok and int(info.get("prev_full_green_streak",0)) == 3
+        if name == "F_SOLO2_FULL":
+            ok = ok and int(info.get("prev_full_green_streak",0)) == 2
+        if not ok:
+            print(f"⚠️ DEBUG ZONA LXV FALLÓ {name}: got zona={info.get('zona')} decision={info.get('decision')} streak={info.get('prev_full_green_streak',0)}")
+
+def _debug_test_fase_zona_verde_lxv():
+    _debug_test_zona_operativa_lxv()
+
 def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     bot_pick = _lxv_5v1x_pick_real_bot(candidate)
     if not bot_pick:
@@ -16899,6 +16895,26 @@ def _resumen_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
     return lines[:2]
 
 
+def _hud_zona_operativa_lxv_line(width=None):
+    try:
+        info = globals().get("_LXV_FASE_ZV_LAST_INFO")
+        if not isinstance(info, dict):
+            info = clasificar_zona_operativa_lxv()
+        zona = str(info.get("zona", info.get("fase", "NEUTRO")))
+        decision = str(info.get("decision", ZONA_NO_INVERTIR))
+        motivo = str(info.get("motivo", "--"))
+        emoji = str(info.get("emoji", "⬜"))
+        badge = "✅ SI_INVERTIR" if decision == ZONA_SI_INVERTIR else "⛔ NO_INVERTIR"
+        if zona == "VERDE_SATURADO_TARDIO":
+            detail = f"prev_full_green_streak={int(info.get('prev_full_green_streak',0))}"
+        elif zona == "INSUFICIENTE":
+            detail = "motivo=historial_insuficiente"
+        else:
+            detail = f"g0={int(info.get('verdes0',0))}/6 g1={int(info.get('verdes1',0))}/6 g2={int(info.get('verdes2',0))}/6 | motivo={motivo}"
+        return f"{emoji} ZONA LXV: {zona} | {badge} | {detail}"
+    except Exception:
+        return "⬜ ZONA LXV: ERROR | ⛔ NO_INVERTIR"
+
 def _resumen_top_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
     lines = []
     try:
@@ -16947,6 +16963,7 @@ def _resumen_top_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
             f"SENSOR_PLANO={planos}/{len(BOT_NAMES)} | n_min_real={int(n_min_real)}/{int(n_req_real)}"
         )
         lines.append(line2)
+        lines.append(_hud_zona_operativa_lxv_line())
     except Exception:
         lines.append("📊 Prob=-- | OBS=-- | REAL=-- | Mejor=-- | SENSOR_PLANO=-- | n_min_real=--")
 
