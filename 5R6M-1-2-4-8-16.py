@@ -1378,6 +1378,16 @@ def _hay_real_close_pending_activo():
         return False, None, None
     except Exception:
         return False, None, None
+
+def _real_close_sig(bot, res, monto, ciclo, payout_total, baseline=None):
+    return (
+        str(bot),
+        str(res),
+        round(float(monto or 0.0), 2),
+        int(ciclo or 0),
+        round(float(payout_total or 0.0), 4),
+        int(baseline or REAL_ENTRY_BASELINE.get(bot, 0) or 0),
+    )
 CTT_CLOSE_EVENTS = deque(maxlen=6000)
 CTT_CLOSE_SEEN = set()
 CTT_STATE = {
@@ -5039,8 +5049,10 @@ def _lxv_green_exhaustion_gate_ok(round_id, pattern_name):
         if blocked:
             return False, "green_exhaustion_late_chase", info
         return True, "ok", info
-    except Exception:
-        return True, "exception_bypass", info
+    except Exception as e:
+        info["error"] = str(e)
+        info["estado"] = "ERROR_SEGURO"
+        return False, "green_exhaustion_error_seguro", info
 
 def _lxv_4v2x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     bot_pick = _lxv_4v2x_pick_real_bot(candidate)
@@ -5115,7 +5127,7 @@ def _lxv_4v2x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         msg=f"REAL CICLO GLOBAL: source={source_real} bot={bot_pick} ciclo_global=C{int(ciclo_pick)} ciclo_local_bot=C{int(ciclo_local_bot)}",
         cooldown_s=8.0,
     )
-    ok_emit = bool(emitir_real_autorizado(bot_pick, int(ciclo_pick), source=source_real))
+    ok_emit = bool(emitir_real_autorizado(bot_pick, int(ciclo_pick), source=source_real, round_id=rid))
     if ok_emit:
         LXV_REAL_AUDIT["real_emitidos"] = int(LXV_REAL_AUDIT.get("real_emitidos", 0) or 0) + 1
         LXV_REAL_AUDIT["ultimo_bloqueo"] = f"emitido_4v2x_{bot_pick}"
@@ -5796,7 +5808,7 @@ def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         msg=f"REAL CICLO GLOBAL: source={source_real} bot={bot_pick} ciclo_global=C{int(ciclo_pick)} ciclo_local_bot=C{int(ciclo_local_bot)}",
         cooldown_s=8.0,
     )
-    ok_emit = bool(emitir_real_autorizado(bot_pick, int(ciclo_pick), source=source_real))
+    ok_emit = bool(emitir_real_autorizado(bot_pick, int(ciclo_pick), source=source_real, round_id=rid))
     if ok_emit:
         LXV_REAL_AUDIT["real_emitidos"] = int(LXV_REAL_AUDIT.get("real_emitidos", 0) or 0) + 1
         LXV_REAL_AUDIT["ultimo_bloqueo"] = f"emitido_5v1x_{bot_pick}"
@@ -5933,6 +5945,7 @@ def _sync_round_collect_closed_acks(round_id: int) -> tuple[dict, dict]:
             continue
         if explicit_demo_ack and ack_token.startswith("REAL:"):
             reasons[bot] = "stale_token_in_demo_ack"
+            continue
         res = str(ack.get("resultado", "")).upper().strip()
         if res not in ("GANANCIA", "PÉRDIDA"):
             reasons[bot] = f"resultado_invalid_{res or 'empty'}"
@@ -6009,6 +6022,17 @@ def _sync_round_tick_maestro():
     if _SYNC_ROUND_LAST_ANNOUNCED != round_id:
         agregar_evento(f"🧭 LXV_SYNC_COLUMN ronda #{round_id} iniciada ({len(expected)} bots esperados).")
         _SYNC_ROUND_LAST_ANNOUNCED = round_id
+    pending_on, pending_bot, pending = _hay_real_close_pending_activo()
+    if pending_on:
+        _lxv_5v1x_event_cooldown(
+            key=f"sync_pending_block:{pending_bot}:{pending.get('ciclo')}",
+            msg=(
+                f"⏸️ LXV_SYNC bloqueado por REAL_CLOSE_PENDING activo | "
+                f"pendiente={pending_bot} C{pending.get('ciclo')} | no se evalúa nueva entrada REAL"
+            ),
+            cooldown_s=8.0,
+        )
+        return
 
     now_ts = float(time.time())
     closed_all, sync_debug_missing = _sync_round_collect_closed_acks(round_id)
@@ -6375,7 +6399,7 @@ def _sync_round_tick_maestro():
                                 motivo_no_emit = f"fase_zv_{fi.get('fase','INSUFICIENTE')}_{fi.get('motivo','sin_motivo')}"
                                 LXV_REAL_AUDIT["ultimo_bloqueo"] = motivo_no_emit
                             else:
-                                ok_emit = bool(emitir_real_autorizado(bot_pick, ciclo_pick, source=LXV_SYNC_REAL_SOURCE))
+                                ok_emit = bool(emitir_real_autorizado(bot_pick, ciclo_pick, source=LXV_SYNC_REAL_SOURCE, round_id=round_id))
                                 if not ok_emit and (not motivo_no_emit):
                                     motivo_no_emit = "escribir_orden_real_fail"
                 _LXV_LAST_EMITTED_ROUND = int(round_id) if ok_emit else int(_LXV_LAST_EMITTED_ROUND or 0)
@@ -6822,7 +6846,7 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
     except Exception:
         return False
 
-def escribir_orden_real(bot: str, ciclo: int) -> bool:
+def escribir_orden_real(bot: str, ciclo: int, round_id=None) -> bool:
     global REAL_OWNER_LOCK
     """
     Wrapper oficial:
@@ -6880,7 +6904,7 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
     ok = bool(ok_activate and owner_after_mem == bot and owner_after_file == bot)
     if ok:
         try:
-            _marcar_real_close_pending(bot, int(ciclo), source=str(globals().get("_REAL_ROUTE_SOURCE", "LEGACY") or "LEGACY"), round_id=globals().get("SYNC_ROUND_ID", None))
+            _marcar_real_close_pending(bot, int(ciclo), source=str(globals().get("_REAL_ROUTE_SOURCE", "LEGACY") or "LEGACY"), round_id=round_id)
         except Exception:
             pass
         _marti_audit_log_orden(ciclo, bot=bot, origen="escribir_orden_real")
@@ -6927,12 +6951,19 @@ def _real_candidate_age_ok_lxv(pick: dict) -> bool:
         return False
 
 
-def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY") -> bool:
+def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_id=None) -> bool:
     """
     Ruta única de emisión REAL cuando LXV_SYNC_REAL_ROUTE_ENABLE está activo.
     Conserva la infraestructura existente (orden_real/token/HUD), pero restringe la decisión.
     """
     src = str(source or "LEGACY").strip().upper()
+    pending_on, pending_bot, pending = _hay_real_close_pending_activo()
+    if pending_on:
+        agregar_evento(
+            f"⏸️ REAL bloqueado por cierre pendiente: no se emite {src} para {bot}; "
+            f"pendiente={pending_bot} C{pending.get('ciclo')}"
+        )
+        return False
     try:
         prev_payload = _sync_round_safe_read_json(path_orden(str(bot))) or {}
         if isinstance(prev_payload, dict) and prev_payload and (not _orden_real_viva(prev_payload)):
@@ -6968,7 +6999,7 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY") -> bool
     if ciclo_req != ciclo_norm:
         agregar_evento(f"⚠️ ciclo>MAX_CICLOS detectado, normalizado a C{ciclo_norm} (solicitado=C{ciclo_req}).")
     try:
-        return bool(escribir_orden_real(bot, ciclo_norm))
+        return bool(escribir_orden_real(bot, ciclo_norm, round_id=round_id))
     finally:
         globals()["_REAL_ROUTE_SOURCE"] = prev_src
 
@@ -21655,14 +21686,7 @@ async def main():
                             continue
                         cierre_info, pending, modo_detector = pack
                         res, monto, ciclo, payout_total = cierre_info
-                        sig = (
-                            bot,
-                            res,
-                            round(float(monto or 0.0), 2),
-                            int(ciclo or 0),
-                            round(float(payout_total or 0.0), 4),
-                            int(pending.get("baseline", 0) or 0),
-                        )
+                        sig = _real_close_sig(bot, res, monto, ciclo, payout_total, baseline=int(pending.get("baseline", 0) or 0))
                         if sig == LAST_REAL_CLOSE_SIG.get(bot):
                             REAL_CLOSE_PENDING[bot] = None
                             continue
@@ -21732,7 +21756,7 @@ async def main():
                             # Cierre inmediato: en REAL siempre 1 operación y vuelve a DEMO (gane o pierda)
                             if cierre_info and isinstance(cierre_info, tuple) and len(cierre_info) >= 4:
                                 res, monto, ciclo, payout_total = cierre_info
-                                sig = (res, round(float(monto or 0.0), 2), int(ciclo or 0), round(float(payout_total or 0.0), 4))
+                                sig = _real_close_sig(bot, res, monto, ciclo, payout_total)
 
                                 # Evita reprocesar el mismo cierre en ticks consecutivos
                                 if sig == LAST_REAL_CLOSE_SIG.get(bot):
