@@ -342,6 +342,15 @@ LXV_4V2X_ENABLE = True
 LXV_4V2X_REAL_SOURCE = "LXV_4V2X"
 LXV_4V2X_REQUIRE_DATA_QUALITY_OK = True
 LXV_4V2X_REQUIRE_ROUND_COMPLETE = True
+LXV_GREEN_EXHAUSTION_GATE_ENABLE = True
+LXV_GREEN_EXHAUSTION_BLOCK_5V1X = True
+LXV_GREEN_EXHAUSTION_BLOCK_4V2X = True
+LXV_GREEN_EXHAUSTION_LOOKBACK = 12
+LXV_GREEN_EXHAUSTION_STREAK80_BLOCK = 2
+LXV_GREEN_EXHAUSTION_STREAK90_BLOCK = 1
+LXV_GREEN_EXHAUSTION_CURRENT90_BLOCK = True
+LXV_GREEN_EXHAUSTION_PREV90_BLOCK = True
+LXV_GREEN_EXHAUSTION_LOG_COOLDOWN_S = 20.0
 LXV_BOTX_MAX_AGE_S = 90
 MANUAL_REAL_ROUTE_ENABLE = True
 MANUAL_REAL_REQUIRE_CONFIRM_RISK = False
@@ -1327,6 +1336,8 @@ OCULTAR_HASTA_NUEVO = {bot: False for bot in BOT_NAMES}
 t_inicio_indef = {bot: None for bot in BOT_NAMES}
 last_update_time = {bot: time.time() for bot in BOT_NAMES}
 LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # evita procesar el mismo cierre REAL varias veces
+REAL_CLOSE_PENDING = {bot: None for bot in BOT_NAMES}
+REAL_CLOSE_PENDING_TTL_S = 240
 REAL_MANUAL_ALERT = {
     "active": False,
     "bot": None,
@@ -1335,6 +1346,48 @@ REAL_MANUAL_ALERT = {
     "ts": 0.0,
     "msg": "",
 }
+
+def _marcar_real_close_pending(bot, ciclo, source="UNKNOWN", round_id=None):
+    try:
+        REAL_CLOSE_PENDING[bot] = {
+            "active": True,
+            "bot": str(bot),
+            "ciclo": int(ciclo),
+            "baseline": int(REAL_ENTRY_BASELINE.get(bot, 0) or 0),
+            "ts": float(time.time()),
+            "source": str(source or "UNKNOWN"),
+            "round_id": int(round_id) if round_id is not None else None,
+        }
+        agregar_evento(
+            f"🧷 REAL_CLOSE_PENDING armado: bot={bot} C{int(ciclo)} "
+            f"baseline={REAL_CLOSE_PENDING[bot]['baseline']} round={round_id}"
+        )
+    except Exception as e:
+        agregar_evento(f"⚠️ Error armando REAL_CLOSE_PENDING: {bot} {e}")
+
+def _hay_real_close_pending_activo():
+    try:
+        now = time.time()
+        for bot, p in REAL_CLOSE_PENDING.items():
+            if isinstance(p, dict) and p.get("active"):
+                age = now - float(p.get("ts", 0) or 0)
+                if age <= float(REAL_CLOSE_PENDING_TTL_S):
+                    return True, bot, p
+                REAL_CLOSE_PENDING[bot] = None
+                agregar_evento(f"⚠️ REAL_CLOSE_PENDING expirado sin cierre: {bot} C{p.get('ciclo')}")
+        return False, None, None
+    except Exception:
+        return False, None, None
+
+def _real_close_sig(bot, res, monto, ciclo, payout_total, baseline=None):
+    return (
+        str(bot),
+        str(res),
+        round(float(monto or 0.0), 2),
+        int(ciclo or 0),
+        round(float(payout_total or 0.0), 4),
+        int(baseline or REAL_ENTRY_BASELINE.get(bot, 0) or 0),
+    )
 CTT_CLOSE_EVENTS = deque(maxlen=6000)
 CTT_CLOSE_SEEN = set()
 CTT_STATE = {
@@ -4969,6 +5022,38 @@ def _lxv_emit_fail_reason(bot, source):
     except Exception as e:
         return f"exception:{type(e).__name__}"
 
+def _lxv_green_exhaustion_gate_ok(round_id, pattern_name):
+    info = {}
+    try:
+        pname = str(pattern_name or "").upper().strip()
+        if not bool(globals().get("LXV_GREEN_EXHAUSTION_GATE_ENABLE", True)):
+            return True, "disabled", info
+        if pname == "5V1X" and not bool(globals().get("LXV_GREEN_EXHAUSTION_BLOCK_5V1X", True)):
+            return True, "skip_5v1x", info
+        if pname == "4V2X" and not bool(globals().get("LXV_GREEN_EXHAUSTION_BLOCK_4V2X", True)):
+            return True, "skip_4v2x", info
+        snap = resumen_racha_verde_roja(round_id_objetivo=int(round_id or 0), lookback=int(globals().get("LXV_GREEN_EXHAUSTION_LOOKBACK", 12)))
+        info = dict(snap if isinstance(snap, dict) else {})
+        streak80 = int(info.get("strong_streak_80", 0) or 0)
+        streak90 = int(info.get("strong_streak_90", 0) or 0)
+        prev90 = bool(info.get("prev90", False))
+        current90 = bool(info.get("current90", False))
+        late_chase = bool(info.get("late_chase", False))
+        blocked = (
+            streak80 >= int(globals().get("LXV_GREEN_EXHAUSTION_STREAK80_BLOCK", 2))
+            or streak90 >= int(globals().get("LXV_GREEN_EXHAUSTION_STREAK90_BLOCK", 1))
+            or (bool(globals().get("LXV_GREEN_EXHAUSTION_PREV90_BLOCK", True)) and prev90)
+            or (bool(globals().get("LXV_GREEN_EXHAUSTION_CURRENT90_BLOCK", True)) and current90)
+            or late_chase
+        )
+        if blocked:
+            return False, "green_exhaustion_late_chase", info
+        return True, "ok", info
+    except Exception as e:
+        info["error"] = str(e)
+        info["estado"] = "ERROR_SEGURO"
+        return False, "green_exhaustion_error_seguro", info
+
 def _lxv_4v2x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     bot_pick = _lxv_4v2x_pick_real_bot(candidate)
     rid = int((candidate or {}).get("round_id", 0) or 0)
@@ -4997,6 +5082,15 @@ def _lxv_4v2x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         cooldown_s=8.0,
     )
     LXV_REAL_AUDIT["patrones_4v2x"] = int(LXV_REAL_AUDIT.get("patrones_4v2x", 0) or 0) + 1
+    ok_exh, reason_exh, info_exh = _lxv_green_exhaustion_gate_ok(rid, "4V2X")
+    if not ok_exh:
+        _lxv_5v1x_event_cooldown(
+            key=f"4v2x_exhaustion_block:{rid}",
+            msg=f"⛔ 4V2X BLOQUEADO por ZONA ROJA VERDE TARDÍA | rid={rid} | reason={reason_exh} | info={info_exh}",
+            cooldown_s=float(globals().get("LXV_GREEN_EXHAUSTION_LOG_COOLDOWN_S", 20.0)),
+        )
+        LXV_REAL_AUDIT["ultimo_bloqueo"] = f"green_exhaustion_4v2x_{reason_exh}"
+        return False
     try:
         fase_ok = _fase_zv_gate_allow_real("LXV_4V2X", rid)
     except Exception:
@@ -5033,7 +5127,7 @@ def _lxv_4v2x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         msg=f"REAL CICLO GLOBAL: source={source_real} bot={bot_pick} ciclo_global=C{int(ciclo_pick)} ciclo_local_bot=C{int(ciclo_local_bot)}",
         cooldown_s=8.0,
     )
-    ok_emit = bool(emitir_real_autorizado(bot_pick, int(ciclo_pick), source=source_real))
+    ok_emit = bool(emitir_real_autorizado(bot_pick, int(ciclo_pick), source=source_real, round_id=rid))
     if ok_emit:
         LXV_REAL_AUDIT["real_emitidos"] = int(LXV_REAL_AUDIT.get("real_emitidos", 0) or 0) + 1
         LXV_REAL_AUDIT["ultimo_bloqueo"] = f"emitido_4v2x_{bot_pick}"
@@ -5625,6 +5719,15 @@ def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         )
         return False
     rid = int((candidate or {}).get("round_id", 0) or 0)
+    ok_exh, reason_exh, info_exh = _lxv_green_exhaustion_gate_ok(rid, "5V1X")
+    if not ok_exh:
+        _lxv_5v1x_event_cooldown(
+            key=f"5v1x_exhaustion_block:{rid}",
+            msg=f"⛔ 5V1X BLOQUEADO por ZONA ROJA VERDE TARDÍA | rid={rid} | reason={reason_exh} | info={info_exh}",
+            cooldown_s=float(globals().get("LXV_GREEN_EXHAUSTION_LOG_COOLDOWN_S", 20.0)),
+        )
+        LXV_REAL_AUDIT["ultimo_bloqueo"] = f"green_exhaustion_5v1x_{reason_exh}"
+        return False
     if bool(globals().get("MRV_5V1X_ENABLE", True)):
         ok_mrv, reason_mrv, info_mrv = _lxv_5v1x_mrv_gate_ok(candidate)
         estado_mrv = str((info_mrv or {}).get("estado", "BLOQUEADO"))
@@ -5640,12 +5743,14 @@ def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
             _lxv_5v1x_event_cooldown(
                 key=f"mrv_telemetry:{rid}:{estado_mrv}",
                 msg=(
-                    f"🟠 MRV_5V1X TELEMETRÍA: no bloquea REAL | bot={bot_pick} | round={rid} | "
+                    f"⛔ MRV_5V1X BLOQUEA REAL | bot={bot_pick} | round={rid} | "
                     f"estado={estado_mrv} | reason={reason_mrv} | green={green_txt} | rebote={rebote_txt} | "
                     f"samples={samples_mrv} | streak80={streak80_mrv} | streak90={streak90_mrv} | prev90={prev90_mrv}"
                 ),
                 cooldown_s=float(globals().get("MRV_5V1X_LOG_COOLDOWN_S", 20.0)),
             )
+            LXV_REAL_AUDIT["ultimo_bloqueo"] = f"mrv_5v1x_{reason_mrv}"
+            return False
         _lxv_5v1x_event_cooldown(
             key=f"mrv_allow:{rid}:{estado_mrv}",
             msg=(
@@ -5703,7 +5808,7 @@ def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         msg=f"REAL CICLO GLOBAL: source={source_real} bot={bot_pick} ciclo_global=C{int(ciclo_pick)} ciclo_local_bot=C{int(ciclo_local_bot)}",
         cooldown_s=8.0,
     )
-    ok_emit = bool(emitir_real_autorizado(bot_pick, int(ciclo_pick), source=source_real))
+    ok_emit = bool(emitir_real_autorizado(bot_pick, int(ciclo_pick), source=source_real, round_id=rid))
     if ok_emit:
         LXV_REAL_AUDIT["real_emitidos"] = int(LXV_REAL_AUDIT.get("real_emitidos", 0) or 0) + 1
         LXV_REAL_AUDIT["ultimo_bloqueo"] = f"emitido_5v1x_{bot_pick}"
@@ -5840,6 +5945,7 @@ def _sync_round_collect_closed_acks(round_id: int) -> tuple[dict, dict]:
             continue
         if explicit_demo_ack and ack_token.startswith("REAL:"):
             reasons[bot] = "stale_token_in_demo_ack"
+            continue
         res = str(ack.get("resultado", "")).upper().strip()
         if res not in ("GANANCIA", "PÉRDIDA"):
             reasons[bot] = f"resultado_invalid_{res or 'empty'}"
@@ -5916,6 +6022,17 @@ def _sync_round_tick_maestro():
     if _SYNC_ROUND_LAST_ANNOUNCED != round_id:
         agregar_evento(f"🧭 LXV_SYNC_COLUMN ronda #{round_id} iniciada ({len(expected)} bots esperados).")
         _SYNC_ROUND_LAST_ANNOUNCED = round_id
+    pending_on, pending_bot, pending = _hay_real_close_pending_activo()
+    if pending_on:
+        _lxv_5v1x_event_cooldown(
+            key=f"sync_pending_block:{pending_bot}:{pending.get('ciclo')}",
+            msg=(
+                f"⏸️ LXV_SYNC bloqueado por REAL_CLOSE_PENDING activo | "
+                f"pendiente={pending_bot} C{pending.get('ciclo')} | no se evalúa nueva entrada REAL"
+            ),
+            cooldown_s=8.0,
+        )
+        return
 
     now_ts = float(time.time())
     closed_all, sync_debug_missing = _sync_round_collect_closed_acks(round_id)
@@ -5945,6 +6062,16 @@ def _sync_round_tick_maestro():
                 cooldown_s=12.0,
             )
         elif reason_bot == "stale_token_in_demo_ack":
+            rp = REAL_CLOSE_PENDING.get(bot)
+            if isinstance(rp, dict) and rp.get("active"):
+                released_round = int(rp.get("round_id", 0) or 0)
+                if int(round_id) <= released_round:
+                    _lxv_5v1x_event_cooldown(
+                        key=f"ack_demo_old_post_real:{bot}:{round_id}:{released_round}",
+                        msg=f"⚠️ ACK DEMO viejo ignorado tras REAL: bot={bot} ack_round={round_id} released_round={released_round}",
+                        cooldown_s=12.0,
+                    )
+                    continue
             _lxv_5v1x_event_cooldown(
                 key=f"ack_stale_token_demo:{bot}:{round_id}",
                 msg=f"🟡 ACK DEMO aceptado con token REAL stale: bot={bot} round={round_id}",
@@ -6272,7 +6399,7 @@ def _sync_round_tick_maestro():
                                 motivo_no_emit = f"fase_zv_{fi.get('fase','INSUFICIENTE')}_{fi.get('motivo','sin_motivo')}"
                                 LXV_REAL_AUDIT["ultimo_bloqueo"] = motivo_no_emit
                             else:
-                                ok_emit = bool(emitir_real_autorizado(bot_pick, ciclo_pick, source=LXV_SYNC_REAL_SOURCE))
+                                ok_emit = bool(emitir_real_autorizado(bot_pick, ciclo_pick, source=LXV_SYNC_REAL_SOURCE, round_id=round_id))
                                 if not ok_emit and (not motivo_no_emit):
                                     motivo_no_emit = "escribir_orden_real_fail"
                 _LXV_LAST_EMITTED_ROUND = int(round_id) if ok_emit else int(_LXV_LAST_EMITTED_ROUND or 0)
@@ -6719,7 +6846,7 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
     except Exception:
         return False
 
-def escribir_orden_real(bot: str, ciclo: int) -> bool:
+def escribir_orden_real(bot: str, ciclo: int, round_id=None) -> bool:
     global REAL_OWNER_LOCK
     """
     Wrapper oficial:
@@ -6776,6 +6903,10 @@ def escribir_orden_real(bot: str, ciclo: int) -> bool:
     owner_after_file = leer_token_archivo_raw()
     ok = bool(ok_activate and owner_after_mem == bot and owner_after_file == bot)
     if ok:
+        try:
+            _marcar_real_close_pending(bot, int(ciclo), source=str(globals().get("_REAL_ROUTE_SOURCE", "LEGACY") or "LEGACY"), round_id=round_id)
+        except Exception:
+            pass
         _marti_audit_log_orden(ciclo, bot=bot, origen="escribir_orden_real")
         if int(ciclo) == 1:
             agregar_evento("🟢 MARTI-AUDIT: apertura explícita en C1 (nuevo ciclo confirmado).")
@@ -6820,12 +6951,19 @@ def _real_candidate_age_ok_lxv(pick: dict) -> bool:
         return False
 
 
-def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY") -> bool:
+def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_id=None) -> bool:
     """
     Ruta única de emisión REAL cuando LXV_SYNC_REAL_ROUTE_ENABLE está activo.
     Conserva la infraestructura existente (orden_real/token/HUD), pero restringe la decisión.
     """
     src = str(source or "LEGACY").strip().upper()
+    pending_on, pending_bot, pending = _hay_real_close_pending_activo()
+    if pending_on:
+        agregar_evento(
+            f"⏸️ REAL bloqueado por cierre pendiente: no se emite {src} para {bot}; "
+            f"pendiente={pending_bot} C{pending.get('ciclo')}"
+        )
+        return False
     try:
         prev_payload = _sync_round_safe_read_json(path_orden(str(bot))) or {}
         if isinstance(prev_payload, dict) and prev_payload and (not _orden_real_viva(prev_payload)):
@@ -6861,7 +6999,7 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY") -> bool
     if ciclo_req != ciclo_norm:
         agregar_evento(f"⚠️ ciclo>MAX_CICLOS detectado, normalizado a C{ciclo_norm} (solicitado=C{ciclo_req}).")
     try:
-        return bool(escribir_orden_real(bot, ciclo_norm))
+        return bool(escribir_orden_real(bot, ciclo_norm, round_id=round_id))
     finally:
         globals()["_REAL_ROUTE_SOURCE"] = prev_src
 
@@ -13172,6 +13310,37 @@ def _y_to_bin(v) -> int | None:
         return None
     except Exception:
         return None
+
+def _buscar_cierre_real_pendiente(bot):
+    pending = REAL_CLOSE_PENDING.get(bot)
+    if not isinstance(pending, dict) or not pending.get("active"):
+        return None
+    now = time.time()
+    age = now - float(pending.get("ts", 0) or 0)
+    if age > float(REAL_CLOSE_PENDING_TTL_S):
+        agregar_evento(f"⚠️ REAL_CLOSE_PENDING expirado sin cierre: {bot} C{pending.get('ciclo')}")
+        REAL_CLOSE_PENDING[bot] = None
+        return None
+    ciclo = int(pending.get("ciclo", 1) or 1)
+    baseline = int(pending.get("baseline", 0) or 0)
+    cierre_info = detectar_cierre_martingala(bot, min_fila=baseline, require_closed=True, require_real_token=True, expected_ciclo=ciclo)
+    if cierre_info:
+        return cierre_info, pending, "estricto"
+    cierre_info = detectar_cierre_martingala(bot, min_fila=baseline, require_closed=True, require_real_token=False, expected_ciclo=ciclo)
+    if not cierre_info:
+        return None
+    res, monto, ciclo_detectado, payout_total = cierre_info
+    if res not in ("GANANCIA", "PÉRDIDA"):
+        return None
+    if int(ciclo_detectado or 0) != int(ciclo):
+        return None
+    try:
+        monto_esperado = float(MARTI_ESCALADO[int(ciclo) - 1])
+        if abs(float(monto or 0.0) - monto_esperado) > float(MONTO_TOL):
+            return None
+    except Exception:
+        return None
+    return cierre_info, pending, "fallback_seguro"
 
 def construir_Xy_incremental(
     df: pd.DataFrame,
@@ -21512,6 +21681,45 @@ async def main():
                     # Watchdog para REAL pegado
                     ahora = time.time()
                     for bot in BOT_NAMES:
+                        pack = _buscar_cierre_real_pendiente(bot)
+                        if not pack:
+                            continue
+                        cierre_info, pending, modo_detector = pack
+                        res, monto, ciclo, payout_total = cierre_info
+                        sig = _real_close_sig(bot, res, monto, ciclo, payout_total, baseline=int(pending.get("baseline", 0) or 0))
+                        if sig == LAST_REAL_CLOSE_SIG.get(bot):
+                            REAL_CLOSE_PENDING[bot] = None
+                            continue
+                        LAST_REAL_CLOSE_SIG[bot] = sig
+                        saldo_antes = obtener_valor_saldo()
+                        registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo)
+                        try:
+                            await refresh_saldo_real(forzado=True)
+                        except Exception:
+                            pass
+                        saldo_despues = obtener_valor_saldo()
+                        _registrar_real_close_trace({
+                            "bot": bot, "resultado": res, "ciclo": int(ciclo or 0), "monto": float(monto or 0.0),
+                            "payout_total": float(payout_total or 0.0), "pending_baseline": int(pending.get("baseline", 0) or 0),
+                            "source_real": pending.get("source"), "round_id": pending.get("round_id"),
+                            "saldo_real_antes": saldo_antes, "saldo_real_despues": saldo_despues,
+                            "detector": f"REAL_CLOSE_PENDING_{modo_detector}",
+                        })
+                        REAL_CLOSE_PENDING[bot] = None
+                        if res == "GANANCIA":
+                            agregar_evento(f"✅ REAL C{int(ciclo)} GANANCIA registrada por pending ({modo_detector}): {bot} -> C1")
+                            cerrar_por_fin_de_ciclo(bot, "Ganancia REAL cerrada por pending; vuelve a DEMO")
+                            _sync_round_release_after_real_close(bot, reason="real_win_pending")
+                            activo_real = None
+                            break
+                        if res == "PÉRDIDA":
+                            prox = int(ciclo_martingala_siguiente() or 1)
+                            agregar_evento(f"❌ REAL C{int(ciclo)} PÉRDIDA registrada por pending ({modo_detector}): {bot} -> próxima C{prox}")
+                            cerrar_por_fin_de_ciclo(bot, f"Pérdida REAL C{int(ciclo)} cerrada por pending")
+                            _sync_round_release_after_real_close(bot, reason="real_loss_pending")
+                            activo_real = None
+                            break
+                    for bot in BOT_NAMES:
                         if estado_bots[bot]["token"] == "REAL":
                             t_last = last_update_time.get(bot, 0)
                             t_real = estado_bots[bot].get("real_activado_en", 0.0)
@@ -21548,7 +21756,7 @@ async def main():
                             # Cierre inmediato: en REAL siempre 1 operación y vuelve a DEMO (gane o pierda)
                             if cierre_info and isinstance(cierre_info, tuple) and len(cierre_info) >= 4:
                                 res, monto, ciclo, payout_total = cierre_info
-                                sig = (res, round(float(monto or 0.0), 2), int(ciclo or 0), round(float(payout_total or 0.0), 4))
+                                sig = _real_close_sig(bot, res, monto, ciclo, payout_total)
 
                                 # Evita reprocesar el mismo cierre en ticks consecutivos
                                 if sig == LAST_REAL_CLOSE_SIG.get(bot):
@@ -21596,6 +21804,13 @@ async def main():
 
                     if (not activo_real) and (not pausa_maestro_activa):
                         set_etapa("TICK_03")
+                        pending_on, pending_bot, pending = _hay_real_close_pending_activo()
+                        if pending_on:
+                            agregar_evento(
+                                f"⏸️ REAL pendiente: no se evalúa nueva entrada REAL hasta cerrar {pending_bot} C{pending.get('ciclo')}"
+                            )
+                            set_etapa("TICK_02")
+                            continue
 
                         # 🔒 Lock estricto: una sola inversión REAL a la vez.
                         # Si token_actual.txt o el estado en memoria ya tienen dueño REAL,
