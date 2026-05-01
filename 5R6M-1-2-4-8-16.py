@@ -353,7 +353,7 @@ LXV_GREEN_EXHAUSTION_PREV90_BLOCK = True
 LXV_GREEN_EXHAUSTION_LOG_COOLDOWN_S = 20.0
 LXV_GREEN_EXHAUSTION_PREV_FULL_GREEN_MIN = 3
 LXV_GREEN_EXHAUSTION_ONLY_FULL_GREEN = True
-LXV_GREEN_EXHAUSTION_FAIL_OPEN = True
+LXV_GREEN_EXHAUSTION_FAIL_OPEN = False
 LXV_BOTX_MAX_AGE_S = 90
 MANUAL_REAL_ROUTE_ENABLE = True
 MANUAL_REAL_REQUIRE_CONFIRM_RISK = False
@@ -4153,66 +4153,114 @@ def _sync_round_manual_status() -> dict:
 
 
 def _round_live_estado_display(row: dict) -> str:
-    """
-    ROUND LIVE muestra estados visuales de cierre/espera:
-    1) waiting
-    2) cierre reciente (✓/X/cerrado)
-
-    Esta función NO modifica datos internos.
-    Solo transforma la fila en texto visual.
-    """
     try:
         row = row if isinstance(row, dict) else {}
 
-        estado = str(row.get("estado") or row.get("status") or "").strip().lower()
-        res = str(row.get("res") or row.get("symbol") or "").strip()
-        is_current = bool(row.get("is_current", True))
+        def _fmt(txt, color="yellow"):
+            try:
+                if color == "red":
+                    return Fore.RED + Style.BRIGHT + txt + Style.RESET_ALL
+                if color == "green":
+                    return Fore.GREEN + Style.BRIGHT + txt + Style.RESET_ALL
+                if color == "cyan":
+                    return Fore.CYAN + Style.BRIGHT + txt + Style.RESET_ALL
+                if color == "gray":
+                    return Fore.WHITE + txt + Style.RESET_ALL
+                return Fore.YELLOW + Style.BRIGHT + txt + Style.RESET_ALL
+            except Exception:
+                return txt
 
-        is_closed = bool(
-            row.get("is_closed_result")
-            or row.get("valid_closed")
-            or estado == "closed"
-            or res in ("✓", "X")
-        )
+        def _parse_age(v):
+            try:
+                if v is None:
+                    return None
+                if isinstance(v, (int, float)):
+                    return float(v)
+                s = str(v).strip().lower()
+                if not s or s in ("--", "-", "none", "null", "."):
+                    return None
+                if s.endswith("ms"):
+                    return float(s[:-2]) / 1000.0
+                if s.endswith("s"):
+                    return float(s[:-1])
+                if s.endswith("m"):
+                    return float(s[:-1]) * 60.0
+                return float(s)
+            except Exception:
+                return None
+
+        res_raw = row.get("res", row.get("resultado", row.get("symbol", "")))
+        res = str(res_raw or "").strip()
+        res_up = res.upper()
+
+        try:
+            ack_round = int(row.get("ack_round", row.get("ack", 0)) or 0)
+        except Exception:
+            ack_round = 0
+
+        try:
+            gap = int(row.get("gap", 0) or 0)
+        except Exception:
+            gap = 0
+
+        is_current = bool(row.get("is_current", row.get("current", True)))
 
         edad_s = None
-        for k in ("edad_s", "age_s", "ack_age_s", "edad_seg", "age"):
-            try:
-                if row.get(k) is not None:
-                    edad_s = float(row.get(k))
-                    break
-            except Exception:
-                pass
+        for k in ("edad_s", "age_s", "ack_age_s", "edad_seg", "age", "edad", "age_txt"):
+            edad_s = _parse_age(row.get(k))
+            if edad_s is not None:
+                break
+
+        loss_values = {"X", "✗", "PÉRDIDA", "PERDIDA", "LOSS"}
+        win_values = {"✓", "GANANCIA", "WIN"}
+
+        is_loss = (res in ("X", "✗")) or (res_up in loss_values)
+        is_win = (res == "✓") or (res_up in win_values)
+
+        estado = str(row.get("estado") or row.get("status") or "").strip().lower()
+        is_closed = bool(
+            is_loss or is_win
+            or row.get("is_closed_result")
+            or row.get("valid_closed")
+            or estado == "closed"
+        )
+
+        if ack_round <= 0:
+            return _fmt("pendiente_ack", "yellow")
+
+        if res_up in ("", ".", "-", "--", "NONE", "NULL"):
+            return _fmt("pendiente_resultado", "yellow")
+
+        if gap != 0:
+            return _fmt("ronda_no_actual", "gray")
 
         if edad_s is None:
-            edad_txt = str(row.get("edad") or row.get("age_txt") or "").strip().lower()
-            try:
-                if edad_txt.endswith("ms"):
-                    edad_s = float(edad_txt[:-2]) / 1000.0
-                elif edad_txt.endswith("s"):
-                    edad_s = float(edad_txt[:-1])
-                elif edad_txt.endswith("m"):
-                    edad_s = float(edad_txt[:-1]) * 60.0
-            except Exception:
-                edad_s = None
-
-        if edad_s is None:
-            # Si no sabemos la edad exacta, por seguridad visual no damos señal de inversión.
-            return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
+            if is_closed:
+                return _fmt("cerrado_sin_edad", "yellow")
+            return _fmt("pendiente_resultado", "yellow")
 
         window_s = float(globals().get("ROUND_LIVE_INVEST_WINDOW_S", 45) or 45)
 
         if is_current and is_closed and 0.0 <= float(edad_s) <= window_s:
-            if res == "X":
-                return Fore.RED + Style.BRIGHT + "X reciente" + Style.RESET_ALL
-            if res == "✓":
-                return Fore.GREEN + Style.BRIGHT + "✓ reciente" + Style.RESET_ALL
-            return Fore.CYAN + Style.BRIGHT + "cerrado reciente" + Style.RESET_ALL
+            if is_loss:
+                return _fmt("X_reciente", "red")
+            if is_win:
+                return _fmt("✓_reciente", "green")
+            return _fmt("cerrado_reciente", "cyan")
 
-        return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
+        if is_current and is_closed and float(edad_s) > window_s:
+            return _fmt("cerrado_fuera_ventana", "gray")
+
+        if is_current and not is_closed:
+            return _fmt("esperando_cierre", "yellow")
+
+        return _fmt("esperando", "yellow")
 
     except Exception:
-        return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
+        try:
+            return Fore.RED + Style.BRIGHT + "estado_error" + Style.RESET_ALL
+        except Exception:
+            return "estado_error"
 
 
 def _ack_live_format_lines(snapshot):
@@ -5097,17 +5145,20 @@ def _lxv_green_exhaustion_gate_ok(round_id, pattern_name):
             return False, "verde_saturado_tardio", info
         return True, "ok", info
     except Exception as e:
-        info["error"] = f"{type(e).__name__}: {e}"
-        info["estado"] = "ERROR_NO_BLOQUEANTE"
+        info = {"error": str(e)}
         try:
             _lxv_5v1x_event_cooldown(
-                key="green_gate_error_no_bloqueante",
-                msg=f"⚠️ LXV GREEN GATE ERROR NO BLOQUEANTE: {type(e).__name__}: {e}",
+                key="green_gate_error",
+                msg=f"⛔ LXV GREEN GATE ERROR: {e}",
                 cooldown_s=20.0,
             )
         except Exception:
             pass
-        return True, "green_gate_error_no_bloqueante", info
+
+        if bool(globals().get("LXV_GREEN_EXHAUSTION_FAIL_OPEN", False)):
+            return True, "green_gate_error_no_bloqueante", info
+
+        return False, "green_gate_error_bloqueante", info
 
 def _lxv_row_bool(row, key, default=False):
     try:
@@ -21195,6 +21246,7 @@ async def cargar_datos_bot(bot, token_actual):
 # Obtener saldo real
 async def obtener_saldo_real():
     global saldo_real, ULTIMA_ACT_SALDO
+    saldo_anterior = saldo_real
     token_demo, token_real = leer_tokens_usuario()
     if not token_real:
         return
@@ -21207,19 +21259,43 @@ async def obtener_saldo_real():
             resp = json.loads(await ws.recv())
             if "error" in resp:
                 print(f"⚠️ Error en auth: {resp['error']['message']}")
+                saldo_real = saldo_anterior
                 return
-            bal_msg = json.dumps({"balance": 1, "subscribe": 1})
+            bal_msg = json.dumps({"balance": 1})
             await ws.send(bal_msg)
-            resp = json.loads(await ws.recv())
-            if "error" in resp:
-                print(f"⚠️ Error en balance: {resp['error']['message']}")
-                return
-            if "balance" in resp:
-                saldo_real = f"{resp['balance']['balance']:.2f}"
+
+            deadline = time.time() + 3.0
+            balance_resp = None
+
+            for _ in range(3):
+                timeout_left = max(0.1, deadline - time.time())
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=timeout_left)
+                except asyncio.TimeoutError:
+                    break
+
+                resp = json.loads(raw)
+
+                if "error" in resp:
+                    print(f"⚠️ Error en balance: {resp['error'].get('message', resp['error'])}")
+                    saldo_real = saldo_anterior
+                    return
+
+                if "balance" in resp:
+                    balance_resp = resp
+                    break
+
+            if balance_resp and "balance" in balance_resp:
+                saldo_real = f"{balance_resp['balance']['balance']:.2f}"
                 ULTIMA_ACT_SALDO = time.time()
-                _update_saldo_monitor_feed(float(resp["balance"]["balance"]))
+                _update_saldo_monitor_feed(float(balance_resp["balance"]["balance"]))
+            else:
+                saldo_real = saldo_anterior
+                print("⚠️ Balance no recibido; se conserva saldo anterior.")
     except Exception as e:
+        saldo_real = saldo_anterior
         print(f"⚠️ Error obteniendo saldo: {e}")
+
 
 async def refresh_saldo_real(forzado=False):
     global ULTIMA_ACT_SALDO
