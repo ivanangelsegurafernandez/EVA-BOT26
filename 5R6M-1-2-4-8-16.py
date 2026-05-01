@@ -351,6 +351,9 @@ LXV_GREEN_EXHAUSTION_STREAK90_BLOCK = 1
 LXV_GREEN_EXHAUSTION_CURRENT90_BLOCK = True
 LXV_GREEN_EXHAUSTION_PREV90_BLOCK = True
 LXV_GREEN_EXHAUSTION_LOG_COOLDOWN_S = 20.0
+LXV_GREEN_EXHAUSTION_PREV_FULL_GREEN_MIN = 3
+LXV_GREEN_EXHAUSTION_ONLY_FULL_GREEN = True
+LXV_GREEN_EXHAUSTION_FAIL_OPEN = True
 LXV_BOTX_MAX_AGE_S = 90
 MANUAL_REAL_ROUTE_ENABLE = True
 MANUAL_REAL_REQUIRE_CONFIRM_RISK = False
@@ -4989,8 +4992,38 @@ def _lxv_4v2x_pick_real_bot(candidate: dict | None) -> str | None:
     ok, _ = _lxv_4v2x_gate_ok(candidate)
     if not ok:
         return None
-    bot = str((candidate or {}).get("bot_x_debil", "") or "").strip()
-    return bot if bot in BOT_NAMES else None
+    c = candidate if isinstance(candidate, dict) else {}
+    rid = int(c.get("round_id", 0) or 0)
+    bot_x1 = str(c.get("bot_x1", "") or "").strip()
+    bot_x2 = str(c.get("bot_x2", "") or "").strip()
+    x_probs = c.get("x_probs_4v2x", {}) if isinstance(c.get("x_probs_4v2x", {}), dict) else {}
+    def _prob_for(bot):
+        try:
+            v = float(x_probs.get(bot))
+            return v if math.isfinite(v) else None
+        except Exception:
+            return None
+    p1 = _prob_for(bot_x1)
+    p2 = _prob_for(bot_x2)
+    if p1 is not None and p2 is not None:
+        picked = bot_x1 if p1 <= p2 else bot_x2
+    elif p1 is not None:
+        picked = bot_x1
+    elif p2 is not None:
+        picked = bot_x2
+    else:
+        picked = str(c.get("bot_x_debil", "") or "").strip()
+        _lxv_5v1x_event_cooldown(
+            key=f"4v2x_pick_prob_missing:{rid}",
+            msg=f"ℹ️ 4V2X sin probabilidad válida en ambas X | rid={rid} | fallback={picked}",
+            cooldown_s=8.0,
+        )
+    _lxv_5v1x_event_cooldown(
+        key=f"4v2x_pick_weak:{rid}",
+        msg=f"🎯 4V2X X débil elegida | rid={rid} | x1={bot_x1}:{p1} | x2={bot_x2}:{p2} | elegida={picked}",
+        cooldown_s=8.0,
+    )
+    return picked if picked in BOT_NAMES else None
 
 def _lxv_fmt_prob_pct(p) -> str:
     try:
@@ -5028,31 +5061,150 @@ def _lxv_green_exhaustion_gate_ok(round_id, pattern_name):
         pname = str(pattern_name or "").upper().strip()
         if not bool(globals().get("LXV_GREEN_EXHAUSTION_GATE_ENABLE", True)):
             return True, "disabled", info
+        if pname not in ("5V1X", "4V2X"):
+            return True, "pattern_not_target", info
         if pname == "5V1X" and not bool(globals().get("LXV_GREEN_EXHAUSTION_BLOCK_5V1X", True)):
             return True, "skip_5v1x", info
         if pname == "4V2X" and not bool(globals().get("LXV_GREEN_EXHAUSTION_BLOCK_4V2X", True)):
             return True, "skip_4v2x", info
-        snap = resumen_racha_verde_roja(round_id_objetivo=int(round_id or 0), lookback=int(globals().get("LXV_GREEN_EXHAUSTION_LOOKBACK", 12)))
-        info = dict(snap if isinstance(snap, dict) else {})
-        streak80 = int(info.get("strong_streak_80", 0) or 0)
-        streak90 = int(info.get("strong_streak_90", 0) or 0)
-        prev90 = bool(info.get("prev90", False))
-        current90 = bool(info.get("current90", False))
-        late_chase = bool(info.get("late_chase", False))
-        blocked = (
-            streak80 >= int(globals().get("LXV_GREEN_EXHAUSTION_STREAK80_BLOCK", 2))
-            or streak90 >= int(globals().get("LXV_GREEN_EXHAUSTION_STREAK90_BLOCK", 1))
-            or (bool(globals().get("LXV_GREEN_EXHAUSTION_PREV90_BLOCK", True)) and prev90)
-            or (bool(globals().get("LXV_GREEN_EXHAUSTION_CURRENT90_BLOCK", True)) and current90)
-            or late_chase
-        )
-        if blocked:
-            return False, "green_exhaustion_late_chase", info
+        rid = int(round_id or 0)
+        if rid <= 0:
+            return True, "rid_invalid_fail_open", {"rid": rid}
+        n_min = int(globals().get("LXV_GREEN_EXHAUSTION_PREV_FULL_GREEN_MIN", 3) or 3)
+        lookback = max(n_min + 2, int(globals().get("LXV_GREEN_EXHAUSTION_LOOKBACK", 12) or 12))
+        streak = _lxv_prev_full_green_streak(rid, lookback=lookback)
+        info = {
+            "rid": rid,
+            "pattern": pname,
+            "prev_full_green_streak": int(streak),
+            "required": int(n_min),
+            "rule": "prev_consecutive_6v0x_only",
+        }
+        if int(streak) >= int(n_min):
+            return False, "verde_saturado_tardio", info
         return True, "ok", info
     except Exception as e:
-        info["error"] = str(e)
-        info["estado"] = "ERROR_SEGURO"
-        return False, "green_exhaustion_error_seguro", info
+        info["error"] = f"{type(e).__name__}: {e}"
+        info["estado"] = "ERROR_NO_BLOQUEANTE"
+        try:
+            _lxv_5v1x_event_cooldown(
+                key="green_gate_error_no_bloqueante",
+                msg=f"⚠️ LXV GREEN GATE ERROR NO BLOQUEANTE: {type(e).__name__}: {e}",
+                cooldown_s=20.0,
+            )
+        except Exception:
+            pass
+        return True, "green_gate_error_no_bloqueante", info
+
+def _lxv_row_bool(row, key, default=False):
+    try:
+        val = (row or {}).get(key, default)
+        if isinstance(val, bool):
+            return val
+        return _mrv_5v1x_to_bool(val, bool(default))
+    except Exception:
+        return bool(default)
+
+def _lxv_row_int(row, key, default=0):
+    try:
+        return _mrv_5v1x_to_int((row or {}).get(key, default), int(default))
+    except Exception:
+        return int(default)
+
+def _lxv_row_quality_ok(row):
+    try:
+        q = str((row or {}).get("data_quality", (row or {}).get("quality", "")) or "").strip().lower()
+        return q == "ok"
+    except Exception:
+        return False
+
+def _lxv_row_round_complete(row):
+    rr = row or {}
+    return _lxv_row_bool(rr, "round_complete", _lxv_row_bool(rr, "complete", False))
+
+def _lxv_row_round_id(row):
+    rr = row or {}
+    for k in ("round_id", "rid", "ronda"):
+        rid = _lxv_row_int(rr, k, 0)
+        if rid > 0:
+            return rid
+    return 0
+
+def _lxv_row_counts(row):
+    rr = row or {}
+    verdes = -1
+    rojos = -1
+    for k in ("n_verdes", "verdes", "total_verdes"):
+        v = _lxv_row_int(rr, k, -1)
+        if v >= 0:
+            verdes = v
+            break
+    for k in ("n_rojos", "rojos", "total_rojos"):
+        r = _lxv_row_int(rr, k, -1)
+        if r >= 0:
+            rojos = r
+            break
+    return verdes, rojos
+
+def _lxv_is_full_green_row(row):
+    try:
+        v, r = _lxv_row_counts(row)
+        return (v == 6 and r == 0 and _lxv_row_round_complete(row) and _lxv_row_quality_ok(row))
+    except Exception:
+        return False
+
+def _lxv_load_recent_columns_for_gate(round_id, lookback=12):
+    try:
+        rid = int(round_id or 0)
+    except Exception:
+        rid = 0
+    if rid <= 0:
+        return []
+    rows = []
+    try:
+        cache_rows = list(globals().get("LXV_FASE_COLUMNS_CACHE", []) or [])
+        if cache_rows:
+            rows.extend([r for r in cache_rows if isinstance(r, dict)])
+    except Exception:
+        pass
+    try:
+        fn = globals().get("_lxv_5v1x_load_recent_matrix_rows")
+        if callable(fn):
+            mrows = fn(max_rows=max(int(lookback or 12) * 2, 12))
+            if isinstance(mrows, list):
+                rows.extend([r for r in mrows if isinstance(r, dict)])
+    except Exception:
+        pass
+    dedup = {}
+    for rr in rows:
+        rrid = _lxv_row_round_id(rr)
+        if rrid > 0 and rrid < rid:
+            dedup[rrid] = rr
+    return [dedup[k] for k in sorted(dedup.keys())]
+
+def _lxv_prev_full_green_streak(round_id, lookback=12):
+    try:
+        rid = int(round_id or 0)
+    except Exception:
+        rid = 0
+    if rid <= 1:
+        return 0
+    try:
+        rows = _lxv_load_recent_columns_for_gate(rid, lookback=lookback)
+        by_rid = {_lxv_row_round_id(r): r for r in rows if _lxv_row_round_id(r) > 0}
+        streak = 0
+        expected = rid - 1
+        while expected > 0:
+            row = by_rid.get(expected)
+            if not isinstance(row, dict):
+                break
+            if not _lxv_is_full_green_row(row):
+                break
+            streak += 1
+            expected -= 1
+        return int(streak)
+    except Exception:
+        return 0
 
 def _lxv_4v2x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     bot_pick = _lxv_4v2x_pick_real_bot(candidate)
@@ -5086,11 +5238,16 @@ def _lxv_4v2x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     if not ok_exh:
         _lxv_5v1x_event_cooldown(
             key=f"4v2x_exhaustion_block:{rid}",
-            msg=f"⛔ 4V2X BLOQUEADO por ZONA ROJA VERDE TARDÍA | rid={rid} | reason={reason_exh} | info={info_exh}",
+            msg=f"⛔ LXV BLOQUEADO: VERDE_SATURADO_TARDIO | rid={rid} | patron=4V2X | prev_full_green_streak={int((info_exh or {}).get('prev_full_green_streak',0))}",
             cooldown_s=float(globals().get("LXV_GREEN_EXHAUSTION_LOG_COOLDOWN_S", 20.0)),
         )
         LXV_REAL_AUDIT["ultimo_bloqueo"] = f"green_exhaustion_4v2x_{reason_exh}"
         return False
+    _lxv_5v1x_event_cooldown(
+        key=f"4v2x_green_ok:{rid}",
+        msg=f"✅ LXV VERDE OK: rid={rid} patron=4V2X prev_full_green_streak={int((info_exh or {}).get('prev_full_green_streak',0))}",
+        cooldown_s=8.0,
+    )
     try:
         fase_ok = _fase_zv_gate_allow_real("LXV_4V2X", rid)
     except Exception:
@@ -5642,9 +5799,13 @@ def evaluar_fase_zona_verde_lxv(rows=None, round_id_objetivo=None):
         elif (g0 <= (3.0/6.0) and d01 < 0) or (d01 < 0 and d12 < 0):
             out.update({"fase":"ROJO_INICIANDO","allow_real":False,"motivo":"pendiente_roja"})
         elif streak > int(globals().get("LXV_FASE_MAX_STREAK_VERDE_TEMPRANO", 3)) or streak >= int(globals().get("LXV_FASE_STREAK_VERDE_MADURO", 4)) or (g0 >= (4.0/6.0) and d01 <= 0 and streak > int(globals().get("LXV_FASE_MAX_STREAK_VERDE_TEMPRANO", 3))):
-            out.update({"fase":"VERDE_MADURO","allow_real":False,"motivo":"verde_cansado"})
+            out.update({"fase":"VERDE_MADURO","allow_real":True,"motivo":"verde_maduro_no_bloqueante"})
         elif g0 >= (4.0/6.0) and g1 >= (4.0/6.0) and d01 >= 0 and streak <= int(globals().get("LXV_FASE_MAX_STREAK_VERDE_TEMPRANO", 3)):
             out.update({"fase":"VERDE_TEMPRANO","allow_real":True,"motivo":"verde_temprano"})
+        if target_rid is not None and target_rid > 0:
+            streak_prev = _lxv_prev_full_green_streak(target_rid, lookback=max(int(globals().get("LXV_GREEN_EXHAUSTION_LOOKBACK", 12) or 12), int(globals().get("LXV_GREEN_EXHAUSTION_PREV_FULL_GREEN_MIN", 3) or 3) + 2))
+            if int(streak_prev) >= int(globals().get("LXV_GREEN_EXHAUSTION_PREV_FULL_GREEN_MIN", 3) or 3):
+                out.update({"fase":"VERDE_SATURADO_TARDIO","allow_real":False,"motivo":"prev_full_green_streak","prev_full_green_streak":int(streak_prev)})
         return out
     except Exception as e:
         base["fase"] = "NEUTRO"
@@ -5683,12 +5844,12 @@ def _fase_zv_gate_allow_real(origen="LXV", rid=0):
     gtxt = f"g0={int(info.get('verdes0',0))}/6 g1={int(info.get('verdes1',0))}/6 g2={int(info.get('verdes2',0))}/6"
     if bool(info.get("allow_real", False)):
         LXV_REAL_AUDIT["fase_ok"] = int(LXV_REAL_AUDIT.get("fase_ok", 0) or 0) + 1
-        _lxv_5v1x_event_cooldown(key=f"fasezv_ok:{origen_txt}:{rid_int}:{info.get('fase')}", msg=f"✅ FASE_ZV OK: origen={origen_txt} rid={rid_int} fase={info.get('fase')} {gtxt}", cooldown_s=float(globals().get("LXV_FASE_LOG_COOLDOWN_S", 20.0)))
+        _lxv_5v1x_event_cooldown(key=f"fasezv_ok:{origen_txt}:{rid_int}:{info.get('fase')}", msg=f"✅ FASE_ZV OK: fase={info.get('fase')} motivo={info.get('motivo')}", cooldown_s=float(globals().get("LXV_FASE_LOG_COOLDOWN_S", 20.0)))
         return True
     cols_txt = f"cols={int(info.get('cols_usadas',0))}/{int(info.get('cols_requeridas', int(globals().get('LXV_FASE_MIN_COLUMNS',3))))}"
     msg = f"⛔ FASE_ZV BLOQUEA REAL: origen={origen_txt} rid={rid_int} fase={info.get('fase')} {cols_txt} {gtxt} motivo={info.get('motivo')}"
-    if str(info.get('fase')) == 'VERDE_MADURO':
-        msg = f"⛔ FASE_ZV BLOQUEA REAL: origen={origen_txt} rid={rid_int} fase=VERDE_MADURO streak={int(info.get('streak_verde',0))} motivo={info.get('motivo')}"
+    if str(info.get('fase')) == 'VERDE_SATURADO_TARDIO':
+        msg = f"⛔ FASE_ZV BLOQUEA REAL: VERDE_SATURADO_TARDIO | rid={rid_int} | streak={int(info.get('prev_full_green_streak',0))}"
     LXV_REAL_AUDIT["fase_bloq"] = int(LXV_REAL_AUDIT.get("fase_bloq", 0) or 0) + 1
     LXV_REAL_AUDIT["ultimo_bloqueo"] = f"fase_zv_{info.get('fase')}_{info.get('motivo')}"
     _lxv_5v1x_event_cooldown(key=f"fasezv_block:{origen_txt}:{rid_int}:{info.get('fase')}", msg=msg, cooldown_s=float(globals().get("LXV_FASE_LOG_COOLDOWN_S", 20.0)))
@@ -5698,16 +5859,16 @@ def _debug_test_fase_zona_verde_lxv():
     if not bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False)):
         return
     cases = [
-        ([(2,4),(3,3),(4,2)], True),
-        ([(3,3),(4,2),(5,1)], True),
-        ([(6,0),(5,1),(4,2)], False),
-        ([(5,1),(4,2),(3,3)], False),
-        ([(4,2),(4,2),(4,2),(4,2)], False),
+        ("C1", [(97,6,0),(98,6,0),(99,6,0),(100,5,1)], "5V1X", False),
+        ("C2", [(98,6,0),(99,6,0),(100,5,1)], "5V1X", True),
+        ("C3", [(97,6,0),(98,5,1),(99,6,0),(100,4,2)], "4V2X", True),
+        ("C4", [(97,6,0),(98,6,0),(99,6,0),(100,4,2)], "4V2X", False),
+        ("C5", [(97,5,1),(98,4,2),(99,5,1),(100,5,1)], "5V1X", True),
     ]
-    for i,(vals,allow) in enumerate(cases,1):
-        rows=[{"round_complete":True,"data_quality":"ok","n_verdes":v,"n_rojos":r} for v,r in vals]
-        got=evaluar_fase_zona_verde_lxv(rows)
-        _lxv_5v1x_event_cooldown(key=f"fasezv_test:{i}", msg=f"🧪 FASE_ZV TEST{i}: fase={got.get('fase')} allow={got.get('allow_real')}", cooldown_s=60.0)
+    for name, vals, pat, expected_ok in cases:
+        rows=[{"round_id":rid, "round_complete":True,"data_quality":"ok","n_verdes":v,"n_rojos":r, "patron_lxv":pat if rid==100 else "OTHER"} for rid,v,r in vals]
+        ok_exh, reason_exh, info_exh = _lxv_green_exhaustion_gate_ok(100, pat)
+        _lxv_5v1x_event_cooldown(key=f"fasezv_test:{name}", msg=f"🧪 FASE_ZV TEST {name}: ok={ok_exh} expected={expected_ok} reason={reason_exh} streak={info_exh.get('prev_full_green_streak',0)}", cooldown_s=60.0)
 def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     bot_pick = _lxv_5v1x_pick_real_bot(candidate)
     if not bot_pick:
@@ -5723,7 +5884,7 @@ def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     if not ok_exh:
         _lxv_5v1x_event_cooldown(
             key=f"5v1x_exhaustion_block:{rid}",
-            msg=f"⛔ 5V1X BLOQUEADO por ZONA ROJA VERDE TARDÍA | rid={rid} | reason={reason_exh} | info={info_exh}",
+            msg=f"⛔ LXV BLOQUEADO: VERDE_SATURADO_TARDIO | rid={rid} | patron=5V1X | prev_full_green_streak={int((info_exh or {}).get('prev_full_green_streak',0))}",
             cooldown_s=float(globals().get("LXV_GREEN_EXHAUSTION_LOG_COOLDOWN_S", 20.0)),
         )
         LXV_REAL_AUDIT["ultimo_bloqueo"] = f"green_exhaustion_5v1x_{reason_exh}"
@@ -5742,15 +5903,9 @@ def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         if not ok_mrv:
             _lxv_5v1x_event_cooldown(
                 key=f"mrv_telemetry:{rid}:{estado_mrv}",
-                msg=(
-                    f"⛔ MRV_5V1X BLOQUEA REAL | bot={bot_pick} | round={rid} | "
-                    f"estado={estado_mrv} | reason={reason_mrv} | green={green_txt} | rebote={rebote_txt} | "
-                    f"samples={samples_mrv} | streak80={streak80_mrv} | streak90={streak90_mrv} | prev90={prev90_mrv}"
-                ),
+                msg=(f"ℹ️ MRV_5V1X telemetría: no bloquea LXV_5V1X | reason={reason_mrv} | estado={estado_mrv} | green={green_txt} | rebote={rebote_txt} | samples={samples_mrv} | streak80={streak80_mrv} | streak90={streak90_mrv} | prev90={prev90_mrv}"),
                 cooldown_s=float(globals().get("MRV_5V1X_LOG_COOLDOWN_S", 20.0)),
             )
-            LXV_REAL_AUDIT["ultimo_bloqueo"] = f"mrv_5v1x_{reason_mrv}"
-            return False
         _lxv_5v1x_event_cooldown(
             key=f"mrv_allow:{rid}:{estado_mrv}",
             msg=(
@@ -22417,3 +22572,8 @@ if __name__ == "__main__":
                             })
                     except Exception:
                         pass
+    _lxv_5v1x_event_cooldown(
+        key=f"5v1x_green_ok:{rid}",
+        msg=f"✅ LXV VERDE OK: rid={rid} patron=5V1X prev_full_green_streak={int((info_exh or {}).get('prev_full_green_streak',0))}",
+        cooldown_s=8.0,
+    )
