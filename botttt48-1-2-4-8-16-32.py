@@ -174,6 +174,9 @@ DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 ACTIVOS = ["1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
 MARTINGALA_DEMO = [1, 2, 4, 8, 16]
 MARTINGALA_REAL = [1, 2, 4, 8, 16]
+# NOTA: El nombre del archivo puede incluir "-32" por historial,
+# pero este bot opera oficialmente con 5 ciclos: 1-2-4-8-16.
+# No usar C6 salvo orden explícita.
 VELAS = 20
 PAUSA_POST_OPERACION_S = 2  # Pausa uniforme tras cada operación con resultado definido (BLOQUE 1)
 # ==================== VENTANA DE DECISIÓN IA ====================
@@ -454,6 +457,7 @@ SYNC_WAIT_POLL_S = 0.80
 SYNC_WAIT_HEARTBEAT_S = 2.0
 SYNC_WAIT_STALE_S = 90.0
 SYNC_WAIT_MAX_IDLE_S = 240.0
+SYNC_WAIT_ABSOLUTE_MAX_S = 360.0
 
 
 def _sync_round_state_ts(st: dict) -> float:
@@ -478,14 +482,14 @@ async def _sync_round_wait_release(round_id: int) -> int:
         if tok == f"REAL:{NOMBRE_BOT}".upper():
             return True
         try:
-            p = os.path.join(ORDEN_DIR, f"{NOMBRE_BOT}.json")
-            data = _sync_round_safe_read_json(p) or {}
-            if bool(data.get('consumed', False)):
-                return False
-            ts = float(data.get('created_ts') or data.get('ts') or 0.0)
-            ttl = float(data.get('ttl_s') or 45.0)
-            if str(data.get('bot', '')).strip() == NOMBRE_BOT and ts > 0 and (time.time() - ts) <= max(1.0, ttl):
-                return True
+            for p in _orden_real_candidate_paths():
+                data = _sync_round_safe_read_json(p) or {}
+                if not isinstance(data, dict) or bool(data.get('consumed', False)):
+                    continue
+                ts = float(data.get('created_ts') or data.get('ts') or 0.0)
+                ttl = float(data.get('ttl_s') or 45.0)
+                if str(data.get('bot', '')).strip() == NOMBRE_BOT and ts > 0 and (time.time() - ts) <= max(1.0, ttl):
+                    return True
         except Exception:
             pass
         return False
@@ -531,6 +535,19 @@ async def _sync_round_wait_release(round_id: int) -> int:
         stale_state = (state_ts > 0) and ((now_ts - state_ts) >= SYNC_WAIT_STALE_S)
         idle_s = now_ts - last_progress_ts
         total_wait_s = now_ts - wait_start_ts
+        pending_contract = bool(estado_bot.get("pending_contract_resolution", False))
+        owner_real = _sync_bot_es_owner_real()
+        if idle_s >= SYNC_WAIT_MAX_IDLE_S:
+            print(Fore.YELLOW + f"⚠️ LXV_SYNC_COLUMN no_progress: {NOMBRE_BOT} ronda #{rid} released={released} esperando #{next_round}")
+            last_progress_ts = now_ts
+        if total_wait_s >= SYNC_WAIT_ABSOLUTE_MAX_S and (not owner_real) and (not pending_contract):
+            print(Fore.YELLOW + Style.BRIGHT + f"🟨 LXV_SYNC_COLUMN escape DEMO seguro: {NOMBRE_BOT} sale de standby por timeout visual, sin REAL activo.")
+            estado_bot["sync_wait"] = False
+            try:
+                _sync_round_write_release_heartbeat(rid, next_round)
+            except Exception:
+                pass
+            return released if released >= next_round else next_round
         if (idle_s >= SYNC_WAIT_MAX_IDLE_S) and (
             stale_state or total_wait_s >= (SYNC_WAIT_STALE_S + SYNC_WAIT_MAX_IDLE_S)
         ):
@@ -609,13 +626,28 @@ def _orden_real_payload_vivo(data: dict | None) -> bool:
 
 
 
+def _orden_real_candidate_paths():
+    paths = []
+    try:
+        paths.append(os.path.join(ORDEN_DIR, f"{NOMBRE_BOT}.json"))
+    except Exception:
+        pass
+    paths.append("orden_real.json")
+    return paths
+
 def _manual_real_order_targets_this_bot() -> bool:
     try:
-        p = "orden_real.json"
-        if not os.path.exists(p):
+        payload = None
+        for p in _orden_real_candidate_paths():
+            if not os.path.exists(p):
+                continue
+            with open(p, "r", encoding="utf-8") as f:
+                cand = json.load(f)
+            if isinstance(cand, dict):
+                payload = cand
+                break
+        if not isinstance(payload, dict):
             return False
-        with open(p, "r", encoding="utf-8") as f:
-            payload = json.load(f)
         if not isinstance(payload, dict):
             return False
 
@@ -663,10 +695,11 @@ def leer_orden_real(bot: str):
     """
     Devuelve (ciclo, ts, quiet, src) si existe orden fresca, o (None, None, 0, None) si no.
     """
-    ruta = os.path.join(ORDEN_DIR, f"{bot}.json")
-    tmp = ruta + ".tmp"
     try:
-        if os.path.exists(ruta):
+        for ruta in _orden_real_candidate_paths():
+            tmp = ruta + ".tmp"
+            if not os.path.exists(ruta):
+                continue
             with open(ruta, "r", encoding="utf-8") as f, open(tmp, "w", encoding="utf-8") as t:
                 t.write(f.read())
             with open(tmp, "r", encoding="utf-8") as f:
