@@ -5974,6 +5974,19 @@ def _sync_round_tick_maestro():
         released_round = max(1, int(st.get("released_round", round_id) or round_id))
     except Exception:
         released_round = round_id
+    expected_round = max(1, int(round_id))
+    pending_on, pending_bot, pending = _hay_real_close_pending_activo()
+    if pending_on:
+        _lxv_5v1x_event_cooldown(
+            key=f"sync_pending_block_early:{pending_bot}:{pending.get('ciclo')}",
+            msg=(
+                f"⏸️ LXV_SYNC/ROUND bloqueado por REAL_CLOSE_PENDING activo | "
+                f"pendiente={pending_bot} C{pending.get('ciclo')} | "
+                f"no se evalúa REAL ni se libera ronda hasta cerrar pending"
+            ),
+            cooldown_s=8.0,
+        )
+        return
     try:
         started_at = float(st.get("started_at", 0.0) or 0.0)
     except Exception:
