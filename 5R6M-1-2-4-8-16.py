@@ -5734,10 +5734,13 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
             if int(x["n_verdes"]) >= int(globals().get("LXV_ZONA_GREEN_MIN",4) or 4): streak += 1
             else: break
         prev_streak = 0
-        streak_fn = globals().get("_lxv_prev_full_green_streak")
-        if callable(streak_fn) and rid0 > 0:
-            try: prev_streak = int(streak_fn(rid0) or 0)
-            except Exception: prev_streak = 0
+        if source == "rows":
+            prev_streak = _lxv_prev_full_green_streak_from_norm_rows(norm, rid0)
+        else:
+            streak_fn = globals().get("_lxv_prev_full_green_streak")
+            if callable(streak_fn) and rid0 > 0:
+                try: prev_streak = int(streak_fn(rid0) or 0)
+                except Exception: prev_streak = 0
         out=dict(base); out.update({"g0":g0,"g1":g1,"g2":g2,"verdes0":v0,"rojos0":r0,"verdes1":v1,"rojos1":r1,"verdes2":v2,"rojos2":r2,"streak_verde":streak,"prev_full_green_streak":prev_streak,"round_id":rid0,"source":source,"cols_usadas":len(norm)})
         if prev_streak >= int(globals().get("LXV_ZONA_FULL_GREEN_MIN",3) or 3) and (target_rid is not None or rid0 > 0):
             out.update({"zona":"VERDE_SATURADO_TARDIO","fase":"VERDE_SATURADO_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"prev_full_green_streak"}); return out
@@ -5754,6 +5757,38 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
     except Exception:
         out=dict(base); out.update({"zona":"NEUTRO","fase":"NEUTRO","decision":ZONA_NO_INVERTIR,"allow_real":False,"motivo":"zona_error_fail_closed","ok":False})
         return out
+
+def _lxv_prev_full_green_streak_from_norm_rows(norm_rows, round_id):
+    try:
+        rid_obj = int(round_id or 0)
+        if rid_obj <= 1:
+            return 0
+        rows = list(norm_rows or [])
+        if not rows:
+            return 0
+        by_rid = {}
+        for rr in rows:
+            if not isinstance(rr, dict):
+                continue
+            rid = _mrv_5v1x_to_int(rr.get("round_id", 0), 0)
+            if rid > 0:
+                by_rid[rid] = rr
+        streak = 0
+        esperado = rid_obj - 1
+        while esperado > 0:
+            col = by_rid.get(esperado)
+            if not isinstance(col, dict):
+                break
+            v = _mrv_5v1x_to_int(col.get("n_verdes", -1), -1)
+            r = _mrv_5v1x_to_int(col.get("n_rojos", -1), -1)
+            if v == 6 and r == 0:
+                streak += 1
+                esperado -= 1
+                continue
+            break
+        return int(streak)
+    except Exception:
+        return 0
 
 def evaluar_fase_zona_verde_lxv(rows=None, round_id_objetivo=None):
     global _LXV_FASE_ZV_LAST_INFO
@@ -5821,7 +5856,9 @@ def _debug_test_zona_operativa_lxv():
         info = clasificar_zona_operativa_lxv(round_id_objetivo=rid_obj, rows=rows_case)
         ok = (info.get("zona") != "VERDE_SATURADO_TARDIO") if expected_zona == "NOT_VERDE_SATURADO_TARDIO" else (info.get("zona") == expected_zona and info.get("decision") == expected_dec)
         if name == "E_SATURADO":
-            ok = ok and int(info.get("prev_full_green_streak",0)) >= 3
+            ok = ok and int(info.get("prev_full_green_streak",0)) == 3
+        if name == "F_SOLO2_FULL":
+            ok = ok and int(info.get("prev_full_green_streak",0)) == 2
         if not ok:
             print(f"⚠️ DEBUG ZONA LXV FALLÓ {name}: got zona={info.get('zona')} decision={info.get('decision')} streak={info.get('prev_full_green_streak',0)}")
 
