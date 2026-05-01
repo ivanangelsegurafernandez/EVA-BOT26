@@ -4163,26 +4163,16 @@ def _round_live_estado_display(row: dict) -> str:
     """
     try:
         row = row if isinstance(row, dict) else {}
-        res = str(row.get("res", row.get("symbol", "")) or "").strip()
-        ack_round = int(row.get("ack_round", row.get("ack", 0)) or 0)
-        gap = row.get("gap", 0)
-        ciclo = row.get("ciclo", "")
-        current_round = bool(row.get("current", row.get("is_current", True)))
 
-        def _c(color, txt, bright=True):
-            return color + (Style.BRIGHT if bright else "") + txt + Style.RESET_ALL
-
-        perdidas = {"X", "✗", "PÉRDIDA", "PERDIDA", "LOSS"}
-        ganancias = {"✓", "GANANCIA", "WIN"}
-        vacios = {"", ".", "-", "none", "null"}
-        res_u = str(res).strip().upper()
         estado = str(row.get("estado") or row.get("status") or "").strip().lower()
+        res = str(row.get("res") or row.get("symbol") or "").strip()
+        is_current = bool(row.get("is_current", True))
+
         is_closed = bool(
             row.get("is_closed_result")
             or row.get("valid_closed")
             or estado == "closed"
-            or res_u in perdidas
-            or res_u in ganancias
+            or res in ("✓", "X")
         )
 
         edad_s = None
@@ -4193,6 +4183,7 @@ def _round_live_estado_display(row: dict) -> str:
                     break
             except Exception:
                 pass
+
         if edad_s is None:
             edad_txt = str(row.get("edad") or row.get("age_txt") or "").strip().lower()
             try:
@@ -4205,36 +4196,23 @@ def _round_live_estado_display(row: dict) -> str:
             except Exception:
                 edad_s = None
 
-        if ack_round <= 0:
-            return _c(Fore.YELLOW, "pendiente_ack")
-        if str(res).strip().lower() in vacios:
-            return _c(Fore.YELLOW, "pendiente_resultado")
-        try:
-            if gap is not None and int(float(gap)) != 0:
-                return _c(Fore.YELLOW, "ronda_no_actual", bright=False)
-        except Exception:
-            pass
-
         if edad_s is None:
-            if res_u in perdidas or res_u in ganancias:
-                return _c(Fore.YELLOW, "cerrado_sin_edad", bright=False)
-            return _c(Fore.YELLOW, "pendiente_resultado")
+            # Si no sabemos la edad exacta, por seguridad visual no damos señal de inversión.
+            return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
 
         window_s = float(globals().get("ROUND_LIVE_INVEST_WINDOW_S", 45) or 45)
-        edad_v = float(edad_s)
-        if res_u in perdidas and edad_v <= window_s:
-            return _c(Fore.RED, "X_reciente")
-        if res_u in ganancias and edad_v <= window_s:
-            return _c(Fore.GREEN, "✓_reciente")
-        if (res_u in perdidas or res_u in ganancias or is_closed) and edad_v > window_s:
-            return _c(Fore.CYAN, "cerrado_fuera_ventana", bright=False)
-        if current_round and (not is_closed):
-            return _c(Fore.YELLOW, "esperando_cierre", bright=False)
 
-        _ = ciclo
-        return _c(Fore.YELLOW, "esperando", bright=False)
+        if is_current and is_closed and 0.0 <= float(edad_s) <= window_s:
+            if res == "X":
+                return Fore.RED + Style.BRIGHT + "X reciente" + Style.RESET_ALL
+            if res == "✓":
+                return Fore.GREEN + Style.BRIGHT + "✓ reciente" + Style.RESET_ALL
+            return Fore.CYAN + Style.BRIGHT + "cerrado reciente" + Style.RESET_ALL
+
+        return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
+
     except Exception:
-        return Fore.RED + Style.BRIGHT + "estado_error" + Style.RESET_ALL
+        return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
 
 
 def _ack_live_format_lines(snapshot):
@@ -4637,51 +4615,6 @@ def _hud_marti_live_lines():
         return [_marti_hud_render_line()]
     except Exception:
         return []
-
-
-def _hud_saldos_meta_lines(valor_saldo=None, saldo_str="--", meta_str="--", width=None):
-    try:
-        lines = []
-        top_lines = list(_resumen_top_hud(valor_saldo=valor_saldo, saldo_str=saldo_str, meta_str=meta_str) or [])
-        lines.extend([_ack_tape_strip_ansi(l) for l in top_lines])
-        return lines
-    except Exception:
-        return ["💰 Saldo/Meta: --"]
-
-
-def _hud_martingala_real_lines(width=None):
-    try:
-        raw = list(render_cuadro_martingala_visible() or [])
-        clean = [ln for ln in raw if str(ln).strip() != ""]
-        return clean
-    except Exception:
-        return ["🔁 MARTINGALA REAL - CICLOS | visual no disponible"]
-
-
-def _hud_merge_blocks_side_by_side(left_lines, right_lines, gap=2):
-    try:
-        left = list(left_lines or [])
-        right = list(right_lines or [])
-        if not left:
-            return right
-        if not right:
-            return left
-        gap_s = " " * max(1, int(gap or 2))
-        max_left = max(hud_visible_len(x) for x in left) if left else 0
-        max_right = max(hud_visible_len(x) for x in right) if right else 0
-        safe_w = min(int(globals().get("HUD_TABLE_WIDTH", 132) or 132), int(shutil.get_terminal_size((132, 30)).columns))
-        if (max_left + len(gap_s) + max_right) > safe_w:
-            return left + [""] + right
-        out = []
-        total = max(len(left), len(right))
-        for i in range(total):
-            l = left[i] if i < len(left) else ""
-            r = right[i] if i < len(right) else ""
-            lpad = l + (" " * max(0, max_left - hud_visible_len(l)))
-            out.append(lpad + gap_s + r)
-        return out
-    except Exception:
-        return list(left_lines or []) + [""] + list(right_lines or [])
 
 
 def render_cuadro_martingala_visible():
@@ -17346,14 +17279,10 @@ def mostrar_panel():
 
     # Bloque visual destacado de saldo/meta + cabecera compacta secundaria
     try:
-        top_left = _hud_saldos_meta_lines(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str, width=HUD_BOX_WIDTH)
-        top_right = _hud_martingala_real_lines(width=60) if bool(globals().get("HUD_MARTI_CLEAN_LAYOUT", True)) else []
-        merged_top = _hud_merge_blocks_side_by_side(top_left, top_right, gap=3) if top_right else top_left
-        for _line in merged_top:
-            if str(_line).strip() == "":
-                print("")
-            else:
-                print(padding + Fore.CYAN + _line)
+        mostrar_bloque_saldo_meta_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str, padding=padding)
+        top_lines = list(_resumen_top_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str) or [])
+        for _line in top_lines[1:]:
+            print(padding + Fore.CYAN + _line)
         if not bool(globals().get("HUD_MARTI_CLEAN_LAYOUT", True)):
             fi = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
             fase = str(fi.get("fase", "INSUFICIENTE"))
@@ -17804,9 +17733,8 @@ def mostrar_panel():
 
     try:
         if bool(globals().get("HUD_MARTINGALA_LIVE_ENABLE", True)):
-            if not bool(globals().get("HUD_MARTI_CLEAN_LAYOUT", True)):
-                for _ml in render_cuadro_martingala_visible():
-                    print(_ml)
+            for _ml in render_cuadro_martingala_visible():
+                print(_ml)
             if not bool(globals().get("HUD_MARTI_CLEAN_LAYOUT", True)):
                 print(_marti_hud_render_line())
             try:
