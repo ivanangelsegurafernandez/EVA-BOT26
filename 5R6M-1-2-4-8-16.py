@@ -4260,10 +4260,17 @@ def _ack_live_calc_summary(rows_pack):
 
     complete = closed_count == expected_count
     fresh_count = sum(1 for r in rows if bool(r.get("session_fresh")) and (not bool(r.get("preboot"))))
-    if closed_count <= 0 and fresh_count <= 0:
-        data_quality = "missing"
-    elif complete:
+    recent_current = [
+        r for r in valid_current
+        if r.get("age_s") is not None
+        and float(r.get("age_s")) <= float(ROUND_LIVE_INVEST_WINDOW_S)
+    ]
+    recent_count = len(recent_current)
+    expired_count = max(0, closed_count - recent_count)
+    if complete and expired_count <= 0:
         data_quality = "ok"
+    elif complete and expired_count > 0:
+        data_quality = "closed_expired"
     elif closed_count > 0:
         data_quality = "partial"
     else:
@@ -4311,6 +4318,9 @@ def _ack_live_calc_summary(rows_pack):
         "real_pending_bot": str(st.get("real_pending_bot", "") or ""),
         "real_pending_cycle": int(st.get("real_pending_cycle", 0) or 0),
         "fresh_count": fresh_count,
+        "recent_count": recent_count,
+        "expired_count": expired_count,
+        "has_expired_closed": bool(expired_count > 0),
     }
 
 
@@ -4522,7 +4532,15 @@ def _ack_live_format_lines(snapshot):
         lines.append(f"{bot:<7}  {ack_txt:<5} {gap_txt:<4} {res_txt:<4} {age_txt:<6} {ciclo_txt:<6} {estado_txt}")
 
     botx = summary.get("bot_x_actual") or "-"
-    motivo_round = "esperando_ack_fresco_sesion" if fresh_count < expected_count else "ack_fresco_ok"
+    expired_count = int(summary.get("expired_count", 0) or 0)
+    if closed_count < expected_count:
+        motivo_round = f"esperando_ack:{closed_count}/{expected_count}"
+    elif str(summary.get("data_quality", "") or "").strip().lower() == "closed_expired":
+        motivo_round = "6_6_cerrado_tarde_release_sin_real"
+    elif str(summary.get("data_quality", "") or "").strip().lower() == "ok":
+        motivo_round = "6_6_ok_evalua_lxv"
+    else:
+        motivo_round = "columna_incompleta"
     resumen = (
         f"📊 RONDA #{obj_round} | V={summary.get('verdes_count', 0)} | R={summary.get('rojas_count', 0)} | "
         f"Faltan={faltan_count} | Parcial={summary.get('partial_pattern', '0V0X')} | "
@@ -4535,6 +4553,10 @@ def _ack_live_format_lines(snapshot):
     columna_lista = bool(closed_count >= expected_count and faltan_count <= 0 and dq_txt == "ok")
     if fresh_count < expected_count:
         lines.append(f"⏳ Aún no se evalúa REAL: round_live_preboot_no_cuenta | faltan={expected_count-fresh_count}")
+    elif bool(summary.get("has_expired_closed", False)):
+        lines.append(f"⏳ Esperando columna objetivo #{obj_round}: cerrados={closed_count}/{expected_count} faltan={faltan_count}")
+        lines.append(f"⏳ Aún no se evalúa REAL: columna cerrada pero fuera de ventana | expired={expired_count}")
+        lines.append("Los símbolos LIVE ACK 80 son historial; REAL solo evalúa ROUND LIVE cerrado.")
     elif (not columna_lista) or parcial_txt == "0V0X":
         lines.append(f"⏳ Esperando columna objetivo #{obj_round}: cerrados={closed_count}/{expected_count} faltan={faltan_count}")
         lines.append("⏳ Aún no se evalúa REAL: columna objetivo incompleta.")
@@ -6543,12 +6565,14 @@ def _sync_round_tick_maestro():
         agregar_evento(f"🧩 LXV_SYNC_COLUMN cierres ronda #{round_id}: {n_closed}/{len(expected)}.")
 
     closed_direct, reasons_direct = {}, {}
+    direct_ack_full = False
     if status_now in ("waiting_closures", "released", "released_after_real_result", "released_recovery_completed_without_real_stuck"):
         closed_direct, reasons_direct = _sync_round_collect_closed_acks(round_id)
         if len(closed_direct) == len(BOT_NAMES):
             closed = {b: closed_direct[b] for b in expected if b in closed_direct}
             n_closed = len(closed)
             missing = []
+            direct_ack_full = bool(n_closed >= len(expected))
             sync_debug_missing = dict(reasons_direct)
             agregar_evento(f"🧯 SYNC RECOVERY ACK: ronda #{round_id} completa por ACK directo; evaluando/liberando.")
     completed_normal = bool(n_closed >= len(expected))
@@ -6585,14 +6609,46 @@ def _sync_round_tick_maestro():
     faltan_count = int(summary.get("faltan_count", max(0, expected_count - closed_count)) or 0)
     data_quality = str(summary.get("data_quality", "") or "").strip().lower()
     partial_pattern = str(summary.get("partial_pattern", "") or "").strip().upper()
-    round_live_complete = bool(closed_count >= expected_count and faltan_count <= 0 and data_quality == "ok")
-    if round_live_complete:
+    round_live_all_closed = bool(closed_count >= expected_count and faltan_count <= 0)
+    round_live_real_ok = bool(round_live_all_closed and data_quality == "ok")
+    round_live_closed_expired = bool(round_live_all_closed and data_quality == "closed_expired")
+    round_live_release_no_real_reason = ""
+    if direct_ack_full and (not round_live_real_ok):
+        completed = True
+        completed_normal = True
+        completed_failsafe = False
+        missing = []
+        round_live_release_no_real_reason = "direct_ack_6_6_release_no_real_if_not_ok"
+    elif round_live_real_ok:
         completed = True
         completed_normal = True
         completed_failsafe = False
         missing = []
         agregar_evento(
             f"✅ SYNC COMPLETE FROM ROUND LIVE: ronda #{round_id} cerrados={closed_count}/{expected_count} parcial={partial_pattern}; evaluando REAL/RELEASE."
+        )
+    elif round_live_closed_expired:
+        completed = True
+        completed_normal = True
+        completed_failsafe = False
+        missing = []
+        round_live_release_no_real_reason = "direct_ack_6_6_release_no_real" if direct_ack_full else "round_closed_expired_release_no_real"
+        _lxv_5v1x_event_cooldown(
+            key=f"sync_release_closed_expired:{round_id}",
+            msg=f"🟨 SYNC RELEASE SIN REAL: ronda #{round_id} cerrada 6/6 pero fuera de ventana; liberando bots sin evaluar REAL.",
+            cooldown_s=8.0,
+        )
+    elif round_live_all_closed:
+        completed = True
+        completed_normal = True
+        completed_failsafe = False
+        missing = []
+        dq_reason = data_quality if data_quality else "unknown"
+        round_live_release_no_real_reason = f"round_closed_non_ok_release_no_real:{dq_reason}"
+        _lxv_5v1x_event_cooldown(
+            key=f"sync_release_closed_non_ok:{round_id}:{dq_reason}",
+            msg=f"🟨 SYNC RELEASE SIN REAL: ronda #{round_id} cerrada {closed_count}/{expected_count} con calidad={dq_reason}; liberando bots sin evaluar REAL.",
+            cooldown_s=8.0,
         )
     payload = {
         "round_id": round_id,
@@ -6635,7 +6691,7 @@ def _sync_round_tick_maestro():
             pick, patron, motivo = None, f"{len([x for x in snapshot if x.get('resultado') == 'GANANCIA'])}V/{len([x for x in snapshot if x.get('resultado') == 'PÉRDIDA'])}X", "masa mínima insuficiente para evaluar LXV_REAL"
         else:
             pick, patron, motivo = _lxv_evaluar_columna(round_id, snapshot)
-        if round_live_complete:
+        if round_live_real_ok:
             ok_emit = False
             emit_bot = None
             motivo_exec = ""
@@ -6705,7 +6761,7 @@ def _sync_round_tick_maestro():
             motivo_no_real = f"sin_patron_lxv_{patron}"
             agregar_evento(f"🚀 RELEASE sin patrón LXV: ronda #{round_id} parcial={patron} -> libera #{round_id + 1}")
             pick = None
-        if (not round_live_complete) and pick:
+        if (not round_live_real_ok) and pick:
             bot_pick = str(pick.get("bot"))
             ciclo_snapshot = int(
                 pick.get("ciclo", estado_bots.get(bot_pick, {}).get("ciclo_actual", 1)) or 1
@@ -6868,6 +6924,8 @@ def _sync_round_tick_maestro():
         if real_emitido and (not hold_valido):
             release_reason = f"real_emitido_sin_hold_valido_{hold_motivo}"
             agregar_evento(f"⚠️ HOLD cancelado: real_emitido=True pero {hold_motivo}; liberando #{round_id + 1}")
+        elif round_live_release_no_real_reason:
+            release_reason = round_live_release_no_real_reason
         elif motivo_no_real:
             release_reason = f"no_real_{motivo_no_real}"
         agregar_evento(f"🚀 RELEASE normal: ronda #{round_id} completa sin HOLD válido -> libera #{round_id + 1}")
