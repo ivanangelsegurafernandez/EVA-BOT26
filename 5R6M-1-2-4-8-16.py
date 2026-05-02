@@ -4260,10 +4260,17 @@ def _ack_live_calc_summary(rows_pack):
 
     complete = closed_count == expected_count
     fresh_count = sum(1 for r in rows if bool(r.get("session_fresh")) and (not bool(r.get("preboot"))))
-    if closed_count <= 0 and fresh_count <= 0:
-        data_quality = "missing"
-    elif complete:
+    recent_current = [
+        r for r in valid_current
+        if r.get("age_s") is not None
+        and float(r.get("age_s")) <= float(ROUND_LIVE_INVEST_WINDOW_S)
+    ]
+    recent_count = len(recent_current)
+    expired_count = max(0, closed_count - recent_count)
+    if complete and expired_count <= 0:
         data_quality = "ok"
+    elif complete and expired_count > 0:
+        data_quality = "closed_expired"
     elif closed_count > 0:
         data_quality = "partial"
     else:
@@ -4311,6 +4318,9 @@ def _ack_live_calc_summary(rows_pack):
         "real_pending_bot": str(st.get("real_pending_bot", "") or ""),
         "real_pending_cycle": int(st.get("real_pending_cycle", 0) or 0),
         "fresh_count": fresh_count,
+        "recent_count": recent_count,
+        "expired_count": expired_count,
+        "has_expired_closed": bool(expired_count > 0),
     }
 
 
@@ -4522,7 +4532,15 @@ def _ack_live_format_lines(snapshot):
         lines.append(f"{bot:<7}  {ack_txt:<5} {gap_txt:<4} {res_txt:<4} {age_txt:<6} {ciclo_txt:<6} {estado_txt}")
 
     botx = summary.get("bot_x_actual") or "-"
-    motivo_round = "esperando_ack_fresco_sesion" if fresh_count < expected_count else "ack_fresco_ok"
+    expired_count = int(summary.get("expired_count", 0) or 0)
+    if fresh_count < expected_count:
+        motivo_round = "esperando_ack_fresco_sesion"
+    elif bool(summary.get("has_expired_closed", False)):
+        motivo_round = f"columna_cerrada_fuera_ventana:{expired_count}"
+    elif str(summary.get("data_quality", "") or "").strip().lower() == "ok":
+        motivo_round = "ack_fresco_ok"
+    else:
+        motivo_round = "columna_incompleta"
     resumen = (
         f"📊 RONDA #{obj_round} | V={summary.get('verdes_count', 0)} | R={summary.get('rojas_count', 0)} | "
         f"Faltan={faltan_count} | Parcial={summary.get('partial_pattern', '0V0X')} | "
@@ -4535,6 +4553,10 @@ def _ack_live_format_lines(snapshot):
     columna_lista = bool(closed_count >= expected_count and faltan_count <= 0 and dq_txt == "ok")
     if fresh_count < expected_count:
         lines.append(f"⏳ Aún no se evalúa REAL: round_live_preboot_no_cuenta | faltan={expected_count-fresh_count}")
+    elif bool(summary.get("has_expired_closed", False)):
+        lines.append(f"⏳ Esperando columna objetivo #{obj_round}: cerrados={closed_count}/{expected_count} faltan={faltan_count}")
+        lines.append(f"⏳ Aún no se evalúa REAL: columna cerrada pero fuera de ventana | expired={expired_count}")
+        lines.append("Los símbolos LIVE ACK 80 son historial; REAL solo evalúa ROUND LIVE cerrado.")
     elif (not columna_lista) or parcial_txt == "0V0X":
         lines.append(f"⏳ Esperando columna objetivo #{obj_round}: cerrados={closed_count}/{expected_count} faltan={faltan_count}")
         lines.append("⏳ Aún no se evalúa REAL: columna objetivo incompleta.")
