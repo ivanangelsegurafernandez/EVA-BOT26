@@ -614,7 +614,9 @@ async def _sync_round_wait_release(round_id: int) -> int:
                 + Style.RESET_ALL
             )
             return next_round
-        if (now_ts - float(last_standby_print_ts or 0.0)) >= float(SYNC_STANDBY_PRINT_COOLDOWN_S):
+        now_print = time.time()
+        if (now_print - last_standby_print_ts) >= float(globals().get("SYNC_STANDBY_PRINT_COOLDOWN_S", 10.0)):
+            last_standby_print_ts = now_print
             print(Fore.CYAN + f"… standby columna {NOMBRE_BOT}: ronda #{rid}, released_round={released}")
             last_standby_print_ts = now_ts
         await asyncio.sleep(SYNC_WAIT_POLL_S)
