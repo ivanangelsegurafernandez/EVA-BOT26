@@ -7122,11 +7122,34 @@ def _sync_round_tick_maestro():
     rows_pack = _ack_live_build_rows()
     summary = _ack_live_calc_summary(rows_pack)
     rows_live = list((rows_pack or {}).get("rows", []) if isinstance(rows_pack, dict) else [])
+    real_emitido = False
     closed_count = int(summary.get("closed_count", 0) or 0)
     expected_count = int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
     faltan_count = int(summary.get("faltan_count", max(0, expected_count - closed_count)) or 0)
+    expired_count = int(summary.get("expired_count", 0) or 0)
+    max_lag_s = summary.get("max_lag_s", None)
+    try:
+        max_lag_s = float(max_lag_s) if max_lag_s is not None else None
+    except Exception:
+        max_lag_s = None
     data_quality = str(summary.get("data_quality", "") or "").strip().lower()
     partial_pattern = str(summary.get("partial_pattern", "") or "").strip().upper()
+    incomplete_round = bool(closed_count < expected_count)
+    has_expired_closed = bool(expired_count > 0)
+    too_old_round = bool(max_lag_s is not None and float(max_lag_s) > float(ROUND_LIVE_INVEST_WINDOW_S))
+    if incomplete_round and (has_expired_closed or too_old_round):
+        if _hay_real_close_pending_activo()[0]:
+            return
+        if hold_status in ("holding_real_result", "holding_real_turn"):
+            return
+        if real_emitido:
+            return
+        agregar_evento(
+            f"⏩ ROUND LIVE incompleto vencido: ronda #{round_id} cerrados={closed_count}/{expected_count} "
+            f"faltan={expected_count - closed_count} expired={expired_count}; liberando sin REAL."
+        )
+        _sync_round_release_next_round(round_id, "incomplete_round_expired_release_no_real")
+        return
     round_live_all_closed = bool(closed_count >= expected_count and faltan_count <= 0)
     round_live_real_ok = bool(round_live_all_closed and data_quality == "ok")
     round_live_closed_expired = bool(round_live_all_closed and data_quality == "closed_expired")
