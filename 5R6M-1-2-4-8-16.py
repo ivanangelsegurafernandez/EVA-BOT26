@@ -6828,6 +6828,7 @@ def _sync_round_tick_maestro():
     expected_round = max(1, int(round_id))
     pending_on, pending_bot, pending = _hay_real_close_pending_activo()
     if pending_on:
+        agregar_evento(f"⛔ TURBO_SYNC_HOLD_REAL_PENDING: ronda #{round_id} no libera por real_close_pending:{pending_bot}")
         _lxv_5v1x_event_cooldown(
             key=f"sync_pending_block_early:{pending_bot}:{pending.get('ciclo')}",
             msg=(
@@ -6984,17 +6985,21 @@ def _sync_round_tick_maestro():
         _SYNC_ROUND_LAST_CLOSED_COUNT[round_id] = n_closed
         agregar_evento(f"🧩 LXV_SYNC_COLUMN cierres ronda #{round_id}: {n_closed}/{len(expected)}.")
 
-    closed_direct, reasons_direct = {}, {}
-    direct_ack_full = False
-    if status_now in ("waiting_closures", "released", "released_after_real_result", "released_recovery_completed_without_real_stuck"):
-        closed_direct, reasons_direct = _sync_round_collect_closed_acks(round_id)
-        if len(closed_direct) == len(BOT_NAMES):
-            closed = {b: closed_direct[b] for b in expected if b in closed_direct}
-            n_closed = len(closed)
-            missing = []
-            direct_ack_full = bool(n_closed >= len(expected))
-            sync_debug_missing = dict(reasons_direct)
-            agregar_evento(f"🧯 SYNC RECOVERY ACK: ronda #{round_id} completa por ACK directo; evaluando/liberando.")
+    closed_direct, reasons_direct = _sync_round_collect_closed_acks(round_id)
+    direct_ack_full = (
+        isinstance(closed_direct, dict)
+        and len(closed_direct) >= len(BOT_NAMES)
+        and all(bot in closed_direct for bot in BOT_NAMES)
+    )
+    if direct_ack_full:
+        closed = {bot: closed_direct[bot] for bot in BOT_NAMES}
+        n_closed = len(closed)
+        missing = []
+        completed = True
+        completed_normal = True
+        completed_failsafe = False
+        sync_debug_missing = {bot: "ok" for bot in BOT_NAMES}
+        agregar_evento(f"⚡ TURBO_SYNC_ACK_FULL: ronda #{round_id} cerrada 6/6 por ACK directo; evaluando ahora.")
     completed_normal = bool(n_closed >= len(expected))
     completed_failsafe = bool(stale_ignored and n_closed >= effective_need)
     completed = bool(completed_normal or completed_failsafe)
@@ -7009,12 +7014,7 @@ def _sync_round_tick_maestro():
         )
     real_on_now, _, _ = _sync_real_turn_activo()
     elapsed_started = max(0.0, float(time.time()) - float(started_at))
-    if status_now == "waiting_closures" and int(released_round) == int(round_id) and elapsed_started > 20.0 and len(closed_direct) == len(BOT_NAMES) and (not real_on_now):
-        closed = {b: closed_direct[b] for b in expected if b in closed_direct}
-        n_closed = len(closed)
-        missing = []
-        completed = True
-    elif status_now == "waiting_closures" and elapsed_started > 60.0 and missing:
+    if status_now == "waiting_closures" and elapsed_started > 60.0 and missing:
         miss_short = [f"{b}:{sync_debug_missing.get(b, 'ack_missing')}" for b in missing]
         _lxv_5v1x_event_cooldown(
             key=f"sync_wait_60:{round_id}",
@@ -7035,12 +7035,13 @@ def _sync_round_tick_maestro():
     round_live_release_no_real_reason = ""
     if round_live_all_closed:
         agregar_evento(f"⚡ TURBO_SYNC: columna #{round_id} cerrada 6/6; evaluando REAL/RELEASE inmediato.")
-    if direct_ack_full and (not round_live_real_ok):
+    if direct_ack_full or round_live_all_closed:
         completed = True
         completed_normal = True
         completed_failsafe = False
         missing = []
-        round_live_release_no_real_reason = "turbo_sync_no_real_release"
+    if direct_ack_full and data_quality and data_quality != "ok":
+        round_live_release_no_real_reason = f"turbo_sync_6_6_no_real_release:{data_quality}"
     elif round_live_real_ok:
         completed = True
         completed_normal = True
@@ -7054,7 +7055,7 @@ def _sync_round_tick_maestro():
         completed_normal = True
         completed_failsafe = False
         missing = []
-        round_live_release_no_real_reason = "turbo_sync_no_real_release" if direct_ack_full else "round_closed_expired_release_no_real"
+        round_live_release_no_real_reason = f"turbo_sync_6_6_no_real_release:{data_quality or 'closed_expired'}" if direct_ack_full else "round_closed_expired_release_no_real"
         _lxv_5v1x_event_cooldown(
             key=f"sync_release_closed_expired:{round_id}",
             msg=f"🟨 SYNC RELEASE SIN REAL: ronda #{round_id} cerrada 6/6 pero fuera de ventana; liberando bots sin evaluar REAL.",
@@ -7066,7 +7067,7 @@ def _sync_round_tick_maestro():
         completed_failsafe = False
         missing = []
         dq_reason = data_quality if data_quality else "unknown"
-        round_live_release_no_real_reason = f"turbo_sync_closed_non_ok_release_no_real:{dq_reason}"
+        round_live_release_no_real_reason = f"turbo_sync_6_6_no_real_release:{dq_reason}"
         _lxv_5v1x_event_cooldown(
             key=f"sync_release_closed_non_ok:{round_id}:{dq_reason}",
             msg=f"🟨 SYNC RELEASE SIN REAL: ronda #{round_id} cerrada {closed_count}/{expected_count} con calidad={dq_reason}; liberando bots sin evaluar REAL.",
@@ -7077,9 +7078,12 @@ def _sync_round_tick_maestro():
     if completed:
         status_payload = "completed_pending_release"
         reason_payload = round_live_release_no_real_reason or "round_completed_turbo_sync"
+    payload_released_round = int(released_round)
+    if completed and hold_status not in ("holding_real_result", "holding_real_turn"):
+        payload_released_round = int(round_id) + 1
     payload = {
         "round_id": round_id,
-        "released_round": released_round,
+        "released_round": payload_released_round,
         "expected_bots": expected,
         "expected_bots_effective": effective_expected,
         "closed_bots": closed,
@@ -7182,7 +7186,7 @@ def _sync_round_tick_maestro():
             if ok_emit:
                 real_emitido = True
                 real_hold_bot = str(emit_bot or "")
-                agregar_evento(f"⚡ TURBO_SYNC REAL: ronda #{round_id} → {real_hold_bot or emit_bot or '-'} C{int(ciclo_pick)} | patrón={patron}")
+                agregar_evento(f"⚡ TURBO_SYNC_REAL_NOW: ronda #{round_id} patrón={patron} bot={real_hold_bot or emit_bot or '-'} ciclo=C{int(ciclo_pick)}")
             else:
                 motivo_no_real = motivo_exec if motivo_exec else f"no_real_{patron}"
         elif patron not in ("5V1X", "4V2X"):
@@ -7313,7 +7317,7 @@ def _sync_round_tick_maestro():
                 if ok_emit:
                     real_emitido = True
                     real_hold_bot = str(bot_pick)
-                    agregar_evento(f"⚡ TURBO_SYNC REAL: ronda #{round_id} → {real_hold_bot} C{int(ciclo_pick)} | patrón={patron}")
+                    agregar_evento(f"⚡ TURBO_SYNC_REAL_NOW: ronda #{round_id} patrón={patron} bot={real_hold_bot} ciclo=C{int(ciclo_pick)}")
                     try:
                         estado_bots[bot_pick]["ciclo_actual"] = int(ciclo_pick)
                     except Exception:
@@ -7350,7 +7354,7 @@ def _sync_round_tick_maestro():
         ))
         if release_written:
             if not real_emitido:
-                agregar_evento(f"⚡ TURBO_SYNC RELEASE: ronda #{round_id} → #{round_id + 1} sin REAL | motivo={release_reason}")
+                agregar_evento(f"⚡ TURBO_SYNC_RELEASE_NOW: ronda #{round_id} → #{round_id + 1} sin REAL | motivo={release_reason}")
             agregar_evento(
                 f"ROUND LIVE #{round_id} | 6/6 OK | patrón={patron} | release={round_id + 1} | real={emit_bot_now or 'none'} | motivo={release_reason}"
             )
