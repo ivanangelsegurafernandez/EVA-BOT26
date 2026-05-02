@@ -1310,11 +1310,15 @@ HUD_BOOT_BASELINE = {
     "rows": {},
     "ack_round": {},
     "csv_mtime": {},
+    "ack_json_round": {},
+    "ack_json_mtime": {},
+    "ack_json_ts": {},
     "ready": False,
     "ts": MASTER_BOOT_TS,
 }
 IA53_TRIGGERED = {bot: False for bot in BOT_NAMES}
 IA53_LAST_TS = {bot: 0.0 for bot in BOT_NAMES}
+ACK_SESSION_FRESH = {bot: False for bot in BOT_NAMES}
 TOKEN_FILE = "token_actual.txt"
 DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 saldo_real = "--"
@@ -1417,9 +1421,26 @@ def inicializar_hud_boot_baseline():
                 rows_count = 0
                 last_ack = None
                 mtime = 0.0
+            ack_json_round = 0
+            ack_json_ts = 0.0
+            ack_json_mtime = 0.0
+            try:
+                ack_path = _sync_round_ack_path(bot)
+                if os.path.exists(ack_path):
+                    ack_payload = _sync_round_safe_read_json(ack_path) or {}
+                    ack_json_round = int(ack_payload.get("round_id", 0) or 0)
+                    ack_json_ts = float(ack_payload.get("ts", 0.0) or 0.0)
+                    ack_json_mtime = float(os.path.getmtime(ack_path) or 0.0)
+            except Exception:
+                ack_json_round = 0
+                ack_json_ts = 0.0
+                ack_json_mtime = 0.0
             HUD_BOOT_BASELINE["rows"][bot] = rows_count
             HUD_BOOT_BASELINE["ack_round"][bot] = last_ack
             HUD_BOOT_BASELINE["csv_mtime"][bot] = mtime
+            HUD_BOOT_BASELINE["ack_json_round"][bot] = ack_json_round
+            HUD_BOOT_BASELINE["ack_json_ts"][bot] = ack_json_ts
+            HUD_BOOT_BASELINE["ack_json_mtime"][bot] = ack_json_mtime
         HUD_BOOT_BASELINE["ready"] = True
         HUD_BOOT_BASELINE["ts"] = MASTER_BOOT_TS
         agregar_evento("🧹 HUD baseline inicializado: ignorando cierres previos al arranque.")
@@ -1429,7 +1450,7 @@ def inicializar_hud_boot_baseline():
         return False
 
 
-def _hud_ack_es_de_sesion_actual(bot, row=None, ack_round=None, ts=None, csv_row_index=None):
+def _hud_ack_es_de_sesion_actual(bot, row=None, ack_round=None, ts=None, csv_row_index=None, ack_path=None):
     try:
         if not bot:
             return False
@@ -1448,28 +1469,41 @@ def _hud_ack_es_de_sesion_actual(bot, row=None, ack_round=None, ts=None, csv_row
             ts_v = float(ts_v) if ts_v is not None else None
         except Exception:
             ts_v = None
+
+        ack_json_base_round = int(HUD_BOOT_BASELINE.get("ack_json_round", {}).get(bot, 0) or 0)
+        ack_json_base_mtime = float(HUD_BOOT_BASELINE.get("ack_json_mtime", {}).get(bot, 0.0) or 0.0)
+        ack_json_base_ts = float(HUD_BOOT_BASELINE.get("ack_json_ts", {}).get(bot, 0.0) or 0.0)
+
+        ack_path_use = ack_path or _sync_round_ack_path(bot)
+        ack_mtime_now = 0.0
+        try:
+            if ack_path_use and os.path.exists(ack_path_use):
+                ack_mtime_now = float(os.path.getmtime(ack_path_use) or 0.0)
+        except Exception:
+            ack_mtime_now = 0.0
+
         if ts_v is not None and ts_v >= (boot_ts - grace):
             return True
+        if ack_mtime_now > boot_ts and ack_round_v > ack_json_base_round:
+            return True
+        if ack_mtime_now > ack_json_base_mtime and ts_v is not None and ts_v > ack_json_base_ts and ts_v >= (boot_ts - grace):
+            return True
+
         idx_v = csv_row_index if csv_row_index is not None else row.get("csv_row_index", None)
         try:
             idx_v = int(idx_v) if idx_v is not None else None
         except Exception:
             idx_v = None
         base_rows = int(HUD_BOOT_BASELINE.get("rows", {}).get(bot, 0) or 0)
-        if idx_v is not None and idx_v > base_rows:
-            return True
-        base_ack = HUD_BOOT_BASELINE.get("ack_round", {}).get(bot, None)
-        try:
-            if base_ack is not None and ack_round_v > int(base_ack):
-                return True
-        except Exception:
-            pass
         csv_path = f"registro_enriquecido_{bot}.csv"
-        if os.path.exists(csv_path):
-            mtime_now = float(os.path.getmtime(csv_path) or 0.0)
-            base_mtime = float(HUD_BOOT_BASELINE.get("csv_mtime", {}).get(bot, 0.0) or 0.0)
-            if mtime_now >= boot_ts and (idx_v is None or idx_v > base_rows) and mtime_now >= base_mtime:
-                return True
+        if idx_v is not None and idx_v > base_rows and os.path.exists(csv_path):
+            try:
+                mtime_now = float(os.path.getmtime(csv_path) or 0.0)
+                base_mtime = float(HUD_BOOT_BASELINE.get("csv_mtime", {}).get(bot, 0.0) or 0.0)
+                if mtime_now >= boot_ts and mtime_now >= base_mtime:
+                    return True
+            except Exception:
+                return False
         return False
     except Exception:
         return False
@@ -4005,7 +4039,10 @@ def _ack_tape_render_bot(bot, fallback_resultados=None, width=None):
     fill_char = str(globals().get("ACK_TAPE_FILL_CHAR", "·") or "·")
     tape = list(ACK_LIVE_TAPE.get(bot, []) or [])
     symbols = []
-    if tape:
+    session_fresh = bool(globals().get("ACK_SESSION_FRESH", {}).get(bot, False))
+    if (not session_fresh) and HUD_IGNORE_PREBOOT_ACK:
+        symbols = []
+    elif tape:
         symbols = [_ack_tape_symbol_plain(x) for x in tape][-w:]
     else:
         fb = list(fallback_resultados or [])
@@ -4061,7 +4098,8 @@ def _ack_live_build_rows():
     now = time.time()
 
     for bot in BOT_NAMES:
-        ack = _sync_round_safe_read_json(_sync_round_ack_path(bot))
+        ack_path = _sync_round_ack_path(bot)
+        ack = _sync_round_safe_read_json(ack_path)
 
         if not isinstance(ack, dict):
             ack_round = 0
@@ -4086,7 +4124,7 @@ def _ack_live_build_rows():
             ciclo = ack.get("ciclo", "--")
             status_ack = str(ack.get("status", "") or "")
             sync_wait = bool(ack.get("sync_wait", False))
-            session_fresh = _hud_ack_es_de_sesion_actual(bot, row=ack, ack_round=ack_round, ts=ts)
+            session_fresh = _hud_ack_es_de_sesion_actual(bot, row=ack, ack_round=ack_round, ts=ts, ack_path=ack_path)
             preboot = bool(not session_fresh)
 
             gap = (obj_round - ack_round) if ack_round > 0 else None
@@ -4106,7 +4144,16 @@ def _ack_live_build_rows():
             except Exception:
                 age_s = None
 
-            if HUD_IGNORE_PREBOOT_ACK and preboot:
+            if preboot:
+                res = "."
+                age_s = None
+                is_closed_result = False
+                is_current = False
+                stale = False
+                future = False
+                warn = False
+                estado = "preboot"
+            elif HUD_IGNORE_PREBOOT_ACK and preboot:
                 res = "."
             elif is_current and norm == "WIN" and status_ack == "closed":
                 res = "✓"
@@ -4150,6 +4197,10 @@ def _ack_live_build_rows():
             estado_visual = estado
             session_fresh = False
             preboot = False
+        try:
+            ACK_SESSION_FRESH[bot] = bool(session_fresh)
+        except Exception:
+            pass
 
         rows.append({
             "bot": bot,
@@ -4186,7 +4237,13 @@ def _ack_live_calc_summary(rows_pack):
     obj_round = int((rows_pack or {}).get("obj_round", 1) or 1)
     released_round = int((rows_pack or {}).get("released_round", obj_round) or obj_round)
 
-    valid_current = [r for r in rows if bool(r.get("is_current")) and bool(r.get("session_fresh", True)) and r.get("res") in ("✓", "X")]
+    valid_current = [
+        r for r in rows
+        if bool(r.get("is_current"))
+        and bool(r.get("session_fresh", True))
+        and (not bool(r.get("preboot")))
+        and r.get("res") in ("✓", "X")
+    ]
     verdes_count = sum(1 for r in valid_current if r.get("res") == "✓")
     rojas_count = sum(1 for r in valid_current if r.get("res") == "X")
     closed_count = verdes_count + rojas_count
@@ -4202,7 +4259,7 @@ def _ack_live_calc_summary(rows_pack):
                 break
 
     complete = closed_count == expected_count
-    fresh_count = sum(1 for r in rows if bool(r.get("session_fresh")))
+    fresh_count = sum(1 for r in rows if bool(r.get("session_fresh")) and (not bool(r.get("preboot"))))
     if closed_count <= 0 and fresh_count <= 0:
         data_quality = "missing"
     elif complete:
@@ -6621,17 +6678,16 @@ def _sync_round_tick_maestro():
                     motivo_exec = "emit_ok" if ok_emit else _lxv_emit_fail_reason(emit_bot, "LXV_4V2X")
                 else:
                     motivo_exec = f"sin_patron_lxv_{patron}"
-            except NameError as e:
-                err_name = getattr(e, "name", "") or str(e)
-                motivo_exec = f"exception_NameError_{err_name}"
-                agregar_evento(f"❌ LXV NO_REAL EXCEPTION: NameError variable={err_name} | round={round_id} | partial={partial_pattern}")
-                traceback.print_exc()
-                ok_emit = False
-                real_emitido = False
             except Exception as e:
-                motivo_exec = f"exception_{type(e).__name__}"
-                agregar_evento(f"❌ LXV NO_REAL EXCEPTION: {type(e).__name__}: {e} | round={round_id} | partial={partial_pattern}")
-                traceback.print_exc()
+                err_name = type(e).__name__
+                err_msg = str(e)
+                tb_short = traceback.format_exc(limit=2)
+                err_var = getattr(e, "name", "") if isinstance(e, NameError) else ""
+                motivo_exec = f"exception_{err_name}_{err_var}" if err_var else f"exception_{err_name}"
+                agregar_evento(f"⚠️ REAL eval exception: {err_name}: {err_msg}")
+                if KEYBOARD_DEBUG or HUD_SHOW_DEBUG_BLOCKS:
+                    agregar_evento(tb_short[:180])
+                agregar_evento(f"❌ LXV NO_REAL EXCEPTION: {err_name}: {err_msg} | round={round_id} | partial={partial_pattern}")
                 ok_emit = False
                 real_emitido = False
             fase_info = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {})) if not fase_info else fase_info
