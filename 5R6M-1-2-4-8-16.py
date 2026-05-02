@@ -2885,6 +2885,7 @@ def _update_saldo_monitor_feed(valor_saldo: float):
 # === LXV_SYNC_COLUMN: sincronización de ronda/columna maestro↔bots ===
 SYNC_ROUND_DIR = "sync_round"
 SYNC_ROUND_STATE_PATH = os.path.join(SYNC_ROUND_DIR, "state.json")
+print(f"🧭 SYNC_ROUND_STATE_PATH={os.path.abspath(SYNC_ROUND_STATE_PATH)}")
 TTL_ACK_SYNC_ROUND_S = 300.0
 ACK_SYNC_ROUND_FUTURE_DRIFT_S = 20.0
 LXV_SYNC_ROUND_FAILSAFE_ENABLE = True
@@ -4261,6 +4262,8 @@ def _ack_live_build_rows():
 def _ack_live_calc_summary(rows_pack):
     rows = list((rows_pack or {}).get("rows", []) or [])
     st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+    if _sync_round_watchdog_release_stuck(st):
+        return
     obj_round = int((rows_pack or {}).get("obj_round", 1) or 1)
     released_round = int((rows_pack or {}).get("released_round", obj_round) or obj_round)
 
@@ -6735,6 +6738,52 @@ def _sync_round_release_now(round_id, payload, reason="release_now", real_emitid
 
 
 
+
+
+def _sync_round_watchdog_release_stuck(st):
+    try:
+        if not isinstance(st, dict):
+            return False
+        round_id = max(1, int(st.get("round_id", 1) or 1))
+        released_round = max(1, int(st.get("released_round", round_id) or round_id))
+        status = str(st.get("status", "") or "").strip().lower()
+        if status in ("holding_real_result", "holding_real_turn"):
+            return False
+        pending_on, pending_bot, _pending = _hay_real_close_pending_activo()
+        if pending_on:
+            return False
+        real_pending_bot = str(st.get("real_pending_bot", "") or "").strip()
+        if real_pending_bot in BOT_NAMES:
+            real_on, real_bot, _mot = _sync_real_turn_activo()
+            if real_on and real_bot == real_pending_bot:
+                return False
+        completed = bool(st.get("completed", False))
+        if (not completed) or int(released_round) >= int(round_id + 1):
+            return False
+        now_ts = float(time.time())
+        ref_ts = 0.0
+        for key in ("ts", "released_ts", "started_at"):
+            try:
+                val = float(st.get(key, 0.0) or 0.0)
+            except Exception:
+                val = 0.0
+            if val > 0.0:
+                ref_ts = val
+                break
+        if ref_ts <= 0.0 or (now_ts - ref_ts) < 3.0:
+            return False
+        agregar_evento(f"🧯 RELEASE WATCHDOG: ronda #{round_id} completa/atascada -> libera #{round_id + 1}")
+        return bool(_sync_round_release_now(
+            round_id=round_id,
+            payload=st,
+            reason="watchdog_completed_stuck_release",
+            real_emitido=False,
+            real_bot="",
+            motivo_no_real="watchdog_completed_stuck_release",
+        ))
+    except Exception:
+        return False
+
 def _sync_real_turn_activo() -> tuple[bool, str | None, str]:
     for b in BOT_NAMES:
         ok, _ = _sync_real_hold_valido(b)
@@ -7345,6 +7394,24 @@ def _sync_round_tick_maestro():
             motivo_no_real=motivo_no_real,
         ))
         if release_written:
+            st_check = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+            try:
+                check_released = int(st_check.get("released_round", 0) or 0)
+            except Exception:
+                check_released = 0
+            if check_released < (round_id + 1):
+                agregar_evento(f"⚠️ RELEASE VERIFY FAIL: reintentando release ronda #{round_id} -> #{round_id + 1}")
+                release_written = bool(_sync_round_release_now(
+                    round_id=round_id,
+                    payload=payload,
+                    reason=release_reason,
+                    real_emitido=real_emitido,
+                    real_bot=emit_bot_now,
+                    motivo_no_real=motivo_no_real,
+                ))
+                if not release_written:
+                    agregar_evento(f"⚠️ RELEASE CRITICAL: no se pudo liberar ronda #{round_id}")
+                    return
             agregar_evento(
                 f"ROUND LIVE #{round_id} | 6/6 OK | patrón={patron} | release={round_id + 1} | real={emit_bot_now or 'none'} | motivo={release_reason}"
             )
