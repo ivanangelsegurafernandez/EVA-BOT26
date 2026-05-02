@@ -363,6 +363,18 @@ LXV_FASE_MIN_COLUMNS = 3
 LXV_FASE_MAX_STREAK_VERDE_TEMPRANO = 3
 LXV_FASE_STREAK_VERDE_MADURO = 4
 LXV_FASE_LOG_COOLDOWN_S = 20.0
+LXV_ZONAS_INVERTIBLES = {"VERDE_TEMPRANO", "VERDE_MADURO"}
+LXV_ZONAS_BLOQUEANTES = {
+    "ROJA_TEMPRANO",
+    "ROJO_MADURO",
+    "VERDE_TARDIO",
+    "VERDE_SATURADO_TARDIO",
+    "NEUTRO",
+    "INSUFICIENTE",
+    "ERROR",
+    "UNKNOWN",
+}
+LXV_SYNC_GENERIC_REAL_ENABLE = False
 
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
 # Esto es lo que querías: contar cierres desde 60% sin afectar la operativa.
@@ -6127,6 +6139,8 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
         out=dict(base); out.update({"g0":g0,"g1":g1,"g2":g2,"verdes0":v0,"rojos0":r0,"verdes1":v1,"rojos1":r1,"verdes2":v2,"rojos2":r2,"streak_verde":streak,"prev_full_green_streak":prev_streak,"round_id":rid0,"source":source_resumen,"sources":source_resumen,"cols_usadas":len(norm),"dq0":str(c0.get("data_quality","")),"dq1":str(c1.get("data_quality","")),"dq2":str(c2.get("data_quality",""))})
         if prev_streak >= int(globals().get("LXV_ZONA_FULL_GREEN_MIN",3) or 3) and (target_rid is not None or rid0 > 0):
             out.update({"zona":"VERDE_SATURADO_TARDIO","fase":"VERDE_SATURADO_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"prev_full_green_streak"}); return out
+        if r0 >= 4 and r1 >= 4:
+            out.update({"zona":"ROJO_MADURO","fase":"ROJO_MADURO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"rojo_maduro"}); return out
         if r0 >= int(globals().get("LXV_ZONA_RED_STRONG",4) or 4) or (g0 <= 0.5 and d01 < 0) or (d01 < 0 and d12 < 0 and g0 <= 0.5):
             out.update({"zona":"ROJA_TEMPRANO","fase":"ROJA_TEMPRANO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_ORANGE","emoji":"🟥","motivo":"inicio_rojo"}); return out
         if (streak >= 4 and d01 < 0) or (g1 >= (5/6) and g0 <= (4/6) and d01 < 0) or (g2 >= (5/6) and g1 >= (4/6) and g0 <= (4/6)) or (r0 > r1 and g0 <= g1 and streak >= 3):
@@ -6138,7 +6152,7 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
         out.update({"zona":"NEUTRO","fase":"NEUTRO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"GRAY","emoji":"⬜","motivo":"sin_predominio_claro"})
         return out
     except Exception:
-        out=dict(base); out.update({"zona":"NEUTRO","fase":"NEUTRO","decision":ZONA_NO_INVERTIR,"allow_real":False,"motivo":"zona_error_fail_closed","ok":False})
+        out=dict(base); out.update({"zona":"ERROR","fase":"ERROR","decision":ZONA_NO_INVERTIR,"allow_real":False,"motivo":"zona_error_fail_closed","ok":False})
         return out
 
 def _lxv_prev_full_green_streak_from_norm_rows(norm_rows, round_id):
@@ -6180,6 +6194,26 @@ def evaluar_fase_zona_verde_lxv(rows=None, round_id_objetivo=None):
     return info
 
 
+def _lxv_zona_es_invertible(info: dict | None) -> tuple[bool, str]:
+    try:
+        if not isinstance(info, dict):
+            return False, "info_invalida"
+        zona = str(info.get("zona", info.get("fase", "")) or "").strip().upper()
+        fase = str(info.get("fase", zona) or "").strip().upper()
+        decision = str(info.get("decision", "") or "").strip().upper()
+        allow_real = bool(info.get("allow_real", False))
+        zonas_ok = set(globals().get("LXV_ZONAS_INVERTIBLES", {"VERDE_TEMPRANO", "VERDE_MADURO"}))
+        zonas_block = set(globals().get("LXV_ZONAS_BLOQUEANTES", set()))
+        if zona in zonas_ok or fase in zonas_ok:
+            if allow_real and decision == str(ZONA_SI_INVERTIR).upper():
+                return True, f"zona_ok:{zona or fase}"
+            return False, f"zona_ok_pero_decision_no:{zona or fase}:{decision}:allow={allow_real}"
+        if zona in zonas_block or fase in zonas_block:
+            return False, f"zona_bloqueante:{zona or fase}"
+        return False, f"zona_no_autorizada:{zona or fase}"
+    except Exception as e:
+        return False, f"zona_error:{e}"
+
 def _fase_zv_gate_allow_real(origen="LXV", rid=0):
     global _LXV_FASE_ZV_LAST_INFO
     origen_txt = str(origen or "LXV").strip().upper()
@@ -6209,15 +6243,15 @@ def _fase_zv_gate_allow_real(origen="LXV", rid=0):
     _LXV_FASE_ZV_LAST_INFO = dict(info)
     if not bool(globals().get("LXV_FASE_ZONA_VERDE_ENABLE", True)):
         return True
-    allow = bool(info.get("allow_real")) and str(info.get("decision")) == ZONA_SI_INVERTIR
+    allow, allow_reason = _lxv_zona_es_invertible(info)
     cols_txt = f"cols={int(info.get('cols_usadas',0))}/{int(info.get('cols_requeridas', int(globals().get('LXV_FASE_MIN_COLUMNS',3))))}"
     source_txt = str(info.get("source", info.get("sources", "none")))
     dq_txt = f"dq=[{info.get('dq0','')},{info.get('dq1','')},{info.get('dq2','')}]"
     if allow:
         LXV_REAL_AUDIT["fase_ok"] = int(LXV_REAL_AUDIT.get("fase_ok", 0) or 0) + 1
-        _lxv_5v1x_event_cooldown(key=f"fasezv_ok:{origen_txt}:{rid_int}:{info.get('fase')}", msg=f"✅ ZONA LXV OK: zona={info.get('zona',info.get('fase'))} decision=SI_INVERTIR motivo={info.get('motivo')} g0={int(info.get('verdes0',0))}/6 g1={int(info.get('verdes1',0))}/6 g2={int(info.get('verdes2',0))}/6 {cols_txt} source={source_txt} {dq_txt}", cooldown_s=float(globals().get("LXV_FASE_LOG_COOLDOWN_S", 20.0)))
+        _lxv_5v1x_event_cooldown(key=f"fasezv_ok:{origen_txt}:{rid_int}:{info.get('fase')}", msg=f"✅ ZONA LXV OK: zona={info.get('zona',info.get('fase'))} decision=SI_INVERTIR reason={allow_reason} motivo={info.get('motivo')} g0={int(info.get('verdes0',0))}/6 g1={int(info.get('verdes1',0))}/6 g2={int(info.get('verdes2',0))}/6 {cols_txt} source={source_txt} {dq_txt}", cooldown_s=float(globals().get("LXV_FASE_LOG_COOLDOWN_S", 20.0)))
         return True
-    msg = f"⛔ ZONA LXV NO INVERTIR: zona={info.get('zona',info.get('fase'))} decision=NO_INVERTIR motivo={info.get('motivo')} g0={int(info.get('verdes0',0))}/6 g1={int(info.get('verdes1',0))}/6 g2={int(info.get('verdes2',0))}/6 {cols_txt} source={source_txt} {dq_txt}"
+    msg = f"⛔ ZONA LXV NO INVERTIR: zona={info.get('zona',info.get('fase'))} decision=NO_INVERTIR reason={allow_reason} motivo={info.get('motivo')} g0={int(info.get('verdes0',0))}/6 g1={int(info.get('verdes1',0))}/6 g2={int(info.get('verdes2',0))}/6 {cols_txt} source={source_txt} {dq_txt}"
     if str(info.get('fase')) == 'VERDE_SATURADO_TARDIO':
         msg = f"⛔ FASE_ZV BLOQUEA REAL: VERDE_SATURADO_TARDIO | rid={rid_int} | streak={int(info.get('prev_full_green_streak',0))}"
     LXV_REAL_AUDIT["fase_bloq"] = int(LXV_REAL_AUDIT.get("fase_bloq", 0) or 0) + 1
@@ -6253,22 +6287,22 @@ def _debug_test_fase_zona_verde_lxv():
 def _selftest_zona_lxv_minimo():
     try:
         cases = [
-            ("A", [{"round_id":1,"n_verdes":2,"n_rojos":4,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":3,"n_rojos":3,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"}], None, ZONA_SI_INVERTIR),
-            ("B", [{"round_id":1,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"}], None, ZONA_SI_INVERTIR),
-            ("C", [{"round_id":1,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"}], None, ZONA_NO_INVERTIR),
-            ("D", [{"round_id":1,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},{"round_id":4,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"}], 4, ZONA_NO_INVERTIR),
-            ("E", [{"round_id":1,"n_verdes":3,"n_rojos":3,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":0,"n_rojos":6,"round_complete":True,"data_quality":"ok"}], None, ZONA_NO_INVERTIR),
-            ("F", [{"round_id":1,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"closed_expired"},{"round_id":2,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"closed_expired"},{"round_id":3,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"closed_expired"}], None, None),
+            ("A", [{"round_id":1,"n_verdes":2,"n_rojos":4,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":3,"n_rojos":3,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"}], None, "VERDE_TEMPRANO", ZONA_SI_INVERTIR, True),
+            ("B", [{"round_id":1,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"}], None, "VERDE_MADURO", ZONA_SI_INVERTIR, True),
+            ("C", [{"round_id":1,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"}], None, "VERDE_TARDIO", ZONA_NO_INVERTIR, False),
+            ("D", [{"round_id":1,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},{"round_id":4,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"}], 4, "VERDE_SATURADO_TARDIO", ZONA_NO_INVERTIR, False),
+            ("E", [{"round_id":1,"n_verdes":3,"n_rojos":3,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":0,"n_rojos":6,"round_complete":True,"data_quality":"ok"}], None, "ROJA_TEMPRANO", ZONA_NO_INVERTIR, False),
+            ("F", [{"round_id":1,"n_verdes":2,"n_rojos":4,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":1,"n_rojos":5,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":2,"n_rojos":4,"round_complete":True,"data_quality":"ok"}], None, "ROJO_MADURO", ZONA_NO_INVERTIR, False),
+            ("G", [{"round_id":1,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"closed_expired"},{"round_id":2,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"closed_expired"},{"round_id":3,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"closed_expired"}], None, "VERDE_MADURO", ZONA_SI_INVERTIR, True),
         ]
         all_ok = True
-        for name, rows_case, rid_obj, expected_dec in cases:
+        for name, rows_case, rid_obj, expected_zona, expected_dec, expected_inv in cases:
             info = clasificar_zona_operativa_lxv(round_id_objetivo=rid_obj, rows=rows_case)
+            inv_ok, inv_reason = _lxv_zona_es_invertible(info)
             ok = isinstance(info, dict) and bool(info.get("ok", True))
-            if expected_dec is not None:
-                ok = ok and str(info.get("decision")) == str(expected_dec)
-            if name == "F":
-                ok = ok and int(info.get("cols_usadas", 0)) >= 3
-            print(f"[SELFTEST_ZONA_LXV] {name}: {'OK' if ok else 'FAIL'} zona={info.get('zona')} decision={info.get('decision')} cols={info.get('cols_usadas')}")
+            ok = ok and str(info.get("zona")) == str(expected_zona) and str(info.get("decision")) == str(expected_dec)
+            ok = ok and bool(inv_ok) == bool(expected_inv)
+            print(f"[SELFTEST_ZONA_LXV] {name}: {'OK' if ok else 'FAIL'} zona={info.get('zona')} decision={info.get('decision')} inv={inv_ok} reason={inv_reason} dq0={info.get('dq0','')}")
             all_ok = all_ok and ok
         return bool(all_ok)
     except Exception as e:
@@ -7006,7 +7040,7 @@ def _sync_round_tick_maestro():
                                     cooldown_s=8.0,
                                 )
 
-                        if (not ok_emit) and bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)):
+                        if (not ok_emit) and bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)) and bool(globals().get("LXV_SYNC_GENERIC_REAL_ENABLE", False)):
                             fase_sync_ok = bool(_fase_zv_gate_allow_real("LXV_SYNC", round_id))
                             if not fase_sync_ok:
                                 fi = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
