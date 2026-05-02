@@ -4533,12 +4533,12 @@ def _ack_live_format_lines(snapshot):
 
     botx = summary.get("bot_x_actual") or "-"
     expired_count = int(summary.get("expired_count", 0) or 0)
-    if fresh_count < expected_count:
-        motivo_round = "esperando_ack_fresco_sesion"
-    elif bool(summary.get("has_expired_closed", False)):
-        motivo_round = f"columna_cerrada_fuera_ventana:{expired_count}"
+    if closed_count < expected_count:
+        motivo_round = f"esperando_ack:{closed_count}/{expected_count}"
+    elif str(summary.get("data_quality", "") or "").strip().lower() == "closed_expired":
+        motivo_round = "6_6_cerrado_tarde_release_sin_real"
     elif str(summary.get("data_quality", "") or "").strip().lower() == "ok":
-        motivo_round = "ack_fresco_ok"
+        motivo_round = "6_6_ok_evalua_lxv"
     else:
         motivo_round = "columna_incompleta"
     resumen = (
@@ -6565,12 +6565,14 @@ def _sync_round_tick_maestro():
         agregar_evento(f"🧩 LXV_SYNC_COLUMN cierres ronda #{round_id}: {n_closed}/{len(expected)}.")
 
     closed_direct, reasons_direct = {}, {}
+    direct_ack_full = False
     if status_now in ("waiting_closures", "released", "released_after_real_result", "released_recovery_completed_without_real_stuck"):
         closed_direct, reasons_direct = _sync_round_collect_closed_acks(round_id)
         if len(closed_direct) == len(BOT_NAMES):
             closed = {b: closed_direct[b] for b in expected if b in closed_direct}
             n_closed = len(closed)
             missing = []
+            direct_ack_full = bool(n_closed >= len(expected))
             sync_debug_missing = dict(reasons_direct)
             agregar_evento(f"🧯 SYNC RECOVERY ACK: ronda #{round_id} completa por ACK directo; evaluando/liberando.")
     completed_normal = bool(n_closed >= len(expected))
@@ -6611,7 +6613,13 @@ def _sync_round_tick_maestro():
     round_live_real_ok = bool(round_live_all_closed and data_quality == "ok")
     round_live_closed_expired = bool(round_live_all_closed and data_quality == "closed_expired")
     round_live_release_no_real_reason = ""
-    if round_live_real_ok:
+    if direct_ack_full and (not round_live_real_ok):
+        completed = True
+        completed_normal = True
+        completed_failsafe = False
+        missing = []
+        round_live_release_no_real_reason = "direct_ack_6_6_release_no_real_if_not_ok"
+    elif round_live_real_ok:
         completed = True
         completed_normal = True
         completed_failsafe = False
@@ -6624,7 +6632,7 @@ def _sync_round_tick_maestro():
         completed_normal = True
         completed_failsafe = False
         missing = []
-        round_live_release_no_real_reason = "round_closed_expired_release_no_real"
+        round_live_release_no_real_reason = "direct_ack_6_6_release_no_real" if direct_ack_full else "round_closed_expired_release_no_real"
         _lxv_5v1x_event_cooldown(
             key=f"sync_release_closed_expired:{round_id}",
             msg=f"🟨 SYNC RELEASE SIN REAL: ronda #{round_id} cerrada 6/6 pero fuera de ventana; liberando bots sin evaluar REAL.",
