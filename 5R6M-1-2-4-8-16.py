@@ -7033,12 +7033,14 @@ def _sync_round_tick_maestro():
     round_live_real_ok = bool(round_live_all_closed and data_quality == "ok")
     round_live_closed_expired = bool(round_live_all_closed and data_quality == "closed_expired")
     round_live_release_no_real_reason = ""
+    if round_live_all_closed:
+        agregar_evento(f"⚡ TURBO_SYNC: columna #{round_id} cerrada 6/6; evaluando REAL/RELEASE inmediato.")
     if direct_ack_full and (not round_live_real_ok):
         completed = True
         completed_normal = True
         completed_failsafe = False
         missing = []
-        round_live_release_no_real_reason = "direct_ack_6_6_release_no_real_if_not_ok"
+        round_live_release_no_real_reason = "turbo_sync_no_real_release"
     elif round_live_real_ok:
         completed = True
         completed_normal = True
@@ -7052,7 +7054,7 @@ def _sync_round_tick_maestro():
         completed_normal = True
         completed_failsafe = False
         missing = []
-        round_live_release_no_real_reason = "direct_ack_6_6_release_no_real" if direct_ack_full else "round_closed_expired_release_no_real"
+        round_live_release_no_real_reason = "turbo_sync_no_real_release" if direct_ack_full else "round_closed_expired_release_no_real"
         _lxv_5v1x_event_cooldown(
             key=f"sync_release_closed_expired:{round_id}",
             msg=f"🟨 SYNC RELEASE SIN REAL: ronda #{round_id} cerrada 6/6 pero fuera de ventana; liberando bots sin evaluar REAL.",
@@ -7064,7 +7066,7 @@ def _sync_round_tick_maestro():
         completed_failsafe = False
         missing = []
         dq_reason = data_quality if data_quality else "unknown"
-        round_live_release_no_real_reason = f"round_closed_non_ok_release_no_real:{dq_reason}"
+        round_live_release_no_real_reason = f"turbo_sync_closed_non_ok_release_no_real:{dq_reason}"
         _lxv_5v1x_event_cooldown(
             key=f"sync_release_closed_non_ok:{round_id}:{dq_reason}",
             msg=f"🟨 SYNC RELEASE SIN REAL: ronda #{round_id} cerrada {closed_count}/{expected_count} con calidad={dq_reason}; liberando bots sin evaluar REAL.",
@@ -7074,7 +7076,7 @@ def _sync_round_tick_maestro():
     reason_payload = "waiting_bots"
     if completed:
         status_payload = "completed_pending_release"
-        reason_payload = round_live_release_no_real_reason or "round_completed"
+        reason_payload = round_live_release_no_real_reason or "round_completed_turbo_sync"
     payload = {
         "round_id": round_id,
         "released_round": released_round,
@@ -7180,6 +7182,7 @@ def _sync_round_tick_maestro():
             if ok_emit:
                 real_emitido = True
                 real_hold_bot = str(emit_bot or "")
+                agregar_evento(f"⚡ TURBO_SYNC REAL: ronda #{round_id} → {real_hold_bot or emit_bot or '-'} C{int(ciclo_pick)} | patrón={patron}")
             else:
                 motivo_no_real = motivo_exec if motivo_exec else f"no_real_{patron}"
         elif patron not in ("5V1X", "4V2X"):
@@ -7310,6 +7313,7 @@ def _sync_round_tick_maestro():
                 if ok_emit:
                     real_emitido = True
                     real_hold_bot = str(bot_pick)
+                    agregar_evento(f"⚡ TURBO_SYNC REAL: ronda #{round_id} → {real_hold_bot} C{int(ciclo_pick)} | patrón={patron}")
                     try:
                         estado_bots[bot_pick]["ciclo_actual"] = int(ciclo_pick)
                     except Exception:
@@ -7345,6 +7349,8 @@ def _sync_round_tick_maestro():
             motivo_no_real=motivo_no_real,
         ))
         if release_written:
+            if not real_emitido:
+                agregar_evento(f"⚡ TURBO_SYNC RELEASE: ronda #{round_id} → #{round_id + 1} sin REAL | motivo={release_reason}")
             agregar_evento(
                 f"ROUND LIVE #{round_id} | 6/6 OK | patrón={patron} | release={round_id + 1} | real={emit_bot_now or 'none'} | motivo={release_reason}"
             )
