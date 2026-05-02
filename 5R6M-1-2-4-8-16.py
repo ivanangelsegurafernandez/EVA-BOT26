@@ -6129,13 +6129,21 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
             if int(x["n_verdes"]) >= int(globals().get("LXV_ZONA_GREEN_MIN",4) or 4): streak += 1
             else: break
         prev_streak = 0
-        if source == "rows":
+        source_actual = str(source_resumen or "").lower()
+        if "rows" in source_actual:
             prev_streak = _lxv_prev_full_green_streak_from_norm_rows(norm, rid0)
         else:
             streak_fn = globals().get("_lxv_prev_full_green_streak")
             if callable(streak_fn) and rid0 > 0:
-                try: prev_streak = int(streak_fn(rid0) or 0)
-                except Exception: prev_streak = 0
+                try:
+                    prev_streak = int(streak_fn(rid0) or 0)
+                except Exception:
+                    prev_streak = 0
+            if prev_streak <= 0:
+                try:
+                    prev_streak = _lxv_prev_full_green_streak_from_norm_rows(norm, rid0)
+                except Exception:
+                    prev_streak = 0
         out=dict(base); out.update({"g0":g0,"g1":g1,"g2":g2,"verdes0":v0,"rojos0":r0,"verdes1":v1,"rojos1":r1,"verdes2":v2,"rojos2":r2,"streak_verde":streak,"prev_full_green_streak":prev_streak,"round_id":rid0,"source":source_resumen,"sources":source_resumen,"cols_usadas":len(norm),"dq0":str(c0.get("data_quality","")),"dq1":str(c1.get("data_quality","")),"dq2":str(c2.get("data_quality",""))})
         if prev_streak >= int(globals().get("LXV_ZONA_FULL_GREEN_MIN",3) or 3) and (target_rid is not None or rid0 > 0):
             out.update({"zona":"VERDE_SATURADO_TARDIO","fase":"VERDE_SATURADO_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"prev_full_green_streak"}); return out
