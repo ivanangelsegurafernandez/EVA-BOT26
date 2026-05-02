@@ -6696,6 +6696,43 @@ def _sync_round_release_next_round(old_round: int, reason: str, extra: dict | No
         agregar_evento(f'🚀 ROUND RELEASE: #{rid} -> #{next_round} | reason={reason}')
     return bool(ok)
 
+def _sync_round_release_now(round_id, payload, reason="release_now", real_emitido=False, real_bot=None, motivo_no_real=""):
+    try:
+        rid = int(round_id or 0)
+        if rid <= 0:
+            return False
+        next_round = rid + 1
+        p = dict(payload or {})
+        now_ts = time.time()
+        p.update({
+            "round_id": rid,
+            "released_round": next_round,
+            "completed": True,
+            "status": "released",
+            "reason": str(reason or "release_now"),
+            "release_reason": str(reason or "release_now"),
+            "real_emitido": bool(real_emitido),
+            "real_bot": str(real_bot or ""),
+            "motivo_no_real": str(motivo_no_real or ""),
+            "ts": now_ts,
+            "released_ts": now_ts,
+        })
+        ok = _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, p)
+        try:
+            agregar_evento(
+                f"🔓 LXV_SYNC_COLUMN RELEASE_NOW ronda #{rid} → #{next_round} "
+                f"reason={p.get('reason')} real={p.get('real_bot') or 'none'}"
+            )
+        except Exception:
+            pass
+        return bool(ok)
+    except Exception as e:
+        try:
+            agregar_evento(f"⚠️ RELEASE_NOW error ronda #{round_id}: {e}")
+        except Exception:
+            pass
+        return False
+
 
 
 def _sync_real_turn_activo() -> tuple[bool, str | None, str]:
@@ -7033,6 +7070,11 @@ def _sync_round_tick_maestro():
             msg=f"🟨 SYNC RELEASE SIN REAL: ronda #{round_id} cerrada {closed_count}/{expected_count} con calidad={dq_reason}; liberando bots sin evaluar REAL.",
             cooldown_s=8.0,
         )
+    status_payload = "waiting_closures"
+    reason_payload = "waiting_bots"
+    if completed:
+        status_payload = "completed_pending_release"
+        reason_payload = round_live_release_no_real_reason or "round_completed"
     payload = {
         "round_id": round_id,
         "released_round": released_round,
@@ -7040,8 +7082,8 @@ def _sync_round_tick_maestro():
         "expected_bots_effective": effective_expected,
         "closed_bots": closed,
         "completed": completed,
-        "status": "waiting_closures",
-        "reason": "waiting_bots",
+        "status": status_payload,
+        "reason": reason_payload,
         "bots_missing": missing,
         "bots_stale_ignored": stale_ignored,
         "round_wait_s": float(wait_s),
@@ -7141,8 +7183,8 @@ def _sync_round_tick_maestro():
             else:
                 motivo_no_real = motivo_exec if motivo_exec else f"no_real_{patron}"
         elif patron not in ("5V1X", "4V2X"):
-            motivo_no_real = f"sin_patron_lxv_{patron}"
-            agregar_evento(f"🚀 RELEASE sin patrón LXV: ronda #{round_id} parcial={patron} -> libera #{round_id + 1}")
+            motivo_no_real = f"patron_no_invertible:{patron}"
+            agregar_evento(f"ROUND LIVE #{round_id}: patrón={patron} | SIN_CANDIDATO_REAL | release inmediato")
             pick = None
         if (not round_live_real_ok) and pick:
             bot_pick = str(pick.get("bot"))
@@ -7290,30 +7332,23 @@ def _sync_round_tick_maestro():
                     _sync_round_write_json_atomic(ack_path, ack_cur)
             except Exception:
                 pass
+    release_written = False
     if completed:
-        hold_valido, hold_motivo = _sync_real_hold_valido(real_hold_bot)
-        if real_emitido and hold_valido:
-            payload["round_id"] = round_id
-            payload["released_round"] = round_id
-            payload["status"] = "holding_real_result"
-            payload["reason"] = "waiting_real_result"
-            payload["real_pending_bot"] = real_hold_bot
-            payload["real_pending_round"] = round_id
-            payload["real_pending_since"] = time.time()
-            _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
-            agregar_evento(f"⏸️ LXV_SYNC_COLUMN HOLD: REAL activo en {real_hold_bot}; esperando resultado antes de liberar #{round_id + 1}")
+        emit_bot_now = real_hold_bot or str(locals().get("emit_bot") or "")
+        release_reason = "real_emitido" if real_emitido else (motivo_no_real or round_live_release_no_real_reason or "no_real_release")
+        release_written = bool(_sync_round_release_now(
+            round_id=round_id,
+            payload=payload,
+            reason=release_reason,
+            real_emitido=real_emitido,
+            real_bot=emit_bot_now,
+            motivo_no_real=motivo_no_real,
+        ))
+        if release_written:
+            agregar_evento(
+                f"ROUND LIVE #{round_id} | 6/6 OK | patrón={patron} | release={round_id + 1} | real={emit_bot_now or 'none'} | motivo={release_reason}"
+            )
             return
-        release_reason = "all_bots_closed_no_real"
-        if real_emitido and (not hold_valido):
-            release_reason = f"real_emitido_sin_hold_valido_{hold_motivo}"
-            agregar_evento(f"⚠️ HOLD cancelado: real_emitido=True pero {hold_motivo}; liberando #{round_id + 1}")
-        elif round_live_release_no_real_reason:
-            release_reason = round_live_release_no_real_reason
-        elif motivo_no_real:
-            release_reason = f"no_real_{motivo_no_real}"
-        agregar_evento(f"🚀 RELEASE normal: ronda #{round_id} completa sin HOLD válido -> libera #{round_id + 1}")
-        _sync_round_release_next_round(round_id, release_reason)
-        return
     if completed:
         agregar_evento("🧯 SYNC invariant recovery: completed=True sin HOLD/RELEASE; liberando next_round")
         _sync_round_release_next_round(round_id, "sync_invariant_completed_no_release")
