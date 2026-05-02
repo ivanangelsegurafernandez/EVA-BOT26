@@ -5954,8 +5954,46 @@ def _lxv_fase_cache_add(round_id: int, closed: dict, expected: list[str]) -> Non
     if not updated:
         LXV_FASE_COLUMNS_CACHE.append(row)
 
+def _lxv_zona_quality_ok(dq):
+    try:
+        dq = str(dq or "").strip().lower()
+        return dq in ("", "ok", "closed_expired")
+    except Exception:
+        return False
+
+
+def _lxv_zona_quality_rank(dq):
+    try:
+        dq = str(dq or "").strip().lower()
+        if dq == "ok":
+            return 3
+        if dq == "closed_expired":
+            return 2
+        if dq == "":
+            return 1
+        return 0
+    except Exception:
+        return 0
+
+
+def _lxv_zona_bool_complete(rr, v, r, expected):
+    try:
+        if bool((rr or {}).get("round_complete", (rr or {}).get("complete", False))):
+            return True
+        return int(v) >= 0 and int(r) >= 0 and int(v) + int(r) == int(expected)
+    except Exception:
+        return False
+
+
 def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
     base = {"zona":"INSUFICIENTE","fase":"INSUFICIENTE","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"GRAY","emoji":"⬜","motivo":"historial_insuficiente","g0":0.0,"g1":0.0,"g2":0.0,"verdes0":0,"rojos0":0,"verdes1":0,"rojos1":0,"verdes2":0,"rojos2":0,"streak_verde":0,"prev_full_green_streak":0,"round_id":None,"source":"none","ok":True,"cols_usadas":0,"cols_requeridas":int(globals().get("LXV_ZONA_MIN_COLUMNS",3) or 3)}
+    base.setdefault("cols_usadas", 0)
+    base.setdefault("cols_requeridas", int(globals().get("LXV_ZONA_MIN_COLUMNS", globals().get("LXV_FASE_MIN_COLUMNS", 3)) or 3))
+    base.setdefault("source", "none")
+    base.setdefault("sources", "")
+    base.setdefault("dq0", "")
+    base.setdefault("dq1", "")
+    base.setdefault("dq2", "")
     try:
         target_rid = int(round_id_objetivo) if round_id_objetivo is not None else None
         if target_rid is not None and target_rid <= 0:
@@ -5963,34 +6001,99 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
     except Exception:
         target_rid = None
     try:
-        src_rows = list(rows) if isinstance(rows, list) and rows else []
-        source = "rows" if src_rows else "none"
-        if not src_rows:
-            src_rows = list(globals().get("LXV_FASE_COLUMNS_CACHE", []) or [])
-            source = "cache" if src_rows else "none"
-        if not src_rows:
-            loader = globals().get("_lxv_5v1x_load_recent_matrix_rows") or globals().get("_lxv_load_recent_columns_for_gate")
-            if callable(loader):
-                src_rows = list(loader(max_rows=80) if loader.__name__ == "_lxv_5v1x_load_recent_matrix_rows" else loader())
-                source = "csv" if src_rows else "none"
-        base["source"] = source
+        all_rows = []
+        source_tags = []
+        if isinstance(rows, list) and rows:
+            try:
+                for rr in list(rows):
+                    if isinstance(rr, dict):
+                        rr2 = dict(rr)
+                        rr2["_zona_source"] = "rows"
+                        all_rows.append(rr2)
+                if all_rows:
+                    source_tags.append("rows")
+            except Exception:
+                pass
+        try:
+            cache_rows = list(globals().get("LXV_FASE_COLUMNS_CACHE", []) or [])
+            if cache_rows:
+                for rr in cache_rows:
+                    if isinstance(rr, dict):
+                        rr2 = dict(rr)
+                        rr2["_zona_source"] = "cache"
+                        all_rows.append(rr2)
+                source_tags.append("cache")
+        except Exception:
+            pass
+        try:
+            csv_rows = []
+            loader_a = globals().get("_lxv_5v1x_load_recent_matrix_rows")
+            if callable(loader_a):
+                csv_rows = list(loader_a(max_rows=80) or [])
+            elif callable(globals().get("_lxv_load_recent_columns_for_gate")):
+                csv_rows = list(globals().get("_lxv_load_recent_columns_for_gate")() or [])
+            if csv_rows:
+                for rr in csv_rows:
+                    if isinstance(rr, dict):
+                        rr2 = dict(rr)
+                        rr2["_zona_source"] = "csv"
+                        all_rows.append(rr2)
+                source_tags.append("csv")
+        except Exception:
+            pass
+        source_resumen = "+".join(source_tags) if source_tags else "none"
+        base["source"] = source_resumen
+        base["sources"] = source_resumen
         norm=[]
-        for rr in src_rows:
+        expected = int(len(globals().get("BOT_NAMES", []) or []))
+        if expected <= 0:
+            expected = 6
+        for rr in all_rows:
             if not isinstance(rr, dict):
                 continue
             rid = _mrv_5v1x_to_int(rr.get("round_id", rr.get("rid", rr.get("ronda", 0))), 0)
             v = _mrv_5v1x_to_int(rr.get("n_verdes", rr.get("verdes", rr.get("total_verdes", -1))), -1)
             r = _mrv_5v1x_to_int(rr.get("n_rojos", rr.get("rojos", rr.get("total_rojos", -1))), -1)
-            complete = bool(rr.get("round_complete", rr.get("complete", False)))
+            complete = _lxv_zona_bool_complete(rr, v, r, expected)
             dq = str(rr.get("data_quality", rr.get("quality", "")) or "").strip().lower()
-            if not complete or (dq and dq != "ok") or v < 0 or r < 0 or (v+r) > 6:
+            if rid <= 0 or (not complete) or (not _lxv_zona_quality_ok(dq)) or v < 0 or r < 0 or (v + r) != expected:
                 continue
-            norm.append({"round_id":rid,"n_verdes":v,"n_rojos":r,"round_complete":True,"data_quality":"ok"})
-        norm = sorted(norm, key=lambda x: int(x.get("round_id", 0)))
+            norm.append({"round_id":rid,"n_verdes":v,"n_rojos":r,"round_complete":True,"data_quality":dq,"source":rr.get("_zona_source", "unknown")})
+        if target_rid is not None and not any(int(x.get("round_id", 0) or 0) == target_rid for x in norm):
+            try:
+                ack = dict(globals().get("LXV_SYNC_LAST_ACK_CANDIDATE") or {})
+                if ack:
+                    rr2 = dict(ack)
+                    rr2["_zona_source"] = "ack_live_summary"
+                    rid = _mrv_5v1x_to_int(rr2.get("round_id", rr2.get("rid", 0)), 0)
+                    v = _mrv_5v1x_to_int(rr2.get("n_verdes", rr2.get("verdes", -1)), -1)
+                    r = _mrv_5v1x_to_int(rr2.get("n_rojos", rr2.get("rojos", -1)), -1)
+                    dq = str(rr2.get("data_quality", rr2.get("quality", "")) or "").strip().lower()
+                    complete = _lxv_zona_bool_complete(rr2, v, r, expected)
+                    if rid == target_rid and complete and _lxv_zona_quality_ok(dq) and v >= 0 and r >= 0 and (v + r) == expected:
+                        norm.append({"round_id":rid,"n_verdes":v,"n_rojos":r,"round_complete":True,"data_quality":dq,"source":"ack_live_summary"})
+                        source_resumen = "ack_live_summary" if source_resumen == "none" else f"{source_resumen}+ack_live_summary"
+            except Exception:
+                pass
+        dedup = {}
+        for rr in norm:
+            rid = int(rr.get("round_id", 0) or 0)
+            if rid <= 0:
+                continue
+            prv = dedup.get(rid)
+            if not isinstance(prv, dict):
+                dedup[rid] = rr
+                continue
+            rank_new = (_lxv_zona_quality_rank(rr.get("data_quality", "")), 1 if bool(rr.get("round_complete")) else 0, rid)
+            rank_old = (_lxv_zona_quality_rank(prv.get("data_quality", "")), 1 if bool(prv.get("round_complete")) else 0, rid)
+            if rank_new > rank_old:
+                dedup[rid] = rr
+        norm = sorted(list(dedup.values()), key=lambda x: int(x.get("round_id", 0)))
         if target_rid is not None:
             norm = [x for x in norm if int(x["round_id"]) <= target_rid]
-        if len(norm) < int(globals().get("LXV_ZONA_MIN_COLUMNS", 3) or 3):
-            out=dict(base); out.update({"ok":True,"source":source,"motivo":"historial_insuficiente","cols_usadas":len(norm)})
+        min_cols = int(globals().get("LXV_ZONA_MIN_COLUMNS", globals().get("LXV_FASE_MIN_COLUMNS", 3)) or 3)
+        if len(norm) < min_cols:
+            out=dict(base); out.update({"zona":"INSUFICIENTE","fase":"INSUFICIENTE","decision":ZONA_NO_INVERTIR,"allow_real":False,"motivo":"historial_insuficiente","cols_usadas":len(norm),"cols_requeridas":min_cols,"source":source_resumen,"sources":source_resumen,"ok":True})
             return out
         curr = norm[-1]
         rid0 = int(curr["round_id"])
@@ -6001,7 +6104,7 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
                 curr = norm[-1]
                 rid0 = int(curr["round_id"])
         if len(norm) < 3:
-            out=dict(base); out.update({"source":source,"round_id":rid0,"cols_usadas":len(norm)})
+            out=dict(base); out.update({"source":source_resumen,"sources":source_resumen,"round_id":rid0,"cols_usadas":len(norm)})
             return out
         c0,c1,c2 = norm[-1], norm[-2], norm[-3]
         v0,r0 = int(c0["n_verdes"]), int(c0["n_rojos"])
@@ -6021,7 +6124,7 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
             if callable(streak_fn) and rid0 > 0:
                 try: prev_streak = int(streak_fn(rid0) or 0)
                 except Exception: prev_streak = 0
-        out=dict(base); out.update({"g0":g0,"g1":g1,"g2":g2,"verdes0":v0,"rojos0":r0,"verdes1":v1,"rojos1":r1,"verdes2":v2,"rojos2":r2,"streak_verde":streak,"prev_full_green_streak":prev_streak,"round_id":rid0,"source":source,"cols_usadas":len(norm)})
+        out=dict(base); out.update({"g0":g0,"g1":g1,"g2":g2,"verdes0":v0,"rojos0":r0,"verdes1":v1,"rojos1":r1,"verdes2":v2,"rojos2":r2,"streak_verde":streak,"prev_full_green_streak":prev_streak,"round_id":rid0,"source":source_resumen,"sources":source_resumen,"cols_usadas":len(norm),"dq0":str(c0.get("data_quality","")),"dq1":str(c1.get("data_quality","")),"dq2":str(c2.get("data_quality",""))})
         if prev_streak >= int(globals().get("LXV_ZONA_FULL_GREEN_MIN",3) or 3) and (target_rid is not None or rid0 > 0):
             out.update({"zona":"VERDE_SATURADO_TARDIO","fase":"VERDE_SATURADO_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"prev_full_green_streak"}); return out
         if r0 >= int(globals().get("LXV_ZONA_RED_STRONG",4) or 4) or (g0 <= 0.5 and d01 < 0) or (d01 < 0 and d12 < 0 and g0 <= 0.5):
@@ -6106,14 +6209,15 @@ def _fase_zv_gate_allow_real(origen="LXV", rid=0):
     _LXV_FASE_ZV_LAST_INFO = dict(info)
     if not bool(globals().get("LXV_FASE_ZONA_VERDE_ENABLE", True)):
         return True
-    gtxt = f"g0={int(info.get('verdes0',0))}/6 g1={int(info.get('verdes1',0))}/6 g2={int(info.get('verdes2',0))}/6"
     allow = bool(info.get("allow_real")) and str(info.get("decision")) == ZONA_SI_INVERTIR
+    cols_txt = f"cols={int(info.get('cols_usadas',0))}/{int(info.get('cols_requeridas', int(globals().get('LXV_FASE_MIN_COLUMNS',3))))}"
+    source_txt = str(info.get("source", info.get("sources", "none")))
+    dq_txt = f"dq=[{info.get('dq0','')},{info.get('dq1','')},{info.get('dq2','')}]"
     if allow:
         LXV_REAL_AUDIT["fase_ok"] = int(LXV_REAL_AUDIT.get("fase_ok", 0) or 0) + 1
-        _lxv_5v1x_event_cooldown(key=f"fasezv_ok:{origen_txt}:{rid_int}:{info.get('fase')}", msg=f"✅ ZONA LXV OK: zona={info.get('zona',info.get('fase'))} decision=SI_INVERTIR motivo={info.get('motivo')} g0={int(info.get('verdes0',0))}/6 g1={int(info.get('verdes1',0))}/6 g2={int(info.get('verdes2',0))}/6", cooldown_s=float(globals().get("LXV_FASE_LOG_COOLDOWN_S", 20.0)))
+        _lxv_5v1x_event_cooldown(key=f"fasezv_ok:{origen_txt}:{rid_int}:{info.get('fase')}", msg=f"✅ ZONA LXV OK: zona={info.get('zona',info.get('fase'))} decision=SI_INVERTIR motivo={info.get('motivo')} g0={int(info.get('verdes0',0))}/6 g1={int(info.get('verdes1',0))}/6 g2={int(info.get('verdes2',0))}/6 {cols_txt} source={source_txt} {dq_txt}", cooldown_s=float(globals().get("LXV_FASE_LOG_COOLDOWN_S", 20.0)))
         return True
-    cols_txt = f"cols={int(info.get('cols_usadas',0))}/{int(info.get('cols_requeridas', int(globals().get('LXV_FASE_MIN_COLUMNS',3))))}"
-    msg = f"⛔ ZONA LXV NO INVERTIR: zona={info.get('zona',info.get('fase'))} decision=NO_INVERTIR motivo={info.get('motivo')} g0={int(info.get('verdes0',0))}/6 g1={int(info.get('verdes1',0))}/6 g2={int(info.get('verdes2',0))}/6"
+    msg = f"⛔ ZONA LXV NO INVERTIR: zona={info.get('zona',info.get('fase'))} decision=NO_INVERTIR motivo={info.get('motivo')} g0={int(info.get('verdes0',0))}/6 g1={int(info.get('verdes1',0))}/6 g2={int(info.get('verdes2',0))}/6 {cols_txt} source={source_txt} {dq_txt}"
     if str(info.get('fase')) == 'VERDE_SATURADO_TARDIO':
         msg = f"⛔ FASE_ZV BLOQUEA REAL: VERDE_SATURADO_TARDIO | rid={rid_int} | streak={int(info.get('prev_full_green_streak',0))}"
     LXV_REAL_AUDIT["fase_bloq"] = int(LXV_REAL_AUDIT.get("fase_bloq", 0) or 0) + 1
@@ -6144,6 +6248,39 @@ def _debug_test_zona_operativa_lxv():
 
 def _debug_test_fase_zona_verde_lxv():
     _debug_test_zona_operativa_lxv()
+
+
+def _selftest_zona_lxv_minimo():
+    try:
+        cases = [
+            ("A", [{"round_id":1,"n_verdes":2,"n_rojos":4,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":3,"n_rojos":3,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"}], None, ZONA_SI_INVERTIR),
+            ("B", [{"round_id":1,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"}], None, ZONA_SI_INVERTIR),
+            ("C", [{"round_id":1,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"}], None, ZONA_NO_INVERTIR),
+            ("D", [{"round_id":1,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},{"round_id":4,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"}], 4, ZONA_NO_INVERTIR),
+            ("E", [{"round_id":1,"n_verdes":3,"n_rojos":3,"round_complete":True,"data_quality":"ok"},{"round_id":2,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"ok"},{"round_id":3,"n_verdes":0,"n_rojos":6,"round_complete":True,"data_quality":"ok"}], None, ZONA_NO_INVERTIR),
+            ("F", [{"round_id":1,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"closed_expired"},{"round_id":2,"n_verdes":4,"n_rojos":2,"round_complete":True,"data_quality":"closed_expired"},{"round_id":3,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"closed_expired"}], None, None),
+        ]
+        all_ok = True
+        for name, rows_case, rid_obj, expected_dec in cases:
+            info = clasificar_zona_operativa_lxv(round_id_objetivo=rid_obj, rows=rows_case)
+            ok = isinstance(info, dict) and bool(info.get("ok", True))
+            if expected_dec is not None:
+                ok = ok and str(info.get("decision")) == str(expected_dec)
+            if name == "F":
+                ok = ok and int(info.get("cols_usadas", 0)) >= 3
+            print(f"[SELFTEST_ZONA_LXV] {name}: {'OK' if ok else 'FAIL'} zona={info.get('zona')} decision={info.get('decision')} cols={info.get('cols_usadas')}")
+            all_ok = all_ok and ok
+        return bool(all_ok)
+    except Exception as e:
+        print(f"[SELFTEST_ZONA_LXV] ERROR: {e}")
+        return False
+
+
+if str(os.getenv("RUN_LXV_ZONE_SELFTEST", "0")).strip() == "1":
+    try:
+        _selftest_zona_lxv_minimo()
+    except Exception:
+        pass
 
 def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     bot_pick = _lxv_5v1x_pick_real_bot(candidate)
@@ -17212,23 +17349,28 @@ def _resumen_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
 
 def _hud_zona_operativa_lxv_line(width=None):
     try:
-        info = globals().get("_LXV_FASE_ZV_LAST_INFO")
-        if not isinstance(info, dict):
-            info = clasificar_zona_operativa_lxv()
+        info = {}
+        try:
+            info_live = clasificar_zona_operativa_lxv()
+            if isinstance(info_live, dict) and info_live.get("ok", True):
+                globals()["_LXV_FASE_ZV_LAST_INFO"] = dict(info_live)
+                info = info_live
+            else:
+                info = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}) or {})
+        except Exception:
+            info = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}) or {})
+        if not isinstance(info, dict) or not info:
+            info = {"zona":"INSUFICIENTE","fase":"INSUFICIENTE","decision":ZONA_NO_INVERTIR,"motivo":"sin_info_zona","emoji":"⬜","cols_usadas":0,"cols_requeridas":int(globals().get("LXV_ZONA_MIN_COLUMNS", 3) or 3),"source":"none"}
         zona = str(info.get("zona", info.get("fase", "NEUTRO")))
         decision = str(info.get("decision", ZONA_NO_INVERTIR))
         motivo = str(info.get("motivo", "--"))
         emoji = str(info.get("emoji", "⬜"))
-        badge = "✅ SI_INVERTIR" if decision == ZONA_SI_INVERTIR else "⛔ NO_INVERTIR"
-        if zona == "VERDE_SATURADO_TARDIO":
-            detail = f"prev_full_green_streak={int(info.get('prev_full_green_streak',0))}"
-        elif zona == "INSUFICIENTE":
-            detail = "motivo=historial_insuficiente"
-        else:
-            detail = f"g0={int(info.get('verdes0',0))}/6 g1={int(info.get('verdes1',0))}/6 g2={int(info.get('verdes2',0))}/6 | motivo={motivo}"
-        return f"{emoji} ZONA LXV: {zona} | {badge} | {detail}"
+        cols_usadas = int(info.get("cols_usadas", 0) or 0)
+        cols_req = int(info.get("cols_requeridas", int(globals().get("LXV_ZONA_MIN_COLUMNS", 3) or 3)) or 3)
+        source = str(info.get("source", info.get("sources", "none")))
+        return f"{emoji} ZONA LXV: {zona} | {decision} | cols={cols_usadas}/{cols_req} | source={source} | motivo={motivo}"
     except Exception:
-        return "⬜ ZONA LXV: ERROR | ⛔ NO_INVERTIR"
+        return "⬜ ZONA LXV: INSUFICIENTE | NO_INVERTIR | cols=0/3 | source=none | motivo=sin_info_zona"
 
 def _resumen_top_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
     lines = []
