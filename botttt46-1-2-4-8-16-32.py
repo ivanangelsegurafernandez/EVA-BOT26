@@ -185,7 +185,7 @@ PAUSA_POST_OPERACION_S = 2  # Pausa uniforme tras cada operación con resultado 
 # Objetivo: dar tiempo al MAESTRO + humano para decidir pasar a REAL ANTES del BUY.
 # Ventana corta de decisión IA para evitar freno excesivo del ciclo.
 # (0 para desactivar)
-VENTANA_DECISION_IA_S = 35        # segundos (alineado con maestro)
+VENTANA_DECISION_IA_S = 35        # GateWin: espera antes del BUY, no standby posterior al cierre.
 # Debe estar alineado con MANUAL_REAL_DECISION_WINDOW_S del maestro.
 # Si es menor, la orden manual REAL puede llegar tarde y cortar contrato DEMO.
 VENTANA_DECISION_IA_POLL_S = 0.25 # granularidad de espera
@@ -272,6 +272,7 @@ MAX_CICLOS = len(MARTINGALA_REAL)
 # === LXV_SYNC_COLUMN: sincronización por ronda/columna ===
 SYNC_ROUND_DIR = "sync_round"
 SYNC_ROUND_STATE = os.path.join(SYNC_ROUND_DIR, "state.json")
+print(f"🧭 SYNC_ROUND_STATE={os.path.abspath(SYNC_ROUND_STATE)}")
 
 try:
     os.makedirs(SYNC_ROUND_DIR, exist_ok=True)
@@ -460,7 +461,7 @@ SYNC_WAIT_HEARTBEAT_S = 2.0
 SYNC_WAIT_STALE_S = 90.0
 SYNC_WAIT_MAX_IDLE_S = 240.0
 SYNC_WAIT_ABSOLUTE_MAX_S = 360.0
-SYNC_STANDBY_PRINT_COOLDOWN_S = 10.0
+SYNC_STANDBY_PRINT_COOLDOWN_S = 5.0
 
 
 def _sync_round_state_ts(st: dict) -> float:
@@ -559,15 +560,15 @@ async def _sync_round_wait_release(round_id: int) -> int:
             print(Fore.YELLOW + f"⚠️ LXV_SYNC_COLUMN no_progress: {NOMBRE_BOT} ronda #{rid} released={released} esperando #{next_round}")
             last_progress_ts = now_ts
         if total_wait_s >= SYNC_WAIT_ABSOLUTE_MAX_S and (not owner_real) and (not pending_contract_resolution) and (not contrato_pendiente) and (not en_modo_real):
-            print(Fore.YELLOW + Style.BRIGHT + f"🟨 LXV_SYNC_COLUMN escape DEMO seguro: {NOMBRE_BOT} sale de standby por timeout visual, sin REAL activo.")
-            estado_bot["sync_wait"] = False
-            if "sync_wait_round" in estado_bot:
-                estado_bot["sync_wait_round"] = None
+            if (now_ts - last_standby_print_ts) >= 10.0:
+                print(Fore.YELLOW + Style.BRIGHT + f"🟨 LXV_SYNC_COLUMN esperando release maestro: bot={NOMBRE_BOT} ronda #{rid} released={released} wait={total_wait_s:.1f}s")
+                last_standby_print_ts = now_ts
             try:
                 _sync_round_write_release_heartbeat(rid, next_round)
             except Exception:
                 pass
-            return released
+            if total_wait_s >= 90.0 and (now_ts - last_progress_ts) >= 10.0:
+                print(Fore.YELLOW + f"⚠️ STANDBY LARGO: revisar maestro/released_round bot={NOMBRE_BOT} ronda #{rid}")
         if (idle_s >= SYNC_WAIT_MAX_IDLE_S) and (
             stale_state or total_wait_s >= (SYNC_WAIT_STALE_S + SYNC_WAIT_MAX_IDLE_S)
         ):
