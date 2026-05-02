@@ -6815,6 +6815,74 @@ def _sync_round_collect_closed_acks(round_id: int) -> tuple[dict, dict]:
         }
     return closed, reasons
 
+def _sync_round_collect_closed_acks_any_round(target_round: int) -> tuple[dict, dict]:
+    closed = {}
+    reasons = {}
+    now_ts = float(time.time())
+    for bot in BOT_NAMES:
+        ack = _sync_round_safe_read_json(_sync_round_ack_path(bot))
+        if not isinstance(ack, dict):
+            reasons[bot] = "ack_missing"
+            continue
+        if bool(ack.get("pending_contract_resolution", False)):
+            reasons[bot] = "pending_contract_resolution"
+            continue
+        try:
+            ack_round = int(ack.get("round_id", 0) or 0)
+        except Exception:
+            ack_round = 0
+        if ack_round != int(target_round):
+            reasons[bot] = f"round_mismatch_ack={ack_round}_target={int(target_round)}"
+            continue
+        status = str(ack.get("status", "")).lower().strip()
+        if status != "closed":
+            reasons[bot] = f"status_no_closed_{status or 'empty'}"
+            continue
+        resultado = str(ack.get("resultado", "") or "").strip().upper()
+        if resultado in ("PERDIDA", "PÉRDIDA", "LOSS", "X", "✗"):
+            resultado = "PÉRDIDA"
+        elif resultado in ("GANANCIA", "WIN", "✓"):
+            resultado = "GANANCIA"
+        else:
+            reasons[bot] = f"resultado_invalid_{resultado or 'empty'}"
+            continue
+        try:
+            ack_ts = float(ack.get("ts", 0.0) or 0.0)
+        except Exception:
+            ack_ts = 0.0
+        if ack_ts <= 0:
+            reasons[bot] = "ts_missing"
+            continue
+        age = now_ts - ack_ts
+        if age > float(TTL_ACK_SYNC_ROUND_S):
+            reasons[bot] = f"ack_stale_age={age:.1f}"
+            continue
+        ack_mode = str(ack.get("mode", "") or "").strip().upper()
+        ack_source = str(ack.get("source", "") or "").strip().upper()
+        explicit_real_ack = (
+            ack_mode == "REAL"
+            or ack_source in ("ORDEN_REAL", "REAL", "REAL_ORDER")
+        )
+        explicit_demo_ack = (
+            ack_mode == "DEMO"
+            or ack_source in ("SYNC_DEMO", "DEMO", "LXV_SYNC")
+        )
+        if explicit_real_ack and not explicit_demo_ack:
+            reasons[bot] = "ack_real_ignored"
+            continue
+        closed[bot] = {
+            "resultado": resultado,
+            "ts": ack_ts,
+            "contract_id": ack.get("contract_id"),
+            "asset": ack.get("asset"),
+            "ciclo": ack.get("ciclo"),
+            "round_id": ack_round,
+            "mode": ack_mode,
+            "source": ack_source,
+        }
+        reasons[bot] = "ok"
+    return closed, reasons
+
 def _sync_round_tick_maestro():
     global _SYNC_ROUND_LAST_ANNOUNCED, _LXV_LAST_EMITTED_ROUND
     _sync_round_bootstrap_state(force=False)
@@ -6828,6 +6896,21 @@ def _sync_round_tick_maestro():
         released_round = max(1, int(st.get("released_round", round_id) or round_id))
     except Exception:
         released_round = round_id
+    status_now = str(st.get("status", "")).strip().lower()
+    resync_future_ack_full = False
+    resync_future_closed = {}
+    resync_future_reasons = {}
+    if (
+        status_now in ("waiting_closures", "released", "released_after_real_result", "released_recovery_completed_without_real_stuck")
+        and int(released_round) > int(round_id)
+    ):
+        agregar_evento(f"🧭 SYNC ROUND_DRIFT: obj #{round_id} < released #{released_round}; buscando ACKs en ronda liberada.")
+        candidate_round = int(released_round)
+        resync_future_closed, resync_future_reasons = _sync_round_collect_closed_acks_any_round(candidate_round)
+        if isinstance(resync_future_closed, dict) and len(resync_future_closed) >= len(BOT_NAMES):
+            agregar_evento(f"🧭 SYNC RESYNC FUTURE_ACK_FULL: obj #{round_id} -> #{candidate_round}; ACK 6/6 ya cerrados.")
+            round_id = int(candidate_round)
+            resync_future_ack_full = True
     expected_round = max(1, int(round_id))
     pending_on, pending_bot, pending = _hay_real_close_pending_activo()
     if pending_on:
@@ -6905,6 +6988,9 @@ def _sync_round_tick_maestro():
     now_ts = float(time.time())
     closed_all, sync_debug_missing = _sync_round_collect_closed_acks(round_id)
     closed = {b: closed_all[b] for b in expected if b in closed_all}
+    if resync_future_ack_full:
+        closed = {b: resync_future_closed[b] for b in BOT_NAMES if b in resync_future_closed}
+        sync_debug_missing = {b: "ok_future_ack_resync" for b in BOT_NAMES}
     for bot in expected:
         reason_bot = str(sync_debug_missing.get(bot, "ack_missing") or "ack_missing")
         if reason_bot == "pending_contract_resolution":
@@ -6995,6 +7081,9 @@ def _sync_round_tick_maestro():
         agregar_evento(f"🧩 LXV_SYNC_COLUMN cierres ronda #{round_id}: {n_closed}/{len(expected)}.")
 
     closed_direct, reasons_direct = _sync_round_collect_closed_acks(round_id)
+    if resync_future_ack_full:
+        closed_direct = dict(resync_future_closed)
+        reasons_direct = {b: "ok_future_ack_resync" for b in BOT_NAMES}
     direct_ack_full = (
         isinstance(closed_direct, dict)
         and len(closed_direct) >= len(BOT_NAMES)
