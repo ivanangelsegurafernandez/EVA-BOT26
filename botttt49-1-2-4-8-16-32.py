@@ -455,12 +455,12 @@ def _sync_round_write_release_heartbeat(round_id: int, next_round: int):
     _sync_round_write_json_atomic(path, payload)
 
 
-SYNC_WAIT_POLL_S = 0.80
-SYNC_WAIT_HEARTBEAT_S = 2.0
+SYNC_WAIT_POLL_S = 0.15
+SYNC_WAIT_HEARTBEAT_S = 1.0
 SYNC_WAIT_STALE_S = 90.0
 SYNC_WAIT_MAX_IDLE_S = 240.0
 SYNC_WAIT_ABSOLUTE_MAX_S = 360.0
-SYNC_STANDBY_PRINT_COOLDOWN_S = 10.0
+SYNC_STANDBY_PRINT_COOLDOWN_S = 3.0
 
 
 def _sync_round_state_ts(st: dict) -> float:
