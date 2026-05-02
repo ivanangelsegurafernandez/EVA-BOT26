@@ -2930,6 +2930,8 @@ _FOLLOWUP_5V1X_EVENT_TS = {}
 _FOLLOWUP_5V1X_LAST_APPLIED = {}
 _LXV_FASE_ZV_EVENT_TS = {}
 _LXV_FASE_ZV_LAST_INFO = {"fase": "INSUFICIENTE", "allow_real": False, "g0": 0.0, "g1": 0.0, "g2": 0.0, "verdes0": 0, "verdes1": 0, "verdes2": 0, "streak_verde": 0, "motivo": "init"}
+_LXV_ZONA_HUD_LAST_INFO = {}
+_LXV_LAST_REAL_GATE_INFO = {}
 LXV_FASE_COLUMNS_CACHE = deque(maxlen=80)
 LXV_ZONA_MIN_COLUMNS = 3
 LXV_ZONA_GREEN_MIN = 4
@@ -6425,7 +6427,7 @@ def _lxv_zona_es_invertible(info: dict | None) -> tuple[bool, str]:
         return False, f"zona_error:{e}"
 
 def _fase_zv_gate_allow_real(origen="LXV", rid=0):
-    global _LXV_FASE_ZV_LAST_INFO
+    global _LXV_FASE_ZV_LAST_INFO, _LXV_LAST_REAL_GATE_INFO
     origen_txt = str(origen or "LXV").strip().upper()
     rid_int = 0
     rid_ok = False
@@ -6451,6 +6453,19 @@ def _fase_zv_gate_allow_real(origen="LXV", rid=0):
         return False
     info = evaluar_fase_zona_verde_lxv(round_id_objetivo=rid_int if rid_ok else None)
     _LXV_FASE_ZV_LAST_INFO = dict(info)
+    _LXV_LAST_REAL_GATE_INFO = {
+        "ts": time.time(),
+        "origen": origen_txt,
+        "round_id": rid_int,
+        "zona": info.get("zona"),
+        "fase": info.get("fase"),
+        "decision": info.get("decision"),
+        "allow_real": bool(info.get("allow_real", False)),
+        "motivo": info.get("motivo"),
+        "source": info.get("source", info.get("sources", "none")),
+        "cols_usadas": info.get("cols_usadas"),
+        "cols_requeridas": info.get("cols_requeridas"),
+    }
     if not bool(globals().get("LXV_FASE_ZONA_VERDE_ENABLE", True)):
         return True
     allow, allow_reason = _lxv_zona_es_invertible(info)
@@ -7122,11 +7137,34 @@ def _sync_round_tick_maestro():
     rows_pack = _ack_live_build_rows()
     summary = _ack_live_calc_summary(rows_pack)
     rows_live = list((rows_pack or {}).get("rows", []) if isinstance(rows_pack, dict) else [])
+    real_emitido = False
     closed_count = int(summary.get("closed_count", 0) or 0)
     expected_count = int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
     faltan_count = int(summary.get("faltan_count", max(0, expected_count - closed_count)) or 0)
+    expired_count = int(summary.get("expired_count", 0) or 0)
+    max_lag_s = summary.get("max_lag_s", None)
+    try:
+        max_lag_s = float(max_lag_s) if max_lag_s is not None else None
+    except Exception:
+        max_lag_s = None
     data_quality = str(summary.get("data_quality", "") or "").strip().lower()
     partial_pattern = str(summary.get("partial_pattern", "") or "").strip().upper()
+    incomplete_round = bool(closed_count < expected_count)
+    has_expired_closed = bool(expired_count > 0)
+    too_old_round = bool(max_lag_s is not None and float(max_lag_s) > float(ROUND_LIVE_INVEST_WINDOW_S))
+    if incomplete_round and (has_expired_closed or too_old_round):
+        if _hay_real_close_pending_activo()[0]:
+            return
+        if hold_status in ("holding_real_result", "holding_real_turn"):
+            return
+        if real_emitido:
+            return
+        agregar_evento(
+            f"⏩ ROUND LIVE incompleto vencido: ronda #{round_id} cerrados={closed_count}/{expected_count} "
+            f"faltan={expected_count - closed_count} expired={expired_count}; liberando sin REAL."
+        )
+        _sync_round_release_next_round(round_id, "incomplete_round_expired_release_no_real")
+        return
     round_live_all_closed = bool(closed_count >= expected_count and faltan_count <= 0)
     round_live_real_ok = bool(round_live_all_closed and data_quality == "ok")
     round_live_closed_expired = bool(round_live_all_closed and data_quality == "closed_expired")
@@ -7231,50 +7269,63 @@ def _sync_round_tick_maestro():
             fase_info = {}
             patron = str(partial_pattern or patron or "").upper()
             ciclo_pick = ciclo_martingala_siguiente()
-            try:
-                if patron == "5V1X":
-                    bot_pick = str(summary.get("bot_x_actual") or "").strip()
-                    row_pick = next((r for r in rows_live if str((r or {}).get("bot", "")).strip() == bot_pick), {}) if bot_pick else {}
-                    edad_s = (row_pick or {}).get("age_s")
-                    ciclo_local_bot = 0
-                    try:
-                        ciclo_local_bot = int((row_pick or {}).get("ciclo", 0) or 0)
-                    except Exception:
+            zona_info_decision = evaluar_fase_zona_verde_lxv(round_id_objetivo=round_id) or {}
+            zona_allow, zona_reason = _lxv_zona_es_invertible(zona_info_decision)
+            if not zona_allow:
+                motivo_no_real = f"zona_no_invertir_{zona_info_decision.get('fase', zona_info_decision.get('zona'))}_{zona_info_decision.get('motivo')}"
+                agregar_evento(
+                    f"🧱 ROUND LIVE REAL BLOQUEADO POR ZONA: rid={round_id} "
+                    f"zona={zona_info_decision.get('zona', zona_info_decision.get('fase'))} "
+                    f"decision={zona_info_decision.get('decision')} "
+                    f"motivo={zona_info_decision.get('motivo')} reason={zona_reason}"
+                )
+                ok_emit = False
+                patron = str(partial_pattern or patron or "").upper()
+            else:
+                try:
+                    if patron == "5V1X":
+                        bot_pick = str(summary.get("bot_x_actual") or "").strip()
+                        row_pick = next((r for r in rows_live if str((r or {}).get("bot", "")).strip() == bot_pick), {}) if bot_pick else {}
+                        edad_s = (row_pick or {}).get("age_s")
                         ciclo_local_bot = 0
-                    emit_bot = bot_pick
-                    if bot_pick in BOT_NAMES:
-                        lxv_payload = {"round_id": round_id, "rid": round_id, "bot": bot_pick, "bot_pick": bot_pick, "bot_x": bot_pick, "bot_x_actual": bot_pick, "bot_x1": bot_pick, "bot_x_fuerte": bot_pick, "x_unica": True, "round_complete": True, "data_quality": "ok", "edad_s": edad_s, "ciclo": ciclo_local_bot, "partial_pattern": "5V1X", "patron_lxv": "5V1X", "source": "LXV_5V1X"}
-                        ok_emit = bool(_lxv_5v1x_apply_real_route(lxv_payload, int(ciclo_pick)))
+                        try:
+                            ciclo_local_bot = int((row_pick or {}).get("ciclo", 0) or 0)
+                        except Exception:
+                            ciclo_local_bot = 0
+                        emit_bot = bot_pick
+                        if bot_pick in BOT_NAMES:
+                            lxv_payload = {"round_id": round_id, "rid": round_id, "bot": bot_pick, "bot_pick": bot_pick, "bot_x": bot_pick, "bot_x_actual": bot_pick, "bot_x1": bot_pick, "bot_x_fuerte": bot_pick, "x_unica": True, "round_complete": True, "data_quality": "ok", "edad_s": edad_s, "ciclo": ciclo_local_bot, "partial_pattern": "5V1X", "patron_lxv": "5V1X", "source": "LXV_5V1X"}
+                            ok_emit = bool(_lxv_5v1x_apply_real_route(lxv_payload, int(ciclo_pick)))
+                            fase_info = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
+                            fase_ok = bool(fase_info.get("allow_real", False))
+                            motivo_exec = "emit_ok" if ok_emit else _lxv_emit_fail_reason(bot_pick, "LXV_5V1X")
+                        else:
+                            motivo_exec = "bot_pick_invalido"
+                    elif patron == "4V2X":
+                        lxv_payload = {"round_id": round_id, "rid": round_id, "summary": summary, "rows": rows_live, "round_complete": True, "data_quality": "ok", "partial_pattern": "4V2X", "patron_lxv": "4V2X", "source": "LXV_4V2X"}
+                        round_row, feat_row = _lxv_5v1x_get_exported_rows(int(round_id))
+                        cand = _lxv_4v2x_candidate_from_round(round_row, feat_row)
+                        if isinstance(cand, dict):
+                            lxv_payload.update(cand)
+                            emit_bot = str(cand.get("bot_x_debil") or "").strip()
+                        ok_emit = bool(_lxv_4v2x_apply_real_route(lxv_payload, int(ciclo_pick)))
                         fase_info = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
                         fase_ok = bool(fase_info.get("allow_real", False))
-                        motivo_exec = "emit_ok" if ok_emit else _lxv_emit_fail_reason(bot_pick, "LXV_5V1X")
+                        motivo_exec = "emit_ok" if ok_emit else _lxv_emit_fail_reason(emit_bot, "LXV_4V2X")
                     else:
-                        motivo_exec = "bot_pick_invalido"
-                elif patron == "4V2X":
-                    lxv_payload = {"round_id": round_id, "rid": round_id, "summary": summary, "rows": rows_live, "round_complete": True, "data_quality": "ok", "partial_pattern": "4V2X", "patron_lxv": "4V2X", "source": "LXV_4V2X"}
-                    round_row, feat_row = _lxv_5v1x_get_exported_rows(int(round_id))
-                    cand = _lxv_4v2x_candidate_from_round(round_row, feat_row)
-                    if isinstance(cand, dict):
-                        lxv_payload.update(cand)
-                        emit_bot = str(cand.get("bot_x_debil") or "").strip()
-                    ok_emit = bool(_lxv_4v2x_apply_real_route(lxv_payload, int(ciclo_pick)))
-                    fase_info = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
-                    fase_ok = bool(fase_info.get("allow_real", False))
-                    motivo_exec = "emit_ok" if ok_emit else _lxv_emit_fail_reason(emit_bot, "LXV_4V2X")
-                else:
-                    motivo_exec = f"sin_patron_lxv_{patron}"
-            except Exception as e:
-                err_name = type(e).__name__
-                err_msg = str(e)
-                tb_short = traceback.format_exc(limit=2)
-                err_var = getattr(e, "name", "") if isinstance(e, NameError) else ""
-                motivo_exec = f"exception_{err_name}_{err_var}" if err_var else f"exception_{err_name}"
-                agregar_evento(f"⚠️ REAL eval exception: {err_name}: {err_msg}")
-                if KEYBOARD_DEBUG or HUD_SHOW_DEBUG_BLOCKS:
-                    agregar_evento(tb_short[:180])
-                agregar_evento(f"❌ LXV NO_REAL EXCEPTION: {err_name}: {err_msg} | round={round_id} | partial={partial_pattern}")
-                ok_emit = False
-                real_emitido = False
+                        motivo_exec = f"sin_patron_lxv_{patron}"
+                except Exception as e:
+                    err_name = type(e).__name__
+                    err_msg = str(e)
+                    tb_short = traceback.format_exc(limit=2)
+                    err_var = getattr(e, "name", "") if isinstance(e, NameError) else ""
+                    motivo_exec = f"exception_{err_name}_{err_var}" if err_var else f"exception_{err_name}"
+                    agregar_evento(f"⚠️ REAL eval exception: {err_name}: {err_msg}")
+                    if KEYBOARD_DEBUG or HUD_SHOW_DEBUG_BLOCKS:
+                        agregar_evento(tb_short[:180])
+                    agregar_evento(f"❌ LXV NO_REAL EXCEPTION: {err_name}: {err_msg} | round={round_id} | partial={partial_pattern}")
+                    ok_emit = False
+                    real_emitido = False
             fase_info = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {})) if not fase_info else fase_info
             fase_name = str(fase_info.get("fase", ""))
             fase_ok = bool(fase_info.get("allow_real", False))
@@ -8039,6 +8090,32 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
             f"🧊 REAL source rechazada: {src} (permitidas={','.join(sorted(allow_sources))})."
         )
         return False
+    auto_lxv_sources = {
+        str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper(),
+        str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X")).upper(),
+        str(globals().get("LXV_4V2X_REAL_SOURCE", "LXV_4V2X")).upper(),
+    }
+    if src in auto_lxv_sources:
+        try:
+            rid_int = int(round_id or 0)
+        except Exception:
+            rid_int = 0
+        if rid_int <= 0:
+            agregar_evento(f"🧱 REAL HARD BLOCK ZONA: source={src} bot={bot} rid_faltante")
+            return False
+        zona_info = evaluar_fase_zona_verde_lxv(round_id_objetivo=rid_int)
+        allow_zona, reason_zona = _lxv_zona_es_invertible(zona_info)
+        if not allow_zona:
+            agregar_evento(
+                f"🧱 REAL HARD BLOCK ZONA: source={src} rid={rid_int} bot={bot} "
+                f"zona={zona_info.get('zona', zona_info.get('fase'))} "
+                f"decision={zona_info.get('decision')} "
+                f"motivo={zona_info.get('motivo')} reason={reason_zona}"
+            )
+            LXV_REAL_AUDIT["ultimo_bloqueo"] = (
+                f"hard_zone_{zona_info.get('fase', zona_info.get('zona'))}_{zona_info.get('motivo')}"
+            )
+            return False
     agregar_evento(f"✅ REAL source autorizada: {src}.")
     prev_src = globals().get("_REAL_ROUTE_SOURCE", None)
     globals()["_REAL_ROUTE_SOURCE"] = src
@@ -17788,14 +17865,17 @@ def _hud_zona_operativa_lxv_line(width=None):
         try:
             info_live = clasificar_zona_operativa_lxv()
             if isinstance(info_live, dict) and info_live.get("ok", True):
-                globals()["_LXV_FASE_ZV_LAST_INFO"] = dict(info_live)
+                info_live = dict(info_live)
+                src = str(info_live.get("source", info_live.get("sources", "cache+csv")) or "cache+csv")
+                info_live["source"] = f"HUD_GLOBAL/{src}"
+                globals()["_LXV_ZONA_HUD_LAST_INFO"] = dict(info_live)
                 info = info_live
             else:
-                info = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}) or {})
+                info = dict(globals().get("_LXV_ZONA_HUD_LAST_INFO", {}) or {})
         except Exception:
-            info = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}) or {})
+            info = dict(globals().get("_LXV_ZONA_HUD_LAST_INFO", {}) or {})
         if not isinstance(info, dict) or not info:
-            info = {"zona":"INSUFICIENTE","fase":"INSUFICIENTE","decision":ZONA_NO_INVERTIR,"motivo":"sin_info_zona","emoji":"⬜","cols_usadas":0,"cols_requeridas":int(globals().get("LXV_ZONA_MIN_COLUMNS", 3) or 3),"source":"none"}
+            info = {"zona":"INSUFICIENTE","fase":"INSUFICIENTE","decision":ZONA_NO_INVERTIR,"motivo":"sin_info_zona","emoji":"⬜","cols_usadas":0,"cols_requeridas":int(globals().get("LXV_ZONA_MIN_COLUMNS", 3) or 3),"source":"HUD_GLOBAL/none"}
         zona = str(info.get("zona", info.get("fase", "NEUTRO")))
         decision = str(info.get("decision", ZONA_NO_INVERTIR))
         motivo = str(info.get("motivo", "--"))
@@ -17803,9 +17883,17 @@ def _hud_zona_operativa_lxv_line(width=None):
         cols_usadas = int(info.get("cols_usadas", 0) or 0)
         cols_req = int(info.get("cols_requeridas", int(globals().get("LXV_ZONA_MIN_COLUMNS", 3) or 3)) or 3)
         source = str(info.get("source", info.get("sources", "none")))
-        return f"{emoji} ZONA LXV: {zona} | {decision} | cols={cols_usadas}/{cols_req} | source={source} | motivo={motivo}"
+        line_hud = f"{emoji} ZONA LXV HUD GLOBAL: {zona} | {decision} | cols={cols_usadas}/{cols_req} | source={source} | motivo={motivo}"
+        gate = dict(globals().get("_LXV_LAST_REAL_GATE_INFO", {}) or {})
+        rid_gate = int(gate.get("round_id", 0) or 0)
+        if rid_gate > 0:
+            z_gate = str(gate.get("zona", gate.get("fase", "--")) or "--")
+            d_gate = str(gate.get("decision", "--") or "--")
+            m_gate = str(gate.get("motivo", "--") or "--")
+            return f"{line_hud} || ULTIMA ZONA REAL: rid={rid_gate} | {z_gate} | {d_gate} | motivo={m_gate}"
+        return line_hud
     except Exception:
-        return "⬜ ZONA LXV: INSUFICIENTE | NO_INVERTIR | cols=0/3 | source=none | motivo=sin_info_zona"
+        return "⬜ ZONA LXV HUD GLOBAL: INSUFICIENTE | NO_INVERTIR | cols=0/3 | source=HUD_GLOBAL/none | motivo=sin_info_zona"
 
 def _resumen_top_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
     lines = []
