@@ -3271,31 +3271,9 @@ async def ejecutar_panel():
                     except Exception:
                         ciclo_actual_real = 1
 
-                    if ciclo_actual_real < len(MARTINGALA_REAL):
-                        siguiente_ciclo = ciclo_actual_real + 1
-
-                        print(
-                            Fore.YELLOW + Style.BRIGHT +
-                            f"❌ PÉRDIDA en REAL C{ciclo_actual_real}. Continúa REAL en C{siguiente_ciclo}.\n"
-                        )
-
-                        estado_bot["ciclo_forzado"] = siguiente_ciclo
-                        estado_bot["ciclo_actual"] = siguiente_ciclo
-                        estado_bot["token_msg_mostrado"] = False
-                        estado_bot["ciclo_en_progreso"] = False
-
-                        try:
-                            globals()["primer_ingreso_real"] = True
-                        except Exception:
-                            pass
-
-                        await asyncio.sleep(PAUSA_POST_OPERACION_S + random.uniform(0.0, 0.5))
-                        ciclo = siguiente_ciclo
-                        continue
-
                     print(
                         Fore.RED + Style.BRIGHT +
-                        f"❌ PÉRDIDA en REAL C{ciclo_actual_real}. Fin de Martingala REAL. Volviendo a DEMO...\n"
+                        f"❌ PÉRDIDA en REAL C{ciclo_actual_real}. Turno terminado. Volviendo a DEMO. Próximo ciclo lo decide el MAESTRO.\n"
                     )
 
                     try:
@@ -3314,6 +3292,9 @@ async def ejecutar_panel():
                         commit_guard_clear()
                     except Exception:
                         pass
+
+                    estado_bot["token_msg_mostrado"] = False
+                    estado_bot["ciclo_en_progreso"] = False
 
                     reinicio_forzado.set()
                     break
