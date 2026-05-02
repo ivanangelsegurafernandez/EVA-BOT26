@@ -6607,14 +6607,40 @@ def _sync_round_tick_maestro():
     faltan_count = int(summary.get("faltan_count", max(0, expected_count - closed_count)) or 0)
     data_quality = str(summary.get("data_quality", "") or "").strip().lower()
     partial_pattern = str(summary.get("partial_pattern", "") or "").strip().upper()
-    round_live_complete = bool(closed_count >= expected_count and faltan_count <= 0 and data_quality == "ok")
-    if round_live_complete:
+    round_live_all_closed = bool(closed_count >= expected_count and faltan_count <= 0)
+    round_live_real_ok = bool(round_live_all_closed and data_quality == "ok")
+    round_live_closed_expired = bool(round_live_all_closed and data_quality == "closed_expired")
+    round_live_release_no_real_reason = ""
+    if round_live_real_ok:
         completed = True
         completed_normal = True
         completed_failsafe = False
         missing = []
         agregar_evento(
             f"✅ SYNC COMPLETE FROM ROUND LIVE: ronda #{round_id} cerrados={closed_count}/{expected_count} parcial={partial_pattern}; evaluando REAL/RELEASE."
+        )
+    elif round_live_closed_expired:
+        completed = True
+        completed_normal = True
+        completed_failsafe = False
+        missing = []
+        round_live_release_no_real_reason = "round_closed_expired_release_no_real"
+        _lxv_5v1x_event_cooldown(
+            key=f"sync_release_closed_expired:{round_id}",
+            msg=f"🟨 SYNC RELEASE SIN REAL: ronda #{round_id} cerrada 6/6 pero fuera de ventana; liberando bots sin evaluar REAL.",
+            cooldown_s=8.0,
+        )
+    elif round_live_all_closed:
+        completed = True
+        completed_normal = True
+        completed_failsafe = False
+        missing = []
+        dq_reason = data_quality if data_quality else "unknown"
+        round_live_release_no_real_reason = f"round_closed_non_ok_release_no_real:{dq_reason}"
+        _lxv_5v1x_event_cooldown(
+            key=f"sync_release_closed_non_ok:{round_id}:{dq_reason}",
+            msg=f"🟨 SYNC RELEASE SIN REAL: ronda #{round_id} cerrada {closed_count}/{expected_count} con calidad={dq_reason}; liberando bots sin evaluar REAL.",
+            cooldown_s=8.0,
         )
     payload = {
         "round_id": round_id,
@@ -6657,7 +6683,7 @@ def _sync_round_tick_maestro():
             pick, patron, motivo = None, f"{len([x for x in snapshot if x.get('resultado') == 'GANANCIA'])}V/{len([x for x in snapshot if x.get('resultado') == 'PÉRDIDA'])}X", "masa mínima insuficiente para evaluar LXV_REAL"
         else:
             pick, patron, motivo = _lxv_evaluar_columna(round_id, snapshot)
-        if round_live_complete:
+        if round_live_real_ok:
             ok_emit = False
             emit_bot = None
             motivo_exec = ""
@@ -6727,7 +6753,7 @@ def _sync_round_tick_maestro():
             motivo_no_real = f"sin_patron_lxv_{patron}"
             agregar_evento(f"🚀 RELEASE sin patrón LXV: ronda #{round_id} parcial={patron} -> libera #{round_id + 1}")
             pick = None
-        if (not round_live_complete) and pick:
+        if (not round_live_real_ok) and pick:
             bot_pick = str(pick.get("bot"))
             ciclo_snapshot = int(
                 pick.get("ciclo", estado_bots.get(bot_pick, {}).get("ciclo_actual", 1)) or 1
@@ -6890,6 +6916,8 @@ def _sync_round_tick_maestro():
         if real_emitido and (not hold_valido):
             release_reason = f"real_emitido_sin_hold_valido_{hold_motivo}"
             agregar_evento(f"⚠️ HOLD cancelado: real_emitido=True pero {hold_motivo}; liberando #{round_id + 1}")
+        elif round_live_release_no_real_reason:
+            release_reason = round_live_release_no_real_reason
         elif motivo_no_real:
             release_reason = f"no_real_{motivo_no_real}"
         agregar_evento(f"🚀 RELEASE normal: ronda #{round_id} completa sin HOLD válido -> libera #{round_id + 1}")
