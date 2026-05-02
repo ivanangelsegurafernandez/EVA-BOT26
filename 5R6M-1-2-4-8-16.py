@@ -4611,8 +4611,10 @@ def _ack_live_format_lines(snapshot):
                 f"g0={int(info_fase.get('verdes0',0))}/6 g1={int(info_fase.get('verdes1',0))}/6 "
                 f"g2={int(info_fase.get('verdes2',0))}/6 | motivo={motivo}"
             )
+        pattern_msg = "PATRÓN LXV: SIN_DATO | SIN_CANDIDATO_REAL | motivo=patron_no_detectado"
         if parcial_txt == "5V1X" and botx != "-":
             lines.append(f"🎯 5V1X listo: única X={botx}")
+            pattern_msg = "PATRÓN LXV: 5V1X | CANDIDATO_REAL"
             lines.append(fase_line)
         elif parcial_txt == "4V2X":
             x_bots = [str(r.get("bot") or "") for r in rows if bool(r.get("is_current")) and str(r.get("res")) == "X"]
@@ -4620,7 +4622,19 @@ def _ack_live_format_lines(snapshot):
             pick = _lxv_pick_bot_x_debil(rojos_rows) if rojos_rows else None
             bot_pick = str((pick or {}).get("bot", "") or (x_bots[0] if x_bots else "-"))
             lines.append(f"🎯 4V2X listo: X menor Prob IA={bot_pick}")
+            pattern_msg = "PATRÓN LXV: 4V2X | CANDIDATO_REAL"
             lines.append(fase_line)
+        elif parcial_txt == "6V0X":
+            pattern_msg = "PATRÓN LXV: 6V0X | SIN_CANDIDATO_REAL | motivo=patron_no_invertible"
+            lines.append(fase_line)
+        else:
+            pattern_msg = f"PATRÓN LXV: {parcial_txt} | SIN_CANDIDATO_REAL | motivo=patron_no_invertible"
+        lines.append(pattern_msg)
+        lines.append(
+            f"ROUND LIVE #{obj_round}: V={int(summary.get('verdes_count', 0) or 0)} R={int(summary.get('rojas_count', 0) or 0)} "
+            f"patrón={parcial_txt} zona={info_fase.get('zona', info_fase.get('fase', 'INSUFICIENTE'))} "
+            f"decision={info_fase.get('decision', ZONA_NO_INVERTIR)} motivo={motivo}"
+        )
 
     if summary.get("all_prev_waiting", False) and bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False)):
         lines.append("↳ Esperando cierres de ronda objetivo; los ACK visibles aún pertenecen a ronda previa.")
@@ -6006,6 +6020,60 @@ def _lxv_zona_quality_rank(dq):
         return 0
 
 
+
+
+def _lxv_zona_source_rank(src):
+    try:
+        src = str(src or "").strip().lower()
+        if src == "round_live":
+            return 5
+        if "ack_live" in src:
+            return 4
+        if "csv" in src:
+            return 3
+        if "cache" in src:
+            return 2
+        if "rows" in src:
+            return 1
+        return 0
+    except Exception:
+        return 0
+
+
+def _lxv_build_live_zone_row_for_round(rid):
+    try:
+        rid = int(rid or 0)
+        if rid <= 0:
+            return None
+        rows_live = []
+        build_fn = globals().get("_ack_live_build_rows")
+        if callable(build_fn):
+            rows_live = list(build_fn() or [])
+        calc_fn = globals().get("_ack_live_calc_summary")
+        summary = calc_fn(rows_live, rid) if callable(calc_fn) else None
+        if not isinstance(summary, dict):
+            return None
+        v = int(summary.get("n_verdes", summary.get("verdes", -1)) or -1)
+        r = int(summary.get("n_rojos", summary.get("rojos", -1)) or -1)
+        complete = bool(summary.get("round_complete", summary.get("complete", False)))
+        dq = str(summary.get("data_quality", summary.get("quality", "")) or "").strip().lower()
+        expected = int(len(globals().get("BOT_NAMES", []) or []) or 6)
+        if expected <= 0:
+            expected = 6
+        if v < 0 or r < 0 or (v + r) != expected:
+            return None
+        return {
+            "round_id": rid,
+            "n_verdes": v,
+            "n_rojos": r,
+            "round_complete": complete,
+            "data_quality": dq or "ok",
+            "source": "round_live",
+            "_zona_source": "round_live",
+        }
+    except Exception:
+        return None
+
 def _lxv_zona_bool_complete(rr, v, r, expected):
     try:
         if bool((rr or {}).get("round_complete", (rr or {}).get("complete", False))):
@@ -6147,6 +6215,12 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
         except Exception:
             pass
         source_resumen = "+".join(source_tags) if source_tags else "none"
+        if target_rid is not None:
+            live_row = _lxv_build_live_zone_row_for_round(target_rid)
+            if isinstance(live_row, dict):
+                all_rows.append(dict(live_row))
+                source_tags.append("round_live")
+                source_resumen = "+".join(dict.fromkeys(source_tags)) if source_tags else "none"
         base["source"] = source_resumen
         base["sources"] = source_resumen
         norm=[]
@@ -6189,25 +6263,65 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
             if not isinstance(prv, dict):
                 dedup[rid] = rr
                 continue
-            rank_new = (_lxv_zona_quality_rank(rr.get("data_quality", "")), 1 if bool(rr.get("round_complete")) else 0, rid)
-            rank_old = (_lxv_zona_quality_rank(prv.get("data_quality", "")), 1 if bool(prv.get("round_complete")) else 0, rid)
+            rank_new = (
+                1 if (target_rid is not None and rid == target_rid) else 0,
+                _lxv_zona_source_rank(rr.get("source", rr.get("_zona_source", ""))),
+                _lxv_zona_quality_rank(rr.get("data_quality", "")),
+                1 if bool(rr.get("round_complete")) else 0,
+                rid,
+            )
+            rank_old = (
+                1 if (target_rid is not None and rid == target_rid) else 0,
+                _lxv_zona_source_rank(prv.get("source", prv.get("_zona_source", ""))),
+                _lxv_zona_quality_rank(prv.get("data_quality", "")),
+                1 if bool(prv.get("round_complete")) else 0,
+                rid,
+            )
             if rank_new > rank_old:
                 dedup[rid] = rr
         norm = sorted(list(dedup.values()), key=lambda x: int(x.get("round_id", 0)))
         if target_rid is not None:
             norm = [x for x in norm if int(x["round_id"]) <= target_rid]
+            idx = next((i for i, x in enumerate(norm) if int(x.get("round_id", 0) or 0) == target_rid), -1)
+            if idx < 0:
+                out = dict(base)
+                out.update({
+                    "zona": "INSUFICIENTE",
+                    "fase": "INSUFICIENTE",
+                    "decision": ZONA_NO_INVERTIR,
+                    "allow_real": False,
+                    "motivo": "target_round_missing",
+                    "round_id": target_rid,
+                    "cols_usadas": len(norm),
+                    "source": source_resumen,
+                    "sources": source_resumen,
+                    "zona_model": "PROM3_PROM8_PROM20",
+                    "ok": True,
+                })
+                return out
+            norm = norm[:idx + 1]
+            if int((norm[-1] or {}).get("round_id", 0) or 0) != int(target_rid):
+                out = dict(base)
+                out.update({
+                    "zona": "INSUFICIENTE",
+                    "fase": "INSUFICIENTE",
+                    "decision": ZONA_NO_INVERTIR,
+                    "allow_real": False,
+                    "motivo": "target_round_not_current",
+                    "round_id": target_rid,
+                    "cols_usadas": len(norm),
+                    "source": source_resumen,
+                    "sources": source_resumen,
+                    "zona_model": "PROM3_PROM8_PROM20",
+                    "ok": True,
+                })
+                return out
         min_cols = int(globals().get("LXV_ZONA_MIN_COLUMNS", globals().get("LXV_FASE_MIN_COLUMNS", 3)) or 3)
         if len(norm) < min_cols:
             out=dict(base); out.update({"zona":"INSUFICIENTE","fase":"INSUFICIENTE","decision":ZONA_NO_INVERTIR,"allow_real":False,"motivo":"historial_insuficiente","cols_usadas":len(norm),"cols_requeridas":min_cols,"source":source_resumen,"sources":source_resumen,"ok":True})
             return out
         curr = norm[-1]
         rid0 = int(curr["round_id"])
-        if target_rid is not None:
-            idx = next((i for i,x in enumerate(norm) if int(x["round_id"]) == target_rid), -1)
-            if idx >= 0:
-                norm = norm[:idx+1]
-                curr = norm[-1]
-                rid0 = int(curr["round_id"])
         if len(norm) < 3:
             out=dict(base); out.update({"source":source_resumen,"sources":source_resumen,"round_id":rid0,"cols_usadas":len(norm),"zona_model":"PROM3_PROM8_PROM20"})
             return out
