@@ -460,6 +460,7 @@ SYNC_WAIT_HEARTBEAT_S = 2.0
 SYNC_WAIT_STALE_S = 90.0
 SYNC_WAIT_MAX_IDLE_S = 240.0
 SYNC_WAIT_ABSOLUTE_MAX_S = 360.0
+SYNC_STANDBY_PRINT_COOLDOWN_S = 10.0
 
 
 def _sync_round_state_ts(st: dict) -> float:
@@ -506,6 +507,7 @@ async def _sync_round_wait_release(round_id: int) -> int:
     last_released = None
     last_state_ts = 0.0
     first_wait_tick = True
+    last_standby_print_ts = 0.0
     while not stop_event.is_set():
         st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
         try:
@@ -612,7 +614,9 @@ async def _sync_round_wait_release(round_id: int) -> int:
                 + Style.RESET_ALL
             )
             return next_round
-        if _print_once(f"sync-standby-{rid}", ttl=6.0):
+        now_print = time.time()
+        if (now_print - last_standby_print_ts) >= float(globals().get("SYNC_STANDBY_PRINT_COOLDOWN_S", 10.0)):
+            last_standby_print_ts = now_print
             print(Fore.CYAN + f"… standby columna {NOMBRE_BOT}: ronda #{rid}, released_round={released}")
         await asyncio.sleep(SYNC_WAIT_POLL_S)
     estado_bot["sync_wait"] = False
