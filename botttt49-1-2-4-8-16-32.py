@@ -422,7 +422,7 @@ def _sync_round_emit_close_ack(round_id: int, resultado: str, contract_id=None, 
         "status": "closed",
         "mode": mode_sync,
         "source": "ORDEN_REAL" if mode_sync == "REAL" else "SYNC_DEMO",
-        "token": str(leer_token_actual() or ""),
+        "token": "DEMO" if mode_sync == "DEMO" else str(leer_token_actual() or ""),
     }
     ok = _sync_round_write_json_atomic(_sync_round_ack_path(), payload)
     if ok:
