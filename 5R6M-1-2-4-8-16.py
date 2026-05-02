@@ -2892,6 +2892,9 @@ LXV_SYNC_ROUND_MAX_WAIT_S = 240.0
 LXV_SYNC_BOT_STALE_S = 120.0
 LXV_SYNC_PENDING_MAX_WAIT_S = 240.0
 LXV_SYNC_MIN_CLOSED_FOR_EVAL = 4
+SYNC_TURBO_WATCHER_ENABLE = True
+SYNC_TURBO_WATCHER_INTERVAL_S = 0.20
+SYNC_TURBO_WATCHER_LOG_COOLDOWN_S = 5.0
 ACK_LIVE_HUD_ENABLE = True
 ACK_LIVE_MAX_AGE_WARN_S = 10.0
 ACK_LIVE_MAX_AGE_STALE_S = 120.0
@@ -2911,6 +2914,7 @@ ACK_LIVE_TAPE = {}
 ACK_LIVE_TAPE_SEEN = deque(maxlen=2000)
 _SYNC_ROUND_LAST_ANNOUNCED = None
 _SYNC_ROUND_LAST_CLOSED_COUNT = {}
+_SYNC_TURBO_WATCHER_STARTED = False
 _LXV_LAST_EMITTED_ROUND = 0
 LXV_REAL_EMITIDOS_POR_RONDA = set()
 LXV_REAL_EMITIDOS_MAX_KEEP = 300
@@ -7014,7 +7018,7 @@ def _sync_round_tick_maestro():
         )
     real_on_now, _, _ = _sync_real_turn_activo()
     elapsed_started = max(0.0, float(time.time()) - float(started_at))
-    if status_now == "waiting_closures" and elapsed_started > 60.0 and missing:
+    if status_now == "waiting_closures" and elapsed_started > 60.0 and missing and (not direct_ack_full):
         miss_short = [f"{b}:{sync_debug_missing.get(b, 'ack_missing')}" for b in missing]
         _lxv_5v1x_event_cooldown(
             key=f"sync_wait_60:{round_id}",
@@ -7340,6 +7344,11 @@ def _sync_round_tick_maestro():
                     _sync_round_write_json_atomic(ack_path, ack_cur)
             except Exception:
                 pass
+    if completed and (not real_emitido) and hold_status not in ("holding_real_result", "holding_real_turn"):
+        payload["released_round"] = int(round_id) + 1
+        payload["status"] = "released"
+        if not str(payload.get("reason", "")).startswith("turbo_sync_6_6_no_real_release"):
+            payload["reason"] = "turbo_sync_6_6_no_real_release"
     release_written = False
     if completed:
         emit_bot_now = real_hold_bot or str(locals().get("emit_bot") or "")
@@ -7360,11 +7369,52 @@ def _sync_round_tick_maestro():
             )
             return
     if completed:
+        motivo_no_release = ""
+        if hold_status in ("holding_real_result", "holding_real_turn"):
+            motivo_no_release = hold_status
+        elif any(str(sync_debug_missing.get(bot, "")).strip() == "pending_contract_resolution" for bot in BOT_NAMES):
+            motivo_no_release = "pending_contract_resolution"
+        elif _hay_real_close_pending_activo()[0]:
+            motivo_no_release = "real_close_pending"
+        elif (not real_emitido) and str(payload.get("released_round", round_id)) == str(round_id):
+            motivo_no_release = "write_state_failed"
+        if motivo_no_release:
+            agregar_evento(f"⛔ TURBO_SYNC_NO_RELEASE: ronda #{round_id} 6/6 pero bloqueado por {motivo_no_release}")
         agregar_evento("🧯 SYNC invariant recovery: completed=True sin HOLD/RELEASE; liberando next_round")
         _sync_round_release_next_round(round_id, "sync_invariant_completed_no_release")
         return
     _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
 # === /LXV_SYNC_COLUMN ===
+
+def _sync_turbo_watcher_loop():
+    while True:
+        try:
+            _sync_round_tick_maestro()
+        except Exception as e:
+            try:
+                _lxv_5v1x_event_cooldown(
+                    key=f"sync_turbo_watcher_err:{type(e).__name__}:{str(e)[:40]}",
+                    msg=f"⚠️ SYNC_TURBO_WATCHER error: {type(e).__name__}: {e}",
+                    cooldown_s=float(SYNC_TURBO_WATCHER_LOG_COOLDOWN_S),
+                )
+            except Exception:
+                pass
+        time.sleep(float(SYNC_TURBO_WATCHER_INTERVAL_S))
+
+def _start_sync_turbo_watcher():
+    global _SYNC_TURBO_WATCHER_STARTED
+    if not bool(globals().get("SYNC_TURBO_WATCHER_ENABLE", True)):
+        return
+    if bool(globals().get("_SYNC_TURBO_WATCHER_STARTED", False)):
+        return
+    _SYNC_TURBO_WATCHER_STARTED = True
+    th = threading.Thread(
+        target=_sync_turbo_watcher_loop,
+        daemon=True,
+        name="sync-turbo-watcher",
+    )
+    th.start()
+    agregar_evento("⚡ SYNC_TURBO_WATCHER iniciado: tick maestro cada 0.20s")
 
 def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") -> None:
     st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
@@ -22542,6 +22592,7 @@ async def main():
             inicializar_hud_boot_baseline()
         # Pasada inicial para sincronizar HUD con CSV existentes
         _sync_round_bootstrap_state(force=False)
+        _start_sync_turbo_watcher()
         token_actual_loop = "--"  # Dummy para carga inicial
         for bot in BOT_NAMES:
             await cargar_datos_bot(bot, token_actual_loop)
