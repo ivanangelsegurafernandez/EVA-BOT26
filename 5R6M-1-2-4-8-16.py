@@ -6799,13 +6799,12 @@ def _sync_round_collect_closed_acks(round_id: int) -> tuple[dict, dict]:
             reasons[bot] = "ack_real_ignored"
             continue
         if explicit_demo_ack and ack_token.startswith("REAL:"):
-            reasons[bot] = "stale_token_in_demo_ack"
-            continue
+            reasons[bot] = "ok_demo_token_real_stale"
         res = str(ack.get("resultado", "")).upper().strip()
         if res not in ("GANANCIA", "PÉRDIDA"):
             reasons[bot] = f"resultado_invalid_{res or 'empty'}"
             continue
-        if reasons.get(bot) != "stale_token_in_demo_ack":
+        if reasons.get(bot) not in ("ok_demo_token_real_stale",):
             reasons[bot] = "ok"
         closed[bot] = {
             "resultado": res,
@@ -6930,7 +6929,7 @@ def _sync_round_tick_maestro():
                 msg=f"ℹ️ ACK REAL ignorado para columna DEMO: bot={bot} round={round_id}",
                 cooldown_s=12.0,
             )
-        elif reason_bot == "stale_token_in_demo_ack":
+        elif reason_bot == "ok_demo_token_real_stale":
             rp = REAL_CLOSE_PENDING.get(bot)
             if isinstance(rp, dict) and rp.get("active"):
                 released_round = int(rp.get("round_id", 0) or 0)
@@ -6941,9 +6940,15 @@ def _sync_round_tick_maestro():
                         cooldown_s=12.0,
                     )
                     continue
+            ack_tok = ""
+            try:
+                ack_dbg = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
+                ack_tok = str((ack_dbg or {}).get("token", "") or "").strip() or "REAL:?"
+            except Exception:
+                ack_tok = "REAL:?"
             _lxv_5v1x_event_cooldown(
-                key=f"ack_stale_token_demo:{bot}:{round_id}",
-                msg=f"🟡 ACK DEMO aceptado con token REAL stale: bot={bot} round={round_id}",
+                key=f"demo_ack_token_stale_ok:{bot}:{round_id}",
+                msg=f"🟡 ACK DEMO aceptado aunque token_actual={ack_tok}: bot={bot} round={round_id}",
                 cooldown_s=12.0,
             )
 
