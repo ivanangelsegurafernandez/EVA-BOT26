@@ -391,7 +391,7 @@ def _sync_bot_es_owner_real() -> bool:
 
     return False
 
-def _sync_round_emit_close_ack(round_id: int, resultado: str, contract_id=None, asset=None, ciclo=None) -> bool:
+def _sync_round_emit_close_ack(round_id: int, resultado: str, contract_id=None, asset=None, ciclo=None, modo_real_contrato=False) -> bool:
     res = str(resultado or "").upper().strip()
     if res not in ("GANANCIA", "PÉRDIDA"):
         return False
@@ -403,12 +403,8 @@ def _sync_round_emit_close_ack(round_id: int, resultado: str, contract_id=None, 
         prev_round = 0
     if prev_round > rid:
         return False
-    try:
-        es_real_owner_ack = _sync_bot_es_owner_real()
-    except Exception:
-        es_real_owner_ack = False
-    if es_real_owner_ack:
-        print(Fore.CYAN + f"ℹ️ ACK SYNC omitido: operación REAL de {NOMBRE_BOT}; no contamina columna DEMO.")
+    if bool(modo_real_contrato):
+        print(Fore.CYAN + f"ℹ️ ACK SYNC omitido: contrato REAL de {NOMBRE_BOT}; no contamina columna DEMO.")
         return False
     mode_sync = "DEMO"
     payload = {
@@ -3232,14 +3228,24 @@ async def ejecutar_panel():
 
                 # LXV_SYNC_COLUMN: cierre definido -> ACK inmediato para maestro/HUD
                 round_id_local = int(estado_bot.get("sync_round_id", 1) or 1)
-                _sync_round_emit_close_ack(round_id_local, resultado, contract_id=contract_id, asset=symbol, ciclo=ciclo)
+                _sync_round_emit_close_ack(
+                    round_id_local,
+                    resultado,
+                    contract_id=contract_id,
+                    asset=symbol,
+                    ciclo=ciclo,
+                    modo_real_contrato=bool(modo_real),
+                )
 
                 print(Back.BLUE + Style.BRIGHT + f"\nTotal DEMO: {resultado_global['demo']:.2f} USD | Total REAL: {resultado_global['real']:.2f} USD")
                 await mostrar_saldos()
                 sep_ciclo()
 
-                # LXV_SYNC_COLUMN: standby hasta liberación global
-                estado_bot["sync_round_id"] = await _sync_round_wait_release(round_id_local)
+                # LXV_SYNC_COLUMN: standby hasta liberación global (solo DEMO)
+                if not modo_real:
+                    estado_bot["sync_round_id"] = await _sync_round_wait_release(round_id_local)
+                else:
+                    print(Fore.CYAN + f"ℹ️ Contrato REAL cerrado: {NOMBRE_BOT} no espera release DEMO de columna.")
 
                 # ========= MODO REAL =========
                 if modo_real:
@@ -3271,31 +3277,9 @@ async def ejecutar_panel():
                     except Exception:
                         ciclo_actual_real = 1
 
-                    if ciclo_actual_real < len(MARTINGALA_REAL):
-                        siguiente_ciclo = ciclo_actual_real + 1
-
-                        print(
-                            Fore.YELLOW + Style.BRIGHT +
-                            f"❌ PÉRDIDA en REAL C{ciclo_actual_real}. Continúa REAL en C{siguiente_ciclo}.\n"
-                        )
-
-                        estado_bot["ciclo_forzado"] = siguiente_ciclo
-                        estado_bot["ciclo_actual"] = siguiente_ciclo
-                        estado_bot["token_msg_mostrado"] = False
-                        estado_bot["ciclo_en_progreso"] = False
-
-                        try:
-                            globals()["primer_ingreso_real"] = True
-                        except Exception:
-                            pass
-
-                        await asyncio.sleep(PAUSA_POST_OPERACION_S + random.uniform(0.0, 0.5))
-                        ciclo = siguiente_ciclo
-                        continue
-
                     print(
                         Fore.RED + Style.BRIGHT +
-                        f"❌ PÉRDIDA en REAL C{ciclo_actual_real}. Fin de Martingala REAL. Volviendo a DEMO...\n"
+                        f"❌ PÉRDIDA en REAL C{ciclo_actual_real}. Turno terminado. Volviendo a DEMO. Próximo ciclo lo decide el MAESTRO.\n"
                     )
 
                     try:
@@ -3314,6 +3298,9 @@ async def ejecutar_panel():
                         commit_guard_clear()
                     except Exception:
                         pass
+
+                    estado_bot["token_msg_mostrado"] = False
+                    estado_bot["ciclo_en_progreso"] = False
 
                     reinicio_forzado.set()
                     break
