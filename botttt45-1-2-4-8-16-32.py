@@ -174,9 +174,11 @@ DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 ACTIVOS = ["1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"]
 MARTINGALA_DEMO = [1, 2, 4, 8, 16]
 MARTINGALA_REAL = [1, 2, 4, 8, 16]
-# NOTA: El nombre del archivo puede incluir "-32" por historial,
-# pero este bot opera oficialmente con 5 ciclos: 1-2-4-8-16.
-# No usar C6 salvo orden explícita.
+# NOTA OPERATIVA:
+# El nombre histórico del archivo puede incluir "-32",
+# pero este bot opera oficialmente con 5 ciclos:
+#     1-2-4-8-16
+# No agregar C6 / 32 USD salvo cambio explícito de estrategia.
 VELAS = 20
 PAUSA_POST_OPERACION_S = 2  # Pausa uniforme tras cada operación con resultado definido (BLOQUE 1)
 # ==================== VENTANA DE DECISIÓN IA ====================
@@ -535,19 +537,35 @@ async def _sync_round_wait_release(round_id: int) -> int:
         stale_state = (state_ts > 0) and ((now_ts - state_ts) >= SYNC_WAIT_STALE_S)
         idle_s = now_ts - last_progress_ts
         total_wait_s = now_ts - wait_start_ts
-        pending_contract = bool(estado_bot.get("pending_contract_resolution", False))
-        owner_real = _sync_bot_es_owner_real()
+        owner_real = False
+        try:
+            owner_real = bool(_sync_bot_es_owner_real())
+        except Exception:
+            owner_real = False
+        pending_contract_resolution = bool(estado_bot.get("pending_contract_resolution", False))
+        contrato_pendiente = bool(
+            estado_bot.get("contrato_pendiente", False)
+            or estado_bot.get("pending_contract", False)
+            or estado_bot.get("contract_pending", False)
+        )
+        en_modo_real = False
+        try:
+            en_modo_real = str(estado_bot.get("tipo_cuenta", "")).upper() == "REAL" or str(estado_bot.get("modo", "")).upper() == "REAL"
+        except Exception:
+            en_modo_real = False
         if idle_s >= SYNC_WAIT_MAX_IDLE_S:
             print(Fore.YELLOW + f"⚠️ LXV_SYNC_COLUMN no_progress: {NOMBRE_BOT} ronda #{rid} released={released} esperando #{next_round}")
             last_progress_ts = now_ts
-        if total_wait_s >= SYNC_WAIT_ABSOLUTE_MAX_S and (not owner_real) and (not pending_contract):
+        if total_wait_s >= SYNC_WAIT_ABSOLUTE_MAX_S and (not owner_real) and (not pending_contract_resolution) and (not contrato_pendiente) and (not en_modo_real):
             print(Fore.YELLOW + Style.BRIGHT + f"🟨 LXV_SYNC_COLUMN escape DEMO seguro: {NOMBRE_BOT} sale de standby por timeout visual, sin REAL activo.")
             estado_bot["sync_wait"] = False
+            if "sync_wait_round" in estado_bot:
+                estado_bot["sync_wait_round"] = None
             try:
                 _sync_round_write_release_heartbeat(rid, next_round)
             except Exception:
                 pass
-            return released if released >= next_round else next_round
+            return released
         if (idle_s >= SYNC_WAIT_MAX_IDLE_S) and (
             stale_state or total_wait_s >= (SYNC_WAIT_STALE_S + SYNC_WAIT_MAX_IDLE_S)
         ):
@@ -629,7 +647,10 @@ def _orden_real_payload_vivo(data: dict | None) -> bool:
 def _orden_real_candidate_paths():
     paths = []
     try:
-        paths.append(os.path.join(ORDEN_DIR, f"{NOMBRE_BOT}.json"))
+        orden_dir = globals().get("ORDEN_DIR", "orden_real")
+        bot = str(globals().get("NOMBRE_BOT", "") or "").strip()
+        if bot:
+            paths.append(os.path.join(orden_dir, f"{bot}.json"))
     except Exception:
         pass
     paths.append("orden_real.json")
@@ -705,8 +726,13 @@ def leer_orden_real(bot: str):
             with open(tmp, "r", encoding="utf-8") as f:
                 data = json.load(f)
             os.remove(tmp)
-            if data.get("bot") != bot:
-                return None, None, 0, None
+            payload_bot = str(data.get("bot") or "").strip()
+            is_fallback = os.path.basename(ruta) == "orden_real.json"
+            if payload_bot:
+                if payload_bot != bot:
+                    continue
+            elif not is_fallback:
+                continue
             if bool(data.get("consumed", False)):
                 return None, None, 0, None
             raw_ciclo = (
