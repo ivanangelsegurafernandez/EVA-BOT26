@@ -6006,80 +6006,250 @@ def _real_locks_ready_pre_real():
     except Exception:
         return False
 
-def hay_real_activo_global() -> tuple[bool, str]:
+# ============================================================
+# PARCHE REAL_ACTIVO + PREPATRÓN LXV
+# ============================================================
+
+_REAL_PREPATRON_EVENT_TS = {}
+
+def _real_prepatron_event_cooldown(key: str, msg: str, cooldown_s: float = 15.0) -> None:
+    """Evento con cooldown mínimo para evitar spam visual."""
     try:
-        tok = ""
-        if callable(globals().get("leer_token_actual")):
-            tok = str(leer_token_actual() or "").strip()
-        up = tok.upper()
-        if "REAL:" in up and "REAL:NONE" not in up:
-            owner = tok.split("REAL:", 1)[1].strip() if "REAL:" in tok else tok
-            if owner and owner.strip().lower() != "none":
-                return True, f"token_actual_REAL:{tok}"
-        st = globals().get("LAST_REAL_OWNER_STATE")
-        if isinstance(st, dict):
-            if str(st.get("owner_bot", "") or "").strip() or str(st.get("bot", "") or "").strip() or bool(st.get("assigned_ts")):
-                return True, f"LAST_REAL_OWNER_STATE:{st.get('owner_bot') or st.get('bot') or 'assigned'}"
-        for k in ("REAL_CLOSE_PENDING", "real_close_pending", "owner_real", "bot_real_activo", "REAL_OWNER", "BOT_REAL_ACTIVO", "_REAL_OWNER", "_REAL_ACTIVE_OWNER", "LAST_REAL_BOT"):
-            v = globals().get(k, None)
-            if isinstance(v, dict):
-                if any(bool(x) for x in v.values()):
-                    return True, f"{k}:dict_active"
-            elif isinstance(v, bool):
-                if v:
-                    return True, f"{k}:true"
-            elif isinstance(v, str):
-                vv = v.strip()
-                if vv and vv.lower() not in ("none", "false", "0", "demo"):
-                    return True, f"{k}:{vv}"
-        for k, v in list(globals().items()):
-            if "token" in str(k).lower() and isinstance(v, str):
-                uv = v.upper().strip()
-                if "REAL:" in uv and "REAL:NONE" not in uv:
-                    return True, f"{k}:{v}"
+        now = time.time()
+        last = float(_REAL_PREPATRON_EVENT_TS.get(str(key), 0.0) or 0.0)
+        if (now - last) < float(cooldown_s):
+            return
+        _REAL_PREPATRON_EVENT_TS[str(key)] = now
+        try:
+            agregar_evento(str(msg))
+        except Exception:
+            print(str(msg))
+    except Exception:
+        pass
+
+
+def hay_real_activo_global() -> tuple[bool, str]:
+    """
+    Detecta de forma conservadora si ya existe REAL activo o token REAL tomado.
+    Nunca debe lanzar excepción.
+    Retorna:
+        (True, motivo) si hay REAL activo.
+        (False, motivo) si no lo hay.
+    """
+    try:
+        # 1) token_actual.txt
+        try:
+            token_path = "token_actual.txt"
+            if os.path.exists(token_path):
+                with open(token_path, "r", encoding="utf-8", errors="ignore") as f:
+                    raw = str(f.read() or "").strip()
+                raw_low = raw.lower().replace(" ", "")
+                if "real:" in raw_low and "real:none" not in raw_low:
+                    after = raw_low.split("real:", 1)[-1].strip()
+                    if after and after not in ("none", "null", "0", "-"):
+                        return True, f"token_actual_REAL:{raw}"
+        except Exception:
+            pass
+
+        # 2) LAST_REAL_OWNER_STATE
+        try:
+            st = globals().get("LAST_REAL_OWNER_STATE", None)
+            if isinstance(st, dict):
+                owner = st.get("owner_bot") or st.get("bot") or st.get("owner")
+                assigned_ts = float(st.get("assigned_ts", st.get("ts", 0.0)) or 0.0)
+                if owner:
+                    edad = time.time() - assigned_ts if assigned_ts > 0 else 0.0
+                    if assigned_ts <= 0 or edad <= float(globals().get("REAL_CLOSE_MAX_AGE_S", 90)) * 3:
+                        return True, f"LAST_REAL_OWNER_STATE:{owner}"
+        except Exception:
+            pass
+
+        # 3) variables globales posibles
+        nombres = [
+            "REAL_CLOSE_PENDING",
+            "real_close_pending",
+            "owner_real",
+            "bot_real_activo",
+            "REAL_OWNER",
+            "BOT_REAL_ACTIVO",
+            "_REAL_OWNER",
+            "_REAL_ACTIVE_OWNER",
+            "LAST_REAL_BOT",
+        ]
+        for name in nombres:
+            try:
+                val = globals().get(name, None)
+                if val is None:
+                    continue
+                if isinstance(val, bool) and val:
+                    return True, f"{name}=True"
+                if isinstance(val, str):
+                    s = val.strip()
+                    if s and s.lower() not in ("none", "real:none", "demo", "false", "0", "-", "null"):
+                        return True, f"{name}:{s}"
+                if isinstance(val, dict):
+                    owner = val.get("owner_bot") or val.get("bot") or val.get("owner")
+                    pending = val.get("pending") or val.get("active") or val.get("real_activo")
+                    if owner or pending:
+                        return True, f"{name}:{owner or pending}"
+            except Exception:
+                continue
+
+        # 4) búsqueda conservadora de estado REAL en memoria
+        for name, val in list(globals().items()):
+            try:
+                if not isinstance(name, str):
+                    continue
+                lname = name.lower()
+                if "token" not in lname and "real" not in lname:
+                    continue
+                if isinstance(val, str):
+                    s = val.strip()
+                    slow = s.lower().replace(" ", "")
+                    if "real:" in slow and "real:none" not in slow:
+                        return True, f"{name}:{s}"
+            except Exception:
+                continue
+
         return False, "libre"
+
     except Exception:
         return False, "error_check_real_activo"
 
+
 def _aplicar_bloqueo_real_activo_a_locks(locks: dict, resultado: str = "", falta: str = "") -> tuple[dict, str, str, bool, str]:
-    real_activo, motivo = hay_real_activo_global()
-    if real_activo:
-        locks["TOKEN_REAL_LIBRE"] = False
-        locks["ORDEN_REAL_OK"] = False
-        resultado = "REAL_ACTIVO / ESPERANDO CIERRE"
-        falta = "CIERRE_REAL_PENDIENTE"
-        return locks, resultado, falta, True, motivo
-    return locks, resultado, falta, False, motivo
+    """
+    Si hay REAL activo, fuerza candados visuales/operativos para impedir nueva orden REAL.
+    Retorna:
+        locks, resultado, falta, real_activo, motivo
+    """
+    try:
+        if not isinstance(locks, dict):
+            locks = {}
+        real_activo, motivo = hay_real_activo_global()
+        if real_activo:
+            locks["TOKEN_REAL_LIBRE"] = False
+            locks["ORDEN_REAL_OK"] = False
+            resultado = "REAL_ACTIVO / ESPERANDO CIERRE"
+            falta = "CIERRE_REAL_PENDIENTE"
+            _real_prepatron_event_cooldown(
+                "real_activo_lock",
+                f"🟡 REAL activo detectado: bloqueando nueva orden REAL hasta cierre | motivo={motivo}",
+                15.0,
+            )
+            return locks, resultado, falta, True, motivo
+        return locks, resultado, falta, False, motivo
+    except Exception as e:
+        try:
+            locks["ORDEN_REAL_OK"] = False
+        except Exception:
+            pass
+        return locks, resultado or "ERROR_CHECK_REAL_ACTIVO", falta or str(e), False, "error"
+
 
 def clasificar_prepatron_lxv(verdes: int, rojas: int, cerrados: int, total: int = 6) -> dict:
-    out = {"prepatron":"NINGUNO","vigilar":False,"puede_5v1x":False,"puede_4v2x":False,"faltan":max(0, int(total)-int(cerrados)),"motivo":"sin_prepatron"}
+    """
+    Clasifica patrones parciales LXV que todavía NO emiten REAL,
+    pero deben ser vigilados porque pueden convertirse en 5V1X o 4V2X.
+    Nunca debe lanzar excepción.
+    """
     try:
-        v, r, c, t = int(verdes), int(rojas), int(cerrados), int(total or 6)
-        out["faltan"] = max(0, t - c)
+        v = int(verdes or 0)
+        r = int(rojas or 0)
+        c = int(cerrados or 0)
+        t = int(total or 6)
+        faltan = max(0, t - c)
+
+        base = {
+            "prepatron": "NINGUNO",
+            "vigilar": False,
+            "puede_5v1x": False,
+            "puede_4v2x": False,
+            "faltan": faltan,
+            "motivo": "sin_prepatron",
+        }
+
         if t != 6:
-            return out
+            return base
+
         if v == 3 and r == 1 and c == 4:
-            return {"prepatron":"PRE_5V1X_OR_4V2X","vigilar":True,"puede_5v1x":True,"puede_4v2x":True,"faltan":2,"motivo":"3V1X parcial: puede cerrar como 5V1X o 4V2X"}
+            return {
+                "prepatron": "PRE_5V1X_OR_4V2X",
+                "vigilar": True,
+                "puede_5v1x": True,
+                "puede_4v2x": True,
+                "faltan": faltan,
+                "motivo": "3V1X parcial: puede cerrar como 5V1X o 4V2X",
+            }
+
         if v == 4 and r == 0 and c == 4:
-            return {"prepatron":"PRE_5V1X","vigilar":True,"puede_5v1x":True,"puede_4v2x":False,"faltan":2,"motivo":"4V0X parcial: puede cerrar como 5V1X"}
+            return {
+                "prepatron": "PRE_5V1X",
+                "vigilar": True,
+                "puede_5v1x": True,
+                "puede_4v2x": False,
+                "faltan": faltan,
+                "motivo": "4V0X parcial: puede cerrar como 5V1X",
+            }
+
         if v == 2 and r == 2 and c == 4:
-            return {"prepatron":"PRE_4V2X_DEBIL","vigilar":True,"puede_5v1x":False,"puede_4v2x":True,"faltan":2,"motivo":"2V2X parcial: puede cerrar como 4V2X si faltantes son verdes"}
+            return {
+                "prepatron": "PRE_4V2X_DEBIL",
+                "vigilar": True,
+                "puede_5v1x": False,
+                "puede_4v2x": True,
+                "faltan": faltan,
+                "motivo": "2V2X parcial: puede cerrar como 4V2X si faltantes son verdes",
+            }
+
         if v == 4 and r == 1 and c == 5:
-            return {"prepatron":"PRE_5V1X_OR_4V2X_FINAL","vigilar":True,"puede_5v1x":True,"puede_4v2x":True,"faltan":1,"motivo":"4V1X parcial final: un cierre define 5V1X o 4V2X"}
+            return {
+                "prepatron": "PRE_5V1X_OR_4V2X_FINAL",
+                "vigilar": True,
+                "puede_5v1x": True,
+                "puede_4v2x": True,
+                "faltan": faltan,
+                "motivo": "4V1X parcial final: un cierre define 5V1X o 4V2X",
+            }
+
         if v == 3 and r == 2 and c == 5:
-            return {"prepatron":"PRE_4V2X_FINAL","vigilar":True,"puede_5v1x":False,"puede_4v2x":True,"faltan":1,"motivo":"3V2X parcial final: si falta verde cierra 4V2X"}
-        return out
+            return {
+                "prepatron": "PRE_4V2X_FINAL",
+                "vigilar": True,
+                "puede_5v1x": False,
+                "puede_4v2x": True,
+                "faltan": faltan,
+                "motivo": "3V2X parcial final: si falta verde cierra 4V2X",
+            }
+
+        return base
+
     except Exception:
-        return out
+        return {
+            "prepatron": "NINGUNO",
+            "vigilar": False,
+            "puede_5v1x": False,
+            "puede_4v2x": False,
+            "faltan": 0,
+            "motivo": "error_prepatron",
+        }
+
 
 def _render_prepatron_lxv_line(info_pre: dict, ronda: int | None = None) -> str:
+    """
+    Devuelve línea compacta para HUD.
+    Si no hay prepatrón, devuelve "".
+    """
     try:
         if not isinstance(info_pre, dict) or not bool(info_pre.get("vigilar", False)):
             return ""
-        ronda_txt = f"#{int(ronda)}" if isinstance(ronda, int) and ronda > 0 else "-"
-        return f"🟡 PREPATRÓN LXV: {info_pre.get('prepatron', 'NINGUNO')} | ronda={ronda_txt} | faltan={int(info_pre.get('faltan', 0) or 0)} | acción=VIGILAR"
+        pre = str(info_pre.get("prepatron", "NINGUNO"))
+        faltan = int(info_pre.get("faltan", 0) or 0)
+        ronda_txt = f"ronda=#{ronda}" if ronda is not None else "ronda=?"
+        return f"🟡 PREPATRÓN LXV: {pre} | {ronda_txt} | faltan={faltan} | acción=VIGILAR"
     except Exception:
         return ""
+
 
 def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_candidato="", round_complete=False, data_quality="", zona_info=None, candidate_info=None, order_status=None):
     try:
