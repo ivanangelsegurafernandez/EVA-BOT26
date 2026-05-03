@@ -6026,9 +6026,11 @@ def actualizar_real_locks_panel_desde_round_live():
         dq = str(summary.get("data_quality", "missing") or "missing").strip().lower()
         partial = str(summary.get("partial_pattern", "0V0X") or "0V0X").strip().upper()
         round_complete = bool(closed_count == expected_count and expected_count > 0)
-        zi = dict(globals().get("_LXV_ZONA_HUD_LAST_INFO", {}) or {})
-        if not zi:
-            zi = evaluar_fase_zona_verde_lxv(round_id_objetivo=rid if rid > 0 else None) or {}
+        zi = resolver_zona_lxv_para_round_live(
+            rid=rid,
+            round_complete=round_complete,
+            partial_pattern=partial,
+        )
         actualizar_real_locks_panel_lxv(
             source="ROUND_LIVE", round_id=rid, patron=partial, bot_candidato="--",
             round_complete=round_complete, data_quality=dq, zona_info=zi,
@@ -6043,6 +6045,59 @@ def actualizar_real_locks_panel_desde_round_live():
             REAL_LOCKS_PANEL["falta_principal"] = _real_locks_first_off() or "UNKNOWN_LOCK"
         except Exception:
             pass
+
+def resolver_zona_lxv_para_round_live(rid, round_complete, partial_pattern):
+    rid_int = int(rid or 0) if str(rid or "").strip() else 0
+    patron = str(partial_pattern or "0V0X").strip().upper()
+    try:
+        if bool(round_complete) and rid_int > 0:
+            info = evaluar_fase_zona_verde_lxv(round_id_objetivo=rid_int) or {}
+            info = dict(info) if isinstance(info, dict) else {}
+            info["source"] = "ROUND_LIVE/OFICIAL"
+            info["round_id_live"] = rid_int
+            info["round_id_zona"] = int(info.get("round_id", rid_int) or rid_int)
+            info["ronda_liberada_previa"] = "no"
+            return info
+    except Exception:
+        pass
+    visual = clasificar_zona_operativa_lxv() or {}
+    visual = dict(visual) if isinstance(visual, dict) else {}
+    prom3 = float(visual.get("prom3", 0.0) or 0.0)
+    prom8 = float(visual.get("prom8", 0.0) or 0.0)
+    prom20 = float(visual.get("prom20", 0.0) or 0.0)
+    d38 = float(visual.get("delta_3_8", prom3 - prom8) or 0.0)
+    if (prom3 >= (prom8 + float(globals().get("LXV_ZONA_DELTA_TEMPRANO", 0.02)))) or (prom3 >= 0.60):
+        visual_hint = "VERDE_EN_FORMACION"
+    elif (prom3 <= (prom8 - float(globals().get("LXV_ZONA_DROP_TARDIO", 0.08)))) or (prom3 <= 0.40):
+        visual_hint = "ROJO_EN_FORMACION"
+    elif float(visual.get("cols_usadas", 0) or 0) > 0:
+        visual_hint = "NEUTRO_EN_FORMACION"
+    else:
+        visual_hint = "SIN_DATOS"
+    rid_zona = int(visual.get("round_id", 0) or 0)
+    return {
+        "zona": "PRE_ZONA_VISUAL",
+        "fase": "PRE_ZONA_VISUAL",
+        "decision": "ESPERANDO_COLUMNA",
+        "allow_real": False,
+        "motivo": "columna_incompleta",
+        "source": "ROUND_LIVE/PARCIAL",
+        "round_id_live": rid_int,
+        "round_id_zona": rid_zona if rid_zona > 0 else None,
+        "round_id": rid_zona if rid_zona > 0 else rid_int,
+        "patron_live": patron,
+        "visual_hint": visual_hint,
+        "g_actual": visual.get("g_actual"),
+        "verdes0": visual.get("verdes0"),
+        "prom3": prom3,
+        "prom8": prom8,
+        "prom20": prom20,
+        "delta_3_8": d38,
+        "prev_full_green_streak": int(visual.get("prev_full_green_streak", 0) or 0),
+        "cols_usadas": int(visual.get("cols_usadas", 0) or 0),
+        "cols_requeridas": int(visual.get("cols_requeridas", int(globals().get("LXV_ZONA_MIN_COLUMNS", 3) or 3)) or 3),
+        "ronda_liberada_previa": "si" if (rid_zona > 0 and rid_int > 0 and rid_zona != rid_int) else "no",
+    }
 
 def render_real_locks_panel():
     try:
@@ -17986,7 +18041,29 @@ def _hud_zona_operativa_lxv_line(width=None):
         cols_usadas = int(info.get("cols_usadas", 0) or 0)
         cols_req = int(info.get("cols_requeridas", int(globals().get("LXV_ZONA_MIN_COLUMNS", 3) or 3)) or 3)
         source = str(info.get("source", info.get("sources", "none")))
-        line_hud = f"{emoji} ZONA LXV HUD GLOBAL: {zona} | {decision} | cols={cols_usadas}/{cols_req} | source={source} | motivo={motivo}"
+        rid_zona = int(info.get("round_id_zona", info.get("round_id", 0)) or 0)
+        rid_live = int(info.get("round_id_live", 0) or 0)
+        g_txt = "--"
+        try:
+            if info.get("g_actual", None) is not None:
+                g_txt = f"{float(info.get('g_actual')):.2f}"
+            elif info.get("verdes0", None) is not None:
+                g_txt = f"{int(info.get('verdes0', 0))}/6"
+        except Exception:
+            g_txt = "--"
+        prom3 = float(info.get("prom3", 0.0) or 0.0)
+        prom8 = float(info.get("prom8", 0.0) or 0.0)
+        prom20 = float(info.get("prom20", 0.0) or 0.0)
+        d38 = float(info.get("delta_3_8", 0.0) or 0.0)
+        prev_full = int(info.get("prev_full_green_streak", 0) or 0)
+        visual_hint = str(info.get("visual_hint", "") or "")
+        ronda_previa = str(info.get("ronda_liberada_previa", "no") or "no")
+        line_hud = (
+            f"{emoji} ZONA LXV HUD GLOBAL: {zona} | {decision} | motivo={motivo} | "
+            f"rid_zona={rid_zona if rid_zona > 0 else '--'} | rid_live={rid_live if rid_live > 0 else '--'} | "
+            f"cols={cols_usadas}/{cols_req} | g={g_txt} | prom3={prom3:.2f} prom8={prom8:.2f} prom20={prom20:.2f} d38={d38:+.2f} | "
+            f"prev_full={prev_full} | visual={visual_hint or '--'} | ronda_liberada_previa={ronda_previa} | source={source}"
+        )
         gate = dict(globals().get("_LXV_LAST_REAL_GATE_INFO", {}) or {})
         rid_gate = int(gate.get("round_id", 0) or 0)
         if rid_gate > 0:
