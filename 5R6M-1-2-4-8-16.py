@@ -6391,10 +6391,27 @@ def _render_prepatron_lxv_line(info_pre: dict, ronda: int | None = None) -> str:
 def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_candidato="", round_complete=False, data_quality="", zona_info=None, candidate_info=None, order_status=None):
     try:
         p = globals().get("REAL_LOCKS_PANEL", {})
+        existing_bot = str(p.get("bot", "") or "").strip()
+        new_bot = str(bot_candidato or "").strip()
+        same_round = str(p.get("round_id", "")) == str(round_id)
+        same_pattern = str(p.get("patron", "")) == str(patron)
+        if same_round and same_pattern and existing_bot and existing_bot not in ("--", "none", "None") and not new_bot:
+            bot_candidato = existing_bot
+            new_bot = existing_bot
+        ci = dict(candidate_info) if isinstance(candidate_info, dict) else {}
+        if same_round and same_pattern:
+            old_locks = p.get("locks", {}) if isinstance(p.get("locks", {}), dict) else {}
+            old_candidate_ok = bool(old_locks.get("CANDIDATO_VALIDO", False))
+            if old_candidate_ok and not bool(ci.get("candidate_ok", False)) and not new_bot:
+                ci = {"candidate_ok": True, "reason": "preserve_candidate_same_round"}
         p["enabled"] = bool(globals().get("LXV_REAL_LOCKS_PANEL_ENABLE", True))
         p["source"] = str(source or "")
         p["round_id"] = round_id
-        p["bot"] = str(bot_candidato or "")
+        bot_set = str(bot_candidato or "").strip()
+        if bot_set and bot_set not in ("--", "none", "None"):
+            p["bot"] = bot_set
+        elif not (same_round and same_pattern and existing_bot and existing_bot not in ("--", "none", "None")):
+            p["bot"] = str(bot_candidato or "")
         p["patron"] = str(patron or "")
         p["diag_visual"] = ""
         zi = zona_info if isinstance(zona_info, dict) else {}
@@ -6407,7 +6424,7 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
         zona_ok, zona_reason = _lxv_zona_es_invertible(zi)
         info_regional = clasificar_zona_regional_dominante_lxv(round_id_objetivo=round_id)
         patron_ok = str(patron) in ("4V2X", "5V1X")
-        cand_ok_try = bool((candidate_info or {}).get("candidate_ok", False))
+        cand_ok_try = bool(ci.get("candidate_ok", False))
         zi2 = combinar_zona_lxv_con_regional(zi, info_regional, patron_valido=patron_ok, candidato_valido=cand_ok_try)
         if isinstance(zi2, dict):
             zi = zi2
@@ -6433,8 +6450,11 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
         bot_cmp = str(bot_candidato or "").strip()
         tok_free = (owner in (None, "", "none", bot_cmp, "--")) and (tok in (None, "", "none", bot_cmp, "--"))
         _real_lock_set("TOKEN_REAL_LIBRE", bool(tok_free), f"owner={owner} token={tok}")
-        ci = candidate_info if isinstance(candidate_info, dict) else {}
         cand_ok = bool(ci.get("candidate_ok", False))
+        if patron_ok and bot_cmp and bot_cmp not in ("--", "none", "None"):
+            cand_ok = True
+            if not ci.get("reason"):
+                ci["reason"] = f"{str(patron)}_bot_candidato_ok"
         _real_lock_set("CANDIDATO_VALIDO", cand_ok, str(ci.get("reason", "")))
         _real_lock_set("ORDEN_REAL_OK", order_status if order_status in (True, False, None) else None, "")
         real_activo, motivo_real_activo = hay_real_activo_global()
@@ -25076,3 +25096,44 @@ def _selftest_lxv_prearmado_seguro():
 
 if os.environ.get("RUN_LXV_PREARMADO_SELFTEST") == "1":
     _selftest_lxv_prearmado_seguro()
+
+def _selftest_lxv_4v2x_candidate_panel():
+    global REAL_LOCKS_PANEL
+
+    REAL_LOCKS_PANEL = {"locks": {}}
+
+    zona_neutro = {
+        "zona": "NEUTRO",
+        "fase": "NEUTRO",
+        "decision": "NO_INVERTIR",
+        "motivo": "sin_predominio_dinamico",
+        "allow_real": False,
+    }
+
+    actualizar_real_locks_panel_lxv(
+        source="LXV_4V2X",
+        round_id=128,
+        patron="4V2X",
+        bot_candidato="fulll49",
+        round_complete=True,
+        data_quality="ok",
+        zona_info=zona_neutro,
+        candidate_info={"candidate_ok": True, "reason": "4v2x_ok"},
+        order_status=None,
+    )
+
+    p = REAL_LOCKS_PANEL
+    locks = p.get("locks", {})
+
+    assert p.get("bot") == "fulll49"
+    assert locks.get("CANDIDATO_VALIDO") is True
+    assert locks.get("PATRON_VALIDO") is True
+    assert locks.get("COLUMNA_COMPLETA") is True
+    assert locks.get("DATA_QUALITY_OK") is True
+    assert locks.get("ZONA_OK") is False
+    assert p.get("falta_principal") == "ZONA_OK"
+
+    print("SELFTEST LXV_4V2X_CANDIDATE_PANEL OK")
+
+if os.environ.get("RUN_LXV_4V2X_CANDIDATE_PANEL_SELFTEST") == "1":
+    _selftest_lxv_4v2x_candidate_panel()
