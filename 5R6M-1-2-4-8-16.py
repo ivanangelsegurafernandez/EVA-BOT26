@@ -6360,6 +6360,18 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
                 cooldown_s=15.0,
             )
         locks_panel = p.get("locks", {}) if isinstance(p.get("locks", {}), dict) else {}
+        hard_lock_names = [
+            "REAL_CLOSE_LIBRE",
+            "COLUMNA_COMPLETA",
+            "DATA_QUALITY_OK",
+            "PATRON_VALIDO",
+            "CANDIDATO_VALIDO",
+            "ZONA_OK",
+            "TOKEN_REAL_LIBRE",
+        ]
+        if any(locks_panel.get(k) is False for k in hard_lock_names):
+            _real_lock_set("ORDEN_REAL_OK", False, "hard_lock_off")
+            locks_panel = p.get("locks", {}) if isinstance(p.get("locks", {}), dict) else locks_panel
         res_calc = ""
         falta_calc = ""
         locks_panel, res_calc, falta_calc, real_activo, motivo_real_activo = _aplicar_bloqueo_real_activo_a_locks(locks_panel, res_calc, falta_calc)
@@ -6384,10 +6396,15 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
                 p["falta_principal"] = "ESPERANDO CIERRE 5V1X/4V2X"
                 p["resultado"] = "VIGILANDO PREPATRÓN"
                 if str(p.get("patron","")) == "5V0X":
-                    p["diag_visual"] = "VERDE_PARCIAL_FUERTE 5/6 | esperando si falta cierra X"
+                    p["diag_visual"] = "VERDE_PARCIAL_FUERTE 5/6 | falta 1 cierre | si falta=X => 5V1X"
             else:
                 p["falta_principal"] = first_off if first_off else "UNKNOWN_LOCK"
                 p["resultado"] = "BLOQUEADO"
+        info_visual = (zi.get("zona_visual_info", {}) if isinstance(zi.get("zona_visual_info", {}), dict) else {})
+        if not p.get("diag_visual") and isinstance(info_visual, dict) and info_visual:
+            diag_txt = str(info_visual.get("diagnostico", "") or "").strip()
+            if diag_txt:
+                p["diag_visual"] = diag_txt
         p["updated_ts"] = float(time.time())
         p["error"] = ""
     except Exception as e:
@@ -8125,6 +8142,12 @@ def _sync_round_tick_maestro():
             else:
                 motivo_no_real = motivo_exec if motivo_exec else f"no_real_{patron}"
         elif patron not in ("5V1X", "4V2X"):
+            try:
+                verdes_count = int(summary.get("verdes_count", 0) or 0)
+                rojas_count = int(summary.get("rojas_count", 0) or 0)
+            except Exception:
+                verdes_count = 0
+                rojas_count = 0
             pre = clasificar_prepatron_lxv(verdes_count, rojas_count, closed_count, expected_count)
             if bool(pre.get("vigilar", False)):
                 motivo_no_real = f"patron_parcial_vigilable:{patron}=>{pre.get('prepatron')}"
@@ -18707,6 +18730,9 @@ def _hud_zona_operativa_lxv_line(width=None):
         d38 = float(info.get("delta_3_8", 0.0) or 0.0)
         prev_full = int(info.get("prev_full_green_streak", 0) or 0)
         visual_hint = str(info.get("visual_hint", "") or "")
+        zv_info = info.get("zona_visual_info", {}) if isinstance(info.get("zona_visual_info", {}), dict) else {}
+        if isinstance(zv_info, dict) and zv_info:
+            visual_hint = str(zv_info.get("zona_visual", visual_hint) or visual_hint)
         ronda_previa = str(info.get("ronda_liberada_previa", "no") or "no")
         line_hud = (
             f"{emoji} ZONA LXV HUD GLOBAL: {zona} | {decision} | motivo={motivo} | "
