@@ -353,6 +353,12 @@ LXV_GREEN_EXHAUSTION_STREAK90_BLOCK = 1  # LEGACY: lógica absorbida por ZONA LX
 LXV_GREEN_EXHAUSTION_CURRENT90_BLOCK = True  # LEGACY: lógica absorbida por ZONA LXV DINÁMICA PROM3/PROM8/PROM20.
 LXV_GREEN_EXHAUSTION_PREV90_BLOCK = True  # LEGACY: lógica absorbida por ZONA LXV DINÁMICA PROM3/PROM8/PROM20.
 LXV_GREEN_EXHAUSTION_LOG_COOLDOWN_S = 20.0
+LXV_PREARMADO_ENABLE = True
+LXV_PREARMADO_SHADOW_ONLY = True
+LXV_PREARMADO_CAN_EMIT_REAL = False
+LXV_GREEN_OPPORTUNITY_STATS_ENABLE = True
+LXV_GREEN_OPPORTUNITY_LOG_COOLDOWN_S = 15.0
+LXV_GREEN_OPPORTUNITY_MAX_EVENTS = 200
 LXV_GREEN_EXHAUSTION_PREV_FULL_GREEN_MIN = 3
 LXV_GREEN_EXHAUSTION_ONLY_FULL_GREEN = True
 LXV_GREEN_EXHAUSTION_FAIL_OPEN = False
@@ -2969,6 +2975,23 @@ LXV_REAL_EMITIDOS_MAX_KEEP = 300
 _SYNC_PENDING_WARN_TS = {}
 _SYNC_STALE_WARN_TS = {}
 _LXV_5V1X_EVENT_TS = {}
+_LXV_PREARMADO_EVENT_TS = {}
+_LXV_GREEN_OPPORTUNITY_SEEN = set()
+LXV_GREEN_OPPORTUNITY_STATS = {
+    "verde_visual_detectado": 0,
+    "prearmado_bajo": 0,
+    "prearmado_medio": 0,
+    "prearmado_alto": 0,
+    "bloq_real_close": 0,
+    "bloq_columna": 0,
+    "bloq_dq": 0,
+    "bloq_patron": 0,
+    "bloq_candidato": 0,
+    "bloq_zona": 0,
+    "bloq_duplicado": 0,
+    "bloq_token": 0,
+    "real_emitido_desde_verde": 0,
+}
 _LXV_HEADER_WARN_TS = {}
 _LXV_HEADER_WARN_COOLDOWN_S = 180.0
 _MATRIZ_SKIP_WARN_TS = 0.0
@@ -18929,6 +18952,126 @@ def render_sync_wait_lxv_panel(summary: dict, release_state: dict | None = None)
         return []
 
 
+
+def diagnosticar_candado_bloqueante_lxv(locks: dict, summary: dict | None = None) -> str:
+    """Devuelve el primer candado que impide REAL. No cambia nada."""
+    try:
+        lk = locks if isinstance(locks, dict) else {}
+        prioridad = ["REAL_CLOSE_LIBRE","COLUMNA_COMPLETA","DATA_QUALITY_OK","PATRON_VALIDO","CANDIDATO_VALIDO","ZONA_OK","NO_DUPLICADO_RONDA","TOKEN_REAL_LIBRE","ORDEN_REAL_OK"]
+        for key in prioridad:
+            if lk.get(key) is False:
+                return key
+        return "DESCONOCIDO"
+    except Exception:
+        return "DESCONOCIDO"
+
+
+def _log_prearmado_lxv_event(key: str, msg: str, cooldown_s: float = 15.0) -> None:
+    try:
+        now = time.time()
+        last = float(_LXV_PREARMADO_EVENT_TS.get(key, 0.0) or 0.0)
+        if (now - last) >= float(cooldown_s or 15.0):
+            _LXV_PREARMADO_EVENT_TS[key] = now
+            agregar_evento(str(msg))
+    except Exception:
+        pass
+
+
+def _extraer_zona_visual_lxv(info: dict) -> str:
+    """
+    Extrae zona visual/regional desde distintos formatos posibles.
+    Nunca lanza excepción.
+    """
+    try:
+        if not isinstance(info, dict):
+            return ""
+
+        candidatos = [
+            info.get("zona_visual_info"),
+            info.get("zona_regional_temprana_info"),
+            info.get("visual"),
+            info.get("visual_hint"),
+            info.get("zona_visual"),
+            info.get("zona_regional_temprana"),
+        ]
+
+        for c in candidatos:
+            if isinstance(c, dict):
+                for k in ("zona_visual", "zona_regional_temprana", "zona_regional", "visual", "fase", "zona"):
+                    v = c.get(k)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+            elif isinstance(c, str) and c.strip():
+                return c.strip()
+
+        return ""
+    except Exception:
+        return ""
+
+
+def detectar_prearmado_lxv(info_zona: dict, summary: dict, locks: dict | None = None) -> dict:
+    """Detecta zona verde visual prioritaria. No emite REAL, no altera locks."""
+    base = {"prearmado": False, "nivel": "NO", "motivo": "sin_prearmado", "esperando": "", "patron_actual": "0V0X", "cerrados": 0, "esperados": 6, "faltan": 6, "zona_visual": "", "zona_oficial": "", "dq": "missing", "candado_principal": "DESCONOCIDO", "puede_ser_5v1x": False, "puede_ser_4v2x": False, "shadow_only": True, "round_id": 0}
+    try:
+        info = info_zona if isinstance(info_zona, dict) else {}
+        ss = summary if isinstance(summary, dict) else {}
+        lk = locks if isinstance(locks, dict) else {}
+        zv = _extraer_zona_visual_lxv(info)
+        zo = str(info.get("zona") or info.get("fase") or "")
+        patron = str(ss.get("partial_pattern") or info.get("patron") or info.get("patron_live") or "0V0X").upper()
+        cerr = int(ss.get("closed_count", 0) or 0); esp = int(ss.get("expected_count", 6) or 6)
+        dq = str(ss.get("data_quality", "missing") or "missing")
+        base.update({"patron_actual": patron, "cerrados": cerr, "esperados": esp, "faltan": max(0, esp-cerr), "zona_visual": zv, "zona_oficial": zo, "dq": dq, "round_id": int(ss.get("round_id",0) or 0), "candado_principal": diagnosticar_candado_bloqueante_lxv(lk, ss)})
+        verde = zv.startswith("VERDE_")
+        if (not verde) or any(x in zo.upper() for x in ("ROJA", "TARDIA", "BLOQ")):
+            return base
+        base["prearmado"] = True
+        base["motivo"] = "zona_verde_visual"
+        base["puede_ser_5v1x"] = patron in ("5V0X","4V1X","4V0X","3V1X")
+        base["puede_ser_4v2x"] = patron in ("3V2X","2V2X","4V1X","3V1X")
+        if cerr >= 4 and patron in ("4V0X","5V0X","3V1X","4V1X","3V2X","2V2X"):
+            base["nivel"] = "ALTO"
+            waits={"5V0X":"esperando X final para 5V1X","4V0X":"esperando cierres para 5V1X","3V1X":"esperando cierre hacia 5V1X o 4V2X","4V1X":"esperando cierre final hacia 5V1X o 4V2X","3V2X":"esperando verde final para 4V2X","2V2X":"esperando verdes para 4V2X"}
+            base["esperando"]=waits.get(patron,"esperando confirmación oficial")
+        elif 1 <= cerr <= 3 and patron not in ("5V1X","4V2X"):
+            base["nivel"] = "MEDIO"; base["esperando"] = "columna oficial y patrón 5V1X/4V2X"
+        elif cerr == 0:
+            base["nivel"] = "BAJO"; base["esperando"] = "primeros cierres oficiales"
+        else:
+            base["nivel"] = "NO"; base["prearmado"] = False
+        return base
+    except Exception:
+        return base
+
+
+def registrar_oportunidad_verde_lxv(info_prearmado: dict, locks: dict, emitio_real: bool = False) -> None:
+    try:
+        if not bool(globals().get("LXV_GREEN_OPPORTUNITY_STATS_ENABLE", True)):
+            return
+        ip = info_prearmado if isinstance(info_prearmado, dict) else {}
+        if not ip.get("prearmado"):
+            return
+        key = f"{int(ip.get('round_id',0) or 0)}:{ip.get('nivel','NO')}:{ip.get('patron_actual','0V0X')}:{int(ip.get('cerrados',0) or 0)}:{ip.get('candado_principal','DESCONOCIDO')}"
+        if key in _LXV_GREEN_OPPORTUNITY_SEEN:
+            return
+        _LXV_GREEN_OPPORTUNITY_SEEN.add(key)
+        if len(_LXV_GREEN_OPPORTUNITY_SEEN) > 500:
+            _LXV_GREEN_OPPORTUNITY_SEEN.clear()
+        st = LXV_GREEN_OPPORTUNITY_STATS
+        st["verde_visual_detectado"] += 1
+        n = str(ip.get("nivel","NO") or "NO").lower()
+        if n == "alto": st["prearmado_alto"] += 1
+        elif n == "medio": st["prearmado_medio"] += 1
+        elif n == "bajo": st["prearmado_bajo"] += 1
+        if emitio_real:
+            st["real_emitido_desde_verde"] += 1
+            return
+        m = {"COLUMNA_COMPLETA":"bloq_columna","DATA_QUALITY_OK":"bloq_dq","PATRON_VALIDO":"bloq_patron","CANDIDATO_VALIDO":"bloq_candidato","ZONA_OK":"bloq_zona","NO_DUPLICADO_RONDA":"bloq_duplicado","TOKEN_REAL_LIBRE":"bloq_token","REAL_CLOSE_LIBRE":"bloq_real_close"}
+        k = m.get(str(ip.get("candado_principal","")), "")
+        if k: st[k] += 1
+    except Exception:
+        pass
+
 def render_estado_lxv_actual_panel(info_zona: dict, summary: dict, locks: dict | None = None, release_state: dict | None = None) -> list[str]:
     """Renderiza panel grande y claro por capas OFICIAL/REGIONAL/COLUMNA/SYNC/REAL/FINAL."""
     try:
@@ -18958,6 +19101,15 @@ def render_estado_lxv_actual_panel(info_zona: dict, summary: dict, locks: dict |
         tok = leer_token_actual() if callable(globals().get("leer_token_actual")) else None
         owner = globals().get("REAL_OWNER_LOCK")
         bot_real = owner if owner in BOT_NAMES else "ninguno"
+        info_prearmado = detectar_prearmado_lxv(info, ss, lk) if bool(globals().get("LXV_PREARMADO_ENABLE", True)) else {"prearmado": False, "nivel": "NO"}
+        if info_prearmado.get("prearmado"):
+            registrar_oportunidad_verde_lxv(info_prearmado, lk, emitio_real=False)
+            if str(info_prearmado.get("nivel")) == "ALTO":
+                _log_prearmado_lxv_event(f"alto:{info_prearmado.get('round_id')}:{info_prearmado.get('patron_actual')}", f"🟢 PRE-ARMADO LXV ALTO | zona={info_prearmado.get('zona_visual')} | patrón={info_prearmado.get('patron_actual')} | cerrados={info_prearmado.get('cerrados')}/{info_prearmado.get('esperados')} | esperando={info_prearmado.get('esperando')} | NO_EMITE_REAL", cooldown_s=float(globals().get("LXV_GREEN_OPPORTUNITY_LOG_COOLDOWN_S", 15.0)))
+            elif str(info_prearmado.get("nivel")) == "MEDIO":
+                _log_prearmado_lxv_event(f"medio:{info_prearmado.get('round_id')}:{info_prearmado.get('patron_actual')}", f"🟡 PRE-ARMADO LXV MEDIO | zona={info_prearmado.get('zona_visual')} | cerrados={info_prearmado.get('cerrados')}/{info_prearmado.get('esperados')} | esperando columna oficial", cooldown_s=float(globals().get("LXV_GREEN_OPPORTUNITY_LOG_COOLDOWN_S", 15.0)))
+            elif str(info_prearmado.get("nivel")) == "BAJO":
+                _log_prearmado_lxv_event(f"bajo:{info_prearmado.get('round_id')}:{info_prearmado.get('patron_actual')}", "⬜ PRE-ARMADO LXV BAJO | zona verde visual inicial | esperando primeros cierres", cooldown_s=float(globals().get("LXV_GREEN_OPPORTUNITY_LOG_COOLDOWN_S", 15.0)))
         if closed_count < expected_count:
             final = "NO_INVERTIR_AÚN | zona verde visual, esperando columna oficial"
         elif not bool(lk.get("PATRON_VALIDO", False)):
@@ -18969,6 +19121,16 @@ def render_estado_lxv_actual_panel(info_zona: dict, summary: dict, locks: dict |
         w=92
         row=lambda t: f"║ {str(t)[:w-4].ljust(w-4)} ║"
         lines=["╔"+"═"*(w-2)+"╗",row("🧭 ESTADO LXV ACTUAL"),row(f"OFICIAL : {zona} | decisión={decision} | motivo={motivo}"),row(f"REGIONAL: {reg_z} | prom3={prom3:.2f} prom8={prom8:.2f} d38={d38:+.2f} | acción={action}"),row(f"COLUMNA : {col_state} | cerrados={closed_count}/{expected_count} | faltan={faltan_count} | patrón={patron} | dq={dq} | g_columna={g_col_txt} | g_visual={g_vis_txt}"),row(f"SYNC    : {'ESPERANDO_BOTS' if faltan_count>0 else 'OK'} | {sync_txt} | REAL={'no_evaluado' if faltan_count>0 else 'evaluable'}"),row(f"REAL    : ACTIVO={'SI' if real_activo else 'NO'} | TOKEN={'DEMO' if tok in (None,'none','') else 'REAL'} | BOT_REAL={bot_real}"),row(f"FINAL   : {final}")]
+        if info_prearmado.get("prearmado"):
+            lines.append(row(f"PRE-ARMADO: {info_prearmado.get('nivel')} | zona={info_prearmado.get('zona_visual')} | patrón={info_prearmado.get('patron_actual')} | esperando={info_prearmado.get('esperando')}"))
+            lines.append(row(f"PRE-DETALLE: motivo={info_prearmado.get('motivo')} | candado={info_prearmado.get('candado_principal')} | shadow_only=SI"))
+            if (str(info_prearmado.get('zona_visual','')).startswith('VERDE_')) and (lk.get('ORDEN_REAL_OK') is False):
+                lines.append(row(f"NO_REAL_DESDE_VERDE | candado={info_prearmado.get('candado_principal')} | patrón={info_prearmado.get('patron_actual')} | cerrados={info_prearmado.get('cerrados')}/{info_prearmado.get('esperados')} | dq={info_prearmado.get('dq')}"))
+        else:
+            lines.append(row("PRE-ARMADO: NO"))
+        st = dict(globals().get('LXV_GREEN_OPPORTUNITY_STATS', {}) or {})
+        lines.append(row(f"OPORTUNIDADES VERDES: det={int(st.get('verde_visual_detectado',0))} | alto={int(st.get('prearmado_alto',0))} | medio={int(st.get('prearmado_medio',0))} | bajo={int(st.get('prearmado_bajo',0))}"))
+        lines.append(row(f"                     col={int(st.get('bloq_columna',0))} | dq={int(st.get('bloq_dq',0))} | pat={int(st.get('bloq_patron',0))} | cand={int(st.get('bloq_candidato',0))} | zona={int(st.get('bloq_zona',0))} | token={int(st.get('bloq_token',0))} | real={int(st.get('real_emitido_desde_verde',0))}"))
         pre = info.get("prepatron_info", {}) if isinstance(info.get("prepatron_info", {}), dict) else {}
         if pre.get("prepatron"):
             lines.append(row(f"PREPATRÓN: {pre.get('prepatron')} | acción={'VIGILAR' if pre.get('vigilar') else 'ESPERAR'}"))
@@ -24802,3 +24964,29 @@ def _selftest_hud_lxv_estado_claro():
 
 if os.environ.get("RUN_HUD_LXV_ESTADO_CLARO_SELFTEST") == "1":
     _selftest_hud_lxv_estado_claro()
+
+
+def _selftest_lxv_prearmado_seguro():
+    locks = {"REAL_CLOSE_LIBRE": True, "COLUMNA_COMPLETA": False, "DATA_QUALITY_OK": False, "PATRON_VALIDO": False, "CANDIDATO_VALIDO": False, "ZONA_OK": False, "NO_DUPLICADO_RONDA": True, "TOKEN_REAL_LIBRE": True, "ORDEN_REAL_OK": False}
+    info_zona = {"visual": "VERDE_TEMPRANO_VISUAL", "zona": "PRE_ZONA_VISUAL"}
+    summary = {"round_id": 100, "closed_count": 1, "expected_count": 6, "partial_pattern": "0V1X", "data_quality": "partial"}
+    p = detectar_prearmado_lxv(info_zona, summary, locks)
+    assert p["prearmado"] is True
+    assert p["nivel"] in ("BAJO", "MEDIO")
+    assert p["shadow_only"] is True
+    assert locks["ORDEN_REAL_OK"] is False
+    summary2 = {"round_id": 101, "closed_count": 5, "expected_count": 6, "partial_pattern": "5V0X", "data_quality": "partial"}
+    info_zona2 = {"visual": "VERDE_DOMINANTE_PARCIAL", "zona": "PRE_ZONA_VISUAL"}
+    p2 = detectar_prearmado_lxv(info_zona2, summary2, locks)
+    assert p2["prearmado"] is True
+    assert p2["nivel"] == "ALTO"
+    assert p2["shadow_only"] is True
+    info_zona3 = {"zona_visual_info": {"zona_visual": "VERDE_DOMINANTE_PARCIAL"}, "zona": "PRE_ZONA_VISUAL"}
+    summary3 = {"round_id": 102, "closed_count": 5, "expected_count": 6, "partial_pattern": "5V0X", "data_quality": "partial"}
+    p3 = detectar_prearmado_lxv(info_zona3, summary3, locks)
+    assert p3["prearmado"] is True
+    assert p3["nivel"] == "ALTO"
+    print("SELFTEST LXV_PREARMADO_SEGURO OK")
+
+if os.environ.get("RUN_LXV_PREARMADO_SELFTEST") == "1":
+    _selftest_lxv_prearmado_seguro()
