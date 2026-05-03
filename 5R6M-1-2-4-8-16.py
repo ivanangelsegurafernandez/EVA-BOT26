@@ -6147,6 +6147,46 @@ def _aplicar_bloqueo_real_activo_a_locks(locks: dict, resultado: str = "", falta
         return locks, resultado or "ERROR_CHECK_REAL_ACTIVO", falta or str(e), False, "error"
 
 
+def clasificar_zona_visual_parcial_lxv(patron: str, cerrados: int, esperados: int = 6, g: float | None = None, data_quality: str = "") -> dict:
+    """
+    Clasifica visualmente la columna parcial para HUD.
+    No habilita REAL.
+    Solo muestra diagnóstico visual claro.
+    Nunca lanza excepción.
+    """
+    try:
+        pat = str(patron or "").strip().upper()
+        c = int(cerrados or 0)
+        e = int(esperados or 6)
+        g_val = float(g) if isinstance(g, (int, float)) else None
+        dq = str(data_quality or "").strip().lower()
+        out = {
+            "zona_visual": "INSUFICIENTE",
+            "estado_visual": "POCOS_CIERRES",
+            "allow_real_visual": False,
+            "motivo_visual": "faltan cierres para zona visual confiable",
+            "color_visual": "white",
+            "emoji_visual": "⬜",
+            "accion_visual": "ESPERAR",
+            "cerrados": c,
+            "esperados": e,
+            "patron": pat,
+            "g": g_val,
+            "data_quality": dq,
+        }
+        if c == 5 and e == 6 and pat == "5V0X" and (g_val is not None and g_val >= 0.80):
+            out.update({"zona_visual":"VERDE_PARCIAL_FUERTE","estado_visual":"ESPERANDO_1_CIERRE","motivo_visual":"5 verdes de 6: falta 1 cierre; si falta cierra X será 5V1X","color_visual":"green","emoji_visual":"🟢","accion_visual":"VIGILAR_NO_INVERTIR_AUN"})
+        elif c == 4 and e == 6 and pat == "4V0X" and (g_val is not None and g_val >= 0.80):
+            out.update({"zona_visual":"VERDE_PARCIAL_EN_FORMACION","estado_visual":"ESPERANDO_2_CIERRES","motivo_visual":"4 verdes de 6: puede evolucionar a 5V1X o 4V2X","color_visual":"green","emoji_visual":"🟢","accion_visual":"VIGILAR"})
+        elif c >= 4 and (g_val is not None and g_val >= 0.65):
+            out.update({"zona_visual":"VERDE_DOMINANTE_PARCIAL","estado_visual":"COLUMNA_INCOMPLETA","motivo_visual":"predomina verde en columna parcial","color_visual":"green","emoji_visual":"🟢","accion_visual":"VIGILAR"})
+        elif c >= 4 and (g_val is not None and g_val < 0.50):
+            out.update({"zona_visual":"ROJA_O_MIXTA_PARCIAL","estado_visual":"COLUMNA_INCOMPLETA","motivo_visual":"no predomina verde","color_visual":"red","emoji_visual":"🔴","accion_visual":"NO_INVERTIR"})
+        return out
+    except Exception:
+        return {"zona_visual":"INSUFICIENTE","estado_visual":"POCOS_CIERRES","allow_real_visual":False,"motivo_visual":"error_clasificador_visual","color_visual":"white","emoji_visual":"⬜","accion_visual":"ESPERAR"}
+
+
 def clasificar_prepatron_lxv(verdes: int, rojas: int, cerrados: int, total: int = 6) -> dict:
     """
     Clasifica patrones parciales LXV que todavía NO emiten REAL,
@@ -6200,6 +6240,16 @@ def clasificar_prepatron_lxv(verdes: int, rojas: int, cerrados: int, total: int 
                 "puede_4v2x": True,
                 "faltan": faltan,
                 "motivo": "2V2X parcial: puede cerrar como 4V2X si faltantes son verdes",
+            }
+
+        if v == 5 and r == 0 and c == 5 and t == 6:
+            return {
+                "prepatron": "PRE_5V1X_FINAL_SI_FALTA_X",
+                "vigilar": True,
+                "puede_5v1x": True,
+                "puede_4v2x": False,
+                "faltan": 1,
+                "motivo": "5V0X parcial final: si el bot faltante cierra X, se convierte en 5V1X",
             }
 
         if v == 4 and r == 1 and c == 5:
@@ -6259,6 +6309,7 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
         p["round_id"] = round_id
         p["bot"] = str(bot_candidato or "")
         p["patron"] = str(patron or "")
+        p["diag_visual"] = ""
         zi = zona_info if isinstance(zona_info, dict) else {}
         p["zona"] = str(zi.get("zona", zi.get("fase", "")) or "")
         p["decision"] = str(zi.get("decision", "") or "")
@@ -6332,6 +6383,8 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
             elif es_prepatron_vigilable:
                 p["falta_principal"] = "ESPERANDO CIERRE 5V1X/4V2X"
                 p["resultado"] = "VIGILANDO PREPATRÓN"
+                if str(p.get("patron","")) == "5V0X":
+                    p["diag_visual"] = "VERDE_PARCIAL_FUERTE 5/6 | falta 1 cierre | si falta=X => 5V1X"
             else:
                 p["falta_principal"] = first_off if first_off else "UNKNOWN_LOCK"
                 p["resultado"] = "BLOQUEADO"
@@ -6363,6 +6416,7 @@ def actualizar_real_locks_panel_desde_round_live():
             round_complete=round_complete,
             partial_pattern=partial,
         )
+        zinfo_full = obtener_zona_lxv_hud_actual() or {}
         p = globals().get("REAL_LOCKS_PANEL", {})
         current_source = str(p.get("source", "") or "").strip().upper()
         current_bot = str(p.get("bot", "") or "").strip()
@@ -6382,12 +6436,24 @@ def actualizar_real_locks_panel_desde_round_live():
             p["updated_ts"] = float(time.time())
             p["source_diag"] = "ROUND_LIVE"
             return
+        try:
+            verdes_count = int((summary or {}).get("verdes_count", 0) or 0)
+            rojas_count = int((summary or {}).get("rojas_count", 0) or 0)
+        except Exception:
+            verdes_count = 0
+            rojas_count = 0
         actualizar_real_locks_panel_lxv(
             source="ROUND_LIVE", round_id=rid, patron=partial, bot_candidato="--",
             round_complete=round_complete, data_quality=dq, zona_info=zi,
-            candidate_info={"candidate_ok": False, "reason": "sin_candidato_round_live"},
+            candidate_info={"candidate_ok": False, "reason": "sin_candidato_round_live", "verdes_count": verdes_count, "rojas_count": rojas_count, "cerrados_count": closed_count},
             order_status=(globals().get("REAL_LOCKS_PANEL", {}).get("locks", {}).get("ORDEN_REAL_OK", None)),
         )
+        try:
+            zv = (zinfo_full or {}).get("zona_visual_info", {}) if isinstance((zinfo_full or {}).get("zona_visual_info", {}), dict) else {}
+            if str(zv.get("zona_visual", "")) == "VERDE_PARCIAL_FUERTE" and partial == "5V0X" and closed_count == 5 and expected_count == 6:
+                p["diag_visual"] = "VERDE_PARCIAL_FUERTE 5/6 | falta 1 cierre | si falta=X => 5V1X"
+        except Exception:
+            pass
     except Exception as e:
         try:
             REAL_LOCKS_PANEL["error"] = str(e)
@@ -6471,6 +6537,17 @@ def obtener_zona_lxv_hud_actual():
         info["esperados"] = expected_count
         info["patron_live"] = partial
         info["data_quality"] = dq
+        g_for_visual = info.get("g_actual", None)
+        info_visual = clasificar_zona_visual_parcial_lxv(partial, closed_count, expected_count, g_for_visual, dq)
+        info["zona_visual_info"] = dict(info_visual)
+        info_pre = clasificar_prepatron_lxv(int(summary.get("verdes_count", 0) or 0), int(summary.get("rojas_count", 0) or 0), closed_count, expected_count)
+        info["prepatron_info"] = dict(info_pre)
+        if (partial == "5V0X" and closed_count == 5 and expected_count == 6 and str(dq) == "partial"):
+            _lxv_5v1x_event_cooldown(
+                key=f"zona_visual_fuerte:{rid}",
+                msg="🟢 ZONA VISUAL LXV: VERDE_PARCIAL_FUERTE | 5V0X 5/6 | si falta=X => 5V1X",
+                cooldown_s=15.0,
+            )
         return info
     except Exception:
         return {"zona":"INSUFICIENTE","fase":"INSUFICIENTE","decision":ZONA_NO_INVERTIR,"motivo":"sin_info_round_live","emoji":"⬜","source":"HUD_GLOBAL/none"}
@@ -6491,12 +6568,16 @@ def render_real_locks_panel():
                row(f"Ronda: {str(p.get('round_id') or '--')} | Bot: {str(p.get('bot') or '--')}"),
                row(f"Patrón: {str(p.get('patron') or '--')} | Zona: {str(p.get('zona') or '--')}"),
                "╠════════════════════════════════════════╣"]
+        hard_lock_names = ["REAL_CLOSE_LIBRE", "COLUMNA_COMPLETA", "DATA_QUALITY_OK", "PATRON_VALIDO", "CANDIDATO_VALIDO", "ZONA_OK", "TOKEN_REAL_LIBRE"]
+        if any(locks.get(k) is False for k in hard_lock_names):
+            locks["ORDEN_REAL_OK"] = False
         for name in list(globals().get("LXV_REAL_REQUIRED_LOCKS", [])) + ["ORDEN_REAL_OK"]:
             out.append(row(f"{name:<20} [ {mk(locks.get(name))}]"))
         res_ok = bool(p.get("ready_pre_real", False))
         out += ["╠════════════════════════════════════════╣",
                 row(f"RESULTADO: {'✅ LISTO PARA REAL' if res_ok else '⛔ BLOQUEADO'}"),
                 row(f"FALTA: {str(p.get('falta_principal') or '---')}"),
+                row(f"DIAGNÓSTICO: {str(p.get('diag_visual') or '---')}" ),
                 "╚════════════════════════════════════════╝"]
         return out
     except Exception:
@@ -8060,6 +8141,12 @@ def _sync_round_tick_maestro():
             else:
                 motivo_no_real = motivo_exec if motivo_exec else f"no_real_{patron}"
         elif patron not in ("5V1X", "4V2X"):
+            try:
+                verdes_count = int((summary or {}).get("verdes_count", 0) or 0)
+                rojas_count = int((summary or {}).get("rojas_count", 0) or 0)
+            except Exception:
+                verdes_count = 0
+                rojas_count = 0
             pre = clasificar_prepatron_lxv(verdes_count, rojas_count, closed_count, expected_count)
             if bool(pre.get("vigilar", False)):
                 motivo_no_real = f"patron_parcial_vigilable:{patron}=>{pre.get('prepatron')}"
@@ -18642,6 +18729,9 @@ def _hud_zona_operativa_lxv_line(width=None):
         d38 = float(info.get("delta_3_8", 0.0) or 0.0)
         prev_full = int(info.get("prev_full_green_streak", 0) or 0)
         visual_hint = str(info.get("visual_hint", "") or "")
+        zv_info = info.get("zona_visual_info", {}) if isinstance(info.get("zona_visual_info", {}), dict) else {}
+        if zv_info:
+            visual_hint = str(zv_info.get("zona_visual", visual_hint) or visual_hint)
         ronda_previa = str(info.get("ronda_liberada_previa", "no") or "no")
         line_hud = (
             f"{emoji} ZONA LXV HUD GLOBAL: {zona} | {decision} | motivo={motivo} | "
@@ -18660,6 +18750,31 @@ def _hud_zona_operativa_lxv_line(width=None):
     except Exception:
         return "⬜ ZONA LXV HUD GLOBAL: INSUFICIENTE | NO_INVERTIR | cols=0/3 | source=HUD_GLOBAL/none | motivo=sin_info_zona"
 
+
+
+def render_zona_visual_lxv_panel(info_zona_oficial: dict, info_zona_visual: dict, info_prepatron: dict | None = None) -> list[str]:
+    """
+    Renderiza un panel ancho, visible y claro.
+    No debe usar el panel pequeño de 36 caracteres.
+    """
+    try:
+        ofi = info_zona_oficial if isinstance(info_zona_oficial, dict) else {}
+        vis = info_zona_visual if isinstance(info_zona_visual, dict) else {}
+        pre = info_prepatron if isinstance(info_prepatron, dict) else {}
+        w = 92
+        def row(txt: str) -> str:
+            body = str(txt)[:w-4]
+            return f"║ {body.ljust(w-4)} ║"
+        emoji = str(vis.get("emoji_visual", "⬜") or "⬜")
+        ofi_line = f"OFICIAL : {ofi.get('zona', ofi.get('fase', '--'))} | decisión={ofi.get('decision','--')} | motivo={ofi.get('motivo','--')}"
+        g_val = vis.get('g', ofi.get('g_actual', None))
+        g_txt = "--" if g_val is None else f"{float(g_val):.2f}"
+        vis_line = f"VISUAL  : {vis.get('zona_visual','--')} | cerrados={vis.get('cerrados', ofi.get('cerrados','--'))}/{vis.get('esperados', ofi.get('esperados','--'))} | patrón={vis.get('patron', ofi.get('patron_live','--'))} | g={g_txt}"
+        pre_line = f"PREPATRÓN: {pre.get('prepatron','NINGUNO')} | acción={'VIGILAR' if bool(pre.get('vigilar',False)) else 'ESPERAR'}"
+        final_line = "FINAL   : NO_INVERTIR_AÚN | esperando cierre faltante" if not bool(ofi.get('allow_real', False)) else "FINAL   : EVALUAR_LÓGICA_NORMAL"
+        return ["╔" + "═"*(w-2) + "╗", row(f"{emoji} ZONA VISUAL LXV"), row(ofi_line), row(vis_line), row(pre_line), row(final_line), "╚" + "═"*(w-2) + "╝"]
+    except Exception:
+        return []
 
 
 def render_zona_lxv_panel():
@@ -20057,9 +20172,13 @@ def mostrar_panel():
     except Exception:
         pass
     try:
+        zinfo = obtener_zona_lxv_hud_actual() or {}
+        zv_panel = render_zona_visual_lxv_panel(zinfo, zinfo.get("zona_visual_info", {}), zinfo.get("prepatron_info", {}))
         lock_lines = render_real_locks_panel()
         if lock_lines:
-            panel_lines = list(lock_lines) + list(panel_lines)
+            panel_lines = list(zv_panel) + list(lock_lines) + list(panel_lines)
+        elif zv_panel:
+            panel_lines = list(zv_panel) + list(panel_lines)
     except Exception:
         pass
 
@@ -24404,6 +24523,7 @@ def _selftest_real_activo_prepatron_lxv():
         (3, 1, 4, "PRE_5V1X_OR_4V2X"),
         (4, 0, 4, "PRE_5V1X"),
         (2, 2, 4, "PRE_4V2X_DEBIL"),
+        (5, 0, 5, "PRE_5V1X_FINAL_SI_FALTA_X"),
         (4, 1, 5, "PRE_5V1X_OR_4V2X_FINAL"),
         (3, 2, 5, "PRE_4V2X_FINAL"),
         (1, 3, 4, "NINGUNO"),
@@ -24415,3 +24535,19 @@ def _selftest_real_activo_prepatron_lxv():
 
 if os.environ.get("RUN_REAL_PREPATRON_SELFTEST") == "1":
     _selftest_real_activo_prepatron_lxv()
+
+
+def _selftest_zona_visual_parcial_lxv():
+    z = clasificar_zona_visual_parcial_lxv("5V0X", 5, 6, 1.0, "partial")
+    assert z["zona_visual"] == "VERDE_PARCIAL_FUERTE"
+    assert z["allow_real_visual"] is False
+
+    p = clasificar_prepatron_lxv(5, 0, 5, 6)
+    assert p["prepatron"] == "PRE_5V1X_FINAL_SI_FALTA_X"
+    assert p["vigilar"] is True
+    assert p["puede_5v1x"] is True
+
+    print("SELFTEST ZONA_VISUAL_PARCIAL_LXV OK")
+
+if os.environ.get("RUN_ZONA_VISUAL_PARCIAL_SELFTEST") == "1":
+    _selftest_zona_visual_parcial_lxv()
