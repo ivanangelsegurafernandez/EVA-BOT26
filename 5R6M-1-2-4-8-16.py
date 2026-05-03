@@ -6237,6 +6237,13 @@ def _lxv_zona_quality_ok(dq):
     except Exception:
         return False
 
+def _lxv_zona_quality_ok_para_real(dq):
+    try:
+        dq = str(dq or "").strip().lower()
+        return dq == "ok"
+    except Exception:
+        return False
+
 
 def _lxv_zona_quality_rank(dq):
     try:
@@ -6290,8 +6297,8 @@ def _lxv_build_live_zone_row_for_round(rid):
             except Exception:
                 pass
             return None
-        v = int(summary.get("n_verdes", summary.get("verdes", -1)) or -1)
-        r = int(summary.get("n_rojos", summary.get("rojos", -1)) or -1)
+        v = int(summary.get("n_verdes", summary.get("verdes", summary.get("verdes_count", -1))) or -1)
+        r = int(summary.get("n_rojos", summary.get("rojos", summary.get("rojas_count", -1))) or -1)
         complete = bool(summary.get("round_complete", summary.get("complete", False)))
         dq = str(summary.get("data_quality", summary.get("quality", "")) or "").strip().lower()
         expected = int(len(globals().get("BOT_NAMES", []) or []) or 6)
@@ -6304,7 +6311,7 @@ def _lxv_build_live_zone_row_for_round(rid):
             "n_verdes": v,
             "n_rojos": r,
             "round_complete": complete,
-            "data_quality": dq or "ok",
+            "data_quality": dq or "missing",
             "source": "round_live",
             "_zona_source": "round_live",
         }
@@ -6645,6 +6652,9 @@ def _lxv_zona_es_invertible(info: dict | None) -> tuple[bool, str]:
         fase = str(info.get("fase", zona) or "").strip().upper()
         decision = str(info.get("decision", "") or "").strip().upper()
         allow_real = bool(info.get("allow_real", False))
+        dq0 = str(info.get("dq0", info.get("data_quality", "")) or "").strip().lower()
+        if dq0 and (not _lxv_zona_quality_ok_para_real(dq0)):
+            return False, f"data_quality_no_ok:{dq0}"
         zonas_ok = set(globals().get("LXV_ZONAS_INVERTIBLES", {"VERDE_TEMPRANO", "VERDE_MADURO"}))
         zonas_block = set(globals().get("LXV_ZONAS_BLOQUEANTES", set()))
         if zona in zonas_ok or fase in zonas_ok:
@@ -6768,10 +6778,45 @@ def _selftest_zona_lxv_minimo():
         print(f"[SELFTEST_ZONA_LXV] ERROR: {e}")
         return False
 
+def _selftest_lxv_live_row_mapping():
+    try:
+        rid = 100
+        summary = {
+            "obj_round": rid,
+            "verdes_count": 4,
+            "rojas_count": 2,
+            "complete": True,
+            "data_quality": "ok",
+        }
+        v = int(summary.get("n_verdes", summary.get("verdes", summary.get("verdes_count", -1))) or -1)
+        r = int(summary.get("n_rojos", summary.get("rojos", summary.get("rojas_count", -1))) or -1)
+        complete = bool(summary.get("round_complete", summary.get("complete", False)))
+        dq = str(summary.get("data_quality", summary.get("quality", "")) or "").strip().lower() or "missing"
+        row = {
+            "round_id": rid,
+            "n_verdes": v,
+            "n_rojos": r,
+            "round_complete": complete,
+            "data_quality": dq,
+            "source": "round_live",
+            "_zona_source": "round_live",
+        }
+        ok = (row.get("n_verdes") == 4 and row.get("n_rojos") == 2 and bool(row.get("round_complete")) is True and row.get("data_quality") == "ok")
+        print(f"[SELFTEST_LXV_LIVE_ROW] {'OK' if ok else 'FAIL'} row={row}")
+        return bool(ok)
+    except Exception as e:
+        print(f"[SELFTEST_LXV_LIVE_ROW] ERROR: {e}")
+        return False
+
 
 if str(os.getenv("RUN_LXV_ZONE_SELFTEST", "0")).strip() == "1":
     try:
         _selftest_zona_lxv_minimo()
+    except Exception:
+        pass
+if str(os.getenv("RUN_LXV_LIVE_ROW_SELFTEST", "0")).strip() == "1":
+    try:
+        _selftest_lxv_live_row_mapping()
     except Exception:
         pass
 
