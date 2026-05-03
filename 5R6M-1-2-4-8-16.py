@@ -237,6 +237,8 @@ HUD_MINIMAL_MODE = True
 HUD_SHOW_DEBUG_BLOCKS = False
 HUD_SHOW_VERBOSE_TOP = False
 HUD_SHOW_VERBOSE_EVENTS = False
+HUD_SHOW_LEGACY_DIAGNOSTICS = False
+HUD_SHOW_ROUND_DETAIL = False
 HUD_EVENTS_MAX = 3
 HUD_SHOW_IA_LONG_TEXT = False
 HUD_MERGE_SIDE_PANELS = True
@@ -400,8 +402,7 @@ LXV_REAL_REQUIRED_LOCKS = [
     "DATA_QUALITY_OK",
     "PATRON_VALIDO",
     "CANDIDATO_VALIDO",
-    "ZONA_VALIDA",
-    "NO_ZONA_BLOQUEANTE",
+    "ZONA_OK",
     "NO_DUPLICADO_RONDA",
     "TOKEN_REAL_LIBRE",
 ]
@@ -2973,7 +2974,7 @@ REAL_LOCKS_PANEL = {
     "enabled": True, "source": "", "round_id": None, "bot": "", "patron": "", "zona": "", "decision": "",
     "locks": {
         "REAL_CLOSE_LIBRE": False, "COLUMNA_COMPLETA": False, "DATA_QUALITY_OK": False, "PATRON_VALIDO": False,
-        "CANDIDATO_VALIDO": False, "ZONA_VALIDA": False, "NO_ZONA_BLOQUEANTE": False, "NO_DUPLICADO_RONDA": False,
+        "CANDIDATO_VALIDO": False, "ZONA_OK": False, "NO_DUPLICADO_RONDA": False,
         "TOKEN_REAL_LIBRE": False, "ORDEN_REAL_OK": None,
     },
     "detalles": {}, "ready_pre_real": False, "resultado": "BLOQUEADO", "falta_principal": "",
@@ -4551,18 +4552,13 @@ def _ack_live_format_lines(snapshot):
 
     lines = []
     lag_txt = max_txt if max_txt != "--" else avg_txt
-    lines.append(
-        f"⚡ ROUND LIVE | obj=#{obj_round} | rel=#{released_round} | cerrados={closed_count}/{expected_count} | faltan={faltan_count} | lag={lag_txt}"
-    )
-    if fresh_count < expected_count:
-        lines.append(f"🟦 ARRANQUE HUD: esperando ACK fresco de sesión | frescos={fresh_count}/{expected_count} | histórico previo no cuenta")
-    lines.append(
-        f"SYNC STATE | status={summary.get('status_state','')} | round={obj_round} | released={released_round} | completed={bool(summary.get('completed_state', False))} | reason={summary.get('reason_state','')} | pending={summary.get('real_pending_bot', '')}"
-    )
-    lines.append(f"SYNC/HOLD | status={summary.get('status_state','')} | round={obj_round} | released={released_round} | real_bot={summary.get('real_pending_bot','')} | ciclo={summary.get('real_pending_cycle','')} | motivo={summary.get('reason_state','')}")
-    lines.append("BOT      ACK   GAP  RES  EDAD   CICLO  DECISIÓN")
+    lines.append(f"⚡ ROUND #{obj_round} | Cerrados {closed_count}/{expected_count} | Faltan {faltan_count} | Calidad {summary.get('data_quality','missing')} | Patrón {summary.get('partial_pattern','0V0X')}")
+    if bool(globals().get("HUD_SHOW_LEGACY_DIAGNOSTICS", False)) or bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False)):
+        lines.append(f"SYNC STATE | status={summary.get('status_state','')} | rel={released_round} | lag={lag_txt}")
+    if bool(globals().get("HUD_SHOW_ROUND_DETAIL", False)) or bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False)):
+        lines.append("BOT      ACK   GAP  RES  EDAD   CICLO  DECISIÓN")
 
-    for row in list(rows)[:6]:
+    for row in (list(rows)[:6] if (bool(globals().get("HUD_SHOW_ROUND_DETAIL", False)) or bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False))) else []):
         bot = str(row.get("bot", "--"))[:7]
         ack_round = int(row.get("ack_round", 0) or 0)
         ack_txt = str(ack_round) if ack_round > 0 else "--"
@@ -4604,21 +4600,17 @@ def _ack_live_format_lines(snapshot):
         f"Faltan={faltan_count} | Parcial={summary.get('partial_pattern', '0V0X')} | "
         f"{'BotX=' + botx + ' | ' if botx != '-' else ''}Calidad={summary.get('data_quality', 'missing')} | motivo={motivo_round}"
     )
-    lines.append(resumen)
-    lines.append("ℹ️ DECISIÓN REAL USA: ROUND LIVE, no la cinta histórica.")
+    if bool(globals().get("HUD_SHOW_LEGACY_DIAGNOSTICS", False)) or bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False)):
+        lines.append(resumen)
     dq_txt = str(summary.get("data_quality", "missing") or "").strip().lower()
     parcial_txt = str(summary.get("partial_pattern", "0V0X") or "0V0X").strip().upper()
     columna_lista = bool(closed_count >= expected_count and faltan_count <= 0 and dq_txt == "ok")
     if fresh_count < expected_count:
         lines.append(f"⏳ Aún no se evalúa REAL: round_live_preboot_no_cuenta | faltan={expected_count-fresh_count}")
     elif bool(summary.get("has_expired_closed", False)):
-        lines.append(f"⏳ Esperando columna objetivo #{obj_round}: cerrados={closed_count}/{expected_count} faltan={faltan_count}")
-        lines.append(f"⏳ Aún no se evalúa REAL: columna cerrada pero fuera de ventana | expired={expired_count}")
-        lines.append("Los símbolos LIVE ACK 80 son historial; REAL solo evalúa ROUND LIVE cerrado.")
+        lines.append(f"⏳ Esperando cierre útil: {closed_count}/{expected_count} | expired={expired_count}")
     elif (not columna_lista) or parcial_txt == "0V0X":
-        lines.append(f"⏳ Esperando columna objetivo #{obj_round}: cerrados={closed_count}/{expected_count} faltan={faltan_count}")
-        lines.append("⏳ Aún no se evalúa REAL: columna objetivo incompleta.")
-        lines.append("Los símbolos LIVE ACK 80 son historial; REAL solo evalúa ROUND LIVE cerrado.")
+        lines.append(f"⏳ Esperando columna objetivo #{obj_round}: {closed_count}/{expected_count}")
     else:
         lines.append(f"✅ Columna objetivo lista #{obj_round}: evaluando patrón LXV")
         info_fase = {}
@@ -5980,17 +5972,28 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
         _real_lock_set("DATA_QUALITY_OK", dq_ok, f"dq={data_quality}")
         _real_lock_set("PATRON_VALIDO", str(patron) in ("4V2X", "5V1X"), patron)
         _real_lock_set("COLUMNA_COMPLETA", bool(round_complete), f"round_complete={bool(round_complete)}")
-        _real_lock_set("ZONA_VALIDA", p["zona"] in ("VERDE_TEMPRANO", "VERDE_MADURO"), p["zona"])
-        _real_lock_set("NO_ZONA_BLOQUEANTE", p["zona"] not in {"ROJA_TEMPRANO","ROJO_MADURO","VERDE_TARDIO","VERDE_SATURADO_TARDIO","NEUTRO","INSUFICIENTE","ERROR","UNKNOWN"}, p["zona"])
+        zona = str(p["zona"] or "").upper()
+        decision = str(p.get("decision", "") or "").upper()
+        allow_real = zi.get("allow_real", None)
+        zona_ok = bool(zona in ("VERDE_TEMPRANO", "VERDE_MADURO") and decision != "NO_INVERTIR" and (allow_real is not False))
+        _real_lock_set("ZONA_OK", zona_ok, f"zona={zona}|decision={decision}|motivo={zi.get('motivo','')}")
         _real_lock_set("NO_DUPLICADO_RONDA", bool(round_id) and (not _lxv_real_round_already_emitted(round_id)), f"rid={round_id}")
         try:
-            close_pending = _hay_real_close_pending_activo() if callable(globals().get("_hay_real_close_pending_activo")) else any(bool(v) for v in (globals().get("REAL_CLOSE_PENDING", {}) or {}).values())
+            if callable(globals().get("_hay_real_close_pending_activo")):
+                pending_state = _hay_real_close_pending_activo()
+                if isinstance(pending_state, tuple):
+                    close_pending = bool(pending_state[0])
+                else:
+                    close_pending = bool(pending_state)
+            else:
+                close_pending = any(bool(v) for v in (globals().get("REAL_CLOSE_PENDING", {}) or {}).values())
         except Exception:
             close_pending = True
         _real_lock_set("REAL_CLOSE_LIBRE", not bool(close_pending), f"pending={close_pending}")
         owner = globals().get("REAL_OWNER_LOCK")
         tok = leer_token_actual() if callable(globals().get("leer_token_actual")) else None
-        tok_free = (owner in (None, "", "none", bot_candidato)) and (tok in (None, "", "none", bot_candidato))
+        bot_cmp = str(bot_candidato or "").strip()
+        tok_free = (owner in (None, "", "none", bot_cmp, "--")) and (tok in (None, "", "none", bot_cmp, "--"))
         _real_lock_set("TOKEN_REAL_LIBRE", bool(tok_free), f"owner={owner} token={tok}")
         ci = candidate_info if isinstance(candidate_info, dict) else {}
         cand_ok = bool(ci.get("candidate_ok", False))
