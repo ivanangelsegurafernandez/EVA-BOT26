@@ -623,6 +623,20 @@ MRV_ZONA_V2_SLOPE_TARDIO = -0.08
 MRV_ZONA_V2_FULL_GREEN_PREV_BLOCK = 3
 _MRV_ZONA_V2_LAST_STATE = None
 _MRV_ZONA_V2_LAST_LOG_TS = 0.0
+ZONA_REGIONAL_DOMINANTE_ENABLE = True
+ZONA_REGIONAL_R1 = 8
+ZONA_REGIONAL_R2 = 16
+ZONA_REGIONAL_R3 = 32
+ZONA_REGIONAL_VERDE_TEMPRANO_R1 = 0.55
+ZONA_REGIONAL_VERDE_TEMPRANO_R2 = 0.50
+ZONA_REGIONAL_VERDE_MADURO_R1 = 0.58
+ZONA_REGIONAL_VERDE_MADURO_R2 = 0.55
+ZONA_REGIONAL_VERDE_MADURO_R3 = 0.52
+ZONA_REGIONAL_SLOPE_TEMPRANO = 0.03
+ZONA_REGIONAL_DROP_TARDIO = 0.08
+ZONA_REGIONAL_FULL_GREEN_PREV_BLOCK = 3
+_ZONA_REGIONAL_LAST_STATE = None
+_ZONA_REGIONAL_LAST_LOG_TS = 0.0
 PATTERN_COL_LAST_STATE = {
     "green_ratio_col_actual": None,
     "total_verdes_col_actual": 0,
@@ -5991,6 +6005,15 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
         _real_lock_set("PATRON_VALIDO", str(patron) in ("4V2X", "5V1X"), patron)
         _real_lock_set("COLUMNA_COMPLETA", bool(round_complete), f"round_complete={bool(round_complete)}")
         zona_ok, zona_reason = _lxv_zona_es_invertible(zi)
+        info_regional = clasificar_zona_regional_dominante_lxv(round_id_objetivo=round_id)
+        patron_ok = str(patron) in ("4V2X", "5V1X")
+        cand_ok_try = bool((candidate_info or {}).get("candidate_ok", False))
+        zi2 = combinar_zona_lxv_con_regional(zi, info_regional, patron_valido=patron_ok, candidato_valido=cand_ok_try)
+        if isinstance(zi2, dict):
+            zi = zi2
+            p["zona"] = str(zi.get("zona", zi.get("fase", "")) or "")
+            p["decision"] = str(zi.get("decision", "") or "")
+            zona_ok, zona_reason = _lxv_zona_es_invertible(zi)
         _real_lock_set("ZONA_OK", bool(zona_ok), str(zona_reason or "zona_no_invertible"))
         _real_lock_set("NO_DUPLICADO_RONDA", bool(round_id) and (not _lxv_real_round_already_emitted(round_id)), f"rid={round_id}")
         try:
@@ -6486,6 +6509,58 @@ def combinar_zona_lxv_con_mrv2(info):
     if str(out.get('decision','')).upper()!='SI_INVERTIR' and z2 in {'VERDE_TEMPRANO_CONFIRMADO','VERDE_MADURO_SANO','VERDE_MADURO_CON_RUIDO'} and bool(globals().get('MRV_ZONA_V2_CAN_UNLOCK_ZONE',True)) and comp and dq=='ok':
         out.update({'zona':z2,'fase':z2,'decision':'SI_INVERTIR','allow_real':True,'motivo':f'mrv2_unlock:{m2}','desbloqueo_mrv_v2':True})
     elif z2=='NEUTRO_MIXTO': out['advertencia_mrv_v2']='neutro_mixto'
+    return out
+
+
+
+def clasificar_zona_regional_dominante_lxv(rows_live=None, historial_por_bot=None, round_id_objetivo=None) -> dict:
+    out={"zona_regional":"NEUTRO_REGIONAL","decision_regional":"NO_INVERTIR","allow_regional":False,"motivo_regional":"sin_dominio_regional","green_ratio_r1":0.0,"green_ratio_r2":0.0,"green_ratio_r3":0.0,"red_ratio_r1":0.0,"red_ratio_r2":0.0,"slope_regional":0.0,"source_regional":"none","ok_regional":False}
+    try:
+        if not bool(globals().get('ZONA_REGIONAL_DOMINANTE_ENABLE',True)): return out
+        tape=historial_por_bot if isinstance(historial_por_bot,dict) else dict(globals().get('ACK_LIVE_TAPE',{}) or {})
+        flat=[]
+        for b in list(globals().get('BOT_NAMES',[]) or []):
+            seq=list(tape.get(b,[]) or [])
+            for ch in seq:
+                if ch in ('✓','X'): flat.append(ch)
+        if not flat:
+            out['motivo_regional']='sin_historial_ack'; return out
+        r1=max(1,int(globals().get('ZONA_REGIONAL_R1',8))); r2=max(r1,int(globals().get('ZONA_REGIONAL_R2',16))); r3=max(r2,int(globals().get('ZONA_REGIONAL_R3',32)))
+        def ratio(win):
+            seg=flat[-win:]
+            if not seg: return 0.0,0.0,0,0
+            g=sum(1 for x in seg if x=='✓'); r=sum(1 for x in seg if x=='X'); n=max(1,g+r)
+            return g/n, r/n, g, r
+        g1,r1r,gc1,rc1=ratio(r1); g2,r2r,gc2,rc2=ratio(r2); g3,r3r,gc3,rc3=ratio(r3)
+        slope=g1-g2
+        out.update({'green_ratio_r1':g1,'green_ratio_r2':g2,'green_ratio_r3':g3,'red_ratio_r1':r1r,'red_ratio_r2':r2r,'slope_regional':slope,'source_regional':'ack_live_tape','ok_regional':True})
+        full_prev=0
+        for b in list(globals().get('BOT_NAMES',[]) or []):
+            seq=[x for x in list(tape.get(b,[]) or []) if x in ('✓','X')]
+            if len(seq)>=4 and seq[-4:-1].count('✓')>=3 and seq[-1]=='X': full_prev +=1
+        if full_prev>=int(globals().get('ZONA_REGIONAL_FULL_GREEN_PREV_BLOCK',3)):
+            out.update({'zona_regional':'VERDE_SATURADO_TARDIO','decision_regional':'NO_INVERTIR','allow_regional':False,'motivo_regional':'saturacion_previa_con_rojo_reciente'})
+        elif g2>=0.60 and (g1 <= (g2-float(globals().get('ZONA_REGIONAL_DROP_TARDIO',0.08))) or rc1>gc1):
+            out.update({'zona_regional':'VERDE_TARDIO_REGIONAL','decision_regional':'NO_INVERTIR','allow_regional':False,'motivo_regional':'caida_reciente'})
+        elif g1>=float(globals().get('ZONA_REGIONAL_VERDE_TEMPRANO_R1',0.55)) and g2>=float(globals().get('ZONA_REGIONAL_VERDE_TEMPRANO_R2',0.50)) and slope>=float(globals().get('ZONA_REGIONAL_SLOPE_TEMPRANO',0.03)) and rc1<=gc1:
+            out.update({'zona_regional':'VERDE_TEMPRANO_REGIONAL','decision_regional':'SI_INVERTIR','allow_regional':True,'motivo_regional':'regional_verde_temprano'})
+        elif g1>=float(globals().get('ZONA_REGIONAL_VERDE_MADURO_R1',0.58)) and g2>=float(globals().get('ZONA_REGIONAL_VERDE_MADURO_R2',0.55)) and g3>=float(globals().get('ZONA_REGIONAL_VERDE_MADURO_R3',0.52)) and g1>=r1r and g2>=r2r and g1>=(g2-float(globals().get('ZONA_REGIONAL_DROP_TARDIO',0.08))):
+            out.update({'zona_regional':'VERDE_MADURO_REGIONAL','decision_regional':'SI_INVERTIR','allow_regional':True,'motivo_regional':'regional_verde_maduro'})
+        else:
+            out['motivo_regional']='sin_dominio_regional'
+        return out
+    except Exception:
+        return out
+
+def combinar_zona_lxv_con_regional(info_zona, info_regional, patron_valido=False, candidato_valido=False):
+    out=dict(info_zona or {})
+    reg=dict(info_regional or {})
+    if str(out.get('decision','')).upper()=='SI_INVERTIR' and bool(out.get('allow_real',False)): return out
+    motivo=str(out.get('motivo','') or '').lower(); zona=str(out.get('zona','') or '').upper(); dq=str(out.get('data_quality',out.get('dq0','')) or '').lower()
+    bloqueada = zona=='PRE_ZONA_VISUAL' or ('columna_incompleta' in motivo) or ('target_round_missing' in motivo) or ('round_mismatch' in motivo) or dq in ('missing','partial','')
+    if bloqueada and bool(reg.get('allow_regional',False)) and bool(patron_valido) and bool(candidato_valido):
+        out.update({'zona':reg.get('zona_regional','NEUTRO_REGIONAL'),'fase':reg.get('zona_regional','NEUTRO_REGIONAL'),'decision':'SI_INVERTIR','allow_real':True,'motivo':f"regional_unlock:{reg.get('motivo_regional','--')}",'desbloqueo_zona_regional':True})
+    out.update(reg)
     return out
 
 def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
@@ -18288,7 +18363,8 @@ def render_zona_lxv_panel():
         if dq != "ok": real_txt = "NO, data_quality no ok"
         elif esp <= 0 or cerr < esp: real_txt = "NO, esperando columna completa"
         elif bool(info.get("bloqueo_mrv_v2", False)): real_txt = "NO, bloqueo MRV_ZONA_V2"
-        return ["╔════════════════════════════════════════════════════════════╗","║ 🧭 ZONA LXV / MRV_ZONA_V2                                ║","╠════════════════════════════════════════════════════════════╣",f"║ Zona actual : {z[:43].ljust(43)}║",f"║ Decisión    : {d[:43].ljust(43)}║",f"║ Motivo      : {m[:43].ljust(43)}║",f"║ MRV_V2      : {z2[:43].ljust(43)}║",f"║ Decisión V2 : {d2[:43].ljust(43)}║",f"║ Motivo V2   : {m2[:43].ljust(43)}║",f"║ Columna     : {cerr}/{esp} | dq={dq} | patrón={patron}"[:61].ljust(61)+"║",f"║ Fuerza      : G={float(info.get('g_actual',0.0)):.2f} R={float(info.get('r_actual',0.0)):.2f} | G3/G5/G8={int(info.get('green_cols_3',0))}/{int(info.get('green_cols_5',0))}/{int(info.get('green_cols_8',0))}"[:61].ljust(61)+"║",f"║ Presión     : verde={float(info.get('green_pressure',0.0)):.2f} roja={float(info.get('red_pressure',0.0)):.2f} ruido={float(info.get('noise_ratio',0.0)):.2f}"[:61].ljust(61)+"║",f"║ REAL        : {real_txt[:47].ljust(47)}║","╚════════════════════════════════════════════════════════════╝"]
+        reg_line = f"ZONA REGIONAL: {str(info.get('zona_regional','NEUTRO_REGIONAL'))} | R1={float(info.get('green_ratio_r1',0.0)):.2f} R2={float(info.get('green_ratio_r2',0.0)):.2f} R3={float(info.get('green_ratio_r3',0.0)):.2f} | decisión={str(info.get('decision_regional','NO_INVERTIR'))}"
+        return ["╔════════════════════════════════════════════════════════════╗","║ 🧭 ZONA LXV / MRV_ZONA_V2                                ║","╠════════════════════════════════════════════════════════════╣",f"║ Zona actual : {z[:43].ljust(43)}║",f"║ Decisión    : {d[:43].ljust(43)}║",f"║ Motivo      : {m[:43].ljust(43)}║",f"║ MRV_V2      : {z2[:43].ljust(43)}║",f"║ Decisión V2 : {d2[:43].ljust(43)}║",f"║ Motivo V2   : {m2[:43].ljust(43)}║",f"║ Columna     : {cerr}/{esp} | dq={dq} | patrón={patron}"[:61].ljust(61)+"║",f"║ Fuerza      : G={float(info.get('g_actual',0.0)):.2f} R={float(info.get('r_actual',0.0)):.2f} | G3/G5/G8={int(info.get('green_cols_3',0))}/{int(info.get('green_cols_5',0))}/{int(info.get('green_cols_8',0))}"[:61].ljust(61)+"║",f"║ Presión     : verde={float(info.get('green_pressure',0.0)):.2f} roja={float(info.get('red_pressure',0.0)):.2f} ruido={float(info.get('noise_ratio',0.0)):.2f}"[:61].ljust(61)+"║",f"║ Regional    : {reg_line[:47].ljust(47)}║",f"║ REAL        : {real_txt[:47].ljust(47)}║","╚════════════════════════════════════════════════════════════╝"]
     except Exception:
         return []
 
