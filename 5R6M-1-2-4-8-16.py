@@ -250,6 +250,7 @@ HUD_SHOW_SALDO_DEBUG = False
 HUD_EVENT_MAX_CHARS = 150
 HUD_SHOW_CONTROL_PANEL = False
 HUD_MARTI_CLEAN_LAYOUT = True
+HUD_LXV_CLEAN_MODE = True
 HUD_BOX_WIDTH = 92
 HUD_TABLE_WIDTH = 132
 ROUND_LIVE_INVEST_WINDOW_S = 90
@@ -6670,10 +6671,19 @@ def render_real_locks_panel():
         for name in list(globals().get("LXV_REAL_REQUIRED_LOCKS", [])) + ["ORDEN_REAL_OK"]:
             out.append(row(f"{name:<20} [ {mk(locks.get(name))}]"))
         res_ok = bool(p.get("ready_pre_real", False))
+        diag_txt = str(p.get("diag_visual") or "")
+        if (not diag_txt) and (not res_ok):
+            diag_txt = _diagnostico_candados_lxv(
+                locks,
+                patron=str(p.get("patron") or "--"),
+                cerrados=int(p.get("closed_count", p.get("cerrados", 0)) or 0),
+                expected=int(p.get("expected_count", p.get("esperados", 6)) or 6),
+                dq=str(p.get("data_quality", p.get("dq", "missing")) or "missing"),
+            )
         out += ["╠════════════════════════════════════════╣",
                 row(f"RESULTADO: {'✅ LISTO PARA REAL' if res_ok else '⛔ BLOQUEADO'}"),
                 row(f"FALTA: {str(p.get('falta_principal') or '---')}"),
-                row(f"DIAGNÓSTICO: {str(p.get('diag_visual') or '---')}" ),
+                row(f"DIAGNÓSTICO: {diag_txt or '---'}" ),
                 "╚════════════════════════════════════════╝"]
         return out
     except Exception:
@@ -8451,8 +8461,14 @@ def _sync_round_tick_maestro():
         if release_written:
             if not real_emitido:
                 agregar_evento(f"⚡ TURBO_SYNC_RELEASE_NOW: ronda #{round_id} → #{round_id + 1} sin REAL | motivo={release_reason}")
+            status_txt = _round_live_status_txt(
+                pattern=patron,
+                completed=completed,
+                data_quality=str(payload.get("data_quality", summary.get("data_quality", ""))),
+                expected=int(payload.get("expected_count", 6) or 6),
+            )
             agregar_evento(
-                f"ROUND LIVE #{round_id} | 6/6 OK | patrón={patron} | release={round_id + 1} | real={emit_bot_now or 'none'} | motivo={release_reason}"
+                f"ROUND LIVE #{round_id} | {status_txt} | patrón={patron} | release={round_id + 1} | real={emit_bot_now or 'none'} | motivo={release_reason}"
             )
             return
     if completed:
@@ -18858,17 +18874,16 @@ def _hud_zona_operativa_lxv_line(width=None):
         zrt_info = info.get("zona_regional_temprana_info", {}) if isinstance(info.get("zona_regional_temprana_info", {}), dict) else {}
         zona_visual_columna = str(zv_info.get("zona_visual", "") or "")
         zona_regional_temprana = str(zrt_info.get("zona_regional_temprana", "") or "")
-        if zona_visual_columna not in ("INSUFICIENTE", "", None):
-            visual_hint = zona_visual_columna
-        elif zona_regional_temprana not in ("MIXTO_O_INSUFICIENTE", "", None):
-            visual_hint = zona_regional_temprana
+        col_visual = zona_visual_columna if zona_visual_columna not in ("INSUFICIENTE", "", None) else (visual_hint or "--")
+        reg_visual = zona_regional_temprana if zona_regional_temprana not in ("MIXTO_O_INSUFICIENTE", "", None) else "--"
         ronda_previa = str(info.get("ronda_liberada_previa", "no") or "no")
-        g_hud = f"g_columna={g_txt}" if cerrados >= esperados else f"g_columna=N/A | g_visual={g_txt}"
+        g_col_parcial = _calcular_g_columna_parcial(patron_live)
+        g_hud = f"g_columna={g_txt}" if cerrados >= esperados else f"g_columna_parcial={g_col_parcial:.2f} | g_regional={g_txt}"
         line_hud = (
             f"{emoji} ZONA LXV HUD GLOBAL: {zona} | {decision} | motivo={motivo} | "
             f"rid_zona={rid_zona if rid_zona > 0 else '--'} | rid_live={rid_live if rid_live > 0 else '--'} | "
             f"cols={cols_usadas}/{cols_req} | cerrados={cerrados}/{esperados} | patrón={patron_live} | dq={dq} | {g_hud} | prom3={prom3:.2f} prom8={prom8:.2f} prom20={prom20:.2f} d38={d38:+.2f} | "
-            f"prev_full={prev_full} | visual={visual_hint or '--'} | ronda_liberada_previa={ronda_previa} | source={source}"
+            f"prev_full={prev_full} | regional={reg_visual} | columna_visual={col_visual} | ronda_liberada_previa={ronda_previa} | source={source}"
         )
         gate = dict(globals().get("_LXV_LAST_REAL_GATE_INFO", {}) or {})
         rid_gate = int(gate.get("round_id", 0) or 0)
@@ -18898,13 +18913,59 @@ def _formatear_sync_missing_detalle(missing_items, faltan: int) -> str:
         elif isinstance(missing_items, (list, tuple)) and missing_items:
             first = str(missing_items[0])
         if not first:
-            return f"missing_total={faltan} | detalle=no_disponible"
+            return f"missing_total={faltan} | faltante=no_identificado"
         otros = max(0, faltan - 1)
         if otros > 0:
-            return f"missing_total={faltan} | first_missing={first} | otros={otros}"
-        return f"missing_total={faltan} | first_missing={first}"
+            return f"missing_total={faltan} | faltante={first} | otros={otros}"
+        return f"missing_total={faltan} | faltante={first}"
     except Exception:
-        return "missing_total=? | detalle=error"
+        return "missing_total=? | faltante=no_identificado"
+
+
+def _calcular_g_columna_parcial(pattern: str) -> float:
+    try:
+        txt = str(pattern or "").upper().replace("/", "")
+        m = re.match(r"^\s*(\d+)V(\d+)X\s*$", txt)
+        if not m:
+            return 0.0
+        v = int(m.group(1) or 0)
+        x = int(m.group(2) or 0)
+        den = max(1, v + x)
+        return round(float(v) / float(den), 2)
+    except Exception:
+        return 0.0
+
+
+def _round_live_status_txt(pattern: str, completed: bool, data_quality: str, expected: int = 6) -> str:
+    try:
+        txt = str(pattern or "").upper().replace("/", "")
+        m = re.match(r"^\s*(\d+)V(\d+)X\s*$", txt)
+        v_count = int(m.group(1)) if m else 0
+        x_count = int(m.group(2)) if m else 0
+        pattern_count = v_count + x_count
+        expected_count = int(expected or 6)
+        dq = str(data_quality or "")
+        if pattern_count == expected_count and bool(completed) and dq == "ok":
+            return f"{expected_count}/{expected_count} OK"
+        status_txt = f"{pattern_count}/{expected_count} PARCIAL"
+        if dq:
+            status_txt += f" dq={dq}"
+        return status_txt
+    except Exception:
+        return f"0/{int(expected or 6)} PARCIAL"
+
+
+def _diagnostico_candados_lxv(locks: dict, patron: str, cerrados: int, expected: int, dq: str) -> str:
+    candado = diagnosticar_candado_bloqueante_lxv(locks if isinstance(locks, dict) else {}, None)
+    return f"candado={candado} | patrón={str(patron or '--')} | cerrados={int(cerrados or 0)}/{int(expected or 6)} | dq={str(dq or 'missing')}"
+
+
+def _hud_fit(text, width):
+    text = str(text or "")
+    width = max(1, int(width or 1))
+    if len(text) <= width:
+        return text
+    return text[:max(0, width - 1)] + "…"
 
 
 def render_sync_wait_lxv_panel(summary: dict, release_state: dict | None = None) -> list[str]:
@@ -19093,10 +19154,11 @@ def render_estado_lxv_actual_panel(info_zona: dict, summary: dict, locks: dict |
         if closed_count >= expected_count: col_state = "COMPLETA"
         elif closed_count <= 0: col_state = "INCOMPLETA"
         else: col_state = "PARCIAL"
-        g_vis = info.get("g_actual", None)
-        g_vis_txt = f"{float(g_vis):.2f}" if isinstance(g_vis, (int,float)) else "--"
-        g_col_txt = "N/A" if closed_count < expected_count else g_vis_txt
-        sync_txt = _formatear_sync_missing_detalle(ss.get("missing", ss.get("missing_bots", [])), faltan_count)
+        g_regional = info.get("g_actual", None)
+        g_regional_txt = f"{float(g_regional):.2f}" if isinstance(g_regional, (int,float)) else "--"
+        g_col_parcial = _calcular_g_columna_parcial(patron)
+        g_col_txt = f"{g_col_parcial:.2f}" if closed_count < expected_count else g_regional_txt
+        sync_txt = _formatear_sync_missing_detalle(ss.get("sync_debug_missing", ss.get("missing_items", ss.get("missing", ss.get("missing_bots", [])))), faltan_count)
         real_activo, _ = hay_real_activo_global() if callable(globals().get("hay_real_activo_global")) else (False, "")
         tok = leer_token_actual() if callable(globals().get("leer_token_actual")) else None
         owner = globals().get("REAL_OWNER_LOCK")
@@ -19119,8 +19181,8 @@ def render_estado_lxv_actual_panel(info_zona: dict, summary: dict, locks: dict |
         else:
             final = "VALIDANDO_CANDADOS"
         w=92
-        row=lambda t: f"║ {str(t)[:w-4].ljust(w-4)} ║"
-        lines=["╔"+"═"*(w-2)+"╗",row("🧭 ESTADO LXV ACTUAL"),row(f"OFICIAL : {zona} | decisión={decision} | motivo={motivo}"),row(f"REGIONAL: {reg_z} | prom3={prom3:.2f} prom8={prom8:.2f} d38={d38:+.2f} | acción={action}"),row(f"COLUMNA : {col_state} | cerrados={closed_count}/{expected_count} | faltan={faltan_count} | patrón={patron} | dq={dq} | g_columna={g_col_txt} | g_visual={g_vis_txt}"),row(f"SYNC    : {'ESPERANDO_BOTS' if faltan_count>0 else 'OK'} | {sync_txt} | REAL={'no_evaluado' if faltan_count>0 else 'evaluable'}"),row(f"REAL    : ACTIVO={'SI' if real_activo else 'NO'} | TOKEN={'DEMO' if tok in (None,'none','') else 'REAL'} | BOT_REAL={bot_real}"),row(f"FINAL   : {final}")]
+        row=lambda t: f"║ {_hud_fit(str(t), w-4).ljust(w-4)} ║"
+        lines=["╔"+"═"*(w-2)+"╗",row("🧭 ESTADO LXV ACTUAL"),row(f"OFICIAL : {zona} | decisión={decision} | motivo={motivo}"),row(f"REGIONAL       : {reg_z} | prom3={prom3:.2f} prom8={prom8:.2f} d38={d38:+.2f} | acción={action}"),row(f"COLUMNA_VISUAL : {str((info.get('zona_visual_info',{}) or {}).get('zona_visual','--'))} | patrón={patron} | cerrados={closed_count}/{expected_count} | faltan={faltan_count} | dq={dq} | g_columna_parcial={g_col_txt} | g_regional={g_regional_txt}"),row(f"SYNC    : {'ESPERANDO_BOTS' if faltan_count>0 else 'OK'} | {sync_txt} | REAL={'no_evaluado' if faltan_count>0 else 'evaluable'}"),row(f"REAL    : ACTIVO={'SI' if real_activo else 'NO'} | TOKEN={'DEMO' if tok in (None,'none','') else 'REAL'} | BOT_REAL={bot_real}"),row(f"FINAL   : {final}")]
         if info_prearmado.get("prearmado"):
             lines.append(row(f"PRE-ARMADO: {info_prearmado.get('nivel')} | zona={info_prearmado.get('zona_visual')} | patrón={info_prearmado.get('patron_actual')} | esperando={info_prearmado.get('esperando')}"))
             lines.append(row(f"PRE-DETALLE: motivo={info_prearmado.get('motivo')} | candado={info_prearmado.get('candado_principal')} | shadow_only=SI"))
@@ -24964,6 +25026,21 @@ def _selftest_hud_lxv_estado_claro():
 
 if os.environ.get("RUN_HUD_LXV_ESTADO_CLARO_SELFTEST") == "1":
     _selftest_hud_lxv_estado_claro()
+
+def _selftest_hud_lxv_ruido_visual():
+    assert _calcular_g_columna_parcial("3V2X") == 0.60
+    assert _calcular_g_columna_parcial("5V0X") == 1.00
+    assert _calcular_g_columna_parcial("2V2X") == 0.50
+    status = _round_live_status_txt(pattern="3V2X", completed=True, data_quality="partial", expected=6)
+    assert "5/6 PARCIAL" in status
+    assert "6/6 OK" not in status
+    diag = _diagnostico_candados_lxv({"COLUMNA_COMPLETA": False}, patron="3V2X", cerrados=5, expected=6, dq="partial")
+    assert "COLUMNA_COMPLETA" in diag
+    assert "3V2X" in diag
+    print("SELFTEST HUD_LXV_RUIDO_VISUAL OK")
+
+if os.environ.get("RUN_HUD_LXV_RUIDO_SELFTEST") == "1":
+    _selftest_hud_lxv_ruido_visual()
 
 
 def _selftest_lxv_prearmado_seguro():
