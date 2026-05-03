@@ -6187,6 +6187,69 @@ def clasificar_zona_visual_parcial_lxv(patron: str, cerrados: int, esperados: in
         return {"zona_visual":"INSUFICIENTE","estado_visual":"POCOS_CIERRES","allow_real_visual":False,"motivo_visual":"error_clasificador_visual","color_visual":"white","emoji_visual":"⬜","accion_visual":"ESPERAR"}
 
 
+def clasificar_zona_regional_temprana_lxv(info_zona: dict, rows_live=None, summary=None) -> dict:
+    """
+    Detecta zona visual/regional temprana desde la matriz live,
+    incluso si la columna oficial está en 0/6, 1/6, 2/6 o 3/6.
+    No habilita REAL.
+    Nunca lanza excepción.
+    """
+    out = {
+        "zona_regional_temprana": "MIXTO_O_INSUFICIENTE",
+        "estado_regional": "SIN_DOMINIO_CLARO",
+        "allow_real_regional": False,
+        "motivo_regional": "sin predominio visual/regional suficiente",
+        "emoji_regional": "⬜",
+        "accion_regional": "ESPERAR",
+        "green_score": 0.0,
+        "r1_green": 0.0,
+        "r2_green": 0.0,
+        "prom3": 0.0,
+        "prom8": 0.0,
+        "prom20": 0.0,
+        "d38": 0.0,
+    }
+    try:
+        info = info_zona if isinstance(info_zona, dict) else {}
+        sumy = summary if isinstance(summary, dict) else {}
+        prom3 = float(info.get("prom3", 0.0) or 0.0)
+        prom8 = float(info.get("prom8", 0.0) or 0.0)
+        prom20 = float(info.get("prom20", 0.0) or 0.0)
+        d38 = float(info.get("delta_3_8", prom3 - prom8) or 0.0)
+        g_actual = float(info.get("g_actual", 0.0) or 0.0)
+        cerrados = int(sumy.get("closed_count", info.get("cerrados", 0)) or 0)
+        out.update({"prom3": prom3, "prom8": prom8, "prom20": prom20, "d38": d38})
+
+        matriz_vals = []
+        if isinstance(rows_live, dict):
+            for bot in BOT_NAMES:
+                cell = rows_live.get(bot, {})
+                if not isinstance(cell, dict):
+                    continue
+                res = normalizar_resultado(cell.get("resultado"))
+                if res == "GANANCIA":
+                    matriz_vals.append(1.0)
+                elif res == "PÉRDIDA":
+                    matriz_vals.append(0.0)
+        r1 = float(_safe_mean_np(matriz_vals[-3:], default=0.0) or 0.0) if matriz_vals else 0.0
+        r2 = float(_safe_mean_np(matriz_vals[-5:], default=0.0) or 0.0) if matriz_vals else 0.0
+        out["r1_green"] = r1
+        out["r2_green"] = r2
+        out["green_score"] = float((0.5 * prom3) + (0.2 * prom8) + (0.2 * r1) + (0.1 * r2))
+
+        if (r1 >= 0.60) or (r2 >= 0.58):
+            out.update({"zona_regional_temprana": "VERDE_DOMINANTE_MATRIZ", "estado_regional": "DOMINIO_VERDE_RECIENTE", "motivo_regional": "predominio verde en historial live reciente", "emoji_regional": "🟢", "accion_regional": "VIGILAR"})
+        elif prom3 >= 0.60 and prom3 > prom8 and d38 >= 0.08:
+            out.update({"zona_regional_temprana": "VERDE_TEMPRANO_VISUAL", "estado_regional": "VERDE_INICIANDO", "motivo_regional": "prom3 domina sobre prom8 con pendiente positiva", "emoji_regional": "🟢", "accion_regional": "VIGILAR"})
+        elif (prom3 >= 0.55 and d38 >= 0.03) or (g_actual >= 0.80 and 1 <= cerrados <= 3):
+            out.update({"zona_regional_temprana": "VERDE_EN_FORMACION_VISUAL", "estado_regional": "FORMACION_INICIAL", "motivo_regional": "verde inicial detectado, columna aún insuficiente", "emoji_regional": "🟢", "accion_regional": "VIGILAR"})
+        elif prom3 <= 0.40 and d38 <= -0.08:
+            out.update({"zona_regional_temprana": "ROJO_TEMPRANO_VISUAL", "estado_regional": "ROJO_INICIANDO", "motivo_regional": "prom3 cae bajo prom8 con pendiente negativa", "emoji_regional": "🔴", "accion_regional": "NO_INVERTIR"})
+        return out
+    except Exception:
+        return out
+
+
 def clasificar_prepatron_lxv(verdes: int, rojas: int, cerrados: int, total: int = 6) -> dict:
     """
     Clasifica patrones parciales LXV que todavía NO emiten REAL,
@@ -6546,6 +6609,15 @@ def obtener_zona_lxv_hud_actual():
         info["zona_visual_info"] = dict(info_visual)
         info_pre = clasificar_prepatron_lxv(int(summary.get("verdes_count", 0) or 0), int(summary.get("rojas_count", 0) or 0), closed_count, expected_count)
         info["prepatron_info"] = dict(info_pre)
+        info_regional_temprana = clasificar_zona_regional_temprana_lxv(info, rows_live=rows_pack, summary=summary)
+        info["zona_regional_temprana_info"] = dict(info_regional_temprana)
+        zona_regional_temprana = str(info_regional_temprana.get("zona_regional_temprana", "") or "")
+        if zona_regional_temprana.startswith("VERDE_"):
+            _lxv_5v1x_event_cooldown(
+                key=f"zona_regional_temprana:{rid}:{zona_regional_temprana}",
+                msg=f"🟢 ZONA REGIONAL TEMPRANA LXV: {zona_regional_temprana} | prom3={float(info_regional_temprana.get('prom3', 0.0)):.2f} prom8={float(info_regional_temprana.get('prom8', 0.0)):.2f} d38={float(info_regional_temprana.get('d38', 0.0)):+.2f} | NO_INVERTIR_AÚN",
+                cooldown_s=15.0,
+            )
         if (partial == "5V0X" and closed_count == 5 and expected_count == 6 and str(dq) == "partial"):
             _lxv_5v1x_event_cooldown(
                 key=f"zona_visual_fuerte:{rid}",
@@ -7357,6 +7429,28 @@ def _selftest_lxv_live_row_mapping():
         print(f"[SELFTEST_LXV_LIVE_ROW] ERROR: {e}")
         return False
 
+def _selftest_zona_regional_temprana_lxv():
+    info = {
+        "prom3": 0.67,
+        "prom8": 0.46,
+        "prom20": 0.55,
+        "delta_3_8": 0.21,
+        "g_actual": 1.00,
+    }
+    z = clasificar_zona_regional_temprana_lxv(info, rows_live=None, summary={"closed_count": 1, "partial_pattern": "1V0X"})
+    assert z["zona_regional_temprana"] in ("VERDE_TEMPRANO_VISUAL", "VERDE_EN_FORMACION_VISUAL", "VERDE_DOMINANTE_MATRIZ")
+    assert z["allow_real_regional"] is False
+    info2 = {
+        "prom3": 0.33,
+        "prom8": 0.40,
+        "prom20": 0.51,
+        "delta_3_8": -0.06,
+        "g_actual": 0.17,
+    }
+    z2 = clasificar_zona_regional_temprana_lxv(info2, rows_live=None, summary={"closed_count": 0, "partial_pattern": "0V0X"})
+    assert z2["allow_real_regional"] is False
+    print("SELFTEST ZONA_REGIONAL_TEMPRANA_LXV OK")
+
 
 if str(os.getenv("RUN_LXV_ZONE_SELFTEST", "0")).strip() == "1":
     try:
@@ -7371,6 +7465,11 @@ if str(os.getenv("RUN_MRV_ZONA_V2_SELFTEST", "0")).strip() == "1":
 if str(os.getenv("RUN_LXV_LIVE_ROW_SELFTEST", "0")).strip() == "1":
     try:
         _selftest_lxv_live_row_mapping()
+    except Exception:
+        pass
+if str(os.getenv("RUN_ZONA_REGIONAL_TEMPRANA_SELFTEST", "0")).strip() == "1":
+    try:
+        _selftest_zona_regional_temprana_lxv()
     except Exception:
         pass
 
@@ -18731,8 +18830,13 @@ def _hud_zona_operativa_lxv_line(width=None):
         prev_full = int(info.get("prev_full_green_streak", 0) or 0)
         visual_hint = str(info.get("visual_hint", "") or "")
         zv_info = info.get("zona_visual_info", {}) if isinstance(info.get("zona_visual_info", {}), dict) else {}
-        if isinstance(zv_info, dict) and zv_info:
-            visual_hint = str(zv_info.get("zona_visual", visual_hint) or visual_hint)
+        zrt_info = info.get("zona_regional_temprana_info", {}) if isinstance(info.get("zona_regional_temprana_info", {}), dict) else {}
+        zona_visual_columna = str(zv_info.get("zona_visual", "") or "")
+        zona_regional_temprana = str(zrt_info.get("zona_regional_temprana", "") or "")
+        if zona_visual_columna not in ("INSUFICIENTE", "", None):
+            visual_hint = zona_visual_columna
+        elif zona_regional_temprana not in ("MIXTO_O_INSUFICIENTE", "", None):
+            visual_hint = zona_regional_temprana
         ronda_previa = str(info.get("ronda_liberada_previa", "no") or "no")
         line_hud = (
             f"{emoji} ZONA LXV HUD GLOBAL: {zona} | {decision} | motivo={motivo} | "
@@ -18762,6 +18866,7 @@ def render_zona_visual_lxv_panel(info_zona_oficial: dict, info_zona_visual: dict
         ofi = info_zona_oficial if isinstance(info_zona_oficial, dict) else {}
         vis = info_zona_visual if isinstance(info_zona_visual, dict) else {}
         pre = info_prepatron if isinstance(info_prepatron, dict) else {}
+        reg = ofi.get("zona_regional_temprana_info", {}) if isinstance(ofi.get("zona_regional_temprana_info", {}), dict) else {}
         w = 92
         def row(txt: str) -> str:
             body = str(txt)[:w-4]
@@ -18770,10 +18875,19 @@ def render_zona_visual_lxv_panel(info_zona_oficial: dict, info_zona_visual: dict
         ofi_line = f"OFICIAL : {ofi.get('zona', ofi.get('fase', '--'))} | decisión={ofi.get('decision','--')} | motivo={ofi.get('motivo','--')}"
         g_val = vis.get('g', ofi.get('g_actual', None))
         g_txt = "--" if g_val is None else f"{float(g_val):.2f}"
-        vis_line = f"VISUAL  : {vis.get('zona_visual','--')} | cerrados={vis.get('cerrados', ofi.get('cerrados','--'))}/{vis.get('esperados', ofi.get('esperados','--'))} | patrón={vis.get('patron', ofi.get('patron_live','--'))} | g={g_txt}"
+        reg_line = f"REGIONAL: {reg.get('zona_regional_temprana','--')} | prom3={float(reg.get('prom3',0.0)):.2f} prom8={float(reg.get('prom8',0.0)):.2f} d38={float(reg.get('d38',0.0)):+.2f} | acción={reg.get('accion_regional','ESPERAR')}"
+        vis_line = f"COLUMNA : {vis.get('zona_visual','--')} | cerrados={vis.get('cerrados', ofi.get('cerrados','--'))}/{vis.get('esperados', ofi.get('esperados','--'))} | patrón={vis.get('patron', ofi.get('patron_live','--'))} | g={g_txt}"
         pre_line = f"PREPATRÓN: {pre.get('prepatron','NINGUNO')} | acción={'VIGILAR' if bool(pre.get('vigilar',False)) else 'ESPERAR'}"
-        final_line = "FINAL   : NO_INVERTIR_AÚN | esperando cierre faltante" if not bool(ofi.get('allow_real', False)) else "FINAL   : EVALUAR_LÓGICA_NORMAL"
-        return ["╔" + "═"*(w-2) + "╗", row(f"{emoji} ZONA VISUAL LXV"), row(ofi_line), row(vis_line), row(pre_line), row(final_line), "╚" + "═"*(w-2) + "╝"]
+        reg_z = str(reg.get("zona_regional_temprana", "") or "")
+        col_c = int(vis.get("cerrados", ofi.get("cerrados", 0)) or 0)
+        col_e = int(vis.get("esperados", ofi.get("esperados", 0)) or 0)
+        if reg_z.startswith("VERDE_") and (col_e > 0 and col_c < col_e):
+            final_line = "FINAL   : NO_INVERTIR_AÚN | zona verde visual, pero columna incompleta"
+        elif not bool(ofi.get('allow_real', False)):
+            final_line = "FINAL   : NO_INVERTIR_AÚN | esperando cierre faltante"
+        else:
+            final_line = "FINAL   : EVALUAR_LÓGICA_NORMAL"
+        return ["╔" + "═"*(w-2) + "╗", row(f"{emoji} ZONA VISUAL LXV"), row(ofi_line), row(reg_line), row(vis_line), row(pre_line), row(final_line), "╚" + "═"*(w-2) + "╝"]
     except Exception:
         return []
 
