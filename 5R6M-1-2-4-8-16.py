@@ -4690,11 +4690,13 @@ def _ack_live_format_lines(snapshot):
                 int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES) or 6),
             )
             if bool(pre.get("vigilar", False)):
-                pattern_msg = f"PATRÓN LXV: {parcial_txt} | SIN_CANDIDATO_REAL | motivo=patron_parcial_vigilable:{parcial_txt}=>{pre.get('prepatron')}"
-                lines.append(f"🟡 PREPATRÓN LXV: {pre.get('prepatron')} | cerrados={closed_count}/{expected_count} | faltan={int(pre.get('faltan',0))} | acción=VIGILAR")
+                pattern_msg = f"PATRÓN LXV: {parcial_txt} | PREPATRÓN_VIGILABLE | motivo=patron_parcial_vigilable:{parcial_txt}=>{pre.get('prepatron')}"
+                pre_line = _render_prepatron_lxv_line(pre, obj_round)
+                if pre_line:
+                    lines.append(pre_line)
                 _lxv_5v1x_event_cooldown(
-                    key=f"prepatron_hud:{obj_round}:{pre.get('prepatron')}",
-                    msg=f"🟡 PREPATRÓN LXV: {pre.get('motivo')} | ronda=#{obj_round}",
+                    key=f"prepatron_lxv:{obj_round}:{pre.get('prepatron')}",
+                    msg=f"🟡 PREPATRÓN LXV: {parcial_txt} parcial puede cerrar como 5V1X/4V2X | ronda=#{obj_round}",
                     cooldown_s=15.0,
                 )
             else:
@@ -6009,34 +6011,45 @@ def hay_real_activo_global() -> tuple[bool, str]:
         tok = ""
         if callable(globals().get("leer_token_actual")):
             tok = str(leer_token_actual() or "").strip()
-        if "REAL:" in tok.upper() and "REAL:NONE" not in tok.upper():
-            return True, f"token_actual:{tok}"
-    except Exception:
-        pass
-    try:
-        owner = str(globals().get("REAL_OWNER_LOCK", "") or "").strip()
-        if owner and owner.lower() != "none":
-            return True, f"owner_lock:{owner}"
-    except Exception:
-        pass
-    for k in ("LAST_REAL_OWNER_STATE", "owner_real", "bot_real_activo", "REAL_ACTIVO", "REAL_ORDER_ACTIVE"):
-        try:
+        up = tok.upper()
+        if "REAL:" in up and "REAL:NONE" not in up:
+            owner = tok.split("REAL:", 1)[1].strip() if "REAL:" in tok else tok
+            if owner and owner.strip().lower() != "none":
+                return True, f"token_actual_REAL:{tok}"
+        st = globals().get("LAST_REAL_OWNER_STATE")
+        if isinstance(st, dict):
+            if str(st.get("owner_bot", "") or "").strip() or str(st.get("bot", "") or "").strip() or bool(st.get("assigned_ts")):
+                return True, f"LAST_REAL_OWNER_STATE:{st.get('owner_bot') or st.get('bot') or 'assigned'}"
+        for k in ("REAL_CLOSE_PENDING", "real_close_pending", "owner_real", "bot_real_activo", "REAL_OWNER", "BOT_REAL_ACTIVO", "_REAL_OWNER", "_REAL_ACTIVE_OWNER", "LAST_REAL_BOT"):
             v = globals().get(k, None)
-            if isinstance(v, str) and v.strip() and v.strip().lower() != "none":
-                return True, f"{k}:{v}"
-            if isinstance(v, dict) and any(bool(x) for x in v.values()):
-                return True, f"{k}:dict_active"
-            if isinstance(v, bool) and v:
-                return True, f"{k}:true"
-        except Exception:
-            continue
-    try:
-        pending_state = _hay_real_close_pending_activo() if callable(globals().get("_hay_real_close_pending_activo")) else None
-        if isinstance(pending_state, tuple) and bool(pending_state[0]):
-            return True, "real_close_pending"
+            if isinstance(v, dict):
+                if any(bool(x) for x in v.values()):
+                    return True, f"{k}:dict_active"
+            elif isinstance(v, bool):
+                if v:
+                    return True, f"{k}:true"
+            elif isinstance(v, str):
+                vv = v.strip()
+                if vv and vv.lower() not in ("none", "false", "0", "demo"):
+                    return True, f"{k}:{vv}"
+        for k, v in list(globals().items()):
+            if "token" in str(k).lower() and isinstance(v, str):
+                uv = v.upper().strip()
+                if "REAL:" in uv and "REAL:NONE" not in uv:
+                    return True, f"{k}:{v}"
+        return False, "libre"
     except Exception:
-        pass
-    return False, "unknown"
+        return False, "error_check_real_activo"
+
+def _aplicar_bloqueo_real_activo_a_locks(locks: dict, resultado: str = "", falta: str = "") -> tuple[dict, str, str, bool, str]:
+    real_activo, motivo = hay_real_activo_global()
+    if real_activo:
+        locks["TOKEN_REAL_LIBRE"] = False
+        locks["ORDEN_REAL_OK"] = False
+        resultado = "REAL_ACTIVO / ESPERANDO CIERRE"
+        falta = "CIERRE_REAL_PENDIENTE"
+        return locks, resultado, falta, True, motivo
+    return locks, resultado, falta, False, motivo
 
 def clasificar_prepatron_lxv(verdes: int, rojas: int, cerrados: int, total: int = 6) -> dict:
     out = {"prepatron":"NINGUNO","vigilar":False,"puede_5v1x":False,"puede_4v2x":False,"faltan":max(0, int(total)-int(cerrados)),"motivo":"sin_prepatron"}
@@ -6058,6 +6071,15 @@ def clasificar_prepatron_lxv(verdes: int, rojas: int, cerrados: int, total: int 
         return out
     except Exception:
         return out
+
+def _render_prepatron_lxv_line(info_pre: dict, ronda: int | None = None) -> str:
+    try:
+        if not isinstance(info_pre, dict) or not bool(info_pre.get("vigilar", False)):
+            return ""
+        ronda_txt = f"#{int(ronda)}" if isinstance(ronda, int) and ronda > 0 else "-"
+        return f"🟡 PREPATRÓN LXV: {info_pre.get('prepatron', 'NINGUNO')} | ronda={ronda_txt} | faltan={int(info_pre.get('faltan', 0) or 0)} | acción=VIGILAR"
+    except Exception:
+        return ""
 
 def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_candidato="", round_complete=False, data_quality="", zona_info=None, candidate_info=None, order_status=None):
     try:
@@ -6116,15 +6138,33 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
                 msg=f"🟡 REAL activo detectado: bloqueando nueva orden REAL hasta cierre | motivo={motivo_real_activo}",
                 cooldown_s=15.0,
             )
+        locks_panel = p.get("locks", {}) if isinstance(p.get("locks", {}), dict) else {}
+        res_calc = ""
+        falta_calc = ""
+        locks_panel, res_calc, falta_calc, real_activo, motivo_real_activo = _aplicar_bloqueo_real_activo_a_locks(locks_panel, res_calc, falta_calc)
+        p["locks"] = locks_panel
         p["ready_pre_real"] = bool(_real_locks_ready_pre_real())
         first_off = _real_locks_first_off()
         if real_activo:
             p["ready_pre_real"] = False
-            p["falta_principal"] = "CIERRE_REAL_PENDIENTE"
-            p["resultado"] = "REAL_ACTIVO / ESPERANDO CIERRE"
+            p["falta_principal"] = falta_calc or "CIERRE_REAL_PENDIENTE"
+            p["resultado"] = res_calc or "REAL_ACTIVO / ESPERANDO CIERRE"
+            _lxv_5v1x_event_cooldown(
+                key="real_activo_lock",
+                msg=f"🟡 REAL activo detectado: bloqueando nueva orden REAL hasta cierre | motivo={motivo_real_activo}",
+                cooldown_s=15.0,
+            )
         else:
-            p["falta_principal"] = (first_off if first_off else "UNKNOWN_LOCK") if not p["ready_pre_real"] else "---"
-            p["resultado"] = "LISTO PARA REAL" if p["ready_pre_real"] else "BLOQUEADO"
+            es_prepatron_vigilable = bool(p.get("patron", "") not in ("4V2X", "5V1X") and str(p.get("patron", "")).strip() not in ("", "0V0X") and bool(clasificar_prepatron_lxv(int((candidate_info or {}).get("verdes_count", 0) or 0), int((candidate_info or {}).get("rojas_count", 0) or 0), int((candidate_info or {}).get("cerrados_count", 0) or 0), 6).get("vigilar", False)))
+            if p["ready_pre_real"]:
+                p["falta_principal"] = "---"
+                p["resultado"] = "LISTO PARA REAL"
+            elif es_prepatron_vigilable:
+                p["falta_principal"] = "ESPERANDO CIERRE 5V1X/4V2X"
+                p["resultado"] = "VIGILANDO PREPATRÓN"
+            else:
+                p["falta_principal"] = first_off if first_off else "UNKNOWN_LOCK"
+                p["resultado"] = "BLOQUEADO"
         p["updated_ts"] = float(time.time())
         p["error"] = ""
     except Exception as e:
@@ -8588,6 +8628,7 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
         return False
     real_activo, motivo_real = hay_real_activo_global()
     if real_activo:
+        agregar_evento("🟡 REAL bloqueado: ya existe REAL activo | motivo=" + str(motivo_real))
         _lxv_5v1x_event_cooldown(
             key=f"emit_block_real_activo:{bot}:{motivo_real}",
             msg=f"⛔ REAL bloqueado: ya existe REAL activo | bot={bot} | motivo={motivo_real}",
@@ -24187,3 +24228,20 @@ if __name__ == "__main__":
         msg=f"✅ LXV VERDE OK: rid={rid} patron=5V1X prev_full_green_streak={int((info_exh or {}).get('prev_full_green_streak',0))}",
         cooldown_s=8.0,
     )
+
+def _selftest_real_activo_prepatron_lxv():
+    tests = [
+        (3, 1, 4, "PRE_5V1X_OR_4V2X"),
+        (4, 0, 4, "PRE_5V1X"),
+        (2, 2, 4, "PRE_4V2X_DEBIL"),
+        (4, 1, 5, "PRE_5V1X_OR_4V2X_FINAL"),
+        (3, 2, 5, "PRE_4V2X_FINAL"),
+        (1, 3, 4, "NINGUNO"),
+    ]
+    for v, r, c, expected in tests:
+        got = clasificar_prepatron_lxv(v, r, c, 6).get("prepatron")
+        assert got == expected, f"prepatron fail {v}V{r}X/{c}: got={got} expected={expected}"
+    print("SELFTEST REAL_ACTIVO_PREPATRON_LXV OK")
+
+if os.environ.get("RUN_REAL_PREPATRON_SELFTEST") == "1":
+    _selftest_real_activo_prepatron_lxv()
