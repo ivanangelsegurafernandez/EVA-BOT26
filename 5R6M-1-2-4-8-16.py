@@ -5955,7 +5955,7 @@ def _real_locks_first_off():
                 return name
     except Exception:
         pass
-    return ""
+    return "UNKNOWN_LOCK"
 
 def _real_locks_ready_pre_real():
     try:
@@ -5997,7 +5997,8 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
         _real_lock_set("CANDIDATO_VALIDO", cand_ok, str(ci.get("reason", "")))
         _real_lock_set("ORDEN_REAL_OK", order_status if order_status in (True, False, None) else None, "")
         p["ready_pre_real"] = bool(_real_locks_ready_pre_real())
-        p["falta_principal"] = _real_locks_first_off() if not p["ready_pre_real"] else "---"
+        first_off = _real_locks_first_off()
+        p["falta_principal"] = (first_off if first_off else "UNKNOWN_LOCK") if not p["ready_pre_real"] else "---"
         p["resultado"] = "LISTO PARA REAL" if p["ready_pre_real"] else "BLOQUEADO"
         p["updated_ts"] = float(time.time())
         p["error"] = ""
@@ -6006,6 +6007,37 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
             REAL_LOCKS_PANEL["resultado"] = "ERROR_PANEL"
             REAL_LOCKS_PANEL["error"] = str(e)
             REAL_LOCKS_PANEL["ready_pre_real"] = False
+            REAL_LOCKS_PANEL["falta_principal"] = _real_locks_first_off() or "UNKNOWN_LOCK"
+        except Exception:
+            pass
+
+def actualizar_real_locks_panel_desde_round_live():
+    try:
+        rows_pack = _ack_live_build_rows() if callable(globals().get("_ack_live_build_rows")) else {}
+        summary = _ack_live_calc_summary(rows_pack) if callable(globals().get("_ack_live_calc_summary")) else {}
+        if not isinstance(summary, dict):
+            summary = {}
+        rid = int(summary.get("obj_round", summary.get("round_id", 0)) or 0)
+        closed_count = int(summary.get("closed_count", 0) or 0)
+        expected_count = int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
+        dq = str(summary.get("data_quality", "missing") or "missing").strip().lower()
+        partial = str(summary.get("partial_pattern", "0V0X") or "0V0X").strip().upper()
+        round_complete = bool(closed_count == expected_count and expected_count > 0)
+        zi = dict(globals().get("_LXV_ZONA_HUD_LAST_INFO", {}) or {})
+        if not zi:
+            zi = evaluar_fase_zona_verde_lxv(round_id_objetivo=rid if rid > 0 else None) or {}
+        actualizar_real_locks_panel_lxv(
+            source="ROUND_LIVE", round_id=rid, patron=partial, bot_candidato="--",
+            round_complete=round_complete, data_quality=dq, zona_info=zi,
+            candidate_info={"candidate_ok": False, "reason": "sin_candidato_round_live"},
+            order_status=(globals().get("REAL_LOCKS_PANEL", {}).get("locks", {}).get("ORDEN_REAL_OK", None)),
+        )
+    except Exception as e:
+        try:
+            REAL_LOCKS_PANEL["error"] = str(e)
+            REAL_LOCKS_PANEL["resultado"] = "ERROR_PANEL"
+            REAL_LOCKS_PANEL["ready_pre_real"] = False
+            REAL_LOCKS_PANEL["falta_principal"] = _real_locks_first_off() or "UNKNOWN_LOCK"
         except Exception:
             pass
 
@@ -6016,20 +6048,22 @@ def render_real_locks_panel():
         p = globals().get("REAL_LOCKS_PANEL", {})
         locks = p.get("locks", {}) if isinstance(p, dict) else {}
         def mk(v):
-            if v is True: return f"{Fore.GREEN}ON{Fore.RESET}"
-            if v is False: return f"{Fore.RED}OFF{Fore.RESET}"
-            return f"{Fore.YELLOW}--{Fore.RESET}"
-        out = ["╔════════════════════════════════════╗","║ 🔐 CANDADOS REAL LXV              ║",
-               f"║ Ronda: {str(p.get('round_id') or '--'):<4} | Bot: {str(p.get('bot') or '--'):<11}║",
-               f"║ Patrón: {str(p.get('patron') or '--'):<4} | Zona: {str(p.get('zona') or '--'):<10}║",
-               "╠════════════════════════════════════╣"]
+            if v is True: return f"{Fore.GREEN}ON  {Fore.RESET}"
+            if v is False: return f"{Fore.RED}OFF {Fore.RESET}"
+            return f"{Fore.YELLOW}--  {Fore.RESET}"
+        def row(txt):
+            return f"║ {str(txt)[:36].ljust(36)} ║"
+        out = ["╔════════════════════════════════════════╗","║ 🔐 CANDADOS REAL LXV                  ║",
+               row(f"Ronda: {str(p.get('round_id') or '--')} | Bot: {str(p.get('bot') or '--')}"),
+               row(f"Patrón: {str(p.get('patron') or '--')} | Zona: {str(p.get('zona') or '--')}"),
+               "╠════════════════════════════════════════╣"]
         for name in list(globals().get("LXV_REAL_REQUIRED_LOCKS", [])) + ["ORDEN_REAL_OK"]:
-            out.append(f"║ {name:<20} [ {mk(locks.get(name)):<9}]║")
+            out.append(row(f"{name:<20} [ {mk(locks.get(name))}]"))
         res_ok = bool(p.get("ready_pre_real", False))
-        out += ["╠════════════════════════════════════╣",
-                f"║ RESULTADO: {'✅ LISTO PARA REAL' if res_ok else '⛔ BLOQUEADO':<20}║",
-                f"║ FALTA: {str(p.get('falta_principal') or '---'):<28}║",
-                "╚════════════════════════════════════╝"]
+        out += ["╠════════════════════════════════════════╣",
+                row(f"RESULTADO: {'✅ LISTO PARA REAL' if res_ok else '⛔ BLOQUEADO'}"),
+                row(f"FALTA: {str(p.get('falta_principal') or '---')}"),
+                "╚════════════════════════════════════════╝"]
         return out
     except Exception:
         return []
@@ -19333,9 +19367,13 @@ def mostrar_panel():
     if real_panel_lines:
         panel_lines += real_panel_lines
     try:
+        actualizar_real_locks_panel_desde_round_live()
+    except Exception:
+        pass
+    try:
         lock_lines = render_real_locks_panel()
         if lock_lines:
-            panel_lines = list(lock_lines) + [""] + list(panel_lines)
+            panel_lines = list(lock_lines) + list(panel_lines)
     except Exception:
         pass
 
