@@ -4683,7 +4683,22 @@ def _ack_live_format_lines(snapshot):
             pattern_msg = "PATRÓN LXV: 6V0X | SIN_CANDIDATO_REAL | motivo=patron_no_invertible"
             lines.append(fase_line)
         else:
-            pattern_msg = f"PATRÓN LXV: {parcial_txt} | SIN_CANDIDATO_REAL | motivo=patron_no_invertible"
+            pre = clasificar_prepatron_lxv(
+                int(summary.get("verdes_count", 0) or 0),
+                int(summary.get("rojas_count", 0) or 0),
+                int(summary.get("closed_count", 0) or 0),
+                int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES) or 6),
+            )
+            if bool(pre.get("vigilar", False)):
+                pattern_msg = f"PATRÓN LXV: {parcial_txt} | SIN_CANDIDATO_REAL | motivo=patron_parcial_vigilable:{parcial_txt}=>{pre.get('prepatron')}"
+                lines.append(f"🟡 PREPATRÓN LXV: {pre.get('prepatron')} | cerrados={closed_count}/{expected_count} | faltan={int(pre.get('faltan',0))} | acción=VIGILAR")
+                _lxv_5v1x_event_cooldown(
+                    key=f"prepatron_hud:{obj_round}:{pre.get('prepatron')}",
+                    msg=f"🟡 PREPATRÓN LXV: {pre.get('motivo')} | ronda=#{obj_round}",
+                    cooldown_s=15.0,
+                )
+            else:
+                pattern_msg = f"PATRÓN LXV: {parcial_txt} | SIN_CANDIDATO_REAL | motivo=patron_no_invertible"
         lines.append(pattern_msg)
         lines.append(
             f"ROUND LIVE #{obj_round}: V={int(summary.get('verdes_count', 0) or 0)} R={int(summary.get('rojas_count', 0) or 0)} "
@@ -5989,6 +6004,61 @@ def _real_locks_ready_pre_real():
     except Exception:
         return False
 
+def hay_real_activo_global() -> tuple[bool, str]:
+    try:
+        tok = ""
+        if callable(globals().get("leer_token_actual")):
+            tok = str(leer_token_actual() or "").strip()
+        if "REAL:" in tok.upper() and "REAL:NONE" not in tok.upper():
+            return True, f"token_actual:{tok}"
+    except Exception:
+        pass
+    try:
+        owner = str(globals().get("REAL_OWNER_LOCK", "") or "").strip()
+        if owner and owner.lower() != "none":
+            return True, f"owner_lock:{owner}"
+    except Exception:
+        pass
+    for k in ("LAST_REAL_OWNER_STATE", "owner_real", "bot_real_activo", "REAL_ACTIVO", "REAL_ORDER_ACTIVE"):
+        try:
+            v = globals().get(k, None)
+            if isinstance(v, str) and v.strip() and v.strip().lower() != "none":
+                return True, f"{k}:{v}"
+            if isinstance(v, dict) and any(bool(x) for x in v.values()):
+                return True, f"{k}:dict_active"
+            if isinstance(v, bool) and v:
+                return True, f"{k}:true"
+        except Exception:
+            continue
+    try:
+        pending_state = _hay_real_close_pending_activo() if callable(globals().get("_hay_real_close_pending_activo")) else None
+        if isinstance(pending_state, tuple) and bool(pending_state[0]):
+            return True, "real_close_pending"
+    except Exception:
+        pass
+    return False, "unknown"
+
+def clasificar_prepatron_lxv(verdes: int, rojas: int, cerrados: int, total: int = 6) -> dict:
+    out = {"prepatron":"NINGUNO","vigilar":False,"puede_5v1x":False,"puede_4v2x":False,"faltan":max(0, int(total)-int(cerrados)),"motivo":"sin_prepatron"}
+    try:
+        v, r, c, t = int(verdes), int(rojas), int(cerrados), int(total or 6)
+        out["faltan"] = max(0, t - c)
+        if t != 6:
+            return out
+        if v == 3 and r == 1 and c == 4:
+            return {"prepatron":"PRE_5V1X_OR_4V2X","vigilar":True,"puede_5v1x":True,"puede_4v2x":True,"faltan":2,"motivo":"3V1X parcial: puede cerrar como 5V1X o 4V2X"}
+        if v == 4 and r == 0 and c == 4:
+            return {"prepatron":"PRE_5V1X","vigilar":True,"puede_5v1x":True,"puede_4v2x":False,"faltan":2,"motivo":"4V0X parcial: puede cerrar como 5V1X"}
+        if v == 2 and r == 2 and c == 4:
+            return {"prepatron":"PRE_4V2X_DEBIL","vigilar":True,"puede_5v1x":False,"puede_4v2x":True,"faltan":2,"motivo":"2V2X parcial: puede cerrar como 4V2X si faltantes son verdes"}
+        if v == 4 and r == 1 and c == 5:
+            return {"prepatron":"PRE_5V1X_OR_4V2X_FINAL","vigilar":True,"puede_5v1x":True,"puede_4v2x":True,"faltan":1,"motivo":"4V1X parcial final: un cierre define 5V1X o 4V2X"}
+        if v == 3 and r == 2 and c == 5:
+            return {"prepatron":"PRE_4V2X_FINAL","vigilar":True,"puede_5v1x":False,"puede_4v2x":True,"faltan":1,"motivo":"3V2X parcial final: si falta verde cierra 4V2X"}
+        return out
+    except Exception:
+        return out
+
 def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_candidato="", round_complete=False, data_quality="", zona_info=None, candidate_info=None, order_status=None):
     try:
         p = globals().get("REAL_LOCKS_PANEL", {})
@@ -6037,10 +6107,24 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
         cand_ok = bool(ci.get("candidate_ok", False))
         _real_lock_set("CANDIDATO_VALIDO", cand_ok, str(ci.get("reason", "")))
         _real_lock_set("ORDEN_REAL_OK", order_status if order_status in (True, False, None) else None, "")
+        real_activo, motivo_real_activo = hay_real_activo_global()
+        if real_activo:
+            _real_lock_set("TOKEN_REAL_LIBRE", False, f"real_activo:{motivo_real_activo}")
+            _real_lock_set("ORDEN_REAL_OK", False, f"real_activo:{motivo_real_activo}")
+            _lxv_5v1x_event_cooldown(
+                key=f"real_activo_global:{motivo_real_activo}",
+                msg=f"🟡 REAL activo detectado: bloqueando nueva orden REAL hasta cierre | motivo={motivo_real_activo}",
+                cooldown_s=15.0,
+            )
         p["ready_pre_real"] = bool(_real_locks_ready_pre_real())
         first_off = _real_locks_first_off()
-        p["falta_principal"] = (first_off if first_off else "UNKNOWN_LOCK") if not p["ready_pre_real"] else "---"
-        p["resultado"] = "LISTO PARA REAL" if p["ready_pre_real"] else "BLOQUEADO"
+        if real_activo:
+            p["ready_pre_real"] = False
+            p["falta_principal"] = "CIERRE_REAL_PENDIENTE"
+            p["resultado"] = "REAL_ACTIVO / ESPERANDO CIERRE"
+        else:
+            p["falta_principal"] = (first_off if first_off else "UNKNOWN_LOCK") if not p["ready_pre_real"] else "---"
+            p["resultado"] = "LISTO PARA REAL" if p["ready_pre_real"] else "BLOQUEADO"
         p["updated_ts"] = float(time.time())
         p["error"] = ""
     except Exception as e:
@@ -7766,7 +7850,16 @@ def _sync_round_tick_maestro():
             else:
                 motivo_no_real = motivo_exec if motivo_exec else f"no_real_{patron}"
         elif patron not in ("5V1X", "4V2X"):
-            motivo_no_real = f"patron_no_invertible:{patron}"
+            pre = clasificar_prepatron_lxv(verdes_count, rojas_count, closed_count, expected_count)
+            if bool(pre.get("vigilar", False)):
+                motivo_no_real = f"patron_parcial_vigilable:{patron}=>{pre.get('prepatron')}"
+                _lxv_5v1x_event_cooldown(
+                    key=f"prepatron_round:{round_id}:{pre.get('prepatron')}",
+                    msg=f"🟡 PREPATRÓN LXV: {pre.get('motivo')} | ronda=#{round_id}",
+                    cooldown_s=15.0,
+                )
+            else:
+                motivo_no_real = f"patron_no_invertible:{patron}"
             agregar_evento(f"ROUND LIVE #{round_id}: patrón={patron} | SIN_CANDIDATO_REAL | release inmediato")
             pick = None
         if (not round_live_real_ok) and pick:
@@ -8491,6 +8584,14 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
         agregar_evento(
             f"⏸️ REAL bloqueado por cierre pendiente: no se emite {src} para {bot}; "
             f"pendiente={pending_bot} C{pending.get('ciclo')}"
+        )
+        return False
+    real_activo, motivo_real = hay_real_activo_global()
+    if real_activo:
+        _lxv_5v1x_event_cooldown(
+            key=f"emit_block_real_activo:{bot}:{motivo_real}",
+            msg=f"⛔ REAL bloqueado: ya existe REAL activo | bot={bot} | motivo={motivo_real}",
+            cooldown_s=15.0,
         )
         return False
     try:
