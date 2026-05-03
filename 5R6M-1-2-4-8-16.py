@@ -7823,6 +7823,8 @@ def _sync_round_tick_maestro():
     ):
         agregar_evento(f"🧭 SYNC ROUND_DRIFT: obj #{round_id} < released #{released_round}; buscando ACKs en ronda liberada.")
         candidate_round = int(released_round)
+        if candidate_round != int(round_id):
+            agregar_evento(f"⚠️ LXV_SYNC_COLUMN release_mismatch: detectada=#{released_round} | destino=#{round_id} | usada=#{candidate_round}")
         resync_future_closed, resync_future_reasons = _sync_round_collect_closed_acks_any_round(candidate_round)
         if isinstance(resync_future_closed, dict) and len(resync_future_closed) >= len(BOT_NAMES):
             agregar_evento(f"🧭 SYNC RESYNC FUTURE_ACK_FULL: obj #{round_id} -> #{candidate_round}; ACK 6/6 ya cerrados.")
@@ -18838,10 +18840,11 @@ def _hud_zona_operativa_lxv_line(width=None):
         elif zona_regional_temprana not in ("MIXTO_O_INSUFICIENTE", "", None):
             visual_hint = zona_regional_temprana
         ronda_previa = str(info.get("ronda_liberada_previa", "no") or "no")
+        g_hud = f"g_columna={g_txt}" if cerrados >= esperados else f"g_columna=N/A | g_visual={g_txt}"
         line_hud = (
             f"{emoji} ZONA LXV HUD GLOBAL: {zona} | {decision} | motivo={motivo} | "
             f"rid_zona={rid_zona if rid_zona > 0 else '--'} | rid_live={rid_live if rid_live > 0 else '--'} | "
-            f"cols={cols_usadas}/{cols_req} | cerrados={cerrados}/{esperados} | patrón={patron_live} | dq={dq} | g={g_txt} | prom3={prom3:.2f} prom8={prom8:.2f} prom20={prom20:.2f} d38={d38:+.2f} | "
+            f"cols={cols_usadas}/{cols_req} | cerrados={cerrados}/{esperados} | patrón={patron_live} | dq={dq} | {g_hud} | prom3={prom3:.2f} prom8={prom8:.2f} prom20={prom20:.2f} d38={d38:+.2f} | "
             f"prev_full={prev_full} | visual={visual_hint or '--'} | ronda_liberada_previa={ronda_previa} | source={source}"
         )
         gate = dict(globals().get("_LXV_LAST_REAL_GATE_INFO", {}) or {})
@@ -18857,6 +18860,123 @@ def _hud_zona_operativa_lxv_line(width=None):
 
 
 
+
+
+def _formatear_sync_missing_detalle(missing_items, faltan: int) -> str:
+    """Devuelve resumen honesto de bots faltantes. Nunca lanza excepción."""
+    try:
+        faltan = int(faltan or 0)
+        if faltan <= 0:
+            return "missing_total=0"
+        first = None
+        if isinstance(missing_items, dict) and missing_items:
+            k = next(iter(missing_items.keys()))
+            first = f"{k}:{missing_items.get(k)}"
+        elif isinstance(missing_items, (list, tuple)) and missing_items:
+            first = str(missing_items[0])
+        if not first:
+            return f"missing_total={faltan} | detalle=no_disponible"
+        otros = max(0, faltan - 1)
+        if otros > 0:
+            return f"missing_total={faltan} | first_missing={first} | otros={otros}"
+        return f"missing_total={faltan} | first_missing={first}"
+    except Exception:
+        return "missing_total=? | detalle=error"
+
+
+def render_sync_wait_lxv_panel(summary: dict, release_state: dict | None = None) -> list[str]:
+    """Muestra espera de sincronización cuando la columna oficial está incompleta. Solo HUD."""
+    try:
+        ss = summary if isinstance(summary, dict) else {}
+        rs = release_state if isinstance(release_state, dict) else {}
+        expected_count = int(ss.get("expected_count", 6) or 6)
+        closed_count = int(ss.get("closed_count", 0) or 0)
+        faltan_count = max(0, expected_count - closed_count)
+        round_id = int(ss.get("round_id", rs.get("round_id", 0)) or 0)
+        missing = ss.get("missing_bots", ss.get("missing", rs.get("missing", [])))
+        if isinstance(missing, dict):
+            missing_list = [str(k) for k in missing.keys()]
+        elif isinstance(missing, (list, tuple)):
+            missing_list = [str(x) for x in missing]
+        else:
+            missing_list = []
+        motivos = []
+        for k in ("missing_reason", "reason", "status", "motivo"):
+            v = ss.get(k, None)
+            if v:
+                motivos.append(str(v))
+        for k in ("round_mismatch", "pending_result", "missing"):
+            if ss.get(k):
+                motivos.append(str(k))
+        motivo_txt = " / ".join(dict.fromkeys(motivos)) if motivos else "missing"
+        detail_txt = _formatear_sync_missing_detalle(missing, faltan_count)
+        w = 92
+        def row(txt: str) -> str:
+            body = str(txt)[:w-4]
+            return f"║ {body.ljust(w-4)} ║"
+        return [
+            "╔" + "═"*(w-2) + "╗",
+            row("⏳ ESPERA SYNC LXV"),
+            row(f"RONDA OBJETIVO : #{round_id}"),
+            row(f"CERRADOS       : {closed_count}/{expected_count}"),
+            row(f"FALTAN         : {faltan_count}"),
+            row(f"BOTS FALTANTES : {', '.join(missing_list) if missing_list else '--'}"),
+            row(f"MOTIVO         : {motivo_txt}"),
+            row(f"REAL           : NO_EVALUADO | columna oficial incompleta | {detail_txt}"),
+            "╚" + "═"*(w-2) + "╝",
+        ]
+    except Exception:
+        return []
+
+
+def render_estado_lxv_actual_panel(info_zona: dict, summary: dict, locks: dict | None = None, release_state: dict | None = None) -> list[str]:
+    """Renderiza panel grande y claro por capas OFICIAL/REGIONAL/COLUMNA/SYNC/REAL/FINAL."""
+    try:
+        info = info_zona if isinstance(info_zona, dict) else {}
+        ss = summary if isinstance(summary, dict) else {}
+        lk = locks if isinstance(locks, dict) else {}
+        expected_count = int(ss.get("expected_count", info.get("esperados", 6)) or 6)
+        closed_count = int(ss.get("closed_count", info.get("cerrados", 0)) or 0)
+        faltan_count = max(0, expected_count - closed_count)
+        dq = str(ss.get("data_quality", info.get("data_quality", "missing")) or "missing")
+        patron = str(ss.get("partial_pattern", info.get("patron_live", "0V0X")) or "0V0X")
+        zona = str(info.get("zona", info.get("fase", "PRE_ZONA_VISUAL")) or "PRE_ZONA_VISUAL")
+        decision = str(info.get("decision", "ESPERANDO_COLUMNA") or "ESPERANDO_COLUMNA")
+        motivo = str(info.get("motivo", "columna_incompleta") or "columna_incompleta")
+        reg = info.get("zona_regional_temprana_info", {}) if isinstance(info.get("zona_regional_temprana_info", {}), dict) else {}
+        reg_z = str(reg.get("zona_regional_temprana", info.get("visual_hint", "--")) or "--")
+        prom3 = float(reg.get("prom3", info.get("prom3", 0.0)) or 0.0); prom8 = float(reg.get("prom8", info.get("prom8", 0.0)) or 0.0); d38 = float(reg.get("d38", info.get("delta_3_8", 0.0)) or 0.0)
+        action = str(reg.get("accion_regional", "VIGILAR" if reg_z.startswith("VERDE") else "ESPERAR") or "ESPERAR")
+        if closed_count >= expected_count: col_state = "COMPLETA"
+        elif closed_count <= 0: col_state = "INCOMPLETA"
+        else: col_state = "PARCIAL"
+        g_vis = info.get("g_actual", None)
+        g_vis_txt = f"{float(g_vis):.2f}" if isinstance(g_vis, (int,float)) else "--"
+        g_col_txt = "N/A" if closed_count < expected_count else g_vis_txt
+        sync_txt = _formatear_sync_missing_detalle(ss.get("missing", ss.get("missing_bots", [])), faltan_count)
+        real_activo, _ = hay_real_activo_global() if callable(globals().get("hay_real_activo_global")) else (False, "")
+        tok = leer_token_actual() if callable(globals().get("leer_token_actual")) else None
+        owner = globals().get("REAL_OWNER_LOCK")
+        bot_real = owner if owner in BOT_NAMES else "ninguno"
+        if closed_count < expected_count:
+            final = "NO_INVERTIR_AÚN | zona verde visual, esperando columna oficial"
+        elif not bool(lk.get("PATRON_VALIDO", False)):
+            final = "NO_INVERTIR | patrón no invertible"
+        elif all(lk.get(k) is True for k in ("COLUMNA_COMPLETA","DATA_QUALITY_OK","PATRON_VALIDO","CANDIDATO_VALIDO","ZONA_OK","TOKEN_REAL_LIBRE")):
+            final = "LISTO_PARA_REAL"
+        else:
+            final = "VALIDANDO_CANDADOS"
+        w=92
+        row=lambda t: f"║ {str(t)[:w-4].ljust(w-4)} ║"
+        lines=["╔"+"═"*(w-2)+"╗",row("🧭 ESTADO LXV ACTUAL"),row(f"OFICIAL : {zona} | decisión={decision} | motivo={motivo}"),row(f"REGIONAL: {reg_z} | prom3={prom3:.2f} prom8={prom8:.2f} d38={d38:+.2f} | acción={action}"),row(f"COLUMNA : {col_state} | cerrados={closed_count}/{expected_count} | faltan={faltan_count} | patrón={patron} | dq={dq} | g_columna={g_col_txt} | g_visual={g_vis_txt}"),row(f"SYNC    : {'ESPERANDO_BOTS' if faltan_count>0 else 'OK'} | {sync_txt} | REAL={'no_evaluado' if faltan_count>0 else 'evaluable'}"),row(f"REAL    : ACTIVO={'SI' if real_activo else 'NO'} | TOKEN={'DEMO' if tok in (None,'none','') else 'REAL'} | BOT_REAL={bot_real}"),row(f"FINAL   : {final}")]
+        pre = info.get("prepatron_info", {}) if isinstance(info.get("prepatron_info", {}), dict) else {}
+        if pre.get("prepatron"):
+            lines.append(row(f"PREPATRÓN: {pre.get('prepatron')} | acción={'VIGILAR' if pre.get('vigilar') else 'ESPERAR'}"))
+        lines.append("╚"+"═"*(w-2)+"╝")
+        return lines
+    except Exception:
+        return []
+
 def render_zona_visual_lxv_panel(info_zona_oficial: dict, info_zona_visual: dict, info_prepatron: dict | None = None) -> list[str]:
     """
     Renderiza un panel ancho, visible y claro.
@@ -18864,30 +18984,13 @@ def render_zona_visual_lxv_panel(info_zona_oficial: dict, info_zona_visual: dict
     """
     try:
         ofi = info_zona_oficial if isinstance(info_zona_oficial, dict) else {}
-        vis = info_zona_visual if isinstance(info_zona_visual, dict) else {}
-        pre = info_prepatron if isinstance(info_prepatron, dict) else {}
-        reg = ofi.get("zona_regional_temprana_info", {}) if isinstance(ofi.get("zona_regional_temprana_info", {}), dict) else {}
-        w = 92
-        def row(txt: str) -> str:
-            body = str(txt)[:w-4]
-            return f"║ {body.ljust(w-4)} ║"
-        emoji = str(vis.get("emoji_visual", "⬜") or "⬜")
-        ofi_line = f"OFICIAL : {ofi.get('zona', ofi.get('fase', '--'))} | decisión={ofi.get('decision','--')} | motivo={ofi.get('motivo','--')}"
-        g_val = vis.get('g', ofi.get('g_actual', None))
-        g_txt = "--" if g_val is None else f"{float(g_val):.2f}"
-        reg_line = f"REGIONAL: {reg.get('zona_regional_temprana','--')} | prom3={float(reg.get('prom3',0.0)):.2f} prom8={float(reg.get('prom8',0.0)):.2f} d38={float(reg.get('d38',0.0)):+.2f} | acción={reg.get('accion_regional','ESPERAR')}"
-        vis_line = f"COLUMNA : {vis.get('zona_visual','--')} | cerrados={vis.get('cerrados', ofi.get('cerrados','--'))}/{vis.get('esperados', ofi.get('esperados','--'))} | patrón={vis.get('patron', ofi.get('patron_live','--'))} | g={g_txt}"
-        pre_line = f"PREPATRÓN: {pre.get('prepatron','NINGUNO')} | acción={'VIGILAR' if bool(pre.get('vigilar',False)) else 'ESPERAR'}"
-        reg_z = str(reg.get("zona_regional_temprana", "") or "")
-        col_c = int(vis.get("cerrados", ofi.get("cerrados", 0)) or 0)
-        col_e = int(vis.get("esperados", ofi.get("esperados", 0)) or 0)
-        if reg_z.startswith("VERDE_") and (col_e > 0 and col_c < col_e):
-            final_line = "FINAL   : NO_INVERTIR_AÚN | zona verde visual, pero columna incompleta"
-        elif not bool(ofi.get('allow_real', False)):
-            final_line = "FINAL   : NO_INVERTIR_AÚN | esperando cierre faltante"
-        else:
-            final_line = "FINAL   : EVALUAR_LÓGICA_NORMAL"
-        return ["╔" + "═"*(w-2) + "╗", row(f"{emoji} ZONA VISUAL LXV"), row(ofi_line), row(reg_line), row(vis_line), row(pre_line), row(final_line), "╚" + "═"*(w-2) + "╝"]
+        ss = dict(globals().get("_ACK_LIVE_SUMMARY", {}) or {})
+        if not ss:
+            expected_count = int(ofi.get("esperados", 6) or 6)
+            closed_count = int(ofi.get("cerrados", 0) or 0)
+            ss = {"expected_count": expected_count, "closed_count": closed_count, "partial_pattern": str(ofi.get("patron_live", "0V0X")), "data_quality": str(ofi.get("data_quality", "missing")), "round_id": int(ofi.get("round_id_live", 0) or 0)}
+        locks = dict((globals().get("REAL_LOCKS_PANEL", {}) or {}).get("locks", {}) or {})
+        return render_estado_lxv_actual_panel(ofi, ss, locks=locks, release_state=dict(globals().get("_SYNC_ROUND_STATE", {}) or {}))
     except Exception:
         return []
 
@@ -18953,15 +19056,16 @@ def _resumen_top_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
                 planos += 1
         mejor_txt = "--" if mejor is None else f"{mejor[0]} {mejor[1]*100:.1f}%"
         n_min_real, n_req_real = _n_minimo_real_status()
+        real_activo_txt = "SI" if hay_real_activo_global()[0] else "NO"
         line2 = (
-            f"📊 Prob={visibles}/{len(BOT_NAMES)} | OBS={obs} | REAL={real} | Mejor={mejor_txt} | "
+            f"📊 Prob={visibles}/{len(BOT_NAMES)} | OBS={obs} | REAL_SIG={real} | REAL_ACTIVO={real_activo_txt} | Mejor={mejor_txt} | "
             f"SENSOR_PLANO={planos}/{len(BOT_NAMES)} | n_min_real={int(n_min_real)}/{int(n_req_real)}"
         )
         lines.append(line2)
         lines.append(_hud_zona_operativa_lxv_line())
         lines.extend(render_zona_lxv_panel())
     except Exception:
-        lines.append("📊 Prob=-- | OBS=-- | REAL=-- | Mejor=-- | SENSOR_PLANO=-- | n_min_real=--")
+        lines.append("📊 Prob=-- | OBS=-- | REAL_SIG=-- | REAL_ACTIVO=-- | Mejor=-- | SENSOR_PLANO=-- | n_min_real=--")
 
     try:
         emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
@@ -24666,3 +24770,35 @@ def _selftest_zona_visual_parcial_lxv():
 
 if os.environ.get("RUN_ZONA_VISUAL_PARCIAL_SELFTEST") == "1":
     _selftest_zona_visual_parcial_lxv()
+
+def _selftest_hud_lxv_estado_claro():
+    summary = {
+        "round_id": 3959,
+        "closed_count": 0,
+        "expected_count": 6,
+        "partial_pattern": "0V0X",
+        "data_quality": "missing",
+    }
+    faltan = max(0, int(summary["expected_count"]) - int(summary["closed_count"]))
+    assert faltan == 6
+    txt = _formatear_sync_missing_detalle(["fulll47:round_mismatch_ack"], faltan)
+    assert "missing_total=6" in txt
+    assert "otros=5" in txt
+    locks = {
+        "REAL_CLOSE_LIBRE": True,
+        "COLUMNA_COMPLETA": False,
+        "DATA_QUALITY_OK": False,
+        "PATRON_VALIDO": False,
+        "CANDIDATO_VALIDO": False,
+        "ZONA_OK": False,
+        "TOKEN_REAL_LIBRE": True,
+    }
+    hard_lock_names = ["REAL_CLOSE_LIBRE", "COLUMNA_COMPLETA", "DATA_QUALITY_OK", "PATRON_VALIDO", "CANDIDATO_VALIDO", "ZONA_OK", "TOKEN_REAL_LIBRE"]
+    if any(locks.get(k) is False for k in hard_lock_names):
+        locks["ORDEN_REAL_OK"] = False
+    assert locks["ORDEN_REAL_OK"] is False
+    print("SELFTEST HUD_LXV_ESTADO_CLARO OK")
+
+
+if os.environ.get("RUN_HUD_LXV_ESTADO_CLARO_SELFTEST") == "1":
+    _selftest_hud_lxv_estado_claro()
