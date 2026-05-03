@@ -18977,6 +18977,38 @@ def _log_prearmado_lxv_event(key: str, msg: str, cooldown_s: float = 15.0) -> No
         pass
 
 
+def _extraer_zona_visual_lxv(info: dict) -> str:
+    """
+    Extrae zona visual/regional desde distintos formatos posibles.
+    Nunca lanza excepción.
+    """
+    try:
+        if not isinstance(info, dict):
+            return ""
+
+        candidatos = [
+            info.get("zona_visual_info"),
+            info.get("zona_regional_temprana_info"),
+            info.get("visual"),
+            info.get("visual_hint"),
+            info.get("zona_visual"),
+            info.get("zona_regional_temprana"),
+        ]
+
+        for c in candidatos:
+            if isinstance(c, dict):
+                for k in ("zona_visual", "zona_regional_temprana", "zona_regional", "visual", "fase", "zona"):
+                    v = c.get(k)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+            elif isinstance(c, str) and c.strip():
+                return c.strip()
+
+        return ""
+    except Exception:
+        return ""
+
+
 def detectar_prearmado_lxv(info_zona: dict, summary: dict, locks: dict | None = None) -> dict:
     """Detecta zona verde visual prioritaria. No emite REAL, no altera locks."""
     base = {"prearmado": False, "nivel": "NO", "motivo": "sin_prearmado", "esperando": "", "patron_actual": "0V0X", "cerrados": 0, "esperados": 6, "faltan": 6, "zona_visual": "", "zona_oficial": "", "dq": "missing", "candado_principal": "DESCONOCIDO", "puede_ser_5v1x": False, "puede_ser_4v2x": False, "shadow_only": True, "round_id": 0}
@@ -18984,7 +19016,7 @@ def detectar_prearmado_lxv(info_zona: dict, summary: dict, locks: dict | None = 
         info = info_zona if isinstance(info_zona, dict) else {}
         ss = summary if isinstance(summary, dict) else {}
         lk = locks if isinstance(locks, dict) else {}
-        zv = str(info.get("zona_visual_info") or info.get("visual") or info.get("zona_regional_temprana_info") or info.get("visual_hint") or "")
+        zv = _extraer_zona_visual_lxv(info)
         zo = str(info.get("zona") or info.get("fase") or "")
         patron = str(ss.get("partial_pattern") or info.get("patron") or info.get("patron_live") or "0V0X").upper()
         cerr = int(ss.get("closed_count", 0) or 0); esp = int(ss.get("expected_count", 6) or 6)
@@ -24949,6 +24981,20 @@ def _selftest_lxv_prearmado_seguro():
     assert p2["prearmado"] is True
     assert p2["nivel"] == "ALTO"
     assert p2["shadow_only"] is True
+    info_zona3 = {
+        "zona_visual_info": {"zona_visual": "VERDE_DOMINANTE_PARCIAL"},
+        "zona": "PRE_ZONA_VISUAL",
+    }
+    summary3 = {
+        "round_id": 102,
+        "closed_count": 5,
+        "expected_count": 6,
+        "partial_pattern": "5V0X",
+        "data_quality": "partial",
+    }
+    p3 = detectar_prearmado_lxv(info_zona3, summary3, locks)
+    assert p3["prearmado"] is True
+    assert p3["nivel"] == "ALTO"
     print("SELFTEST LXV_PREARMADO_SEGURO OK")
 
 if os.environ.get("RUN_LXV_PREARMADO_SELFTEST") == "1":
