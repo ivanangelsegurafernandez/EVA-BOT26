@@ -390,6 +390,21 @@ LXV_ZONAS_BLOQUEANTES = {
     "UNKNOWN",
 }
 LXV_SYNC_GENERIC_REAL_ENABLE = False
+LXV_REAL_SIMPLE_ROUTE_ENABLE = True
+LXV_REAL_LOCKS_PANEL_ENABLE = True
+LXV_REAL_LOCKS_PANEL_ENFORCE = True
+LXV_REAL_LOCKS_FAIL_SAFE = True
+LXV_REAL_REQUIRED_LOCKS = [
+    "REAL_CLOSE_LIBRE",
+    "COLUMNA_COMPLETA",
+    "DATA_QUALITY_OK",
+    "PATRON_VALIDO",
+    "CANDIDATO_VALIDO",
+    "ZONA_VALIDA",
+    "NO_ZONA_BLOQUEANTE",
+    "NO_DUPLICADO_RONDA",
+    "TOKEN_REAL_LIBRE",
+]
 
 # ✅ Umbral SOLO para auditoría/calibración (señales CERRADAS en ia_signals_log)
 # Esto es lo que querías: contar cierres desde 60% sin afectar la operativa.
@@ -2953,6 +2968,16 @@ LXV_REAL_AUDIT = {
     "fase_bloq": 0,
     "real_emitidos": 0,
     "ultimo_bloqueo": "",
+}
+REAL_LOCKS_PANEL = {
+    "enabled": True, "source": "", "round_id": None, "bot": "", "patron": "", "zona": "", "decision": "",
+    "locks": {
+        "REAL_CLOSE_LIBRE": False, "COLUMNA_COMPLETA": False, "DATA_QUALITY_OK": False, "PATRON_VALIDO": False,
+        "CANDIDATO_VALIDO": False, "ZONA_VALIDA": False, "NO_ZONA_BLOQUEANTE": False, "NO_DUPLICADO_RONDA": False,
+        "TOKEN_REAL_LIBRE": False, "ORDEN_REAL_OK": None,
+    },
+    "detalles": {}, "ready_pre_real": False, "resultado": "BLOQUEADO", "falta_principal": "",
+    "updated_ts": 0.0, "error": "",
 }
 MATRIZ_COLUMNAS_LXV_CSV = "matriz_columnas_lxv.csv"
 MATRIZ_CELDAS_LXV_CSV = "matriz_celdas_lxv.csv"
@@ -5574,48 +5599,14 @@ def _lxv_4v2x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         cooldown_s=8.0,
     )
     LXV_REAL_AUDIT["patrones_4v2x"] = int(LXV_REAL_AUDIT.get("patrones_4v2x", 0) or 0) + 1
-    if not bool(globals().get("LXV_ZONA_DINAMICA_ENABLE", False)):
-        ok_exh, reason_exh, info_exh = _lxv_green_exhaustion_gate_ok(rid, "4V2X")
-    else:
-        ok_exh, reason_exh, info_exh = True, "absorbed_by_zona_dinamica", {}
-    if not ok_exh:
-        _lxv_5v1x_event_cooldown(
-            key=f"4v2x_exhaustion_block:{rid}",
-            msg=f"⛔ LXV BLOQUEADO: VERDE_SATURADO_TARDIO | rid={rid} | patron=4V2X | prev_full_green_streak={int((info_exh or {}).get('prev_full_green_streak',0))}",
-            cooldown_s=float(globals().get("LXV_GREEN_EXHAUSTION_LOG_COOLDOWN_S", 20.0)),
-        )
-        LXV_REAL_AUDIT["ultimo_bloqueo"] = f"green_exhaustion_4v2x_{reason_exh}"
-        return False
-    _lxv_5v1x_event_cooldown(
-        key=f"4v2x_green_ok:{rid}",
-        msg=f"✅ LXV VERDE OK: rid={rid} patron=4V2X prev_full_green_streak={int((info_exh or {}).get('prev_full_green_streak',0))}",
-        cooldown_s=8.0,
-    )
-    try:
-        fase_ok = _fase_zv_gate_allow_real("LXV_4V2X", rid)
-    except Exception:
-        fase_ok = False
-    if not fase_ok:
-        fi = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
-        _lxv_5v1x_event_cooldown(
-            key=f"fasezv_block_real_4v2x:{rid}",
-            msg=(
-                f"⛔ 4V2X BLOQUEADO por FASE_ZV | rid={rid} "
-                f"fase={fi.get('fase')} "
-                f"g0={int(fi.get('verdes0',0))}/6 "
-                f"g1={int(fi.get('verdes1',0))}/6 "
-                f"g2={int(fi.get('verdes2',0))}/6 "
-                f"motivo={fi.get('motivo')}"
-            ),
-            cooldown_s=8.0,
-        )
-        LXV_REAL_AUDIT["ultimo_bloqueo"] = f"fase_zv_{fi.get('fase','')}_{fi.get('motivo','')}"
-        return False
-    _lxv_5v1x_event_cooldown(
-        key=f"4v2x_real_ok:{rid}",
-        msg=f"✅ 4V2X REAL habilitado por FASE_ZV | ronda #{rid} | bot={bot_pick}",
-        cooldown_s=8.0,
-    )
+    zi = evaluar_fase_zona_verde_lxv(round_id_objetivo=rid) or {}
+    actualizar_real_locks_panel_lxv(source="LXV_4V2X", round_id=rid, patron="4V2X", bot_candidato=bot_pick, round_complete=bool((candidate or {}).get("round_complete", False)), data_quality=str((candidate or {}).get("data_quality", "")), zona_info=zi, candidate_info={"candidate_ok": True, "reason": "4v2x_ok"}, order_status=None)
+    if bool(globals().get("LXV_REAL_SIMPLE_ROUTE_ENABLE", True)) and bool(globals().get("LXV_REAL_LOCKS_PANEL_ENFORCE", True)):
+        if not _real_locks_ready_pre_real():
+            falta = _real_locks_first_off() or "UNKNOWN"
+            _lxv_5v1x_event_cooldown(key=f"real_locks_block:4v2x:{rid}:{falta}", msg=f"⛔ REAL LXV bloqueado | falta={falta} | ronda={rid} | patrón=4V2X | bot={bot_pick}", cooldown_s=12.0)
+            return False
+        _lxv_5v1x_event_cooldown(key=f"real_locks_ready:4v2x:{rid}:{bot_pick}", msg=f"✅ REAL LXV listo | ronda={rid} | patrón=4V2X | bot={bot_pick}", cooldown_s=12.0)
     source_real = str(globals().get("LXV_4V2X_REAL_SOURCE", "LXV_4V2X"))
     ciclo_local_bot = 0
     try:
@@ -5628,7 +5619,9 @@ def _lxv_4v2x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         cooldown_s=8.0,
     )
     ok_emit = bool(emitir_real_autorizado(bot_pick, int(ciclo_pick), source=source_real, round_id=rid))
+    _real_lock_set("ORDEN_REAL_OK", bool(ok_emit), "post_emit")
     if ok_emit:
+        _lxv_5v1x_event_cooldown(key=f"real_emit_ok:4v2x:{rid}:{bot_pick}", msg=f"🚀 REAL LXV emitido | ronda={rid} | patrón=4V2X | bot={bot_pick} | C{int(ciclo_pick)}", cooldown_s=10.0)
         LXV_REAL_AUDIT["real_emitidos"] = int(LXV_REAL_AUDIT.get("real_emitidos", 0) or 0) + 1
         LXV_REAL_AUDIT["ultimo_bloqueo"] = f"emitido_4v2x_{bot_pick}"
     else:
@@ -5940,6 +5933,140 @@ def _lxv_real_round_already_emitted(rid):
         return int(rid) in LXV_REAL_EMITIDOS_POR_RONDA
     except Exception:
         return False
+
+def _real_lock_set(name, value, detalle=""):
+    try:
+        p = globals().get("REAL_LOCKS_PANEL")
+        if not isinstance(p, dict):
+            return
+        p.setdefault("locks", {})
+        p.setdefault("detalles", {})
+        p["locks"][str(name)] = value
+        p["detalles"][str(name)] = str(detalle or "")
+    except Exception:
+        pass
+
+def _real_locks_first_off():
+    try:
+        p = globals().get("REAL_LOCKS_PANEL", {})
+        locks = p.get("locks", {}) if isinstance(p, dict) else {}
+        for name in list(globals().get("LXV_REAL_REQUIRED_LOCKS", [])):
+            if not bool(locks.get(name, False)):
+                return name
+    except Exception:
+        pass
+    return "UNKNOWN_LOCK"
+
+def _real_locks_ready_pre_real():
+    try:
+        p = globals().get("REAL_LOCKS_PANEL", {})
+        locks = p.get("locks", {}) if isinstance(p, dict) else {}
+        return all(bool(locks.get(name, False)) for name in list(globals().get("LXV_REAL_REQUIRED_LOCKS", [])))
+    except Exception:
+        return False
+
+def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_candidato="", round_complete=False, data_quality="", zona_info=None, candidate_info=None, order_status=None):
+    try:
+        p = globals().get("REAL_LOCKS_PANEL", {})
+        p["enabled"] = bool(globals().get("LXV_REAL_LOCKS_PANEL_ENABLE", True))
+        p["source"] = str(source or "")
+        p["round_id"] = round_id
+        p["bot"] = str(bot_candidato or "")
+        p["patron"] = str(patron or "")
+        zi = zona_info if isinstance(zona_info, dict) else {}
+        p["zona"] = str(zi.get("zona", zi.get("fase", "")) or "")
+        p["decision"] = str(zi.get("decision", "") or "")
+        dq_ok = str(data_quality or "").strip().lower() == "ok"
+        _real_lock_set("DATA_QUALITY_OK", dq_ok, f"dq={data_quality}")
+        _real_lock_set("PATRON_VALIDO", str(patron) in ("4V2X", "5V1X"), patron)
+        _real_lock_set("COLUMNA_COMPLETA", bool(round_complete), f"round_complete={bool(round_complete)}")
+        _real_lock_set("ZONA_VALIDA", p["zona"] in ("VERDE_TEMPRANO", "VERDE_MADURO"), p["zona"])
+        _real_lock_set("NO_ZONA_BLOQUEANTE", p["zona"] not in {"ROJA_TEMPRANO","ROJO_MADURO","VERDE_TARDIO","VERDE_SATURADO_TARDIO","NEUTRO","INSUFICIENTE","ERROR","UNKNOWN"}, p["zona"])
+        _real_lock_set("NO_DUPLICADO_RONDA", bool(round_id) and (not _lxv_real_round_already_emitted(round_id)), f"rid={round_id}")
+        try:
+            close_pending = _hay_real_close_pending_activo() if callable(globals().get("_hay_real_close_pending_activo")) else any(bool(v) for v in (globals().get("REAL_CLOSE_PENDING", {}) or {}).values())
+        except Exception:
+            close_pending = True
+        _real_lock_set("REAL_CLOSE_LIBRE", not bool(close_pending), f"pending={close_pending}")
+        owner = globals().get("REAL_OWNER_LOCK")
+        tok = leer_token_actual() if callable(globals().get("leer_token_actual")) else None
+        tok_free = (owner in (None, "", "none", bot_candidato)) and (tok in (None, "", "none", bot_candidato))
+        _real_lock_set("TOKEN_REAL_LIBRE", bool(tok_free), f"owner={owner} token={tok}")
+        ci = candidate_info if isinstance(candidate_info, dict) else {}
+        cand_ok = bool(ci.get("candidate_ok", False))
+        _real_lock_set("CANDIDATO_VALIDO", cand_ok, str(ci.get("reason", "")))
+        _real_lock_set("ORDEN_REAL_OK", order_status if order_status in (True, False, None) else None, "")
+        p["ready_pre_real"] = bool(_real_locks_ready_pre_real())
+        first_off = _real_locks_first_off()
+        p["falta_principal"] = (first_off if first_off else "UNKNOWN_LOCK") if not p["ready_pre_real"] else "---"
+        p["resultado"] = "LISTO PARA REAL" if p["ready_pre_real"] else "BLOQUEADO"
+        p["updated_ts"] = float(time.time())
+        p["error"] = ""
+    except Exception as e:
+        try:
+            REAL_LOCKS_PANEL["resultado"] = "ERROR_PANEL"
+            REAL_LOCKS_PANEL["error"] = str(e)
+            REAL_LOCKS_PANEL["ready_pre_real"] = False
+            REAL_LOCKS_PANEL["falta_principal"] = _real_locks_first_off() or "UNKNOWN_LOCK"
+        except Exception:
+            pass
+
+def actualizar_real_locks_panel_desde_round_live():
+    try:
+        rows_pack = _ack_live_build_rows() if callable(globals().get("_ack_live_build_rows")) else {}
+        summary = _ack_live_calc_summary(rows_pack) if callable(globals().get("_ack_live_calc_summary")) else {}
+        if not isinstance(summary, dict):
+            summary = {}
+        rid = int(summary.get("obj_round", summary.get("round_id", 0)) or 0)
+        closed_count = int(summary.get("closed_count", 0) or 0)
+        expected_count = int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
+        dq = str(summary.get("data_quality", "missing") or "missing").strip().lower()
+        partial = str(summary.get("partial_pattern", "0V0X") or "0V0X").strip().upper()
+        round_complete = bool(closed_count == expected_count and expected_count > 0)
+        zi = dict(globals().get("_LXV_ZONA_HUD_LAST_INFO", {}) or {})
+        if not zi:
+            zi = evaluar_fase_zona_verde_lxv(round_id_objetivo=rid if rid > 0 else None) or {}
+        actualizar_real_locks_panel_lxv(
+            source="ROUND_LIVE", round_id=rid, patron=partial, bot_candidato="--",
+            round_complete=round_complete, data_quality=dq, zona_info=zi,
+            candidate_info={"candidate_ok": False, "reason": "sin_candidato_round_live"},
+            order_status=(globals().get("REAL_LOCKS_PANEL", {}).get("locks", {}).get("ORDEN_REAL_OK", None)),
+        )
+    except Exception as e:
+        try:
+            REAL_LOCKS_PANEL["error"] = str(e)
+            REAL_LOCKS_PANEL["resultado"] = "ERROR_PANEL"
+            REAL_LOCKS_PANEL["ready_pre_real"] = False
+            REAL_LOCKS_PANEL["falta_principal"] = _real_locks_first_off() or "UNKNOWN_LOCK"
+        except Exception:
+            pass
+
+def render_real_locks_panel():
+    try:
+        if not bool(globals().get("LXV_REAL_LOCKS_PANEL_ENABLE", True)):
+            return []
+        p = globals().get("REAL_LOCKS_PANEL", {})
+        locks = p.get("locks", {}) if isinstance(p, dict) else {}
+        def mk(v):
+            if v is True: return f"{Fore.GREEN}ON  {Fore.RESET}"
+            if v is False: return f"{Fore.RED}OFF {Fore.RESET}"
+            return f"{Fore.YELLOW}--  {Fore.RESET}"
+        def row(txt):
+            return f"║ {str(txt)[:36].ljust(36)} ║"
+        out = ["╔════════════════════════════════════════╗","║ 🔐 CANDADOS REAL LXV                  ║",
+               row(f"Ronda: {str(p.get('round_id') or '--')} | Bot: {str(p.get('bot') or '--')}"),
+               row(f"Patrón: {str(p.get('patron') or '--')} | Zona: {str(p.get('zona') or '--')}"),
+               "╠════════════════════════════════════════╣"]
+        for name in list(globals().get("LXV_REAL_REQUIRED_LOCKS", [])) + ["ORDEN_REAL_OK"]:
+            out.append(row(f"{name:<20} [ {mk(locks.get(name))}]"))
+        res_ok = bool(p.get("ready_pre_real", False))
+        out += ["╠════════════════════════════════════════╣",
+                row(f"RESULTADO: {'✅ LISTO PARA REAL' if res_ok else '⛔ BLOQUEADO'}"),
+                row(f"FALTA: {str(p.get('falta_principal') or '---')}"),
+                "╚════════════════════════════════════════╝"]
+        return out
+    except Exception:
+        return []
 
 def _lxv_mark_real_round_emitted(rid):
     try:
@@ -6555,18 +6682,6 @@ def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         )
         return False
     rid = int((candidate or {}).get("round_id", 0) or 0)
-    if not bool(globals().get("LXV_ZONA_DINAMICA_ENABLE", False)):
-        ok_exh, reason_exh, info_exh = _lxv_green_exhaustion_gate_ok(rid, "5V1X")
-    else:
-        ok_exh, reason_exh, info_exh = True, "absorbed_by_zona_dinamica", {}
-    if not ok_exh:
-        _lxv_5v1x_event_cooldown(
-            key=f"5v1x_exhaustion_block:{rid}",
-            msg=f"⛔ LXV BLOQUEADO: VERDE_SATURADO_TARDIO | rid={rid} | patron=5V1X | prev_full_green_streak={int((info_exh or {}).get('prev_full_green_streak',0))}",
-            cooldown_s=float(globals().get("LXV_GREEN_EXHAUSTION_LOG_COOLDOWN_S", 20.0)),
-        )
-        LXV_REAL_AUDIT["ultimo_bloqueo"] = f"green_exhaustion_5v1x_{reason_exh}"
-        return False
     if bool(globals().get("MRV_5V1X_ENABLE", True)):
         ok_mrv, reason_mrv, info_mrv = _lxv_5v1x_mrv_gate_ok(candidate)
         estado_mrv = str((info_mrv or {}).get("estado", "BLOQUEADO"))
@@ -6605,31 +6720,14 @@ def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         cooldown_s=8.0,
     )
     LXV_REAL_AUDIT["patrones_5v1x"] = int(LXV_REAL_AUDIT.get("patrones_5v1x", 0) or 0) + 1
-    try:
-        fase_ok = _fase_zv_gate_allow_real("LXV_5V1X", rid)
-    except Exception:
-        fase_ok = False
-    if not fase_ok:
-        fi = dict(globals().get("_LXV_FASE_ZV_LAST_INFO", {}))
-        _lxv_5v1x_event_cooldown(
-            key=f"fasezv_block_real_5v1x:{rid}",
-            msg=(
-                f"⛔ 5V1X BLOQUEADO por FASE_ZV | rid={rid} "
-                f"fase={fi.get('fase')} "
-                f"g0={int(fi.get('verdes0',0))}/6 "
-                f"g1={int(fi.get('verdes1',0))}/6 "
-                f"g2={int(fi.get('verdes2',0))}/6 "
-                f"motivo={fi.get('motivo')}"
-            ),
-            cooldown_s=8.0,
-        )
-        LXV_REAL_AUDIT["ultimo_bloqueo"] = f"fase_zv_{fi.get('fase','')}_{fi.get('motivo','')}"
-        return False
-    _lxv_5v1x_event_cooldown(
-        key=f"5v1x_real_ok:{rid}",
-        msg=f"✅ 5V1X REAL habilitado por FASE_ZV | ronda #{rid} | bot={bot_pick}",
-        cooldown_s=8.0,
-    )
+    zi = evaluar_fase_zona_verde_lxv(round_id_objetivo=rid) or {}
+    actualizar_real_locks_panel_lxv(source="LXV_5V1X", round_id=rid, patron="5V1X", bot_candidato=bot_pick, round_complete=bool((candidate or {}).get("round_complete", False)), data_quality=str((candidate or {}).get("data_quality", "")), zona_info=zi, candidate_info={"candidate_ok": True, "reason": "5v1x_ok"}, order_status=None)
+    if bool(globals().get("LXV_REAL_SIMPLE_ROUTE_ENABLE", True)) and bool(globals().get("LXV_REAL_LOCKS_PANEL_ENFORCE", True)):
+        if not _real_locks_ready_pre_real():
+            falta = _real_locks_first_off() or "UNKNOWN"
+            _lxv_5v1x_event_cooldown(key=f"real_locks_block:5v1x:{rid}:{falta}", msg=f"⛔ REAL LXV bloqueado | falta={falta} | ronda={rid} | patrón=5V1X | bot={bot_pick}", cooldown_s=12.0)
+            return False
+        _lxv_5v1x_event_cooldown(key=f"real_locks_ready:5v1x:{rid}:{bot_pick}", msg=f"✅ REAL LXV listo | ronda={rid} | patrón=5V1X | bot={bot_pick}", cooldown_s=12.0)
     source_real = str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X"))
     ciclo_local_bot = 0
     try:
@@ -6642,7 +6740,9 @@ def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
         cooldown_s=8.0,
     )
     ok_emit = bool(emitir_real_autorizado(bot_pick, int(ciclo_pick), source=source_real, round_id=rid))
+    _real_lock_set("ORDEN_REAL_OK", bool(ok_emit), "post_emit")
     if ok_emit:
+        _lxv_5v1x_event_cooldown(key=f"real_emit_ok:5v1x:{rid}:{bot_pick}", msg=f"🚀 REAL LXV emitido | ronda={rid} | patrón=5V1X | bot={bot_pick} | C{int(ciclo_pick)}", cooldown_s=10.0)
         LXV_REAL_AUDIT["real_emitidos"] = int(LXV_REAL_AUDIT.get("real_emitidos", 0) or 0) + 1
         LXV_REAL_AUDIT["ultimo_bloqueo"] = f"emitido_5v1x_{bot_pick}"
     else:
@@ -19266,6 +19366,16 @@ def mostrar_panel():
     real_panel_lines = mostrar_panel_real_activo()
     if real_panel_lines:
         panel_lines += real_panel_lines
+    try:
+        actualizar_real_locks_panel_desde_round_live()
+    except Exception:
+        pass
+    try:
+        lock_lines = render_real_locks_panel()
+        if lock_lines:
+            panel_lines = list(lock_lines) + list(panel_lines)
+    except Exception:
+        pass
 
     if PENDIENTE_FORZAR_BOT:
         rest = 0
