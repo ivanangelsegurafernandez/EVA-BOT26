@@ -605,6 +605,38 @@ MRV_5V1X_BLOCK_LATE_CHASE = True
 MRV_5V1X_BLOCK_SATURACION = True
 MRV_5V1X_PREV90_BLOCK = True
 MRV_5V1X_LOG_COOLDOWN_S = 20.0
+
+MRV_ZONA_V2_ENABLE = True
+MRV_ZONA_V2_HUD_ENABLE = True
+MRV_ZONA_V2_CAN_UNLOCK_ZONE = True
+MRV_ZONA_V2_LOG_COOLDOWN_S = 20.0
+MRV_ZONA_V2_GREEN_MIN = 4
+MRV_ZONA_V2_RED_MIN = 4
+MRV_ZONA_V2_FULL_GREEN_MIN = 5
+MRV_ZONA_V2_PROM8_MIN = 0.50
+MRV_ZONA_V2_PROM8_MADURO_MIN = 0.55
+MRV_ZONA_V2_PROM8_MADURO_MAX = 0.88
+MRV_ZONA_V2_PROM8_RUIDO_MAX = 0.90
+MRV_ZONA_V2_SLOPE_TEMPRANO = 0.02
+MRV_ZONA_V2_SLOPE_MADURO_MIN = -0.06
+MRV_ZONA_V2_SLOPE_TARDIO = -0.08
+MRV_ZONA_V2_FULL_GREEN_PREV_BLOCK = 3
+_MRV_ZONA_V2_LAST_STATE = None
+_MRV_ZONA_V2_LAST_LOG_TS = 0.0
+ZONA_REGIONAL_DOMINANTE_ENABLE = True
+ZONA_REGIONAL_R1 = 8
+ZONA_REGIONAL_R2 = 16
+ZONA_REGIONAL_R3 = 32
+ZONA_REGIONAL_VERDE_TEMPRANO_R1 = 0.55
+ZONA_REGIONAL_VERDE_TEMPRANO_R2 = 0.50
+ZONA_REGIONAL_VERDE_MADURO_R1 = 0.58
+ZONA_REGIONAL_VERDE_MADURO_R2 = 0.55
+ZONA_REGIONAL_VERDE_MADURO_R3 = 0.52
+ZONA_REGIONAL_SLOPE_TEMPRANO = 0.03
+ZONA_REGIONAL_DROP_TARDIO = 0.08
+ZONA_REGIONAL_FULL_GREEN_PREV_BLOCK = 3
+_ZONA_REGIONAL_LAST_STATE = None
+_ZONA_REGIONAL_LAST_LOG_TS = 0.0
 PATTERN_COL_LAST_STATE = {
     "green_ratio_col_actual": None,
     "total_verdes_col_actual": 0,
@@ -5973,6 +6005,15 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
         _real_lock_set("PATRON_VALIDO", str(patron) in ("4V2X", "5V1X"), patron)
         _real_lock_set("COLUMNA_COMPLETA", bool(round_complete), f"round_complete={bool(round_complete)}")
         zona_ok, zona_reason = _lxv_zona_es_invertible(zi)
+        info_regional = clasificar_zona_regional_dominante_lxv(round_id_objetivo=round_id)
+        patron_ok = str(patron) in ("4V2X", "5V1X")
+        cand_ok_try = bool((candidate_info or {}).get("candidate_ok", False))
+        zi2 = combinar_zona_lxv_con_regional(zi, info_regional, patron_valido=patron_ok, candidato_valido=cand_ok_try)
+        if isinstance(zi2, dict):
+            zi = zi2
+            p["zona"] = str(zi.get("zona", zi.get("fase", "")) or "")
+            p["decision"] = str(zi.get("decision", "") or "")
+            zona_ok, zona_reason = _lxv_zona_es_invertible(zi)
         _real_lock_set("ZONA_OK", bool(zona_ok), str(zona_reason or "zona_no_invertible"))
         _real_lock_set("NO_DUPLICADO_RONDA", bool(round_id) and (not _lxv_real_round_already_emitted(round_id)), f"rid={round_id}")
         try:
@@ -6402,6 +6443,126 @@ def _lxv_zona_dynamic_metrics(norm_rows, expected=6):
         return {}
 
 
+
+def detectar_zona_mrv_v2(cols_norm, expected=6, prom3=None, prom8=None, prom20=None):
+    base = {"zona_mrv_v2":"NEUTRO_MIXTO","decision_mrv_v2":"NO_INVERTIR","allow_real_mrv_v2":False,"motivo_mrv_v2":"sin_dominio_claro","g_actual":0.0,"r_actual":0.0,"green_cols_3":0,"green_cols_5":0,"green_cols_8":0,"red_cols_3":0,"red_cols_5":0,"full_green_prev_streak_mrv2":0,"green_pressure":0.0,"red_pressure":0.0,"slope_3_8":0.0,"slope_8_20":0.0,"noise_ratio":0.0,"mrv2_ok":False}
+    try:
+        rows=list(cols_norm or [])
+        if not rows: base["motivo_mrv_v2"]="insuficiente"; return base
+        exp=max(1,int(expected or 6))
+        norm=[]
+        for rr in rows:
+            if not isinstance(rr,dict):
+                continue
+            v=rr.get('n_verdes'); r=rr.get('n_rojos')
+            if v is None and isinstance(rr.get('verdes'),(list,tuple)): v=len(rr.get('verdes'))
+            if r is None and isinstance(rr.get('rojos'),(list,tuple)): r=len(rr.get('rojos'))
+            if v is None or r is None: continue
+            v=int(v); r=int(r)
+            if v<0 or r<0: continue
+            norm.append({'round_id':int(rr.get('round_id',0) or 0),'n_verdes':v,'n_rojos':r})
+        if not norm: base['motivo_mrv_v2']='sin_n_verdes_n_rojos'; return base
+        vals=[max(0.0,min(1.0,float(x['n_verdes'])/exp)) for x in norm]
+        if prom3 is None: prom3=sum(vals[-3:])/max(1,len(vals[-3:]))
+        if prom8 is None: prom8=sum(vals[-8:])/max(1,len(vals[-8:]))
+        if prom20 is None: prom20=sum(vals[-20:])/max(1,len(vals[-20:]))
+        cur=norm[-1]; g=float(cur['n_verdes'])/exp; r=float(cur['n_rojos'])/exp
+        green_min=int(globals().get('MRV_ZONA_V2_GREEN_MIN',4)); red_min=int(globals().get('MRV_ZONA_V2_RED_MIN',4)); full_min=int(globals().get('MRV_ZONA_V2_FULL_GREEN_MIN',5))
+        base.update({'g_actual':g,'r_actual':r,'green_cols_3':sum(1 for x in norm[-3:] if x['n_verdes']>=green_min),'green_cols_5':sum(1 for x in norm[-5:] if x['n_verdes']>=green_min),'green_cols_8':sum(1 for x in norm[-8:] if x['n_verdes']>=green_min),'red_cols_3':sum(1 for x in norm[-3:] if x['n_rojos']>=red_min),'red_cols_5':sum(1 for x in norm[-5:] if x['n_rojos']>=red_min)})
+        st=0
+        for x in reversed(norm[:-1]):
+            if x['n_verdes']>=full_min: st+=1
+            else: break
+        base['full_green_prev_streak_mrv2']=st
+        last5=norm[-5:]
+        base['green_pressure']=sum(float(x['n_verdes'])/exp for x in last5)/max(1,len(last5))
+        base['red_pressure']=sum(float(x['n_rojos'])/exp for x in last5)/max(1,len(last5))
+        base['slope_3_8']=float(prom3-prom8); base['slope_8_20']=float(prom8-prom20)
+        gcols=[x for x in norm[-8:] if x['n_verdes']>=green_min]
+        base['noise_ratio']=sum(x['n_rojos'] for x in gcols)/(max(1,len(gcols))*exp) if gcols else 0.0
+        p8=float(prom8); s38=base['slope_3_8']
+        if st>=3 and g<=(4/6) and s38<0 and base['red_pressure']>0.25: z,m,d,a='VERDE_SATURADO_TARDIO','saturacion_tardia_confirmada','NO_INVERTIR',False
+        elif p8>=0.70 and s38<=-0.08 and g<=(4/6) and base['red_cols_3']>=1: z,m,d,a='VERDE_TARDIO','verde_perdiendo_fuerza','NO_INVERTIR',False
+        elif base['red_cols_3']>=2 and g<=(3/6) and s38<-0.04: z,m,d,a='ROJA_TEMPRANO','presion_roja_en_aumento','NO_INVERTIR',False
+        elif g>=(4/6) and base['green_cols_3']>=2 and s38>=0.02 and base['red_cols_3']<=1 and st<3: z,m,d,a='VERDE_TEMPRANO_CONFIRMADO','verde_temprano_confirmado','SI_INVERTIR',True
+        elif g>=(4/6) and base['green_cols_5']>=3 and 0.55<=p8<=0.88 and s38>=-0.06 and base['red_cols_5']<=2: z,m,d,a='VERDE_MADURO_SANO','verde_maduro_sano','SI_INVERTIR',True
+        elif g>=(4/6) and base['green_cols_8']>=4 and 0.50<=p8<=0.90 and base['red_pressure']<base['green_pressure'] and base['red_cols_5']<=2: z,m,d,a='VERDE_MADURO_CON_RUIDO','verde_maduro_con_ruido','SI_INVERTIR',True
+        else: z,m,d,a='NEUTRO_MIXTO','sin_dominio_claro','NO_INVERTIR',False
+        base.update({'zona_mrv_v2':z,'motivo_mrv_v2':m,'decision_mrv_v2':d,'allow_real_mrv_v2':a,'mrv2_ok':True})
+        return base
+    except Exception as e:
+        base['motivo_mrv_v2']=f'error:{e}'
+        return base
+
+def combinar_zona_lxv_con_mrv2(info):
+    if not isinstance(info,dict): return info
+    out=dict(info)
+    z2=str(out.get('zona_mrv_v2','NEUTRO_MIXTO'))
+    d2=str(out.get('decision_mrv_v2','NO_INVERTIR'))
+    m2=str(out.get('motivo_mrv_v2','--'))
+    dq=str(out.get('dq0',out.get('data_quality','')) or '').lower()
+    comp=bool(int(out.get('cerrados',0) or 0)==int(out.get('esperados',0) or 0) and int(out.get('esperados',0) or 0)>0)
+    if dq!='ok': out.update({'allow_real':False,'decision':'NO_INVERTIR'}); return out
+    if not comp and str(out.get('zona','')).upper()=='PRE_ZONA_VISUAL': out.update({'allow_real':False,'decision':'ESPERANDO_COLUMNA'}); return out
+    if z2 in {'VERDE_TARDIO','VERDE_SATURADO_TARDIO','ROJA_TEMPRANO'}: out.update({'decision':'NO_INVERTIR','allow_real':False,'motivo':m2,'bloqueo_mrv_v2':True}); return out
+    if str(out.get('decision','')).upper()=='SI_INVERTIR' and d2=='SI_INVERTIR': out['confirmacion_mrv_v2']=True; return out
+    if str(out.get('decision','')).upper()!='SI_INVERTIR' and z2 in {'VERDE_TEMPRANO_CONFIRMADO','VERDE_MADURO_SANO','VERDE_MADURO_CON_RUIDO'} and bool(globals().get('MRV_ZONA_V2_CAN_UNLOCK_ZONE',True)) and comp and dq=='ok':
+        out.update({'zona':z2,'fase':z2,'decision':'SI_INVERTIR','allow_real':True,'motivo':f'mrv2_unlock:{m2}','desbloqueo_mrv_v2':True})
+    elif z2=='NEUTRO_MIXTO': out['advertencia_mrv_v2']='neutro_mixto'
+    return out
+
+
+
+def clasificar_zona_regional_dominante_lxv(rows_live=None, historial_por_bot=None, round_id_objetivo=None) -> dict:
+    out={"zona_regional":"NEUTRO_REGIONAL","decision_regional":"NO_INVERTIR","allow_regional":False,"motivo_regional":"sin_dominio_regional","green_ratio_r1":0.0,"green_ratio_r2":0.0,"green_ratio_r3":0.0,"red_ratio_r1":0.0,"red_ratio_r2":0.0,"slope_regional":0.0,"source_regional":"none","ok_regional":False}
+    try:
+        if not bool(globals().get('ZONA_REGIONAL_DOMINANTE_ENABLE',True)): return out
+        tape=historial_por_bot if isinstance(historial_por_bot,dict) else dict(globals().get('ACK_LIVE_TAPE',{}) or {})
+        flat=[]
+        for b in list(globals().get('BOT_NAMES',[]) or []):
+            seq=list(tape.get(b,[]) or [])
+            for ch in seq:
+                if ch in ('✓','X'): flat.append(ch)
+        if not flat:
+            out['motivo_regional']='sin_historial_ack'; return out
+        r1=max(1,int(globals().get('ZONA_REGIONAL_R1',8))); r2=max(r1,int(globals().get('ZONA_REGIONAL_R2',16))); r3=max(r2,int(globals().get('ZONA_REGIONAL_R3',32)))
+        def ratio(win):
+            seg=flat[-win:]
+            if not seg: return 0.0,0.0,0,0
+            g=sum(1 for x in seg if x=='✓'); r=sum(1 for x in seg if x=='X'); n=max(1,g+r)
+            return g/n, r/n, g, r
+        g1,r1r,gc1,rc1=ratio(r1); g2,r2r,gc2,rc2=ratio(r2); g3,r3r,gc3,rc3=ratio(r3)
+        slope=g1-g2
+        out.update({'green_ratio_r1':g1,'green_ratio_r2':g2,'green_ratio_r3':g3,'red_ratio_r1':r1r,'red_ratio_r2':r2r,'slope_regional':slope,'source_regional':'ack_live_tape','ok_regional':True})
+        full_prev=0
+        for b in list(globals().get('BOT_NAMES',[]) or []):
+            seq=[x for x in list(tape.get(b,[]) or []) if x in ('✓','X')]
+            if len(seq)>=4 and seq[-4:-1].count('✓')>=3 and seq[-1]=='X': full_prev +=1
+        if full_prev>=int(globals().get('ZONA_REGIONAL_FULL_GREEN_PREV_BLOCK',3)):
+            out.update({'zona_regional':'VERDE_SATURADO_TARDIO','decision_regional':'NO_INVERTIR','allow_regional':False,'motivo_regional':'saturacion_previa_con_rojo_reciente'})
+        elif g2>=0.60 and (g1 <= (g2-float(globals().get('ZONA_REGIONAL_DROP_TARDIO',0.08))) or rc1>gc1):
+            out.update({'zona_regional':'VERDE_TARDIO_REGIONAL','decision_regional':'NO_INVERTIR','allow_regional':False,'motivo_regional':'caida_reciente'})
+        elif g1>=float(globals().get('ZONA_REGIONAL_VERDE_TEMPRANO_R1',0.55)) and g2>=float(globals().get('ZONA_REGIONAL_VERDE_TEMPRANO_R2',0.50)) and slope>=float(globals().get('ZONA_REGIONAL_SLOPE_TEMPRANO',0.03)) and rc1<=gc1:
+            out.update({'zona_regional':'VERDE_TEMPRANO_REGIONAL','decision_regional':'SI_INVERTIR','allow_regional':True,'motivo_regional':'regional_verde_temprano'})
+        elif g1>=float(globals().get('ZONA_REGIONAL_VERDE_MADURO_R1',0.58)) and g2>=float(globals().get('ZONA_REGIONAL_VERDE_MADURO_R2',0.55)) and g3>=float(globals().get('ZONA_REGIONAL_VERDE_MADURO_R3',0.52)) and g1>=r1r and g2>=r2r and g1>=(g2-float(globals().get('ZONA_REGIONAL_DROP_TARDIO',0.08))):
+            out.update({'zona_regional':'VERDE_MADURO_REGIONAL','decision_regional':'SI_INVERTIR','allow_regional':True,'motivo_regional':'regional_verde_maduro'})
+        else:
+            out['motivo_regional']='sin_dominio_regional'
+        return out
+    except Exception:
+        return out
+
+def combinar_zona_lxv_con_regional(info_zona, info_regional, patron_valido=False, candidato_valido=False):
+    out=dict(info_zona or {})
+    reg=dict(info_regional or {})
+    if str(out.get('decision','')).upper()=='SI_INVERTIR' and bool(out.get('allow_real',False)): return out
+    motivo=str(out.get('motivo','') or '').lower(); zona=str(out.get('zona','') or '').upper(); dq=str(out.get('data_quality',out.get('dq0','')) or '').lower()
+    bloqueada = zona=='PRE_ZONA_VISUAL' or ('columna_incompleta' in motivo) or ('target_round_missing' in motivo) or ('round_mismatch' in motivo) or dq in ('missing','partial','')
+    if bloqueada and bool(reg.get('allow_regional',False)) and bool(patron_valido) and bool(candidato_valido):
+        out.update({'zona':reg.get('zona_regional','NEUTRO_REGIONAL'),'fase':reg.get('zona_regional','NEUTRO_REGIONAL'),'decision':'SI_INVERTIR','allow_real':True,'motivo':f"regional_unlock:{reg.get('motivo_regional','--')}",'desbloqueo_zona_regional':True})
+    out.update(reg)
+    return out
+
 def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
     base = {"zona":"INSUFICIENTE","fase":"INSUFICIENTE","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"GRAY","emoji":"⬜","motivo":"historial_insuficiente","g0":0.0,"g1":0.0,"g2":0.0,"verdes0":0,"rojos0":0,"verdes1":0,"rojos1":0,"verdes2":0,"rojos2":0,"streak_verde":0,"prev_full_green_streak":0,"round_id":None,"source":"none","ok":True,"cols_usadas":0,"cols_requeridas":int(globals().get("LXV_ZONA_MIN_COLUMNS",3) or 3)}
     base.setdefault("cols_usadas", 0)
@@ -6588,17 +6749,17 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
         prev_streak = int(metrics.get("prev_full_green_streak", 0) or 0)
         out=dict(base); out.update({"g0":g0,"g1":g1,"g2":g2,"verdes0":v0,"rojos0":r0,"verdes1":v1,"rojos1":r1,"verdes2":v2,"rojos2":r2,"streak_verde":streak,"prev_full_green_streak":prev_streak,"round_id":rid0,"source":source_resumen,"sources":source_resumen,"cols_usadas":len(norm),"dq0":str(c0.get("data_quality","")),"dq1":str(c1.get("data_quality","")),"dq2":str(c2.get("data_quality","")),"g_actual":g,"prom3":p3,"prom8":p8,"prom20":p20,"delta_3_8":d38,"delta_8_20":d820,"zona_model":"PROM3_PROM8_PROM20"})
         if (r0 >= 4 and r1 >= 4) or (p3 <= 0.40 and p8 <= 0.50):
-            out.update({"zona":"ROJO_MADURO","fase":"ROJO_MADURO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"rojo_maduro_promedios"}); return out
+            out.update({"zona":"ROJO_MADURO","fase":"ROJO_MADURO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"rojo_maduro_promedios"}); out = combinar_zona_lxv_con_mrv2(out); return out
         if r0 >= 4 or (p3 < p8 - float(globals().get("LXV_ZONA_DROP_TARDIO", 0.08)) and g <= 0.50):
-            out.update({"zona":"ROJA_TEMPRANO","fase":"ROJA_TEMPRANO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_ORANGE","emoji":"🟥","motivo":"caida_hacia_rojo"}); return out
+            out.update({"zona":"ROJA_TEMPRANO","fase":"ROJA_TEMPRANO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_ORANGE","emoji":"🟥","motivo":"caida_hacia_rojo"}); out = combinar_zona_lxv_con_mrv2(out); return out
         if (prev_streak >= int(globals().get("LXV_ZONA_FULL_GREEN_PREV_BLOCK", 3) or 3) and g <= (5/6)) or (p8 >= float(globals().get("LXV_ZONA_PROM8_SATURADO", 0.92)) and p3 < p8 - float(globals().get("LXV_ZONA_DROP_SATURADO", 0.04)) and g <= (5/6)):
-            out.update({"zona":"VERDE_SATURADO_TARDIO","fase":"VERDE_SATURADO_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"prev_full_green_streak" if prev_streak >= int(globals().get("LXV_ZONA_FULL_GREEN_PREV_BLOCK", 3) or 3) else "saturacion_con_caida"}); return out
+            out.update({"zona":"VERDE_SATURADO_TARDIO","fase":"VERDE_SATURADO_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"prev_full_green_streak" if prev_streak >= int(globals().get("LXV_ZONA_FULL_GREEN_PREV_BLOCK", 3) or 3) else "saturacion_con_caida"}); out = combinar_zona_lxv_con_mrv2(out); return out
         if p8 >= float(globals().get("LXV_ZONA_PROM8_TARDIO_MIN", 0.70)) and p3 < p8 - float(globals().get("LXV_ZONA_DROP_TARDIO", 0.08)) and g <= (4/6):
-            out.update({"zona":"VERDE_TARDIO","fase":"VERDE_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"ORANGE","emoji":"🟧","motivo":"verde_perdiendo_fuerza"}); return out
+            out.update({"zona":"VERDE_TARDIO","fase":"VERDE_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"ORANGE","emoji":"🟧","motivo":"verde_perdiendo_fuerza"}); out = combinar_zona_lxv_con_mrv2(out); return out
         if g >= (4/6) and p8 >= 0.45 and p8 < 0.68 and p3 >= p8 + float(globals().get("LXV_ZONA_DELTA_TEMPRANO", 0.02)):
-            out.update({"zona":"VERDE_TEMPRANO","fase":"VERDE_TEMPRANO","decision":ZONA_SI_INVERTIR,"allow_real":True,"color_key":"GREEN_BRIGHT","emoji":"🟩","motivo":"verde_naciendo_promedios"}); return out
+            out.update({"zona":"VERDE_TEMPRANO","fase":"VERDE_TEMPRANO","decision":ZONA_SI_INVERTIR,"allow_real":True,"color_key":"GREEN_BRIGHT","emoji":"🟩","motivo":"verde_naciendo_promedios"}); out = combinar_zona_lxv_con_mrv2(out); return out
         if g >= (4/6) and p8 >= float(globals().get("LXV_ZONA_PROM8_MIN_ALLOW", 0.50)) and p8 <= float(globals().get("LXV_ZONA_PROM8_MAX_ALLOW", 0.92)) and p3 >= p8 - float(globals().get("LXV_ZONA_DELTA_OK", 0.05)):
-            out.update({"zona":"VERDE_MADURO","fase":"VERDE_MADURO","decision":ZONA_SI_INVERTIR,"allow_real":True,"color_key":"GREEN_YELLOW","emoji":"🟨","motivo":"verde_estable_promedios"}); return out
+            out.update({"zona":"VERDE_MADURO","fase":"VERDE_MADURO","decision":ZONA_SI_INVERTIR,"allow_real":True,"color_key":"GREEN_YELLOW","emoji":"🟨","motivo":"verde_estable_promedios"}); out = combinar_zona_lxv_con_mrv2(out); return out
         out.update({"zona":"NEUTRO","fase":"NEUTRO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"GRAY","emoji":"⬜","motivo":"sin_predominio_dinamico"})
         return out
     except Exception:
@@ -6778,6 +6939,18 @@ def _selftest_zona_lxv_minimo():
         print(f"[SELFTEST_ZONA_LXV] ERROR: {e}")
         return False
 
+
+def _selftest_mrv_zona_v2():
+    tests=[('VERDE_TEMPRANO_CONFIRMADO',[2,3,4,4],True),('VERDE_MADURO_SANO',[4,5,4,5,4,5],True),('VERDE_MADURO_CON_RUIDO',[3,4,5,3,4,5,4,4],True),('VERDE_TARDIO',[5,5,5,4,3],False),('VERDE_SATURADO_TARDIO',[6,6,6,4],False),('ROJA_TEMPRANO',[4,3,2,2],False),('NEUTRO_MIXTO',[3,4,3,4],False)]
+    ok_all=True
+    for n,seq,exp in tests:
+        rows=[{'round_id':i+1,'n_verdes':v,'n_rojos':6-v,'round_complete':True,'data_quality':'ok'} for i,v in enumerate(seq)]
+        r=detectar_zona_mrv_v2(rows,6)
+        ok=bool(r.get('allow_real_mrv_v2'))==bool(exp)
+        print(f"[SELFTEST_MRV_ZONA_V2] {n} {'OK' if ok else 'FAIL'} zona={r.get('zona_mrv_v2')} motivo={r.get('motivo_mrv_v2')}")
+        ok_all=ok_all and ok
+    return ok_all
+
 def _selftest_lxv_live_row_mapping():
     try:
         rid = 100
@@ -6812,6 +6985,11 @@ def _selftest_lxv_live_row_mapping():
 if str(os.getenv("RUN_LXV_ZONE_SELFTEST", "0")).strip() == "1":
     try:
         _selftest_zona_lxv_minimo()
+    except Exception:
+        pass
+if str(os.getenv("RUN_MRV_ZONA_V2_SELFTEST", "0")).strip() == "1":
+    try:
+        _selftest_mrv_zona_v2()
     except Exception:
         pass
 if str(os.getenv("RUN_LXV_LIVE_ROW_SELFTEST", "0")).strip() == "1":
@@ -18170,6 +18348,26 @@ def _hud_zona_operativa_lxv_line(width=None):
     except Exception:
         return "⬜ ZONA LXV HUD GLOBAL: INSUFICIENTE | NO_INVERTIR | cols=0/3 | source=HUD_GLOBAL/none | motivo=sin_info_zona"
 
+
+
+def render_zona_lxv_panel():
+    try:
+        if not bool(globals().get("MRV_ZONA_V2_HUD_ENABLE", True)):
+            return []
+        info = obtener_zona_lxv_hud_actual() or {}
+        z = str(info.get("zona", "--")); d=str(info.get("decision","--")); m=str(info.get("motivo","--"))
+        z2 = str(info.get("zona_mrv_v2", "--")); d2=str(info.get("decision_mrv_v2","--")); m2=str(info.get("motivo_mrv_v2","--"))
+        cerr=int(info.get("cerrados",0) or 0); esp=int(info.get("esperados",0) or 0)
+        dq=str(info.get("data_quality","--")); patron=str(info.get("patron_live","--"))
+        real_txt = "POSIBLE si patrón/candidato/token/cierre están OK"
+        if dq != "ok": real_txt = "NO, data_quality no ok"
+        elif esp <= 0 or cerr < esp: real_txt = "NO, esperando columna completa"
+        elif bool(info.get("bloqueo_mrv_v2", False)): real_txt = "NO, bloqueo MRV_ZONA_V2"
+        reg_line = f"ZONA REGIONAL: {str(info.get('zona_regional','NEUTRO_REGIONAL'))} | R1={float(info.get('green_ratio_r1',0.0)):.2f} R2={float(info.get('green_ratio_r2',0.0)):.2f} R3={float(info.get('green_ratio_r3',0.0)):.2f} | decisión={str(info.get('decision_regional','NO_INVERTIR'))}"
+        return ["╔════════════════════════════════════════════════════════════╗","║ 🧭 ZONA LXV / MRV_ZONA_V2                                ║","╠════════════════════════════════════════════════════════════╣",f"║ Zona actual : {z[:43].ljust(43)}║",f"║ Decisión    : {d[:43].ljust(43)}║",f"║ Motivo      : {m[:43].ljust(43)}║",f"║ MRV_V2      : {z2[:43].ljust(43)}║",f"║ Decisión V2 : {d2[:43].ljust(43)}║",f"║ Motivo V2   : {m2[:43].ljust(43)}║",f"║ Columna     : {cerr}/{esp} | dq={dq} | patrón={patron}"[:61].ljust(61)+"║",f"║ Fuerza      : G={float(info.get('g_actual',0.0)):.2f} R={float(info.get('r_actual',0.0)):.2f} | G3/G5/G8={int(info.get('green_cols_3',0))}/{int(info.get('green_cols_5',0))}/{int(info.get('green_cols_8',0))}"[:61].ljust(61)+"║",f"║ Presión     : verde={float(info.get('green_pressure',0.0)):.2f} roja={float(info.get('red_pressure',0.0)):.2f} ruido={float(info.get('noise_ratio',0.0)):.2f}"[:61].ljust(61)+"║",f"║ Regional    : {reg_line[:47].ljust(47)}║",f"║ REAL        : {real_txt[:47].ljust(47)}║","╚════════════════════════════════════════════════════════════╝"]
+    except Exception:
+        return []
+
 def _resumen_top_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
     lines = []
     try:
@@ -18219,6 +18417,7 @@ def _resumen_top_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
         )
         lines.append(line2)
         lines.append(_hud_zona_operativa_lxv_line())
+        lines.extend(render_zona_lxv_panel())
     except Exception:
         lines.append("📊 Prob=-- | OBS=-- | REAL=-- | Mejor=-- | SENSOR_PLANO=-- | n_min_real=--")
 
