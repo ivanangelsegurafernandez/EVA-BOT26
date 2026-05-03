@@ -248,6 +248,7 @@ HUD_TABLE_COMPACT_WIDTH = True
 HUD_SIDE_PANEL_INLINE = True
 HUD_SHOW_SALDO_DEBUG = False
 HUD_EVENT_MAX_CHARS = 150
+HUD_EVENTS_CURRENT_ROUND_ONLY = True
 HUD_SHOW_CONTROL_PANEL = False
 HUD_MARTI_CLEAN_LAYOUT = True
 HUD_LXV_CLEAN_MODE = True
@@ -6699,12 +6700,24 @@ def render_real_locks_panel():
                 cerrados=int(p.get("closed_count", p.get("cerrados", 0)) or 0),
                 expected=int(p.get("expected_count", p.get("esperados", 6)) or 6),
                 dq=str(p.get("data_quality", p.get("dq", "missing")) or "missing"),
+                zona=str(p.get("zona") or "--"),
+                bot=str(p.get("bot") or "--"),
+                motivo=str(p.get("motivo") or "--"),
+                real="sí" if bool(p.get("ready_pre_real", False)) else "no",
             )
+        diag1 = diag_txt
+        diag2 = ""
+        if (not res_ok) and (" | " in str(diag_txt)):
+            parts = str(diag_txt).split(" | ")
+            diag1 = " | ".join(parts[:2])
+            diag2 = " | ".join(parts[2:])
         out += ["╠════════════════════════════════════════╣",
                 row(f"RESULTADO: {'✅ LISTO PARA REAL' if res_ok else '⛔ BLOQUEADO'}"),
                 row(f"FALTA: {str(p.get('falta_principal') or '---')}"),
-                row(f"DIAGNÓSTICO: {diag_txt or '---'}" ),
-                "╚════════════════════════════════════════╝"]
+                row(f"DIAG 1: {diag1 or '---'}")]
+        if diag2:
+            out.append(row(f"DIAG 2: {diag2}"))
+        out.append("╚════════════════════════════════════════╝")
         return out
     except Exception:
         return []
@@ -18975,9 +18988,13 @@ def _round_live_status_txt(pattern: str, completed: bool, data_quality: str, exp
         return f"0/{int(expected or 6)} PARCIAL"
 
 
-def _diagnostico_candados_lxv(locks: dict, patron: str, cerrados: int, expected: int, dq: str) -> str:
+def _diagnostico_candados_lxv(locks: dict, patron: str, cerrados: int, expected: int, dq: str, zona: str = "--", bot: str = "--", motivo: str = "--", real: str = "no") -> str:
     candado = diagnosticar_candado_bloqueante_lxv(locks if isinstance(locks, dict) else {}, None)
-    return f"candado={candado} | patrón={str(patron or '--')} | cerrados={int(cerrados or 0)}/{int(expected or 6)} | dq={str(dq or 'missing')}"
+    return (
+        f"candado={candado} | dq={str(dq or 'missing')} | patrón={str(patron or '--')} | "
+        f"zona={str(zona or '--')} | bot={str(bot or '--')} | motivo={str(motivo or '--')} | real={str(real or 'no')} | "
+        f"cerrados={int(cerrados or 0)}/{int(expected or 6)}"
+    )
 
 
 def _hud_fit(text, width):
@@ -19192,17 +19209,26 @@ def render_estado_lxv_actual_panel(info_zona: dict, summary: dict, locks: dict |
                 _log_prearmado_lxv_event(f"medio:{info_prearmado.get('round_id')}:{info_prearmado.get('patron_actual')}", f"🟡 PRE-ARMADO LXV MEDIO | zona={info_prearmado.get('zona_visual')} | cerrados={info_prearmado.get('cerrados')}/{info_prearmado.get('esperados')} | esperando columna oficial", cooldown_s=float(globals().get("LXV_GREEN_OPPORTUNITY_LOG_COOLDOWN_S", 15.0)))
             elif str(info_prearmado.get("nivel")) == "BAJO":
                 _log_prearmado_lxv_event(f"bajo:{info_prearmado.get('round_id')}:{info_prearmado.get('patron_actual')}", "⬜ PRE-ARMADO LXV BAJO | zona verde visual inicial | esperando primeros cierres", cooldown_s=float(globals().get("LXV_GREEN_OPPORTUNITY_LOG_COOLDOWN_S", 15.0)))
-        if closed_count < expected_count:
-            final = "NO_INVERTIR_AÚN | zona verde visual, esperando columna oficial"
-        elif not bool(lk.get("PATRON_VALIDO", False)):
+        patron_real_valido = str(patron or "").upper() in ("5V1X", "4V2X")
+        oficial_bloquea = (str(decision).upper() == "NO_INVERTIR") or (str(zona).upper() in ("ROJA_TEMPRANO", "ROJO_MADURO", "NEUTRO", "VERDE_TARDIO", "VERDE_SATURADO_TARDIO"))
+        if str(dq).lower() == "closed_expired":
+            final = "NO_INVERTIR | columna vencida/expirada | no se evalúa REAL"
+        elif closed_count < expected_count:
+            final = "NO_INVERTIR_AÚN | columna oficial incompleta"
+        elif not patron_real_valido:
             final = "NO_INVERTIR | patrón no invertible"
+        elif oficial_bloquea:
+            final = f"NO_INVERTIR | OFICIAL_BLOQUEA | dq={dq}"
         elif all(lk.get(k) is True for k in ("COLUMNA_COMPLETA","DATA_QUALITY_OK","PATRON_VALIDO","CANDIDATO_VALIDO","ZONA_OK","TOKEN_REAL_LIBRE")):
             final = "LISTO_PARA_REAL"
         else:
             final = "VALIDANDO_CANDADOS"
         w=92
         row=lambda t: f"║ {_hud_fit(str(t), w-4).ljust(w-4)} ║"
-        lines=["╔"+"═"*(w-2)+"╗",row("🧭 ESTADO LXV ACTUAL"),row(f"OFICIAL : {zona} | decisión={decision} | motivo={motivo}"),row(f"REGIONAL       : {reg_z} | prom3={prom3:.2f} prom8={prom8:.2f} d38={d38:+.2f} | acción={action}"),row(f"COLUMNA_VISUAL : {str((info.get('zona_visual_info',{}) or {}).get('zona_visual','--'))} | patrón={patron} | cerrados={closed_count}/{expected_count} | faltan={faltan_count} | dq={dq} | g_columna_parcial={g_col_txt} | g_regional={g_regional_txt}"),row(f"SYNC    : {'ESPERANDO_BOTS' if faltan_count>0 else 'OK'} | {sync_txt} | REAL={'no_evaluado' if faltan_count>0 else 'evaluable'}"),row(f"REAL    : ACTIVO={'SI' if real_activo else 'NO'} | TOKEN={'DEMO' if tok in (None,'none','') else 'REAL'} | BOT_REAL={bot_real}"),row(f"FINAL   : {final}")]
+        no_habilita = " | NO_HABILITA_REAL" if (str(reg_z).startswith("VERDE_") and oficial_bloquea) else ""
+        lines=["╔"+"═"*(w-2)+"╗",row("🧭 ESTADO LXV ACTUAL"),row(f"OFICIAL : {zona} | MANDA_DECISIÓN | decisión={decision} | motivo={motivo}"),row(f"REGIONAL: {reg_z} | SOLO_DIAGNÓSTICO{no_habilita} | acción={action} | prom3={prom3:.2f} prom8={prom8:.2f} d38={d38:+.2f}"),row(f"COLUMNA_VISUAL: {str((info.get('zona_visual_info',{}) or {}).get('zona_visual','--'))} | patrón={patron} | cerrados={closed_count}/{expected_count} | dq={dq} | g_columna={g_col_txt}"),row(f"PATRÓN_REAL: {'VALIDO' if patron_real_valido else 'NO_VALIDO'} | patrón={patron} | válidos=5V1X/4V2X"),row(f"SYNC    : {'ESPERANDO_BOTS' if faltan_count>0 else 'OK'} | {sync_txt} | REAL={'no_evaluado' if faltan_count>0 else 'evaluable'}"),row(f"REAL    : ACTIVO={'SI' if real_activo else 'NO'} | TOKEN={'DEMO' if tok in (None,'none','') else 'REAL'} | BOT_REAL={bot_real}"),row(f"FINAL   : {final}")]
+        if str(reg_z).startswith("VERDE_") and oficial_bloquea:
+            lines.append(row(f"⚠️ VERDE REGIONAL IGNORADO PARA REAL: zona oficial manda | oficial={zona} | motivo={motivo}"))
         if info_prearmado.get("prearmado"):
             lines.append(row(f"PRE-ARMADO: {info_prearmado.get('nivel')} | zona={info_prearmado.get('zona_visual')} | patrón={info_prearmado.get('patron_actual')} | esperando={info_prearmado.get('esperando')}"))
             lines.append(row(f"PRE-DETALLE: motivo={info_prearmado.get('motivo')} | candado={info_prearmado.get('candado_principal')} | shadow_only=SI"))
@@ -19214,8 +19240,10 @@ def render_estado_lxv_actual_panel(info_zona: dict, summary: dict, locks: dict |
         lines.append(row(f"OPORTUNIDADES VERDES: det={int(st.get('verde_visual_detectado',0))} | alto={int(st.get('prearmado_alto',0))} | medio={int(st.get('prearmado_medio',0))} | bajo={int(st.get('prearmado_bajo',0))}"))
         lines.append(row(f"                     col={int(st.get('bloq_columna',0))} | dq={int(st.get('bloq_dq',0))} | pat={int(st.get('bloq_patron',0))} | cand={int(st.get('bloq_candidato',0))} | zona={int(st.get('bloq_zona',0))} | token={int(st.get('bloq_token',0))} | real={int(st.get('real_emitido_desde_verde',0))}"))
         pre = info.get("prepatron_info", {}) if isinstance(info.get("prepatron_info", {}), dict) else {}
-        if pre.get("prepatron"):
+        if pre.get("prepatron") and patron_real_valido:
             lines.append(row(f"PREPATRÓN: {pre.get('prepatron')} | acción={'VIGILAR' if pre.get('vigilar') else 'ESPERAR'}"))
+        elif not patron_real_valido and closed_count >= expected_count:
+            lines.append(row("PREPATRÓN: NINGUNO | patrón completo no evoluciona a 5V1X/4V2X"))
         lines.append("╚"+"═"*(w-2)+"╝")
         return lines
     except Exception:
@@ -20916,6 +20944,25 @@ def mostrar_eventos():
         else:
             raw_events = raw_events[-max_ev:]
         max_chars = 90 if bool(globals().get("HUD_MARTI_CLEAN_LAYOUT", True)) else HUD_EVENT_MAX_CHARS
+        if bool(globals().get("HUD_EVENTS_CURRENT_ROUND_ONLY", True)):
+            rid = int((globals().get("_ACK_LIVE_SUMMARY", {}) or {}).get("round_id", 0) or 0)
+            actuales, anteriores = [], []
+            tag = f"#{rid}"
+            for ev in raw_events:
+                evs = str(ev or "")
+                if rid > 0 and tag in evs:
+                    actuales.append(evs)
+                else:
+                    anteriores.append(evs)
+            if rid > 0:
+                print(Fore.MAGENTA + f"Eventos ronda actual #{rid}:")
+            for ev in actuales[-max_ev:]:
+                print(Fore.MAGENTA + " - " + _hud_trim_line(ev, max_chars))
+            if anteriores:
+                print(Fore.MAGENTA + "Eventos anteriores:")
+                for ev in anteriores[-max_ev:]:
+                    print(Fore.MAGENTA + " - " + _hud_trim_line(ev, max_chars))
+            return
         for ev in raw_events:
             print(Fore.MAGENTA + " - " + _hud_trim_line(ev, max_chars))
 # === FIN BLOQUE 11 ===
@@ -25137,3 +25184,62 @@ def _selftest_lxv_4v2x_candidate_panel():
 
 if os.environ.get("RUN_LXV_4V2X_CANDIDATE_PANEL_SELFTEST") == "1":
     _selftest_lxv_4v2x_candidate_panel()
+
+
+def _selftest_hud_oficial_vs_regional_lxv():
+    info = {
+        "zona": "ROJA_TEMPRANO",
+        "fase": "ROJA_TEMPRANO",
+        "decision": "NO_INVERTIR",
+        "motivo": "caida_hacia_rojo",
+        "allow_real": False,
+        "zona_regional_temprana_info": {
+            "zona_regional_temprana": "VERDE_EN_FORMACION_VISUAL",
+            "accion_regional": "VIGILAR",
+        },
+        "zona_visual_info": {
+            "zona_visual": "ROJA_O_MIXTA_PARCIAL",
+        },
+    }
+    summary = {
+        "round_id": 133,
+        "closed_count": 6,
+        "expected_count": 6,
+        "partial_pattern": "1V5X",
+        "data_quality": "closed_expired",
+    }
+    locks = {
+        "REAL_CLOSE_LIBRE": True,
+        "COLUMNA_COMPLETA": True,
+        "DATA_QUALITY_OK": False,
+        "PATRON_VALIDO": False,
+        "CANDIDATO_VALIDO": False,
+        "ZONA_OK": False,
+        "NO_DUPLICADO_RONDA": True,
+        "TOKEN_REAL_LIBRE": True,
+        "ORDEN_REAL_OK": False,
+    }
+    diag = _diagnostico_candados_lxv(
+        locks,
+        patron="1V5X",
+        cerrados=6,
+        expected=6,
+        dq="closed_expired",
+        zona="ROJA_TEMPRANO",
+        bot="--",
+        motivo="caida_hacia_rojo",
+    )
+    panel = render_estado_lxv_actual_panel(info, summary, locks=locks)
+    joined = " ".join(panel)
+    assert "MANDA_DECISIÓN" in joined
+    assert "SOLO_DIAGNÓSTICO" in joined
+    assert "NO_HABILITA_REAL" in joined
+    assert "closed_expired" in diag
+    assert "1V5X" in diag
+    assert "ROJA_TEMPRANO" in diag
+    assert locks["ORDEN_REAL_OK"] is False
+    print("SELFTEST HUD_OFICIAL_VS_REGIONAL_LXV OK")
+
+
+if os.environ.get("RUN_HUD_OFICIAL_VS_REGIONAL_SELFTEST") == "1":
+    _selftest_hud_oficial_vs_regional_lxv()
