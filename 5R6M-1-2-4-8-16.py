@@ -6415,8 +6415,8 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
             p["bot"] = str(bot_candidato or "")
         p["patron"] = str(patron or "")
         p["diag_visual"] = ""
-        zi = zona_info if isinstance(zona_info, dict) else {}
-        p["zona"] = str(zi.get("zona", zi.get("fase", "")) or "")
+        zi = resolver_zona_final_lxv(round_id_objetivo=round_id, zona_info_previa=zona_info if isinstance(zona_info, dict) else None)
+        p["zona"] = str(zi.get("zona_base", zi.get("zona", zi.get("fase", ""))) or "")
         p["decision"] = str(zi.get("decision", "") or "")
         dq_ok = str(data_quality or "").strip().lower() == "ok"
         _real_lock_set("DATA_QUALITY_OK", dq_ok, f"dq={data_quality}")
@@ -6429,9 +6429,11 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
         zi2 = combinar_zona_lxv_con_regional(zi, info_regional, patron_valido=patron_ok, candidato_valido=cand_ok_try)
         if isinstance(zi2, dict):
             zi = zi2
-            p["zona"] = str(zi.get("zona", zi.get("fase", "")) or "")
+            zi = resolver_zona_final_lxv(round_id_objetivo=round_id, zona_info_previa=zi)
+            p["zona"] = str(zi.get("zona_base", zi.get("zona", zi.get("fase", ""))) or "")
             p["decision"] = str(zi.get("decision", "") or "")
             zona_ok, zona_reason = _lxv_zona_es_invertible(zi)
+        zona_ok = bool(zi.get("zona_base", "UNKNOWN") in LXV_ZONAS_INVERTIBLES and bool(zi.get("allow_real", False)))
         _real_lock_set("ZONA_OK", bool(zona_ok), str(zona_reason or "zona_no_invertible"))
         _real_lock_set("NO_DUPLICADO_RONDA", bool(round_id) and (not _lxv_real_round_already_emitted(round_id)), f"rid={round_id}")
         try:
@@ -7318,27 +7320,74 @@ def evaluar_fase_zona_verde_lxv(rows=None, round_id_objetivo=None):
     _LXV_FASE_ZV_LAST_INFO = dict(info)
     return info
 
+def normalizar_zona_lxv_oficial(info):
+    zonas_validas = {
+        "VERDE_TEMPRANO", "VERDE_MADURO", "VERDE_TARDIO", "VERDE_SATURADO_TARDIO",
+        "ROJA_TEMPRANO", "ROJO_MADURO", "NEUTRO", "INSUFICIENTE", "ERROR", "UNKNOWN",
+    }
+    try:
+        raw = dict(info) if isinstance(info, dict) else {}
+        zona_raw = str(raw.get("zona", raw.get("fase", "")) or "").strip().upper()
+        subzona = zona_raw or "UNKNOWN"
+        motivo_raw = str(raw.get("motivo", "") or "").strip()
+        allow_raw = bool(raw.get("allow_real", False))
+        zona_base = zona_raw if zona_raw in zonas_validas else "UNKNOWN"
+        if zona_raw == "VERDE_TEMPRANO_CONFIRMADO":
+            zona_base = "VERDE_TEMPRANO"
+        elif zona_raw == "VERDE_MADURO_SANO":
+            zona_base = "VERDE_MADURO"
+        elif zona_raw == "VERDE_MADURO_CON_RUIDO":
+            zona_base = "VERDE_MADURO" if (allow_raw and "bloq" not in motivo_raw.lower() and "block" not in motivo_raw.lower()) else "UNKNOWN"
+        zonas_ok = set(globals().get("LXV_ZONAS_INVERTIBLES", {"VERDE_TEMPRANO", "VERDE_MADURO"}))
+        allow_final = bool(zona_base in zonas_ok)
+        decision = str(raw.get("decision", "") or "").strip().upper()
+        if not decision:
+            decision = ZONA_SI_INVERTIR if allow_final else ZONA_NO_INVERTIR
+        if zona_base == "UNKNOWN" and not motivo_raw:
+            motivo_raw = "zona_no_determinada"
+        out = dict(raw)
+        out.update({
+            "zona": zona_raw or "UNKNOWN",
+            "zona_base": zona_base,
+            "subzona": subzona,
+            "decision": decision,
+            "allow_real": allow_final,
+            "motivo": motivo_raw or ("zona_oficial_invertible" if allow_final else "zona_no_invertible"),
+            "fuente_zona": str(raw.get("fuente_zona", raw.get("source", raw.get("sources", "LXV")) ) or "LXV"),
+        })
+        return out
+    except Exception as e:
+        return {
+            "zona": "ERROR", "zona_base": "ERROR", "subzona": "ERROR", "decision": ZONA_NO_INVERTIR,
+            "allow_real": False, "motivo": f"normalizacion_error:{str(e)[:80]}", "fuente_zona": "LXV",
+        }
+
+def resolver_zona_final_lxv(round_id_objetivo=None, zona_info_previa=None):
+    try:
+        if isinstance(zona_info_previa, dict) and zona_info_previa:
+            base = zona_info_previa
+        else:
+            base = evaluar_fase_zona_verde_lxv(round_id_objetivo=round_id_objetivo) or {}
+        return normalizar_zona_lxv_oficial(base)
+    except Exception as e:
+        return {
+            "zona": "ERROR", "zona_base": "ERROR", "subzona": "ERROR", "decision": ZONA_NO_INVERTIR,
+            "allow_real": False, "motivo": f"resolver_error:{str(e)[:80]}", "fuente_zona": "LXV",
+        }
+
 
 def _lxv_zona_es_invertible(info: dict | None) -> tuple[bool, str]:
     try:
-        if not isinstance(info, dict):
-            return False, "info_invalida"
-        zona = str(info.get("zona", info.get("fase", "")) or "").strip().upper()
-        fase = str(info.get("fase", zona) or "").strip().upper()
-        decision = str(info.get("decision", "") or "").strip().upper()
-        allow_real = bool(info.get("allow_real", False))
-        dq0 = str(info.get("dq0", info.get("data_quality", "")) or "").strip().lower()
+        zona_norm = normalizar_zona_lxv_oficial(info)
+        zona_base = str(zona_norm.get("zona_base", "UNKNOWN") or "UNKNOWN").upper()
+        dq0 = str(zona_norm.get("dq0", zona_norm.get("data_quality", "")) or "").strip().lower()
         if dq0 and (not _lxv_zona_quality_ok_para_real(dq0)):
             return False, f"data_quality_no_ok:{dq0}"
-        zonas_ok = set(globals().get("LXV_ZONAS_INVERTIBLES", {"VERDE_TEMPRANO", "VERDE_MADURO"}))
-        zonas_block = set(globals().get("LXV_ZONAS_BLOQUEANTES", set()))
-        if zona in zonas_ok or fase in zonas_ok:
-            if allow_real and decision == str(ZONA_SI_INVERTIR).upper():
-                return True, f"zona_ok:{zona or fase}"
-            return False, f"zona_ok_pero_decision_no:{zona or fase}:{decision}:allow={allow_real}"
-        if zona in zonas_block or fase in zonas_block:
-            return False, f"zona_bloqueante:{zona or fase}"
-        return False, f"zona_no_autorizada:{zona or fase}"
+        allow = zona_base in set(globals().get("LXV_ZONAS_INVERTIBLES", {"VERDE_TEMPRANO", "VERDE_MADURO"})) and bool(zona_norm.get("allow_real", False)) is True
+        if allow:
+            return True, f"zona_invertible_{zona_base}"
+        motivo = str(zona_norm.get("motivo", "sin_motivo") or "sin_motivo").replace(" ", "_")
+        return False, f"zona_no_invertible_{zona_base}_{motivo}"
     except Exception as e:
         return False, f"zona_error:{e}"
 
@@ -7517,6 +7566,26 @@ def _selftest_zona_regional_temprana_lxv():
     assert z2["allow_real_regional"] is False
     print("SELFTEST ZONA_REGIONAL_TEMPRANA_LXV OK")
 
+def _selftest_zona_final_lxv_unica():
+    casos = [
+        ({"zona":"VERDE_TEMPRANO"}, "VERDE_TEMPRANO", True),
+        ({"zona":"VERDE_MADURO"}, "VERDE_MADURO", True),
+        ({"zona":"VERDE_TARDIO"}, "VERDE_TARDIO", False),
+        ({"zona":"VERDE_SATURADO_TARDIO"}, "VERDE_SATURADO_TARDIO", False),
+        ({"zona":"VERDE_MADURO_SANO","allow_real":True}, "VERDE_MADURO", True),
+        ({"zona":"VERDE_TEMPRANO_CONFIRMADO","allow_real":True}, "VERDE_TEMPRANO", True),
+        ({"zona":"ROJA_TEMPRANO","zona_visual":"VERDE_DOMINANTE_PARCIAL"}, "ROJA_TEMPRANO", False),
+        ({}, "UNKNOWN", False),
+    ]
+    for i, (info, exp_zona, exp_allow) in enumerate(casos, 1):
+        zf = normalizar_zona_lxv_oficial(info)
+        assert str(zf.get("zona_base")) == exp_zona, f"caso{i}: zona_base={zf.get('zona_base')} != {exp_zona}"
+        assert bool(zf.get("allow_real", False)) is exp_allow, f"caso{i}: allow_real={zf.get('allow_real')} != {exp_allow}"
+    zf_none = normalizar_zona_lxv_oficial(None)
+    assert str(zf_none.get("zona_base")) == "UNKNOWN"
+    assert bool(zf_none.get("allow_real", False)) is False
+    print("SELFTEST ZONA_FINAL_LXV_UNICA OK")
+
 
 if str(os.getenv("RUN_LXV_ZONE_SELFTEST", "0")).strip() == "1":
     try:
@@ -7536,6 +7605,11 @@ if str(os.getenv("RUN_LXV_LIVE_ROW_SELFTEST", "0")).strip() == "1":
 if str(os.getenv("RUN_ZONA_REGIONAL_TEMPRANA_SELFTEST", "0")).strip() == "1":
     try:
         _selftest_zona_regional_temprana_lxv()
+    except Exception:
+        pass
+if str(os.getenv("RUN_ZONA_FINAL_LXV_SELFTEST", "0")).strip() == "1":
+    try:
+        _selftest_zona_final_lxv_unica()
     except Exception:
         pass
 
@@ -9103,17 +9177,19 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
         if rid_int <= 0:
             agregar_evento(f"🧱 REAL HARD BLOCK ZONA: source={src} bot={bot} rid_faltante")
             return False
-        zona_info = evaluar_fase_zona_verde_lxv(round_id_objetivo=rid_int)
+        zona_info = resolver_zona_final_lxv(round_id_objetivo=rid_int)
         allow_zona, reason_zona = _lxv_zona_es_invertible(zona_info)
         if not allow_zona:
             agregar_evento(
                 f"🧱 REAL HARD BLOCK ZONA: source={src} rid={rid_int} bot={bot} "
-                f"zona={zona_info.get('zona', zona_info.get('fase'))} "
+                f"zona_base={zona_info.get('zona_base', zona_info.get('zona', zona_info.get('fase')))} "
+                f"subzona={zona_info.get('subzona', zona_info.get('zona', zona_info.get('fase')))} "
                 f"decision={zona_info.get('decision')} "
+                f"allow_real={bool(zona_info.get('allow_real', False))} "
                 f"motivo={zona_info.get('motivo')} reason={reason_zona}"
             )
             LXV_REAL_AUDIT["ultimo_bloqueo"] = (
-                f"hard_zone_{zona_info.get('fase', zona_info.get('zona'))}_{zona_info.get('motivo')}"
+                f"hard_zone_{zona_info.get('zona_base', zona_info.get('fase', zona_info.get('zona')))}_{zona_info.get('motivo')}"
             )
             return False
     agregar_evento(f"✅ REAL source autorizada: {src}.")
@@ -18876,9 +18952,10 @@ def _hud_zona_operativa_lxv_line(width=None):
             info = dict(globals().get("_LXV_ZONA_HUD_LAST_INFO", {}) or {})
         if not isinstance(info, dict) or not info:
             info = {"zona":"INSUFICIENTE","fase":"INSUFICIENTE","decision":ZONA_NO_INVERTIR,"motivo":"sin_info_zona","emoji":"⬜","cols_usadas":0,"cols_requeridas":int(globals().get("LXV_ZONA_MIN_COLUMNS", 3) or 3),"source":"HUD_GLOBAL/none"}
-        zona = str(info.get("zona", info.get("fase", "NEUTRO")))
-        decision = str(info.get("decision", ZONA_NO_INVERTIR))
-        motivo = str(info.get("motivo", "--"))
+        zona_final = resolver_zona_final_lxv(round_id_objetivo=info.get("round_id"), zona_info_previa=info)
+        zona = str(zona_final.get("zona_base", "UNKNOWN"))
+        decision = str(zona_final.get("decision", ZONA_NO_INVERTIR))
+        motivo = str(zona_final.get("motivo", "--"))
         emoji = str(info.get("emoji", "⬜"))
         cols_usadas = int(info.get("cols_usadas", 0) or 0)
         cols_req = int(info.get("cols_requeridas", int(globals().get("LXV_ZONA_MIN_COLUMNS", 3) or 3)) or 3)
@@ -18913,10 +18990,10 @@ def _hud_zona_operativa_lxv_line(width=None):
         g_col_parcial = _calcular_g_columna_parcial(patron_live)
         g_hud = f"g_columna={g_txt}" if cerrados >= esperados else f"g_columna_parcial={g_col_parcial:.2f} | g_regional={g_txt}"
         line_hud = (
-            f"{emoji} ZONA LXV HUD GLOBAL: {zona} | {decision} | motivo={motivo} | "
+            f"{emoji} ZONA LXV HUD GLOBAL: ZONA OFICIAL REAL={zona} | DECISIÓN ZONA={decision} | MOTIVO={motivo} | FUENTE={zona_final.get('fuente_zona','LXV')} | "
             f"rid_zona={rid_zona if rid_zona > 0 else '--'} | rid_live={rid_live if rid_live > 0 else '--'} | "
             f"cols={cols_usadas}/{cols_req} | cerrados={cerrados}/{esperados} | patrón={patron_live} | dq={dq} | {g_hud} | prom3={prom3:.2f} prom8={prom8:.2f} prom20={prom20:.2f} d38={d38:+.2f} | "
-            f"prev_full={prev_full} | regional={reg_visual} | columna_visual={col_visual} | ronda_liberada_previa={ronda_previa} | source={source}"
+            f"prev_full={prev_full} | SUBZONA/VISUAL={zona_final.get('subzona','--')} | regional={reg_visual} | columna_visual={col_visual} | VISUAL/REGIONAL=SOLO_DIAGNOSTICO,NO_HABILITA_REAL | ronda_liberada_previa={ronda_previa} | source={source}"
         )
         gate = dict(globals().get("_LXV_LAST_REAL_GATE_INFO", {}) or {})
         rid_gate = int(gate.get("round_id", 0) or 0)
@@ -19272,7 +19349,10 @@ def render_zona_lxv_panel():
         if not bool(globals().get("MRV_ZONA_V2_HUD_ENABLE", True)):
             return []
         info = obtener_zona_lxv_hud_actual() or {}
-        z = str(info.get("zona", "--")); d=str(info.get("decision","--")); m=str(info.get("motivo","--"))
+        zf = resolver_zona_final_lxv(round_id_objetivo=info.get("round_id"), zona_info_previa=info)
+        z = str(zf.get("zona_base", "--")); d=str(zf.get("decision","--")); m=str(zf.get("motivo","--"))
+        subz = str(zf.get("subzona", info.get("zona", "--")) or "--")
+        fuente = str(zf.get("fuente_zona", "LXV") or "LXV")
         z2 = str(info.get("zona_mrv_v2", "--")); d2=str(info.get("decision_mrv_v2","--")); m2=str(info.get("motivo_mrv_v2","--"))
         cerr=int(info.get("cerrados",0) or 0); esp=int(info.get("esperados",0) or 0)
         dq=str(info.get("data_quality","--")); patron=str(info.get("patron_live","--"))
@@ -19281,7 +19361,7 @@ def render_zona_lxv_panel():
         elif esp <= 0 or cerr < esp: real_txt = "NO, esperando columna completa"
         elif bool(info.get("bloqueo_mrv_v2", False)): real_txt = "NO, bloqueo MRV_ZONA_V2"
         reg_line = f"ZONA REGIONAL: {str(info.get('zona_regional','NEUTRO_REGIONAL'))} | R1={float(info.get('green_ratio_r1',0.0)):.2f} R2={float(info.get('green_ratio_r2',0.0)):.2f} R3={float(info.get('green_ratio_r3',0.0)):.2f} | decisión={str(info.get('decision_regional','NO_INVERTIR'))}"
-        return ["╔════════════════════════════════════════════════════════════╗","║ 🧭 ZONA LXV / MRV_ZONA_V2                                ║","╠════════════════════════════════════════════════════════════╣",f"║ Zona actual : {z[:43].ljust(43)}║",f"║ Decisión    : {d[:43].ljust(43)}║",f"║ Motivo      : {m[:43].ljust(43)}║",f"║ MRV_V2      : {z2[:43].ljust(43)}║",f"║ Decisión V2 : {d2[:43].ljust(43)}║",f"║ Motivo V2   : {m2[:43].ljust(43)}║",f"║ Columna     : {cerr}/{esp} | dq={dq} | patrón={patron}"[:61].ljust(61)+"║",f"║ Fuerza      : G={float(info.get('g_actual',0.0)):.2f} R={float(info.get('r_actual',0.0)):.2f} | G3/G5/G8={int(info.get('green_cols_3',0))}/{int(info.get('green_cols_5',0))}/{int(info.get('green_cols_8',0))}"[:61].ljust(61)+"║",f"║ Presión     : verde={float(info.get('green_pressure',0.0)):.2f} roja={float(info.get('red_pressure',0.0)):.2f} ruido={float(info.get('noise_ratio',0.0)):.2f}"[:61].ljust(61)+"║",f"║ Regional    : {reg_line[:47].ljust(47)}║",f"║ REAL        : {real_txt[:47].ljust(47)}║","╚════════════════════════════════════════════════════════════╝"]
+        return ["╔════════════════════════════════════════════════════════════╗","║ 🧭 ZONA LXV / MRV_ZONA_V2                                ║","╠════════════════════════════════════════════════════════════╣",f"║ ZONA OFICIAL REAL : {z[:37].ljust(37)}║",f"║ SUBZONA / VISUAL  : {subz[:37].ljust(37)}║",f"║ DECISIÓN ZONA     : {d[:37].ljust(37)}║",f"║ MOTIVO            : {m[:37].ljust(37)}║",f"║ FUENTE            : {fuente[:37].ljust(37)}║",f"║ MRV_V2      : {z2[:43].ljust(43)}║",f"║ Decisión V2 : {d2[:43].ljust(43)}║",f"║ Motivo V2   : {m2[:43].ljust(43)}║",f"║ Columna     : {cerr}/{esp} | dq={dq} | patrón={patron}"[:61].ljust(61)+"║",f"║ Regional    : SOLO_DIAGNOSTICO, NO_HABILITA_REAL"[:61].ljust(61)+"║",f"║ Regional+   : {reg_line[:47].ljust(47)}║",f"║ REAL        : {real_txt[:47].ljust(47)}║","╚════════════════════════════════════════════════════════════╝"]
     except Exception:
         return []
 
