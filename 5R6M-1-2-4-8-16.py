@@ -5972,11 +5972,8 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
         _real_lock_set("DATA_QUALITY_OK", dq_ok, f"dq={data_quality}")
         _real_lock_set("PATRON_VALIDO", str(patron) in ("4V2X", "5V1X"), patron)
         _real_lock_set("COLUMNA_COMPLETA", bool(round_complete), f"round_complete={bool(round_complete)}")
-        zona = str(p["zona"] or "").upper()
-        decision = str(p.get("decision", "") or "").upper()
-        allow_real = zi.get("allow_real", None)
-        zona_ok = bool(zona in ("VERDE_TEMPRANO", "VERDE_MADURO") and decision != "NO_INVERTIR" and (allow_real is not False))
-        _real_lock_set("ZONA_OK", zona_ok, f"zona={zona}|decision={decision}|motivo={zi.get('motivo','')}")
+        zona_ok, zona_reason = _lxv_zona_es_invertible(zi)
+        _real_lock_set("ZONA_OK", bool(zona_ok), str(zona_reason or "zona_no_invertible"))
         _real_lock_set("NO_DUPLICADO_RONDA", bool(round_id) and (not _lxv_real_round_already_emitted(round_id)), f"rid={round_id}")
         try:
             if callable(globals().get("_hay_real_close_pending_activo")):
@@ -6031,6 +6028,25 @@ def actualizar_real_locks_panel_desde_round_live():
             round_complete=round_complete,
             partial_pattern=partial,
         )
+        p = globals().get("REAL_LOCKS_PANEL", {})
+        current_source = str(p.get("source", "") or "").strip().upper()
+        current_bot = str(p.get("bot", "") or "").strip()
+        current_updated_ts = float(p.get("updated_ts", 0.0) or 0.0)
+        current_candidato_ok = bool((p.get("locks", {}) or {}).get("CANDIDATO_VALIDO") is True)
+        fresh_real_candidate = (
+            current_source in ("LXV_4V2X", "LXV_5V1X", "LXV_SYNC", "MANUAL")
+            and current_bot in BOT_NAMES
+            and current_candidato_ok
+            and ((time.time() - current_updated_ts) <= 20.0)
+        )
+        if fresh_real_candidate:
+            p["round_id"] = rid
+            p["patron"] = partial
+            p["zona"] = str((zi or {}).get("zona", (zi or {}).get("fase", "")) or "")
+            p["decision"] = str((zi or {}).get("decision", "") or "")
+            p["updated_ts"] = float(time.time())
+            p["source_diag"] = "ROUND_LIVE"
+            return
         actualizar_real_locks_panel_lxv(
             source="ROUND_LIVE", round_id=rid, patron=partial, bot_candidato="--",
             round_complete=round_complete, data_quality=dq, zona_info=zi,
@@ -6098,6 +6114,31 @@ def resolver_zona_lxv_para_round_live(rid, round_complete, partial_pattern):
         "cols_requeridas": int(visual.get("cols_requeridas", int(globals().get("LXV_ZONA_MIN_COLUMNS", 3) or 3)) or 3),
         "ronda_liberada_previa": "si" if (rid_zona > 0 and rid_int > 0 and rid_zona != rid_int) else "no",
     }
+
+def obtener_zona_lxv_hud_actual():
+    try:
+        rows_pack = _ack_live_build_rows() if callable(globals().get("_ack_live_build_rows")) else {}
+        summary = _ack_live_calc_summary(rows_pack) if callable(globals().get("_ack_live_calc_summary")) else {}
+        if not isinstance(summary, dict):
+            summary = {}
+        rid = int(summary.get("obj_round", summary.get("round_id", 0)) or 0)
+        closed_count = int(summary.get("closed_count", 0) or 0)
+        expected_count = int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
+        if expected_count <= 0:
+            expected_count = int(len(BOT_NAMES) or 6)
+        dq = str(summary.get("data_quality", "missing") or "missing").strip().lower()
+        partial = str(summary.get("partial_pattern", "0V0X") or "0V0X").strip().upper()
+        round_complete = bool(closed_count == expected_count and expected_count > 0)
+        info = resolver_zona_lxv_para_round_live(rid=rid, round_complete=round_complete, partial_pattern=partial)
+        info = dict(info) if isinstance(info, dict) else {}
+        info["round_id_live"] = rid
+        info["cerrados"] = closed_count
+        info["esperados"] = expected_count
+        info["patron_live"] = partial
+        info["data_quality"] = dq
+        return info
+    except Exception:
+        return {"zona":"INSUFICIENTE","fase":"INSUFICIENTE","decision":ZONA_NO_INVERTIR,"motivo":"sin_info_round_live","emoji":"⬜","source":"HUD_GLOBAL/none"}
 
 def render_real_locks_panel():
     try:
@@ -6236,13 +6277,18 @@ def _lxv_build_live_zone_row_for_round(rid):
         rid = int(rid or 0)
         if rid <= 0:
             return None
-        rows_live = []
         build_fn = globals().get("_ack_live_build_rows")
-        if callable(build_fn):
-            rows_live = list(build_fn() or [])
+        rows_pack = build_fn() if callable(build_fn) else {}
         calc_fn = globals().get("_ack_live_calc_summary")
-        summary = calc_fn(rows_live, rid) if callable(calc_fn) else None
+        summary = calc_fn(rows_pack) if callable(calc_fn) else None
         if not isinstance(summary, dict):
+            return None
+        summary_rid = int(summary.get("obj_round", summary.get("round_id", 0)) or 0)
+        if summary_rid != rid:
+            try:
+                _dbg_lxv(f"⚠️ LXV live row skip rid={rid} summary_rid={summary_rid} motivo=live_summary_rid_mismatch")
+            except Exception:
+                pass
             return None
         v = int(summary.get("n_verdes", summary.get("verdes", -1)) or -1)
         r = int(summary.get("n_rojos", summary.get("rojos", -1)) or -1)
@@ -18021,7 +18067,7 @@ def _hud_zona_operativa_lxv_line(width=None):
     try:
         info = {}
         try:
-            info_live = clasificar_zona_operativa_lxv()
+            info_live = obtener_zona_lxv_hud_actual()
             if isinstance(info_live, dict) and info_live.get("ok", True):
                 info_live = dict(info_live)
                 src = str(info_live.get("source", info_live.get("sources", "cache+csv")) or "cache+csv")
@@ -18043,6 +18089,10 @@ def _hud_zona_operativa_lxv_line(width=None):
         source = str(info.get("source", info.get("sources", "none")))
         rid_zona = int(info.get("round_id_zona", info.get("round_id", 0)) or 0)
         rid_live = int(info.get("round_id_live", 0) or 0)
+        cerrados = int(info.get("cerrados", 0) or 0)
+        esperados = int(info.get("esperados", len(BOT_NAMES)) or len(BOT_NAMES))
+        patron_live = str(info.get("patron_live", "--") or "--")
+        dq = str(info.get("data_quality", "--") or "--")
         g_txt = "--"
         try:
             if info.get("g_actual", None) is not None:
@@ -18061,7 +18111,7 @@ def _hud_zona_operativa_lxv_line(width=None):
         line_hud = (
             f"{emoji} ZONA LXV HUD GLOBAL: {zona} | {decision} | motivo={motivo} | "
             f"rid_zona={rid_zona if rid_zona > 0 else '--'} | rid_live={rid_live if rid_live > 0 else '--'} | "
-            f"cols={cols_usadas}/{cols_req} | g={g_txt} | prom3={prom3:.2f} prom8={prom8:.2f} prom20={prom20:.2f} d38={d38:+.2f} | "
+            f"cols={cols_usadas}/{cols_req} | cerrados={cerrados}/{esperados} | patrón={patron_live} | dq={dq} | g={g_txt} | prom3={prom3:.2f} prom8={prom8:.2f} prom20={prom20:.2f} d38={d38:+.2f} | "
             f"prev_full={prev_full} | visual={visual_hint or '--'} | ronda_liberada_previa={ronda_previa} | source={source}"
         )
         gate = dict(globals().get("_LXV_LAST_REAL_GATE_INFO", {}) or {})
