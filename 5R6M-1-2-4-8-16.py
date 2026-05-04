@@ -7956,6 +7956,52 @@ def _selftest_zona_final_lxv_unica():
     assert bool(zf_none.get("allow_real", False)) is False
     print("SELFTEST ZONA_FINAL_LXV_UNICA OK")
 
+def _selftest_canonical_round_sync():
+    bots = list(BOT_NAMES)
+    now_ts = float(time.time())
+    original_reader = globals().get("_sync_round_safe_read_json")
+    original_path = globals().get("_sync_round_ack_path")
+    original_ttl = float(globals().get("TTL_ACK_SYNC_ROUND_S", 300.0) or 300.0)
+    try:
+        globals()["TTL_ACK_SYNC_ROUND_S"] = 300.0
+        def _fake_ack_path(bot: str) -> str:
+            return f"/tmp/{bot}.json"
+        def _build_ack(round_id, fresh=True, mode="DEMO", status="closed", resultado="GANANCIA"):
+            ts = now_ts - 10.0 if fresh else now_ts - 900.0
+            return {"round_id": round_id, "status": status, "resultado": resultado, "mode": mode, "source": "SYNC_DEMO", "ts": ts}
+        # Caso A
+        acks = {b: _build_ack(295, fresh=True, mode="DEMO") for b in bots}
+        globals()["_sync_round_ack_path"] = _fake_ack_path
+        globals()["_sync_round_safe_read_json"] = lambda p: acks.get(os.path.basename(p).replace(".json", ""))
+        r = _sync_round_resolver_ronda_canonica({}, {}, 294, {"round_id": 296})
+        assert bool(r.get("ok")) and int(r.get("round_closed_eval", 0)) == 295 and int(r.get("round_next_release", 0)) == 296 and len(r.get("closed", {})) == len(bots)
+        # Caso B
+        acks = {b: _build_ack(295) for b in bots[:5]}
+        globals()["_sync_round_safe_read_json"] = lambda p: acks.get(os.path.basename(p).replace(".json", ""))
+        r = _sync_round_resolver_ronda_canonica({}, {}, 294, {"round_id": 296})
+        assert (not bool(r.get("ok"))) and str(r.get("reason")) == "partial_consensus"
+        # Caso C
+        acks = {b: _build_ack(295, fresh=False) for b in bots}
+        globals()["_sync_round_safe_read_json"] = lambda p: acks.get(os.path.basename(p).replace(".json", ""))
+        r = _sync_round_resolver_ronda_canonica({}, {}, 294, {"round_id": 296})
+        assert (not bool(r.get("ok"))) and str(r.get("reason")) == "stale_consensus"
+        # Caso D
+        acks = {b: _build_ack(295 if i < 3 else 296, fresh=True) for i, b in enumerate(bots)}
+        globals()["_sync_round_safe_read_json"] = lambda p: acks.get(os.path.basename(p).replace(".json", ""))
+        r = _sync_round_resolver_ronda_canonica({}, {}, 294, {"round_id": 296})
+        assert (not bool(r.get("ok"))) and str(r.get("reason")) == "mixed_rounds"
+        # Caso E (ya consumida -> no duplicar REAL)
+        acks = {b: _build_ack(295, fresh=True) for b in bots}
+        globals()["_sync_round_safe_read_json"] = lambda p: acks.get(os.path.basename(p).replace(".json", ""))
+        r = _sync_round_resolver_ronda_canonica({}, {}, 294, {"round_id": 296})
+        already = bool(int(r.get("round_closed_eval", 0)) <= 295)
+        assert bool(r.get("ok")) and already
+        print("SELFTEST CANONICAL_ROUND_SYNC OK")
+    finally:
+        globals()["_sync_round_safe_read_json"] = original_reader
+        globals()["_sync_round_ack_path"] = original_path
+        globals()["TTL_ACK_SYNC_ROUND_S"] = original_ttl
+
 
 if str(os.getenv("RUN_LXV_ZONE_SELFTEST", "0")).strip() == "1":
     try:
@@ -7982,6 +8028,11 @@ if str(os.getenv("RUN_ZONA_FINAL_LXV_SELFTEST", "0")).strip() == "1":
         _selftest_zona_final_lxv_unica()
     except Exception:
         pass
+if str(os.getenv("RUN_CANONICAL_ROUND_SELFTEST", "0")).strip() == "1":
+    try:
+        _selftest_canonical_round_sync()
+    except Exception as _e:
+        print(f"SELFTEST CANONICAL_ROUND_SYNC FAIL: {_e}")
 
 def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     bot_pick = _lxv_5v1x_pick_real_bot(candidate)
@@ -8310,6 +8361,90 @@ def _sync_round_collect_closed_acks_any_round(target_round: int) -> tuple[dict, 
         reasons[bot] = "ok"
     return closed, reasons
 
+def _sync_round_resolver_ronda_canonica(closed_current, reasons_current, target_round, state):
+    now_ts = float(time.time())
+    valid_by_round = {}
+    stale_by_round = {}
+    reasons_by_bot = {}
+    seen_rounds = set()
+    for bot in BOT_NAMES:
+        ack = _sync_round_safe_read_json(_sync_round_ack_path(bot))
+        if not isinstance(ack, dict):
+            reasons_by_bot[bot] = "ack_missing"
+            continue
+        try:
+            ack_round = int(ack.get("round_id", 0) or 0)
+        except Exception:
+            ack_round = 0
+        if ack_round > 0:
+            seen_rounds.add(ack_round)
+        status = str(ack.get("status", "")).strip().lower()
+        if status != "closed":
+            reasons_by_bot[bot] = f"status_no_closed_{status or 'empty'}"
+            continue
+        ack_mode = str(ack.get("mode", "") or "").strip().upper()
+        ack_source = str(ack.get("source", "") or "").strip().upper()
+        if ack_mode == "REAL" or ack_source in ("ORDEN_REAL", "REAL", "REAL_ORDER"):
+            reasons_by_bot[bot] = "ack_real_ignored"
+            continue
+        if ack_mode not in ("DEMO", "SYNC", "") and ack_source not in ("SYNC_DEMO", "DEMO", "LXV_SYNC", "SYNC"):
+            reasons_by_bot[bot] = "ack_mode_source_invalid"
+            continue
+        resultado = str(ack.get("resultado", "") or "").strip().upper()
+        if resultado in ("PERDIDA", "PÉRDIDA", "LOSS", "X", "✗"):
+            resultado = "PÉRDIDA"
+        elif resultado in ("GANANCIA", "WIN", "✓"):
+            resultado = "GANANCIA"
+        if resultado not in ("GANANCIA", "PÉRDIDA"):
+            reasons_by_bot[bot] = f"resultado_invalid_{resultado or 'empty'}"
+            continue
+        try:
+            ack_ts = float(ack.get("ts", 0.0) or 0.0)
+        except Exception:
+            ack_ts = 0.0
+        if ack_ts <= 0:
+            reasons_by_bot[bot] = "ts_missing"
+            continue
+        age = now_ts - ack_ts
+        if age > float(TTL_ACK_SYNC_ROUND_S):
+            stale_by_round.setdefault(ack_round, set()).add(bot)
+            reasons_by_bot[bot] = "stale"
+            continue
+        valid_by_round.setdefault(ack_round, {})[bot] = {
+            "resultado": resultado, "ts": ack_ts, "contract_id": ack.get("contract_id"),
+            "asset": ack.get("asset"), "ciclo": ack.get("ciclo"),
+        }
+        reasons_by_bot[bot] = "ok"
+    full_need = len(BOT_NAMES)
+    full_rounds = [r for r, d in valid_by_round.items() if isinstance(d, dict) and len(d) >= full_need]
+    if full_rounds:
+        chosen = sorted(full_rounds)[-1]
+        return {
+            "ok": True,
+            "round_closed_eval": int(chosen),
+            "round_next_release": int(chosen) + 1,
+            "closed": dict(valid_by_round.get(chosen, {})),
+            "reasons": {b: ("ok" if b in valid_by_round.get(chosen, {}) else str(reasons_by_bot.get(b, "missing"))) for b in BOT_NAMES},
+            "reason": "full_consensus_ack_round",
+            "best_round": int(chosen),
+            "best_closed": int(len(valid_by_round.get(chosen, {}))),
+        }
+    best_round = 0
+    best_closed = -1
+    for rr, dd in valid_by_round.items():
+        cc = len(dd) if isinstance(dd, dict) else 0
+        if cc > best_closed or (cc == best_closed and rr > best_round):
+            best_round, best_closed = int(rr), int(cc)
+    if len(seen_rounds) > 1 and best_closed < full_need:
+        reason = "mixed_rounds"
+    elif best_round > 0 and len(stale_by_round.get(best_round, set())) >= full_need:
+        reason = "stale_consensus"
+    elif best_closed > 0:
+        reason = "partial_consensus"
+    else:
+        reason = "missing"
+    return {"ok": False, "reason": reason, "best_round": int(best_round), "best_closed": int(max(0, best_closed))}
+
 def _sync_round_tick_maestro():
     global _SYNC_ROUND_LAST_ANNOUNCED, _LXV_LAST_EMITTED_ROUND
     _sync_round_bootstrap_state(force=False)
@@ -8538,6 +8673,30 @@ def _sync_round_tick_maestro():
         completed_failsafe = False
         sync_debug_missing = {bot: "ok" for bot in BOT_NAMES}
         agregar_evento(f"⚡ TURBO_SYNC_ACK_FULL: ronda #{round_id} cerrada 6/6 por ACK directo; evaluando ahora.")
+    canonical = {"ok": False}
+    if not direct_ack_full:
+        canonical = _sync_round_resolver_ronda_canonica(closed, sync_debug_missing, round_id, st) or {"ok": False}
+        if bool(canonical.get("ok", False)):
+            adopted_round = int(canonical.get("round_closed_eval", round_id) or round_id)
+            agregar_evento(
+                f"🧭 CANONICAL_ROUND_ADOPTED: state_round={int(st.get('round_id', round_id) or round_id)} "
+                f"audit_round={round_id} ack_round={adopted_round} closed=6/6 reason=full_consensus_ack_round "
+                f"next_release={int(canonical.get('round_next_release', adopted_round + 1) or adopted_round + 1)}"
+            )
+            round_id = adopted_round
+            closed = {b: canonical["closed"][b] for b in BOT_NAMES if b in canonical.get("closed", {})}
+            sync_debug_missing = dict(canonical.get("reasons", {}))
+            n_closed = len(closed)
+            missing = [b for b in BOT_NAMES if b not in closed]
+            direct_ack_full = (n_closed >= len(BOT_NAMES))
+            completed = bool(direct_ack_full)
+            completed_normal = bool(direct_ack_full)
+            completed_failsafe = False
+        else:
+            agregar_evento(
+                f"🧭 CANONICAL_ROUND_NOT_READY: best_round={int(canonical.get('best_round', 0) or 0)} "
+                f"closed={int(canonical.get('best_closed', 0) or 0)}/{len(BOT_NAMES)} reason={canonical.get('reason', 'missing')}"
+            )
     completed_normal = bool(n_closed >= len(expected))
     completed_failsafe = bool(stale_ignored and n_closed >= effective_need)
     completed = bool(completed_normal or completed_failsafe)
@@ -8669,6 +8828,7 @@ def _sync_round_tick_maestro():
         payload_released_round = int(round_id) + 1
     payload = {
         "round_id": round_id,
+        "round_closed_eval": int(round_id),
         "released_round": payload_released_round,
         "expected_bots": expected,
         "expected_bots_effective": effective_expected,
