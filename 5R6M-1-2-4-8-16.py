@@ -4252,6 +4252,34 @@ def _lxv_normalizar_patron_txt(patron):
         return ""
 
 
+
+
+def _sync_round_is_released(summary=None, state=None, round_id=None) -> bool:
+    try:
+        ss = summary if isinstance(summary, dict) else {}
+        st = state if isinstance(state, dict) else (_sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {})
+        rid = int(round_id if round_id is not None else ss.get("round_id", ss.get("obj_round", st.get("round_id", 0))) or 0)
+        if rid <= 0:
+            return False
+        rel = int(ss.get("released_round", st.get("released_round", rid)) or rid)
+        return int(rel) >= (int(rid) + 1)
+    except Exception:
+        return False
+
+
+def _dq_visual_lxv(summary, state=None):
+    try:
+        ss = summary if isinstance(summary, dict) else {}
+        dq_operativa = str(ss.get("data_quality", "missing") or "missing").strip().lower()
+        rid = int(ss.get("round_id", ss.get("obj_round", 0)) or 0)
+        if _sync_round_is_released(ss, state=state, round_id=rid):
+            if dq_operativa == "closed_expired":
+                return "released_post_eval"
+            return "released"
+        return dq_operativa
+    except Exception:
+        return str((summary or {}).get("data_quality", "missing") or "missing").strip().lower()
+
 def _sync_round_build_canonical_summary(round_id, closed, expected=None, source="CANONICAL_ROUND"):
     rid = int(round_id or 0)
     closed = dict(closed or {})
@@ -4796,7 +4824,7 @@ def _ack_live_format_lines(snapshot):
 
     lines = []
     lag_txt = max_txt if max_txt != "--" else avg_txt
-    lines.append(f"⚡ ROUND #{obj_round} | Cerrados {closed_count}/{expected_count} | Faltan {faltan_count} | Calidad {summary.get('data_quality','missing')} | Patrón {_lxv_normalizar_patron_txt(summary.get('partial_pattern','0V0X')) or '0V0X'}")
+    lines.append(f"⚡ ROUND #{obj_round} | Cerrados {closed_count}/{expected_count} | Faltan {faltan_count} | Calidad {_dq_visual_lxv(summary)} | Patrón {_lxv_normalizar_patron_txt(summary.get('partial_pattern','0V0X')) or '0V0X'}")
     if bool((rows_pack or {}).get("canonical")):
         lines.append("🧭 RONDA CANÓNICA ACTIVA")
     if bool(globals().get("HUD_SHOW_LEGACY_DIAGNOSTICS", False)) or bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False)):
@@ -4844,7 +4872,7 @@ def _ack_live_format_lines(snapshot):
     resumen = (
         f"📊 RONDA #{obj_round} | V={summary.get('verdes_count', 0)} | R={summary.get('rojas_count', 0)} | "
         f"Faltan={faltan_count} | Parcial={summary.get('partial_pattern', '0V0X')} | "
-        f"{'BotX=' + botx + ' | ' if botx != '-' else ''}Calidad={summary.get('data_quality', 'missing')} | motivo={motivo_round}"
+        f"{'BotX=' + botx + ' | ' if botx != '-' else ''}Calidad={_dq_visual_lxv(summary)} | motivo={motivo_round}"
     )
     if bool(globals().get("HUD_SHOW_LEGACY_DIAGNOSTICS", False)) or bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False)):
         lines.append(resumen)
@@ -4864,17 +4892,20 @@ def _ack_live_format_lines(snapshot):
         motivo_hist.append("missing" if fresh_count < expected_count else "ok")
     dq_txt = str(summary.get("data_quality", "missing") or "").strip().lower()
     if vis == int(closed_count) and int(no_cuentan) == 0:
-        lines.append(f"COLUMNA OFICIAL: {closed_count}/{expected_count} | dq={summary.get('data_quality', 'missing')} | esperando bots")
+        lines.append(f"COLUMNA OFICIAL: {closed_count}/{expected_count} | dq={_dq_visual_lxv(summary)} | esperando bots")
     else:
         if vis == int(closed_count) and int(closed_count) >= int(expected_count) and int(no_cuentan) > 0:
-            lines.append(f"HISTORIAL VISUAL = {vis}/{expected_count}, pero ACKs no frescos")
+            if _sync_round_is_released(summary, round_id=obj_round):
+                lines.append(f"NOTA: ACKs válidos, ronda ya liberada; no oportunidad activa.")
+            else:
+                lines.append(f"HISTORIAL VISUAL = {vis}/{expected_count}, pero ACKs no frescos")
         else:
             lines.append("HISTORIAL VISUAL ≠ COLUMNA OFICIAL")
         lines.append(f"visibles={vis}/6")
         lines.append(f"oficiales={closed_count}/{expected_count}")
         lines.append(f"no_cuentan={no_cuentan}")
         lines.append(f"motivo={'+'.join(motivo_hist)}")
-    if dq_txt == "closed_expired":
+    if dq_txt == "closed_expired" and (not _sync_round_is_released(summary, round_id=obj_round)):
         min_lag_s = summary.get("min_lag_s", None)
         max_lag_s = summary.get("max_lag_s", None)
         exp_cnt = int(summary.get("expired_count", 0) or 0)
@@ -9437,7 +9468,7 @@ def _sync_round_tick_maestro():
             real_hold_bot = None
             fase_ok = False
             fase_info = {}
-            patron = str(partial_pattern or patron or "").upper()
+            patron = _lxv_normalizar_patron_txt(partial_pattern or patron) or "0V0X"
             ciclo_pick = ciclo_martingala_siguiente()
             zona_info_decision = evaluar_fase_zona_verde_lxv(round_id_objetivo=round_id) or {}
             zona_allow, zona_reason = _lxv_zona_es_invertible(zona_info_decision)
@@ -9460,7 +9491,7 @@ def _sync_round_tick_maestro():
                     f"motivo={zona_info_decision.get('motivo')} reason={zona_reason}"
                 )
                 ok_emit = False
-                patron = str(partial_pattern or patron or "").upper()
+                patron = _lxv_normalizar_patron_txt(partial_pattern or patron) or "0V0X"
             else:
                 try:
                     if patron == "5V1X":
@@ -9517,8 +9548,22 @@ def _sync_round_tick_maestro():
                 real_hold_bot = str(emit_bot or "")
                 agregar_evento(f"⚡ TURBO_SYNC_REAL_NOW: ronda #{round_id} patrón={patron} bot={real_hold_bot or emit_bot or '-'} ciclo=C{int(ciclo_pick)}")
             else:
-                motivo_no_real = motivo_exec if motivo_exec else f"no_real_{patron}"
-        elif patron not in ("5V1X", "4V2X"):
+                dq_now = str(data_quality or "").strip().lower()
+                if dq_now != "ok" and (not _sync_round_is_released(summary, round_id=round_id)):
+                    motivo_no_real = f"dq_no_ok:{dq_now or 'missing'}"
+                elif not zona_allow:
+                    motivo_no_real = f"zona_no_invertible:{zona_info_decision.get('zona', zona_info_decision.get('fase', 'DESCONOCIDA'))}"
+                elif not emit_bot:
+                    motivo_no_real = "sin_candidato_real"
+                elif _sync_round_pending_blocks_real_only(real_close_pending_active):
+                    motivo_no_real = "real_close_pending"
+                elif str(motivo_exec or "").strip().lower() in ("token_ocupado", "token_real_ocupado"):
+                    motivo_no_real = "token_real_ocupado"
+                elif (_lxv_normalizar_patron_txt(patron) or '0V0X') not in ("5V1X", "4V2X"):
+                    motivo_no_real = f"patron_no_invertible:{_lxv_normalizar_patron_txt(patron) or '0V0X'}"
+                else:
+                    motivo_no_real = motivo_exec if motivo_exec else "sin_candidato_real"
+        elif (_lxv_normalizar_patron_txt(patron) or '0V0X') not in ("5V1X", "4V2X"):
             try:
                 verdes_count = int(summary.get("verdes_count", 0) or 0)
                 rojas_count = int(summary.get("rojas_count", 0) or 0)
@@ -9534,7 +9579,7 @@ def _sync_round_tick_maestro():
                     cooldown_s=15.0,
                 )
             else:
-                motivo_no_real = f"patron_no_invertible:{patron}"
+                motivo_no_real = f"patron_no_invertible:{_lxv_normalizar_patron_txt(patron) or '0V0X'}"
             agregar_evento(f"ROUND LIVE #{round_id}: patrón={patron} | SIN_CANDIDATO_REAL | release condicionado a columna completa")
             pick = None
         if (not round_live_real_ok) and pick:
@@ -26936,3 +26981,30 @@ def _selftest_sync_recovery_release_gate():
 
 if os.environ.get("RUN_SYNC_RECOVERY_RELEASE_SELFTEST") == "1":
     _selftest_sync_recovery_release_gate()
+
+def _selftest_dq_released_hud():
+    sa = {"round_id": 360, "released_round": 361, "data_quality": "closed_expired"}
+    assert _dq_visual_lxv(sa) == "released_post_eval"
+    sb = {"round_id": 360, "released_round": 360, "data_quality": "closed_expired"}
+    assert _dq_visual_lxv(sb) == "closed_expired"
+    assert (_lxv_normalizar_patron_txt("5V/1X") or "") == "5V1X"
+    pat = _lxv_normalizar_patron_txt("5V1X") or "0V0X"
+    zona = "ROJO_MADURO"
+    dq = "ok"
+    if dq != "ok":
+        motivo = f"dq_no_ok:{dq}"
+    elif zona != "VERDE_MADURO":
+        motivo = f"zona_no_invertible:{zona}"
+    elif pat not in ("5V1X", "4V2X"):
+        motivo = f"patron_no_invertible:{pat}"
+    else:
+        motivo = "sin_candidato_real"
+    assert motivo == "zona_no_invertible:ROJO_MADURO"
+    pat2 = _lxv_normalizar_patron_txt("1V5X") or "0V0X"
+    motivo2 = f"patron_no_invertible:{pat2}" if pat2 not in ("5V1X", "4V2X") else "-"
+    assert motivo2 == "patron_no_invertible:1V5X"
+
+
+if os.environ.get("RUN_DQ_RELEASED_HUD_SELFTEST") == "1":
+    _selftest_dq_released_hud()
+
