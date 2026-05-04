@@ -4322,11 +4322,11 @@ def _lxv_green_opportunity_sync_diag(summary, rows_pack=None):
         canonical = bool(ss.get("canonical"))
         closed_count = int(ss.get("closed_count", 0) or 0)
         expected_count = int(ss.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
-        dq = str(ss.get("data_quality", "") or "").lower()
+        dq = _dq_oficial_lxv(ss)
         if canonical and closed_count >= expected_count and dq == "ok":
             return
         cause = "unknown"
-        dq = str(ss.get("data_quality", "") or "").lower()
+        dq = _dq_oficial_lxv(ss)
         if dq == "closed_expired":
             cause = "expired"
         elif dq == "missing":
@@ -6765,7 +6765,7 @@ def actualizar_real_locks_panel_desde_round_live():
         rid = int(summary.get("obj_round", summary.get("round_id", 0)) or 0)
         closed_count = int(summary.get("closed_count", 0) or 0)
         expected_count = int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
-        dq = str(summary.get("data_quality", "missing") or "missing").strip().lower()
+        dq = _dq_oficial_lxv(summary)
         partial = _lxv_normalizar_patron_txt(summary.get("partial_pattern", "0V0X")) or "0V0X"
         round_complete = bool(closed_count == expected_count and expected_count > 0)
         if bool(pref.get("canonical")) and round_complete and str(dq) == "ok":
@@ -6808,6 +6808,14 @@ def actualizar_real_locks_panel_desde_round_live():
             candidate_info={"candidate_ok": False, "reason": "sin_candidato_round_live"},
             order_status=(globals().get("REAL_LOCKS_PANEL", {}).get("locks", {}).get("ORDEN_REAL_OK", None)),
         )
+        real_close_pending_active, _, _ = _hay_real_close_pending_activo()
+        if bool(real_close_pending_active):
+            p2 = globals().get("REAL_LOCKS_PANEL", {})
+            p2.setdefault("locks", {})
+            p2["locks"]["REAL_CLOSE_LIBRE"] = False
+            p2["locks"]["ORDEN_REAL_OK"] = False
+            p2["falta_principal"] = "CIERRE_REAL_PENDIENTE"
+            p2["resultado"] = "BLOQUEADO POR CIERRE_REAL_PENDIENTE"
     except Exception as e:
         try:
             REAL_LOCKS_PANEL["error"] = str(e)
@@ -8652,6 +8660,16 @@ def _sync_round_resolver_ronda_canonica(closed_current, reasons_current, target_
         reason = "missing"
     return {"ok": False, "reason": reason, "best_round": int(best_round), "best_closed": int(max(0, best_closed))}
 
+def _sync_round_pending_blocks_real_only(pending_on: bool) -> bool:
+    return bool(pending_on)
+
+def _dq_oficial_lxv(summary):
+    ss = summary if isinstance(summary, dict) else {}
+    dq = str(ss.get("data_quality", "missing") or "missing").strip().lower()
+    if dq in ("ok", "closed_expired", "partial", "missing"):
+        return dq
+    return dq
+
 def _sync_round_tick_maestro():
     global _SYNC_ROUND_LAST_ANNOUNCED, _LXV_LAST_EMITTED_ROUND
     _sync_round_bootstrap_state(force=False)
@@ -8691,18 +8709,18 @@ def _sync_round_tick_maestro():
             resync_future_ack_full = True
     expected_round = max(1, int(round_id))
     pending_on, pending_bot, pending = _hay_real_close_pending_activo()
-    if pending_on:
-        agregar_evento(f"⛔ TURBO_SYNC_HOLD_REAL_PENDING: ronda #{round_id} no libera por real_close_pending:{pending_bot}")
+    real_close_pending_active = bool(pending_on)
+    real_close_pending_bot = pending_bot
+    real_close_pending_data = pending or {}
+    if real_close_pending_active:
         _lxv_5v1x_event_cooldown(
-            key=f"sync_pending_block_early:{pending_bot}:{pending.get('ciclo')}",
+            key=f"sync_real_pending_active:{real_close_pending_bot}:{real_close_pending_data.get('ciclo')}",
             msg=(
-                f"⏸️ LXV_SYNC/ROUND bloqueado por REAL_CLOSE_PENDING activo | "
-                f"pendiente={pending_bot} C{pending.get('ciclo')} | "
-                f"no se evalúa REAL ni se libera ronda hasta cerrar pending"
+                f"⏸️ REAL_CLOSE_PENDING_ACTIVO: bot={real_close_pending_bot} ciclo={real_close_pending_data.get('ciclo')} | "
+                f"bloquea_nueva_REAL=SI | sync_sigue=SI"
             ),
             cooldown_s=8.0,
         )
-        return
     try:
         started_at = float(st.get("started_at", 0.0) or 0.0)
     except Exception:
@@ -8751,17 +8769,12 @@ def _sync_round_tick_maestro():
     if _SYNC_ROUND_LAST_ANNOUNCED != round_id:
         agregar_evento(f"🧭 LXV_SYNC_COLUMN ronda #{round_id} iniciada ({len(expected)} bots esperados).")
         _SYNC_ROUND_LAST_ANNOUNCED = round_id
-    pending_on, pending_bot, pending = _hay_real_close_pending_activo()
-    if pending_on:
+    if real_close_pending_active:
         _lxv_5v1x_event_cooldown(
-            key=f"sync_pending_block:{pending_bot}:{pending.get('ciclo')}",
-            msg=(
-                f"⏸️ LXV_SYNC bloqueado por REAL_CLOSE_PENDING activo | "
-                f"pendiente={pending_bot} C{pending.get('ciclo')} | no se evalúa nueva entrada REAL"
-            ),
+            key=f"sync_pending_block:{real_close_pending_bot}:{real_close_pending_data.get('ciclo')}",
+            msg="⏸️ TURBO_SYNC_REAL_PENDING: nueva REAL bloqueada, pero sync/release sigue activo",
             cooldown_s=8.0,
         )
-        return
 
     now_ts = float(time.time())
     closed_all, sync_debug_missing = _sync_round_collect_closed_acks(round_id)
@@ -9113,7 +9126,17 @@ def _sync_round_tick_maestro():
             ciclo_pick = ciclo_martingala_siguiente()
             zona_info_decision = evaluar_fase_zona_verde_lxv(round_id_objetivo=round_id) or {}
             zona_allow, zona_reason = _lxv_zona_es_invertible(zona_info_decision)
-            if not zona_allow:
+            if _sync_round_pending_blocks_real_only(real_close_pending_active):
+                real_emitido = False
+                motivo_no_real = "real_close_pending_active"
+                locks = (globals().get("REAL_LOCKS_PANEL", {}) or {}).setdefault("locks", {})
+                locks["REAL_CLOSE_LIBRE"] = False
+                locks["ORDEN_REAL_OK"] = False
+                agregar_evento(
+                    f"⛔ REAL_EMISION_BLOQUEADA_POR_PENDING: ronda #{round_id} patrón={patron} "
+                    f"bot={real_close_pending_bot} pending={real_close_pending_data.get('ciclo')}"
+                )
+            elif not zona_allow:
                 motivo_no_real = f"zona_no_invertir_{zona_info_decision.get('fase', zona_info_decision.get('zona'))}_{zona_info_decision.get('motivo')}"
                 agregar_evento(
                     f"🧱 ROUND LIVE REAL BLOQUEADO POR ZONA: rid={round_id} "
@@ -9346,6 +9369,27 @@ def _sync_round_tick_maestro():
                     _sync_round_write_json_atomic(ack_path, ack_cur)
             except Exception:
                 pass
+    if completed and real_close_pending_active and (not real_emitido) and hold_status not in ("holding_real_result", "holding_real_turn"):
+        payload["released_round"] = int(round_id) + 1
+        payload["status"] = "released"
+        if data_quality == "ok" and int(closed_count) >= int(expected_count):
+            payload["reason"] = "real_close_pending_no_real_release"
+            payload["last_no_real_reason"] = "real_close_pending_active"
+            _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+            agregar_evento(
+                f"⚡ RELEASE_PENDING_NO_REAL: ronda #{round_id} → #{round_id + 1} | "
+                f"motivo=real_close_pending_active | patrón={partial_pattern} | dq={data_quality} | pending={real_close_pending_bot}"
+            )
+            return
+        if data_quality == "closed_expired":
+            payload["reason"] = "release_expired_due_to_pending"
+            payload["last_no_real_reason"] = "closed_expired_while_real_pending"
+            _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+            agregar_evento(
+                f"🧊 RELEASE_EXPIRED_PENDING: ronda #{round_id} → #{round_id + 1} | "
+                f"vencida por espera pending | max_age={max_lag_s} | patrón={partial_pattern}"
+            )
+            return
     if completed and (not real_emitido) and hold_status not in ("holding_real_result", "holding_real_turn"):
         payload["released_round"] = int(round_id) + 1
         payload["status"] = "released"
@@ -20408,7 +20452,7 @@ def render_decision_real_compacta():
         ss=dict(pref.get('summary',{}) or {})
         lk=dict((globals().get('REAL_LOCKS_PANEL',{}) or {}).get('locks',{}) or {})
         rid=int(ss.get('round_id',0) or 0); cc=int(ss.get('closed_count',0) or 0); ex=int(ss.get('expected_count',len(BOT_NAMES)) or len(BOT_NAMES))
-        dq=str(ss.get('data_quality','missing') or 'missing'); patron=str(ss.get('partial_pattern','0V0X') or '0V0X')
+        dq=_dq_oficial_lxv(ss); patron=str(ss.get('partial_pattern','0V0X') or '0V0X')
         cand=diagnosticar_candado_bloqueante_lxv(lk, ss)
         estado=f"{_c_bad('BLOQ')} {cand}" if cand!='DESCONOCIDO' else f"{_c_ok('NINGUNO')} | {_c_ok('LISTO PARA REAL')}"
         zline=render_zona_compacta()
@@ -20427,7 +20471,7 @@ def render_estado_lxv_actual_compacto():
         zona = str(zf.get("zona_base", "INSUFICIENTE"))
         decision = str(zf.get("decision", "NO_INVERTIR"))
         vis = str((_extraer_zona_visual_lxv(info) or "SOLO_DIAGNOSTICO"))
-        dq = str(summary.get("data_quality", "missing"))
+        dq = _dq_oficial_lxv(summary)
         patron = str(summary.get("partial_pattern", "0V0X"))
         cc = int(summary.get("closed_count", 0) or 0); ex = int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
         faltan = int(summary.get("missing_total", max(0, ex-cc)) or 0)
@@ -26438,3 +26482,44 @@ def _selftest_hud_oficial_vs_regional_lxv():
 
 if os.environ.get("RUN_HUD_OFICIAL_VS_REGIONAL_SELFTEST") == "1":
     _selftest_hud_oficial_vs_regional_lxv()
+
+def _selftest_real_pending_release_policy():
+    def _simulate(rid, pending_on, closed_count, expected_count, dq, patron):
+        real_emitido = False
+        locks = {"REAL_CLOSE_LIBRE": True, "ORDEN_REAL_OK": True}
+        reason = ""
+        released_round = None
+        if _sync_round_pending_blocks_real_only(pending_on):
+            locks["REAL_CLOSE_LIBRE"] = False
+            locks["ORDEN_REAL_OK"] = False
+            reason = "real_close_pending_active"
+        if closed_count >= expected_count and dq == "ok" and pending_on and not real_emitido and patron in ("5V1X", "4V2X"):
+            return {"emit": False, "released_round": rid + 1, "release_reason": "real_close_pending_no_real_release", "locks": locks, "reason": reason}
+        if closed_count >= expected_count and dq == "closed_expired" and pending_on and not real_emitido:
+            return {"emit": False, "released_round": rid + 1, "release_reason": "release_expired_due_to_pending", "locks": locks, "reason": "closed_expired_while_real_pending"}
+        return {"emit": False, "released_round": None, "release_reason": "", "locks": locks, "reason": reason}
+    a = _simulate(500, True, 6, 6, "ok", "5V1X")
+    assert (not a["emit"]) and a["locks"]["REAL_CLOSE_LIBRE"] is False and a["locks"]["ORDEN_REAL_OK"] is False and a["release_reason"] == "real_close_pending_no_real_release" and a["released_round"] == 501
+    b = _simulate(501, True, 6, 6, "closed_expired", "5V1X")
+    assert (not b["emit"]) and b["released_round"] == 502 and b["release_reason"] == "release_expired_due_to_pending"
+    c = _simulate(502, False, 6, 6, "ok", "5V1X")
+    assert c["reason"] == "" and c["locks"]["REAL_CLOSE_LIBRE"] is True
+    d = _simulate(503, True, 5, 6, "partial", "5V1X")
+    assert d["released_round"] is None and (not d["emit"])
+    e = _simulate(504, True, 6, 6, "ok", "4V2X")
+    assert e["release_reason"] == "real_close_pending_no_real_release"
+    print("SELFTEST REAL_PENDING_RELEASE_POLICY OK")
+
+if os.environ.get("RUN_REAL_PENDING_RELEASE_SELFTEST") == "1":
+    _selftest_real_pending_release_policy()
+
+
+def _selftest_dq_visual_unico():
+    s1 = {"data_quality": "closed_expired"}
+    s2 = {"data_quality": "ok"}
+    assert _dq_oficial_lxv(s1) == "closed_expired"
+    assert _dq_oficial_lxv(s2) == "ok"
+    print("SELFTEST DQ_VISUAL_UNICO OK")
+
+if os.environ.get("RUN_DQ_VISUAL_UNICO_SELFTEST") == "1":
+    _selftest_dq_visual_unico()
