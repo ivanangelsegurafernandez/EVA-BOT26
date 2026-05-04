@@ -264,6 +264,7 @@ HUD_SIDE_PANEL_INLINE = True
 HUD_SHOW_SALDO_DEBUG = False
 HUD_EVENT_MAX_CHARS = 150
 HUD_ULTRA_COMPACT_MODE = True
+HUD_LXV_COLOR_DYNAMIC_ONLY = True
 HUD_DEBUG_VERBOSE_PANEL = False
 HUD_SHOW_LONG_ZONE_LINE = False
 HUD_SHOW_FULL_LOCKS_PANEL = False
@@ -272,6 +273,8 @@ HUD_SHOW_EVENTS_ANTERIORES = False
 HUD_BOT_HISTORY_COMPACT_LEN = 24
 HUD_MAX_EVENT_LINES_COMPACT = 2
 HUD_PANEL_WIDTH_COMPACT = 118
+HUD_PARALLEL_PANELS = True
+HUD_PARALLEL_MIN_WIDTH = 110
 HUD_COMPACT_MAX_LINES_TARGET = 30
 HUD_EVENTS_CURRENT_ROUND_ONLY = True
 HUD_SHOW_CONTROL_PANEL = False
@@ -19612,6 +19615,45 @@ def _hud_color_estado(txt, estado):
     except Exception:
         return str(txt or "--")
 
+def _c_reset():
+    try:
+        return Style.RESET_ALL if "Style" in globals() else ""
+    except Exception:
+        return ""
+
+def _c_dim(txt):
+    try:
+        return f"{Fore.LIGHTBLACK_EX}{txt}{_c_reset()}" if "Fore" in globals() else str(txt)
+    except Exception:
+        return str(txt)
+
+def _c_ok(txt):
+    try:
+        return f"{Fore.GREEN}{txt}{_c_reset()}" if "Fore" in globals() else str(txt)
+    except Exception:
+        return str(txt)
+
+def _c_warn(txt):
+    try:
+        return f"{Fore.YELLOW}{txt}{_c_reset()}" if "Fore" in globals() else str(txt)
+    except Exception:
+        return str(txt)
+
+def _c_bad(txt):
+    try:
+        return f"{Fore.RED}{txt}{_c_reset()}" if "Fore" in globals() else str(txt)
+    except Exception:
+        return str(txt)
+
+def _c_info(txt):
+    try:
+        return f"{Fore.CYAN}{txt}{_c_reset()}" if "Fore" in globals() else str(txt)
+    except Exception:
+        return str(txt)
+
+def _c_muted(txt):
+    return _c_dim(txt)
+
 
 def _hud_trim(txt, max_len):
     try:
@@ -19672,6 +19714,7 @@ def render_bots_compacto():
         real_bot = REAL_OWNER_LOCK if REAL_OWNER_LOCK in order else next((b for b in order if str(estado_bots.get(b,{}).get("token","DEMO")).upper().startswith("REAL")), None)
         if real_bot in order:
             order=[real_bot]+[b for b in order if b!=real_bot]
+        rows.append(f"{_c_dim('BOT'):7} {_c_dim('TK'):4} {_c_dim('IA'):6} {_c_dim('MODO'):8} {_c_dim('HIST24')}")
         for b in order:
             st=estado_bots.get(b,{})
             tk=str(st.get("token","DEMO") or "DEMO").upper()
@@ -19680,12 +19723,7 @@ def render_bots_compacto():
             modo=f"{str(st.get('modo_ia','OFF')).upper()} S{int(st.get('step',st.get('ciclo_actual',1)) or 1)}"
             hist=''.join([str(x) for x in list(st.get('historial',[]) or [])])
             hist=_hud_trim(hist if hist else '·'*int(HUD_BOT_HISTORY_COMPACT_LEN), int(HUD_BOT_HISTORY_COMPACT_LEN))
-            g=int(st.get('ganadas',0) or 0); pdd=int(st.get('perdidas',0) or 0)
-            rend = ""
-            if (g+pdd)>0:
-                pct=(g*100.0/max(1,g+pdd))
-                rend=f" | {g}/{pdd} {pct:.0f}%"
-            rows.append(_hud_trim(f"{b:<7} {tk:<4} {ptxt:<6} {modo:<8} {hist}{rend}", 54))
+            rows.append(_hud_trim(f"{b:<7} {tk:<4} {ptxt:<6} {modo:<8} {hist}", 54))
         return rows
     except Exception:
         return ["bots: --"]
@@ -19698,11 +19736,56 @@ def render_decision_real_compacta():
         rid=int(ss.get('round_id',0) or 0); cc=int(ss.get('closed_count',0) or 0); ex=int(ss.get('expected_count',len(BOT_NAMES)) or len(BOT_NAMES))
         dq=str(ss.get('data_quality','missing') or 'missing'); patron=str(ss.get('partial_pattern','0V0X') or '0V0X')
         cand=diagnosticar_candado_bloqueante_lxv(lk, ss)
-        estado=f"⛔ BLOQ {cand}" if cand!='DESCONOCIDO' else "✅ OK"
+        estado=f"{_c_bad('BLOQ')} {cand}" if cand!='DESCONOCIDO' else f"{_c_ok('NINGUNO')} | {_c_ok('LISTO PARA REAL')}"
         zline=render_zona_compacta()
-        return [f"Estado : {estado}", f"Ronda  : #{rid} | cerrados {cc}/{ex} | dq={dq} | patrón={patron}", zline.replace('Zona: ','Zona   : '), render_real_locks_compact_line().replace('Locks: ','Locks  : '), f"Motivo : {str(ss.get('reason', ss.get('missing_reason', '--')))}"]
+        return [f"{_c_dim('BLOQ')} : {estado}", f"{_c_dim('RONDA')}: #{rid} | cerrados {cc}/{ex} | dq={dq} | patrón={patron}", zline.replace('Zona: ',f"{_c_dim('ZONA')} : "), render_real_locks_compact_line().replace('Locks: ',f"{_c_dim('LOCKS')}: "), f"{_c_dim('MOT'):<6}: {str(ss.get('reason', ss.get('missing_reason', '--')))}"]
     except Exception:
         return ["Estado : --", "Ronda  : --", "Zona   : --", "Locks  : --", "Motivo : --"]
+
+def render_estado_lxv_actual_compacto():
+    try:
+        info = obtener_zona_lxv_hud_actual() or {}
+        summary = dict(globals().get("_ACK_LIVE_SUMMARY", {}) or {})
+        locks = dict((globals().get("REAL_LOCKS_PANEL", {}) or {}).get("locks", {}) or {})
+        zf = resolver_zona_final_lxv(round_id_objetivo=info.get("round_id"), zona_info_previa=info)
+        zona = str(zf.get("zona_base", "INSUFICIENTE"))
+        decision = str(zf.get("decision", "NO_INVERTIR"))
+        vis = str((_extraer_zona_visual_lxv(info) or "SOLO_DIAGNOSTICO"))
+        dq = str(summary.get("data_quality", "missing"))
+        patron = str(summary.get("partial_pattern", "0V0X"))
+        cc = int(summary.get("closed_count", 0) or 0); ex = int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
+        faltan = int(summary.get("missing_total", max(0, ex-cc)) or 0)
+        real_activo, bot_real = hay_real_activo_global()
+        prearm = "SI" if bool(locks.get("CANDIDATO_VALIDO", False)) else "NO"
+        return [
+            f"{_c_dim('OFICIAL')}: {_c_warn(zona)}",
+            f"{_c_dim('REGION') :8}: {_c_info(vis)} | {_c_muted('SOLO_DIAGNÓSTICO')}",
+            f"{_c_dim('COLUMNA')}: visual {(_c_bad('INSUFICIENTE') if cc < ex else _c_ok('OK'))} | patrón={patron} | cerrados={cc}/{ex} | dq={_c_bad(dq) if dq!='ok' else _c_ok(dq)}",
+            f"{_c_dim('SYNC')   :8}: {(_c_warn('ESPERANDO_BOTS') if faltan>0 else _c_ok('OK'))} | missing_total={faltan}",
+            f"{_c_dim('REAL')   :8}: ACTIVO={_c_warn('NO') if not real_activo else _c_ok('SI')} | TOKEN={_c_warn('DEMO') if not real_activo else _c_ok('REAL')} | BOT={bot_real or 'ninguno'}",
+            f"{_c_dim('FINAL')  :8}: {_c_bad(decision)}",
+            f"{_c_dim('PRE-ARM')}: {_c_warn(prearm) if prearm=='NO' else _c_ok(prearm)}",
+        ]
+    except Exception:
+        return [f"{_c_dim('LXV')}: --"]
+
+def render_panels_side_by_side(left_lines, right_lines, width_total=118, gap=3):
+    try:
+        if (not bool(globals().get("HUD_PARALLEL_PANELS", True))) or int(width_total or 0) < int(globals().get("HUD_PARALLEL_MIN_WIDTH", 110) or 110):
+            return list(left_lines or []) + [""] + list(right_lines or [])
+        lns = list(left_lines or [])
+        rns = list(right_lines or [])
+        left_w = max(20, (int(width_total) - int(gap) - 2) // 2)
+        right_w = max(20, int(width_total) - int(gap) - left_w)
+        n = max(len(lns), len(rns))
+        out = []
+        for i in range(n):
+            l = _hud_trim(lns[i], left_w) if i < len(lns) else ""
+            r = _hud_trim(rns[i], right_w) if i < len(rns) else ""
+            out.append(f"{l.ljust(left_w)}{' '*int(gap)}{r.ljust(right_w)}")
+        return out
+    except Exception:
+        return list(left_lines or []) + list(right_lines or [])
 
 
 def render_hud_ultra_compacto(valor_saldo=None, saldo_str="--", meta_str="--"):
@@ -19718,12 +19801,17 @@ def render_hud_ultra_compacto(valor_saldo=None, saldo_str="--", meta_str="--"):
         tok_txt='DEMO' if tok in (None,'none','') else 'REAL'
         real_on='SI' if hay_real_activo_global()[0] else 'NO'
         ss=dict(globals().get('_ACK_LIVE_SUMMARY',{}) or {})
-        head=f"SALDO {saldo_str} | META {meta_str} | FALTA {falta} | TOKEN {tok_txt} | REAL {real_on} | C{ciclo_martingala_actual()}→C{ciclo_martingala_siguiente()} | R#{int(ss.get('round_id',0) or 0)} {int(ss.get('closed_count',0) or 0)}/{int(ss.get('expected_count',len(BOT_NAMES)) or len(BOT_NAMES))} {str(ss.get('partial_pattern','0V0X'))}"
+        lk=dict((globals().get('REAL_LOCKS_PANEL',{}) or {}).get('locks',{}) or {})
+        faltante = diagnosticar_candado_bloqueante_lxv(lk, ss)
+        head1=f"SALDO {saldo_str} | META {meta_str} | FALTA {falta} | TOKEN {tok_txt} | REAL {real_on} | C{ciclo_martingala_actual()}→C{ciclo_martingala_siguiente()}"
+        head2=f"R#{int(ss.get('round_id',0) or 0)} | cerrados {int(ss.get('closed_count',0) or 0)}/{int(ss.get('expected_count',len(BOT_NAMES)) or len(BOT_NAMES))} | patrón={str(ss.get('partial_pattern','0V0X'))} | dq={str(ss.get('data_quality','missing'))} | BLOQ: {faltante if faltante!='DESCONOCIDO' else 'NINGUNO | LISTO PARA REAL'}"
         bots=render_bots_compacto()
-        dec=render_decision_real_compacta()
-        lines=["╔"+"═"*inw+"╗", box(head), "╠"+"═"*inw+"╣", box("BOTS"), *[box("  "+b) for b in bots[:len(BOT_NAMES)]], box("DECISIÓN REAL"), *[box("  "+d) for d in dec]]
+        right=["DECISIÓN REAL"] + render_decision_real_compacta() + ["ESTADO LXV"] + render_estado_lxv_actual_compacto()
+        parallel = render_panels_side_by_side(bots, right, width_total=inw-2, gap=3)
+        lines=["╔"+"═"*inw+"╗", box(head1), box(head2), "╠"+"═"*inw+"╣", *[box(p) for p in parallel]]
         ev=list(eventos_recientes)[-int(globals().get('HUD_MAX_EVENT_LINES_COMPACT',2) or 2):] if 'eventos_recientes' in globals() else []
-        lines.append(box(_hud_trim(f"IA {mostrar_ia_resumen_compacto.__name__ if False else 'AUC/Thr/Conf en modo compacto'}", inw-2)))
+        lines.append("╠"+"═"*inw+"╣")
+        lines.append(box(_hud_trim("IA: resumen AUC/Thr/Conf", inw-2)))
         for e in ev:
             lines.append(box(f"Evento: {_hud_trim(e, inw-10)}"))
         lines.append("╚"+"═"*inw+"╝")
@@ -20015,8 +20103,8 @@ def mostrar_panel():
             if bool(globals().get("HUD_DEBUG_VERBOSE_PANEL", False)):
                 print(f"HUD lines={len(compact_lines)}")
             return
-        except Exception as e:
-            agregar_evento(f"⚠️ HUD compacto falló: {type(e).__name__}; usando HUD clásico")
+        except Exception:
+            agregar_evento("⚠️ HUD compacto falló; fallback clásico")
 
     if not bool(globals().get("HUD_MINIMAL_MODE", True)):
         print(padding + Fore.GREEN + f"💰 SALDO INICIAL {inicial_str} 🎯 META {meta_str}")
