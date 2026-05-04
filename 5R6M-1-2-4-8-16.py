@@ -6784,7 +6784,11 @@ def _diagnosticar_ack_bot_round(bot, round_id_objetivo=None):
         if bool(st_bot.get('pending_contract_resolution', False) or ack.get('pending_contract_resolution', False)):
             cuenta = False; motivo = 'preboot'
         elif rid_obj > 0 and ack_round != rid_obj:
-            cuenta = False; motivo = 'round_mismatch'
+            cuenta = False
+            if ack_round > rid_obj:
+                motivo = 'round_mismatch_ahead'
+            else:
+                motivo = 'round_mismatch_behind'
         else:
             status = str(ack.get('status', '') or '').strip().lower()
             if status != 'closed':
@@ -6846,6 +6850,8 @@ def render_ack_audit_panel(round_id_objetivo=None):
             if not bool(d.get('cuenta', False)):
                 faltan.append(b)
         ok_n = expired_n = stale_n = mismatch_n = missing_n = 0
+        align_current = align_behind = align_ahead = 0
+        behind_items = []
         max_age_s = 0
         for d in rows[:6]:
             mot = str(d.get('motivo', 'missing') or 'missing')
@@ -6858,12 +6864,24 @@ def render_ack_audit_panel(round_id_objetivo=None):
                 ok_n += 1
             elif mot == 'expired':
                 expired_n += 1
-            elif mot == 'round_mismatch':
+            elif mot in ('round_mismatch', 'round_mismatch_behind', 'round_mismatch_ahead'):
                 mismatch_n += 1
+                try:
+                    ack_round_i = int(d.get('ack_round', 0) or 0)
+                except Exception:
+                    ack_round_i = 0
+                if rid > 0 and ack_round_i > rid:
+                    align_ahead += 1
+                else:
+                    align_behind += 1
+                    if ack_round_i > 0:
+                        behind_items.append(f"{str(d.get('bot','--'))}=#{ack_round_i}")
             elif mot in ('stale', 'preboot', 'no_result', 'invalid_result', 'session_mismatch'):
                 stale_n += 1
             else:
                 missing_n += 1
+            if bool(d.get('cuenta', False)) and mot == 'ok':
+                align_current += 1
             lines.append(f"{str(d.get('bot','--')):<7} {str(d.get('ack_round','--')):<9} {str(d.get('result','--')):<4} {str(d.get('age_s','--')):<5} {'SI' if d.get('cuenta') else 'NO':<6} {str(d.get('motivo','--'))}")
         rs = globals().get('_SYNC_ROUND_STATE', {}) if isinstance(globals().get('_SYNC_ROUND_STATE', {}), dict) else {}
         rel = int(rs.get('released_round', 0) or 0)
@@ -6872,6 +6890,9 @@ def render_ack_audit_panel(round_id_objetivo=None):
         if _print_once(f"ack_audit:{rid}:summary", ttl=12.0):
             mot_txt = ','.join(f"{k}:{v}" for k,v in sorted(motivos.items()))
             agregar_evento(f"ACK AUDIT #{rid}: {cerr}/{exp} válidos | faltan={','.join(faltan)} | motivos={mot_txt}")
+        lines.append(f"ALIGN: current=#{rid if rid>0 else '--'} | bots_current={align_current}/{exp} | behind={align_behind} | ahead={align_ahead}")
+        if behind_items:
+            lines.append(f"BEHIND: {', '.join(behind_items)}")
         lines.append(f"resumen: ok={ok_n} expired={expired_n} stale={stale_n} mismatch={mismatch_n} missing={missing_n} max_age={max_age_s}s")
         return lines[:10]
     except Exception:
@@ -8557,17 +8578,42 @@ def _sync_round_tick_maestro():
     has_expired_closed = bool(expired_count > 0)
     too_old_round = bool(max_lag_s is not None and float(max_lag_s) > float(ROUND_LIVE_INVEST_WINDOW_S))
     if incomplete_round and (has_expired_closed or too_old_round):
-        if _hay_real_close_pending_activo()[0]:
-            return
-        if hold_status in ("holding_real_result", "holding_real_turn"):
-            return
-        if real_emitido:
-            return
-        agregar_evento(
-            f"⏩ ROUND LIVE incompleto vencido: ronda #{round_id} cerrados={closed_count}/{expected_count} "
-            f"faltan={expected_count - closed_count} expired={expired_count}; liberando sin REAL."
+        release_state = "RELEASE_BLOQUEADO_POR_INCOMPLETA"
+        missing_bots = [str(b) for b in BOT_NAMES if b not in set(closed.keys())]
+        missing_txt = ",".join(missing_bots) if missing_bots else "--"
+        _lxv_5v1x_event_cooldown(
+            key=f"round_hold_incomplete:{round_id}",
+            msg=f"⏸️ {release_state}: ROUND HOLD #{round_id}: {closed_count}/{expected_count} | faltan={missing_txt} | no se libera #{round_id + 1}",
+            cooldown_s=8.0,
         )
-        _sync_round_release_next_round(round_id, "incomplete_round_expired_release_no_real")
+        real_on_now, _, _ = _sync_real_turn_activo()
+        real_close_pending_now = bool(_hay_real_close_pending_activo()[0])
+        real_order_pending_now = False
+        try:
+            for _bot_chk in BOT_NAMES:
+                orden_chk = _read_json(path_orden(_bot_chk), default={})
+                if isinstance(orden_chk, dict) and _orden_real_viva(orden_chk) and (not bool(orden_chk.get("consumed", False))):
+                    real_order_pending_now = True
+                    break
+        except Exception:
+            real_order_pending_now = True
+        elapsed_round_s = float(elapsed_started or 0.0)
+        timeout_s = float(globals().get("ROUND_INCOMPLETE_RECOVERY_TIMEOUT_S", LXV_SYNC_ROUND_MAX_WAIT_S) or LXV_SYNC_ROUND_MAX_WAIT_S)
+        can_recover = bool(
+            (elapsed_round_s > timeout_s)
+            and (not real_on_now)
+            and (not real_close_pending_now)
+            and (not real_order_pending_now)
+            and hold_status not in ("holding_real_result", "holding_real_turn")
+        )
+        if not can_recover:
+            return
+        release_state = "RECOVERY_RONDA_INCOMPLETA"
+        agregar_evento(
+            f"🛟 {release_state}: ROUND RECOVERY #{round_id} → #{round_id + 1} | descartada incompleta {closed_count}/{expected_count} | "
+            f"faltan={missing_txt} | motivo=recovery_incomplete_timeout"
+        )
+        _sync_round_release_next_round(round_id, "recovery_incomplete_timeout")
         return
     round_live_all_closed = bool(closed_count >= expected_count and faltan_count <= 0)
     round_live_real_ok = bool(round_live_all_closed and data_quality == "ok")
@@ -8759,7 +8805,7 @@ def _sync_round_tick_maestro():
                 )
             else:
                 motivo_no_real = f"patron_no_invertible:{patron}"
-            agregar_evento(f"ROUND LIVE #{round_id}: patrón={patron} | SIN_CANDIDATO_REAL | release inmediato")
+            agregar_evento(f"ROUND LIVE #{round_id}: patrón={patron} | SIN_CANDIDATO_REAL | release condicionado a columna completa")
             pick = None
         if (not round_live_real_ok) and pick:
             bot_pick = str(pick.get("bot"))
@@ -8914,6 +8960,11 @@ def _sync_round_tick_maestro():
         if not str(payload.get("reason", "")).startswith("turbo_sync_6_6_no_real_release"):
             payload["reason"] = "turbo_sync_6_6_no_real_release"
     release_written = False
+    if bool(completed) and bool(closed_count < expected_count):
+        missing_bots = [str(b) for b in BOT_NAMES if b not in set(closed.keys())]
+        missing_txt = ",".join(missing_bots) if missing_bots else "--"
+        agregar_evento(f"⏸️ RELEASE_BLOQUEADO_POR_INCOMPLETA: ROUND HOLD #{round_id}: {closed_count}/{expected_count} | faltan={missing_txt} | no se libera #{round_id + 1}")
+        completed = False
     if completed:
         emit_bot_now = real_hold_bot or str(locals().get("emit_bot") or "")
         release_reason = "real_emitido" if real_emitido else (motivo_no_real or round_live_release_no_real_reason or "no_real_release")
@@ -8927,7 +8978,7 @@ def _sync_round_tick_maestro():
         ))
         if release_written:
             if not real_emitido:
-                agregar_evento(f"⚡ TURBO_SYNC_RELEASE_NOW: ronda #{round_id} → #{round_id + 1} sin REAL | motivo={release_reason}")
+                agregar_evento(f"✅ RELEASE_NORMAL: ronda #{round_id} → #{round_id + 1} sin REAL | motivo={release_reason}")
             status_txt = _round_live_status_txt(
                 pattern=patron,
                 completed=completed,
