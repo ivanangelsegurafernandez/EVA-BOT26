@@ -4703,11 +4703,14 @@ def _ack_live_format_lines(snapshot):
         motivo_hist.append("stale")
     if not motivo_hist:
         motivo_hist.append("missing" if fresh_count < expected_count else "ok")
-    lines.append("HISTORIAL VISUAL ≠ COLUMNA OFICIAL")
-    lines.append(f"visibles={vis}/6")
-    lines.append(f"oficiales={closed_count}/{expected_count}")
-    lines.append(f"no_cuentan={no_cuentan}")
-    lines.append(f"motivo={'+'.join(motivo_hist)}")
+    if vis == int(closed_count) and int(no_cuentan) == 0:
+        lines.append(f"COLUMNA OFICIAL: {closed_count}/{expected_count} | dq={summary.get('data_quality', 'missing')} | esperando bots")
+    else:
+        lines.append("HISTORIAL VISUAL ≠ COLUMNA OFICIAL")
+        lines.append(f"visibles={vis}/6")
+        lines.append(f"oficiales={closed_count}/{expected_count}")
+        lines.append(f"no_cuentan={no_cuentan}")
+        lines.append(f"motivo={'+'.join(motivo_hist)}")
     dq_txt = str(summary.get("data_quality", "missing") or "").strip().lower()
     parcial_txt = str(summary.get("partial_pattern", "0V0X") or "0V0X").strip().upper()
     columna_lista = bool(closed_count >= expected_count and faltan_count <= 0 and dq_txt == "ok")
@@ -6741,24 +6744,62 @@ def obtener_zona_lxv_hud_actual():
 
 def _hud_round_summary_safe():
     try:
-        s = globals().get("_ACK_LIVE_SUMMARY", {})
+        fuentes = []
+        s = globals().get("_ACK_LIVE_SUMMARY", None)
         if isinstance(s, dict):
-            return {
-                "round_id": s.get("round_id", s.get("rid", "--")),
-                "cerrados": s.get("closed_count", s.get("cerrados", "--")),
-                "expected": s.get("expected_count", s.get("expected", 6)),
-                "dq": s.get("data_quality", s.get("dq", "--")),
-                "patron": s.get("patron", s.get("pattern", s.get("partial_pattern", "--"))),
-            }
+            fuentes.append(s)
+        p = globals().get("REAL_LOCKS_PANEL", None)
+        if isinstance(p, dict):
+            fuentes.append(p)
+        z = globals().get("_LXV_LAST_ZONE_INFO", None)
+        if isinstance(z, dict):
+            fuentes.append(z)
+        out = {
+            "round_id": "--",
+            "cerrados": "--",
+            "expected": 6,
+            "faltan": "--",
+            "dq": "--",
+            "patron": "--",
+            "zona_oficial": "--",
+            "decision": "--",
+            "motivo": "--",
+        }
+        for d in fuentes:
+            if out["round_id"] == "--":
+                out["round_id"] = d.get("round_id", d.get("rid", d.get("rid_live", "--")))
+            if out["cerrados"] == "--":
+                out["cerrados"] = d.get("closed_count", d.get("cerrados", d.get("cerrados_validos", "--")))
+            if out["expected"] == 6:
+                out["expected"] = d.get("expected_count", d.get("expected", d.get("esperados", 6)))
+            if out["dq"] == "--":
+                out["dq"] = d.get("data_quality", d.get("dq", "--"))
+            if out["patron"] == "--":
+                out["patron"] = d.get("patron", d.get("pattern", d.get("partial_pattern", "--")))
+            if out["zona_oficial"] == "--":
+                out["zona_oficial"] = d.get("zona_base", d.get("zona_oficial", d.get("zona", "--")))
+            if out["decision"] == "--":
+                out["decision"] = d.get("decision", "--")
+            if out["motivo"] == "--":
+                out["motivo"] = d.get("motivo", "--")
+        try:
+            if out["cerrados"] != "--" and out["expected"] != "--":
+                out["faltan"] = max(0, int(out["expected"]) - int(out["cerrados"]))
+        except Exception:
+            out["faltan"] = "--"
+        return out
     except Exception:
-        pass
-    return {
-        "round_id": "--",
-        "cerrados": "--",
-        "expected": "--",
-        "dq": "--",
-        "patron": "--",
-    }
+        return {
+            "round_id": "--",
+            "cerrados": "--",
+            "expected": "--",
+            "faltan": "--",
+            "dq": "--",
+            "patron": "--",
+            "zona_oficial": "--",
+            "decision": "--",
+            "motivo": "--",
+        }
 
 def render_real_locks_panel():
     try:
@@ -6790,17 +6831,18 @@ def render_real_locks_panel():
         res_ok = bool(p.get("ready_pre_real", False))
         falta = str(p.get("falta_principal") or "---")
         hs = _hud_round_summary_safe()
-        round_show = hs.get("round_id", "--")
-        patron_show = hs.get("patron", "--")
-        dq_show = hs.get("dq", "--")
-        cerr_show = hs.get("cerrados", "--")
-        exp_show = hs.get("expected", "--")
+        round_show = hs.get("round_id", "--") if str(p.get("round_id", "--")) == "--" else p.get("round_id", "--")
+        patron_show = hs.get("patron", "--") if str(p.get("patron", "--")) == "--" else p.get("patron", "--")
+        dq_show = hs.get("dq", "--") if str(p.get("dq", "--")) == "--" else p.get("dq", "--")
+        cerr_show = hs.get("cerrados", "--") if str(p.get("cerrados", "--")) == "--" else p.get("cerrados", "--")
+        exp_show = hs.get("expected", "--") if str(p.get("expected", "--")) == "--" else p.get("expected", "--")
+        zona_show = hs.get("zona_oficial", "--") if str(p.get("zona", "--")) == "--" else p.get("zona", "--")
 
         out = [
             "╔" + "═"*(W-2) + "╗",
             row(ctext(Fore.CYAN, "🔐 CANDADOS REAL LXV")),
             row(f"Ronda: {str(round_show or '--')} | Bot: {str(p.get('bot') or '--')}"),
-            row(f"Patrón: {str(patron_show or '--')} | Zona: {str(p.get('zona') or '--')}"),
+            row(f"Patrón: {str(patron_show or '--')} | Zona: {str(zona_show or '--')}"),
             "╠" + "═"*(W-2) + "╣",
             row(ctext(Fore.WHITE, f"BLOQUEO PRINCIPAL: {falta}")),
             row(ctext(Fore.GREEN if res_ok else Fore.RED, ("ESTADO FINAL: ✅ LISTO PARA REAL" if res_ok else f"ESTADO FINAL: ⛔ BLOQUEADO POR {falta}"))),
@@ -6841,7 +6883,7 @@ def render_real_locks_panel():
             row(ctext(Fore.WHITE, "Motivo:")),
             row(ctext(Fore.LIGHTBLACK_EX, f"- dq={trunc(dq_show, 60)}")),
             row(ctext(Fore.LIGHTBLACK_EX, f"- patrón={trunc(patron_show, 60)}")),
-            row(ctext(Fore.LIGHTBLACK_EX, f"- zona={trunc(p.get('zona', '--'), 60)}")),
+            row(ctext(Fore.LIGHTBLACK_EX, f"- zona={trunc(zona_show, 60)}")),
             row(ctext(Fore.LIGHTBLACK_EX, f"- bot={trunc(p.get('bot', '--'), 60)}")),
             row(ctext(Fore.LIGHTBLACK_EX, f"- cerrados={trunc(cerr_show, 20)}/{trunc(exp_show, 20)}")),
         ]
@@ -8292,6 +8334,10 @@ def _sync_round_tick_maestro():
             msg=f"🔎 SYNC WAIT #{round_id}: cerrados={n_closed}/{len(expected)} faltan={len(missing)} | missing={miss_txt}",
             cooldown_s=8.0,
         )
+        if _print_once(f"sync_wait_audit:{round_id}", ttl=10.0):
+            missing_bots = ",".join(str(b) for b in missing)
+            motivos = sorted({str(sync_debug_missing.get(b, "missing")) for b in missing})
+            agregar_evento(f"SYNC WAIT #{round_id}: faltan={missing_bots} | motivo={'/'.join(motivos)}")
     globals()["SYNC_MISSING_LINE"] = "SYNC MISSING | " + " | ".join(f"{b}={sync_debug_missing.get(b, 'ack_missing')}" for b in expected)
     now_ts = float(time.time())
     wait_s = max(0.0, now_ts - float(started_at))
@@ -19482,7 +19528,8 @@ def render_estado_lxv_actual_panel(info_zona: dict, summary: dict, locks: dict |
         w=92
         row=lambda t: f"║ {_hud_fit(str(t), w-4).ljust(w-4)} ║"
         no_habilita = " | NO_HABILITA_REAL" if (str(reg_z).startswith("VERDE_") and oficial_bloquea) else ""
-        lines=["╔"+"═"*(w-2)+"╗",row("🧭 ESTADO LXV ACTUAL"),row(f"OFICIAL : {zona} | MANDA_DECISIÓN | decisión={decision} | motivo={motivo}"),row(f"REGIONAL: {reg_z} | SOLO_DIAGNÓSTICO{no_habilita} | acción={action} | prom3={prom3:.2f} prom8={prom8:.2f} d38={d38:+.2f}"),row(f"COLUMNA_VISUAL: {str((info.get('zona_visual_info',{}) or {}).get('zona_visual','--'))} | patrón={patron} | cerrados={closed_count}/{expected_count} | dq={dq} | g_columna={g_col_txt}"),row(f"PATRÓN_REAL: {'VALIDO' if patron_real_valido else 'NO_VALIDO'} | patrón={patron} | válidos=5V1X/4V2X"),row(f"SYNC    : {'ESPERANDO_BOTS' if faltan_count>0 else 'OK'} | {sync_txt} | REAL={'no_evaluado' if faltan_count>0 else 'evaluable'}"),row(f"REAL    : ACTIVO={'SI' if real_activo else 'NO'} | TOKEN={'DEMO' if tok in (None,'none','') else 'REAL'} | BOT_REAL={bot_real}"),row(f"FINAL   : {final}")]
+        zona_visual_txt = str((info.get('zona_visual_info',{}) or {}).get('zona_visual','--'))
+        lines=["╔"+"═"*(w-2)+"╗",row("🧭 ESTADO LXV ACTUAL"),row(f"OFICIAL REAL : {zona} | decisión={decision} | motivo={motivo}"),row(f"VISUAL       : {zona_visual_txt} | NO_MANDA_REAL"),row(f"REGIONAL     : {reg_z} | SOLO_DIAGNÓSTICO | NO_HABILITA_REAL | acción={action} | prom3={prom3:.2f} prom8={prom8:.2f} d38={d38:+.2f}"),row(f"COLUMNA_VISUAL: {zona_visual_txt} | patrón={patron} | cerrados={closed_count}/{expected_count} | dq={dq} | g_columna={g_col_txt}"),row(f"PATRÓN_REAL: {'VALIDO' if patron_real_valido else 'NO_VALIDO'} | patrón={patron} | válidos=5V1X/4V2X"),row(f"SYNC    : {'ESPERANDO_BOTS' if faltan_count>0 else 'OK'} | {sync_txt} | REAL={'no_evaluado' if faltan_count>0 else 'evaluable'}"),row(f"REAL    : ACTIVO={'SI' if real_activo else 'NO'} | TOKEN={'DEMO' if tok in (None,'none','') else 'REAL'} | BOT_REAL={bot_real}"),row(f"FINAL   : {final}")]
         if str(reg_z).startswith("VERDE_") and oficial_bloquea:
             lines.append(row(f"⚠️ VERDE REGIONAL IGNORADO PARA REAL: zona oficial manda | oficial={zona} | motivo={motivo}"))
         if info_prearmado.get("prearmado"):
