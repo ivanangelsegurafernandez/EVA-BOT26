@@ -1092,7 +1092,11 @@ async def _pending_contract_fence_tick(ws):
     if elapsed < float(PENDING_CONTRACT_FENCE_S):
         if _print_once("pending-contract-wait", ttl=6.0):
             rem = max(0.0, float(PENDING_CONTRACT_FENCE_S) - elapsed)
-            print(Fore.YELLOW + f"⏳ Fence contrato incierto activo ({rem:.0f}s restantes). No se permiten compras nuevas.")
+            print(
+                Fore.YELLOW +
+                f"⏳ FENCE ACTIVO | {NOMBRE_BOT} | ciclo=C{estado_bot.get('ciclo_actual', '?')} "
+                f"| restante={rem:.0f}s | compra_bloqueada=SI | mismo_ciclo=SI"
+            )
         await asyncio.sleep(1.0)
         return False
 
@@ -3111,14 +3115,20 @@ async def ejecutar_panel():
                 modo_real = (current_token == TOKEN_REAL)
                 martingala = MARTINGALA_REAL if modo_real else MARTINGALA_DEMO
 
+                # Fence conservador: si hay contrato incierto pendiente, no imprimir cabecera ni comprar
+                if estado_bot.get("pending_contract_resolution"):
+                    if not await _pending_contract_fence_tick(ws):
+                        continue
+
                 print(Fore.CYAN + Style.BRIGHT + "=" * 80)
                 titulo = f"{NOMBRE_BOT.upper()} | MODO {'REAL' if modo_real else 'DEMO'} | CICLO #{ciclo}/{len(martingala)}"
                 print(Fore.CYAN + Style.BRIGHT + titulo.center(80))
                 print(Fore.CYAN + Style.BRIGHT + "=" * 80)
 
                 # Fence conservador: si hay contrato incierto pendiente, no permitir nuevas compras
-                if not await _pending_contract_fence_tick(ws):
-                    continue
+                if estado_bot.get("pending_contract_resolution"):
+                    if not await _pending_contract_fence_tick(ws):
+                        continue
 
                 # Salud WS (si buscar_estrategia detectó 1006 masivos)
                 if ws_reset_needed.is_set():
