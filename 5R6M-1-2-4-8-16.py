@@ -4319,6 +4319,12 @@ def _lxv_green_opportunity_sync_diag(summary, rows_pack=None):
         col = int(globals().get("LXV_OPORTUNIDADES_VERDES_BLOQUEADAS_SYNC", 0) or 0)
         if det <= 0 or col <= 0:
             return
+        canonical = bool(ss.get("canonical"))
+        closed_count = int(ss.get("closed_count", 0) or 0)
+        expected_count = int(ss.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
+        dq = str(ss.get("data_quality", "") or "").lower()
+        if canonical and closed_count >= expected_count and dq == "ok":
+            return
         cause = "unknown"
         dq = str(ss.get("data_quality", "") or "").lower()
         if dq == "closed_expired":
@@ -4577,6 +4583,49 @@ def _ack_live_calc_summary(rows_pack):
     }
 
 
+def _sync_round_get_summary_preferente(max_age_s=120.0, rebuild_rows=True):
+    try:
+        last_sync = globals().get("LAST_SYNC_ROUND_SUMMARY")
+        if isinstance(last_sync, dict) and bool(last_sync.get("canonical")):
+            age = time.time() - float(last_sync.get("ts", 0.0) or 0.0)
+            if age <= float(max_age_s):
+                summary = dict(last_sync)
+                round_id = int(summary.get("round_closed_eval", summary.get("round_id", summary.get("obj_round", 0))) or 0)
+                closed_override = summary.get("closed_bots") or summary.get("closed") or None
+                if bool(rebuild_rows) and round_id > 0:
+                    rows_pack = _ack_live_build_rows(obj_round_override=round_id, closed_override=closed_override)
+                    rows_pack["canonical"] = True
+                    rows_pack["summary_override"] = summary
+                else:
+                    rows_pack = {"canonical": True, "summary_override": summary, "rows": []}
+                return {"summary": summary, "rows_pack": rows_pack, "source": "LAST_SYNC_ROUND_SUMMARY", "canonical": True}
+        rows_pack = _ack_live_build_rows()
+        summary = _ack_live_calc_summary(rows_pack)
+        return {"summary": (summary if isinstance(summary, dict) else {}), "rows_pack": rows_pack, "source": "ACK_LIVE", "canonical": False}
+    except Exception:
+        try:
+            rows_pack = _ack_live_build_rows()
+            summary = _ack_live_calc_summary(rows_pack)
+            return {"summary": (summary if isinstance(summary, dict) else {}), "rows_pack": rows_pack, "source": "ACK_LIVE", "canonical": False}
+        except Exception:
+            return {"summary": {}, "rows_pack": {"rows": []}, "source": "ACK_LIVE", "canonical": False}
+
+
+def _sync_round_publish_summary(summary, rows_pack=None, source="UNKNOWN"):
+    try:
+        ts_now = time.time()
+        ss = dict(summary or {})
+        globals()["LAST_SYNC_ROUND_SUMMARY"] = dict(ss)
+        globals()["LAST_SYNC_ROUND_SUMMARY"]["ts"] = ts_now
+        globals()["_ACK_LIVE_SUMMARY"] = dict(ss)
+        globals()["_ACK_LIVE_SUMMARY"]["ts"] = ts_now
+        globals()["_ACK_LIVE_SUMMARY"]["source"] = str(source or "UNKNOWN")
+        if rows_pack is not None:
+            globals()["_ACK_LIVE_ROWS_PACK"] = rows_pack
+    except Exception:
+        pass
+
+
 def _fmt_estado_round_live(estado_visual: str, estado_base: str = "") -> str:
     return Fore.YELLOW + Style.BRIGHT + "waiting" + Style.RESET_ALL
 
@@ -4728,12 +4777,9 @@ def _round_live_estado_display(row: dict) -> str:
 
 
 def _ack_live_format_lines(snapshot):
-    rows_pack = _ack_live_build_rows()
-    summary = _ack_live_calc_summary(rows_pack)
-    last_sync = globals().get("LAST_SYNC_ROUND_SUMMARY") if isinstance(globals().get("LAST_SYNC_ROUND_SUMMARY"), dict) else {}
-    if bool(last_sync.get("canonical")) and (time.time() - float(last_sync.get("ts", 0.0) or 0.0) <= 120.0):
-        summary = dict(last_sync)
-        rows_pack["canonical"] = True
+    pref = _sync_round_get_summary_preferente(max_age_s=120.0, rebuild_rows=True)
+    rows_pack = pref.get("rows_pack", {})
+    summary = pref.get("summary", {})
     rows = rows_pack.get("rows", [])
 
     obj_round = int(summary.get("obj_round", 1) or 1)
@@ -6711,8 +6757,9 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
 
 def actualizar_real_locks_panel_desde_round_live():
     try:
-        rows_pack = _ack_live_build_rows() if callable(globals().get("_ack_live_build_rows")) else {}
-        summary = _ack_live_calc_summary(rows_pack) if callable(globals().get("_ack_live_calc_summary")) else {}
+        pref = _sync_round_get_summary_preferente(max_age_s=120.0, rebuild_rows=True)
+        rows_pack = pref.get("rows_pack", {})
+        summary = pref.get("summary", {})
         if not isinstance(summary, dict):
             summary = {}
         rid = int(summary.get("obj_round", summary.get("round_id", 0)) or 0)
@@ -6721,6 +6768,8 @@ def actualizar_real_locks_panel_desde_round_live():
         dq = str(summary.get("data_quality", "missing") or "missing").strip().lower()
         partial = _lxv_normalizar_patron_txt(summary.get("partial_pattern", "0V0X")) or "0V0X"
         round_complete = bool(closed_count == expected_count and expected_count > 0)
+        if bool(pref.get("canonical")) and round_complete and str(dq) == "ok":
+            round_complete = True
         zi = resolver_zona_lxv_para_round_live(
             rid=rid,
             round_complete=round_complete,
@@ -6750,10 +6799,11 @@ def actualizar_real_locks_panel_desde_round_live():
             p["falta_principal"] = _real_locks_first_off() or "---"
             p["resultado"] = "LISTO PARA REAL" if p["ready_pre_real"] else "BLOQUEADO"
             p["updated_ts"] = float(time.time())
-            p["source_diag"] = "ROUND_LIVE"
+            p["source_diag"] = "ROUND_LIVE_CANONICAL" if bool(pref.get("canonical")) else "ROUND_LIVE"
             return
+        source_panel = "ROUND_LIVE_CANONICAL" if bool(pref.get("canonical")) else "ROUND_LIVE"
         actualizar_real_locks_panel_lxv(
-            source="ROUND_LIVE", round_id=rid, patron=partial, bot_candidato="--",
+            source=source_panel, round_id=rid, patron=partial, bot_candidato="--",
             round_complete=round_complete, data_quality=dq, zona_info=zi,
             candidate_info={"candidate_ok": False, "reason": "sin_candidato_round_live"},
             order_status=(globals().get("REAL_LOCKS_PANEL", {}).get("locks", {}).get("ORDEN_REAL_OK", None)),
@@ -6822,8 +6872,9 @@ def resolver_zona_lxv_para_round_live(rid, round_complete, partial_pattern):
 
 def obtener_zona_lxv_hud_actual():
     try:
-        rows_pack = _ack_live_build_rows() if callable(globals().get("_ack_live_build_rows")) else {}
-        summary = _ack_live_calc_summary(rows_pack) if callable(globals().get("_ack_live_calc_summary")) else {}
+        pref = _sync_round_get_summary_preferente(max_age_s=120.0, rebuild_rows=True)
+        rows_pack = pref.get("rows_pack", {})
+        summary = pref.get("summary", {})
         if not isinstance(summary, dict):
             summary = {}
         rid = int(summary.get("obj_round", summary.get("round_id", 0)) or 0)
@@ -6841,6 +6892,10 @@ def obtener_zona_lxv_hud_actual():
         info["esperados"] = expected_count
         info["patron_live"] = partial
         info["data_quality"] = dq
+        info["summary_source"] = pref.get("source")
+        info["canonical"] = bool(pref.get("canonical"))
+        if bool(pref.get("canonical")) and round_complete and str(dq) == "ok":
+            info["source"] = "HUD_GLOBAL/CANONICAL"
         g_for_visual = info.get("g_actual", None)
         info_visual = clasificar_zona_visual_parcial_lxv(partial, closed_count, expected_count, g_for_visual, dq)
         info["zona_visual_info"] = dict(info_visual)
@@ -8069,6 +8124,39 @@ def _selftest_zona_final_lxv_unica():
     assert bool(zf_none.get("allow_real", False)) is False
     print("SELFTEST ZONA_FINAL_LXV_UNICA OK")
 
+def _selftest_canonical_summary_hud_unificado():
+    now_ts = float(time.time())
+    backup_last = globals().get("LAST_SYNC_ROUND_SUMMARY")
+    backup_ack_summary = globals().get("_ACK_LIVE_SUMMARY")
+    backup_panel = dict(globals().get("REAL_LOCKS_PANEL", {}) or {})
+    original_build = globals().get("_ack_live_build_rows")
+    try:
+        def _fake_rows(*args, **kwargs):
+            return {"obj_round": 301, "released_round": 301, "rows": []}
+        globals()["_ack_live_build_rows"] = _fake_rows
+        globals()["LAST_SYNC_ROUND_SUMMARY"] = {"canonical": True, "ts": now_ts, "round_id": 295, "round_closed_eval": 295, "closed_count": 6, "expected_count": 6, "data_quality": "ok", "partial_pattern": "5V1X", "verdes_count": 5, "rojas_count": 1, "closed_bots": {}}
+        pref = _sync_round_get_summary_preferente(max_age_s=120.0, rebuild_rows=False)
+        assert int((pref.get("summary") or {}).get("closed_count", 0)) == 6 and str((pref.get("summary") or {}).get("data_quality", "")) == "ok" and str((pref.get("summary") or {}).get("partial_pattern", "")) == "5V1X" and bool(pref.get("canonical"))
+        info = obtener_zona_lxv_hud_actual()
+        assert int(info.get("cerrados", 0)) == 6 and int(info.get("esperados", 0)) == 6 and str(info.get("patron_live", "")) == "5V1X" and str(info.get("data_quality", "")) == "ok" and bool(info.get("canonical"))
+        globals()["LAST_SYNC_ROUND_SUMMARY"]["partial_pattern"] = "4V2X"
+        actualizar_real_locks_panel_desde_round_live()
+        rp = dict(globals().get("REAL_LOCKS_PANEL", {}) or {})
+        locks = dict(rp.get("locks", {}) or {})
+        assert bool(locks.get("COLUMNA_COMPLETA")) and bool(locks.get("DATA_QUALITY_OK")) and str(rp.get("patron", "")) == "4V2X" and "CANONICAL" in str(rp.get("source", "")).upper()
+        _sync_round_publish_summary(globals().get("LAST_SYNC_ROUND_SUMMARY", {}), rows_pack={"rows": []}, source="CANONICAL")
+        assert int((globals().get("_ACK_LIVE_SUMMARY", {}) or {}).get("closed_count", 0)) == int((globals().get("LAST_SYNC_ROUND_SUMMARY", {}) or {}).get("closed_count", 0))
+        assert str((globals().get("_ACK_LIVE_SUMMARY", {}) or {}).get("data_quality", "")) == "ok" and bool((globals().get("_ACK_LIVE_SUMMARY", {}) or {}).get("canonical"))
+        txt = "\n".join(_ack_live_format_lines(None))
+        assert "ROUND #295" in txt and "Cerrados 6/6" in txt and "Calidad ok" in txt and "Patrón 5V1X" in txt and "RONDA CANÓNICA ACTIVA" in txt
+        print("SELFTEST CANONICAL_HUD_UNIFICADO OK")
+    finally:
+        globals()["_ack_live_build_rows"] = original_build
+        globals()["REAL_LOCKS_PANEL"] = backup_panel
+        globals()["LAST_SYNC_ROUND_SUMMARY"] = backup_last
+        globals()["_ACK_LIVE_SUMMARY"] = backup_ack_summary
+
+
 def _selftest_canonical_round_sync():
     bots = list(BOT_NAMES)
     now_ts = float(time.time())
@@ -8144,8 +8232,14 @@ if str(os.getenv("RUN_ZONA_FINAL_LXV_SELFTEST", "0")).strip() == "1":
 if str(os.getenv("RUN_CANONICAL_ROUND_SELFTEST", "0")).strip() == "1":
     try:
         _selftest_canonical_round_sync()
+        _selftest_canonical_summary_hud_unificado()
     except Exception as _e:
         print(f"SELFTEST CANONICAL_ROUND_SYNC FAIL: {_e}")
+if str(os.getenv("RUN_CANONICAL_HUD_SELFTEST", "0")).strip() == "1":
+    try:
+        _selftest_canonical_summary_hud_unificado()
+    except Exception as _e:
+        print(f"SELFTEST CANONICAL_HUD_UNIFICADO FAIL: {_e}")
 
 def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     bot_pick = _lxv_5v1x_pick_real_bot(candidate)
@@ -8847,8 +8941,11 @@ def _sync_round_tick_maestro():
         rows_pack = _ack_live_build_rows()
         summary = _ack_live_calc_summary(rows_pack)
     rows_live = list((rows_pack or {}).get("rows", []) if isinstance(rows_pack, dict) else [])
-    globals()["LAST_SYNC_ROUND_SUMMARY"] = dict(summary or {})
-    globals()["LAST_SYNC_ROUND_SUMMARY"]["ts"] = time.time()
+    _sync_round_publish_summary(
+        summary,
+        rows_pack=rows_pack,
+        source="CANONICAL" if canonical_active else "ACK_LIVE"
+    )
     _lxv_green_opportunity_sync_diag(summary, rows_pack)
     real_emitido = False
     closed_count = int(summary.get("closed_count", 0) or 0)
@@ -20307,7 +20404,8 @@ def render_bots_compacto():
 
 def render_decision_real_compacta():
     try:
-        ss=dict(globals().get('_ACK_LIVE_SUMMARY',{}) or {})
+        pref = _sync_round_get_summary_preferente(max_age_s=120.0, rebuild_rows=False)
+        ss=dict(pref.get('summary',{}) or {})
         lk=dict((globals().get('REAL_LOCKS_PANEL',{}) or {}).get('locks',{}) or {})
         rid=int(ss.get('round_id',0) or 0); cc=int(ss.get('closed_count',0) or 0); ex=int(ss.get('expected_count',len(BOT_NAMES)) or len(BOT_NAMES))
         dq=str(ss.get('data_quality','missing') or 'missing'); patron=str(ss.get('partial_pattern','0V0X') or '0V0X')
@@ -20321,7 +20419,9 @@ def render_decision_real_compacta():
 def render_estado_lxv_actual_compacto():
     try:
         info = obtener_zona_lxv_hud_actual() or {}
-        summary = dict(globals().get("_ACK_LIVE_SUMMARY", {}) or {})
+        pref = _sync_round_get_summary_preferente(max_age_s=120.0, rebuild_rows=False)
+        summary = dict(pref.get("summary", {}) or {})
+        canonical = bool(pref.get("canonical"))
         locks = dict((globals().get("REAL_LOCKS_PANEL", {}) or {}).get("locks", {}) or {})
         zf = resolver_zona_final_lxv(round_id_objetivo=info.get("round_id"), zona_info_previa=info)
         zona = str(zf.get("zona_base", "INSUFICIENTE"))
@@ -20336,7 +20436,7 @@ def render_estado_lxv_actual_compacto():
         return [
             f"{_c_dim('OFICIAL')}: {_c_warn(zona)}",
             f"{_c_dim('REGION') :8}: {_c_info(vis)} | {_c_muted('SOLO_DIAGNÓSTICO')}",
-            f"{_c_dim('COLUMNA')}: visual {(_c_bad('INSUFICIENTE') if cc < ex else _c_ok('OK'))} | patrón={patron} | cerrados={cc}/{ex} | dq={_c_bad(dq) if dq!='ok' else _c_ok(dq)}",
+            f"{_c_dim('COLUMNA')}: visual {(_c_bad('INSUFICIENTE') if cc < ex else _c_ok('OK'))} | patrón={patron} | cerrados={cc}/{ex} | dq={_c_bad(dq) if dq!='ok' else _c_ok(dq)} | fuente={'CANONICAL' if canonical else 'ACK_LIVE'}",
             f"{_c_dim('SYNC')   :8}: {(_c_warn('ESPERANDO_BOTS') if faltan>0 else _c_ok('OK'))} | missing_total={faltan}",
             f"{_c_dim('REAL')   :8}: ACTIVO={_c_warn('NO') if not real_activo else _c_ok('SI')} | TOKEN={_c_warn('DEMO') if not real_activo else _c_ok('REAL')} | BOT={bot_real or 'ninguno'}",
             f"{_c_dim('FINAL')  :8}: {_c_bad(decision)}",
@@ -20376,7 +20476,8 @@ def render_hud_ultra_compacto(valor_saldo=None, saldo_str="--", meta_str="--"):
         tok=leer_token_actual() if callable(globals().get('leer_token_actual')) else None
         tok_txt='DEMO' if tok in (None,'none','') else 'REAL'
         real_on='SI' if hay_real_activo_global()[0] else 'NO'
-        ss=dict(globals().get('_ACK_LIVE_SUMMARY',{}) or {})
+        pref = _sync_round_get_summary_preferente(max_age_s=120.0, rebuild_rows=False)
+        ss=dict(pref.get('summary',{}) or {})
         lk=dict((globals().get('REAL_LOCKS_PANEL',{}) or {}).get('locks',{}) or {})
         faltante = diagnosticar_candado_bloqueante_lxv(lk, ss)
         head1=f"SALDO {saldo_str} | META {meta_str} | FALTA {falta} | TOKEN {tok_txt} | REAL {real_on} | C{ciclo_martingala_actual()}→C{ciclo_martingala_siguiente()}"
