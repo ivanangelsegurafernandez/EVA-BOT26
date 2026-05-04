@@ -4374,7 +4374,7 @@ def _ack_live_build_rows(obj_round_override=None, closed_override=None):
         else:
             ack_round = int(ack.get("round_id", 0) or 0)
             resultado = ack.get("resultado", "")
-            ts = ack.get("ts", None)
+            ts = _sync_ack_effective_ts(ack)
             asset = ack.get("asset", "--")
             ciclo = ack.get("ciclo", "--")
             status_ack = str(ack.get("status", "") or "")
@@ -6948,11 +6948,12 @@ def _diagnosticar_ack_bot_round(bot, round_id_objetivo=None):
             ack_round = 0
         raw_res = str(ack.get('resultado', '') or '').strip().upper()
         res_sym = '✓' if raw_res == 'GANANCIA' else ('X' if raw_res in ('PÉRDIDA', 'PERDIDA') else '--')
-        try:
-            ack_ts = float(ack.get('ts', 0.0) or 0.0)
-        except Exception:
-            ack_ts = 0.0
+        ack_ts = float(_sync_ack_effective_ts(ack) or 0.0)
+        close_ts = float(_sync_ack_close_ts(ack) or 0.0)
+        hb_ts = float(_sync_ack_heartbeat_ts(ack) or 0.0)
         age = (time.time() - ack_ts) if ack_ts > 0 else None
+        close_age = (time.time() - close_ts) if close_ts > 0 else None
+        hb_age = (time.time() - hb_ts) if hb_ts > 0 else None
         age_txt = f"{int(max(0.0, age))}s" if isinstance(age, (int, float)) else '--'
         motivo = 'ok'
         cuenta = True
@@ -6986,7 +6987,9 @@ def _diagnosticar_ack_bot_round(bot, round_id_objetivo=None):
                 explicit_demo_ack = (ack_mode == 'DEMO' or ack_source in ('SYNC_DEMO', 'DEMO', 'LXV_SYNC'))
                 if explicit_real_ack and not explicit_demo_ack:
                     cuenta = False; motivo = 'session_mismatch'
-        return {"bot": b, "round_obj": rid_obj or round_id_objetivo, "ack_round": ack_round if ack_round > 0 else '--', "result": res_sym, "age_s": age_txt, "cuenta": bool(cuenta), "motivo": str(motivo)}
+        if motivo == "ok" and close_age is not None and hb_age is not None and close_age > float(globals().get('TTL_ACK_SYNC_ROUND_S', 300.0) or 300.0) and hb_age <= float(globals().get('TTL_ACK_SYNC_ROUND_S', 300.0) or 300.0) and bool(ack.get("sync_wait", False)) and str(ack.get("status","")).strip().lower() == "closed":
+            motivo = "ok_heartbeat"
+        return {"bot": b, "round_obj": rid_obj or round_id_objetivo, "ack_round": ack_round if ack_round > 0 else '--', "result": res_sym, "age_s": age_txt, "age_eff_s": age, "close_age_s": close_age, "hb_age_s": hb_age, "cuenta": bool(cuenta), "motivo": str(motivo)}
     except Exception as e:
         return {
             "bot": str(bot),
@@ -7014,7 +7017,7 @@ def render_ack_audit_panel(round_id_objetivo=None):
         if not show:
             return ["ACK AUDIT: 6/6 OK"]
         lines.append(f"🧾 ACK AUDIT ROUND #{rid if rid>0 else '--'}")
-        lines.append("bot     ack_round  res  age   cuenta  motivo")
+        lines.append("bot     ack_round  res  age_eff close_age hb_age cuenta  motivo")
         rows = []
         motivos = {}
         faltan = []
@@ -7058,7 +7061,11 @@ def render_ack_audit_panel(round_id_objetivo=None):
                 missing_n += 1
             if bool(d.get('cuenta', False)) and mot == 'ok':
                 align_current += 1
-            lines.append(f"{str(d.get('bot','--')):<7} {str(d.get('ack_round','--')):<9} {str(d.get('result','--')):<4} {str(d.get('age_s','--')):<5} {'SI' if d.get('cuenta') else 'NO':<6} {str(d.get('motivo','--'))}")
+            ae = d.get('age_eff_s'); ca = d.get('close_age_s'); ha = d.get('hb_age_s')
+            ae_txt = f"{int(max(0.0,float(ae)))}s" if isinstance(ae,(int,float)) else "--"
+            ca_txt = f"{int(max(0.0,float(ca)))}s" if isinstance(ca,(int,float)) else "--"
+            ha_txt = f"{int(max(0.0,float(ha)))}s" if isinstance(ha,(int,float)) else "--"
+            lines.append(f"{str(d.get('bot','--')):<7} {str(d.get('ack_round','--')):<9} {str(d.get('result','--')):<4} {ae_txt:<7} {ca_txt:<8} {ha_txt:<6} {'SI' if d.get('cuenta') else 'NO':<6} {str(d.get('motivo','--'))}")
         rs = globals().get('_SYNC_ROUND_STATE', {}) if isinstance(globals().get('_SYNC_ROUND_STATE', {}), dict) else {}
         rel = int(rs.get('released_round', 0) or 0)
         if rid > 0 and rel > 0 and rel != rid:
@@ -8439,6 +8446,30 @@ def _sync_real_turn_activo() -> tuple[bool, str | None, str]:
             return (True, b, 'owner/token/orden')
     return (False, None, 'sin_real_activo')
 
+def _sync_ack_close_ts(ack: dict) -> float:
+    try:
+        return float((ack or {}).get("ts") or (ack or {}).get("closed_ts") or 0.0)
+    except Exception:
+        return 0.0
+
+def _sync_ack_heartbeat_ts(ack: dict) -> float:
+    try:
+        return float((ack or {}).get("last_seen_ts") or 0.0)
+    except Exception:
+        return 0.0
+
+def _sync_ack_effective_ts(ack: dict) -> float:
+    close_ts = _sync_ack_close_ts(ack)
+    hb_ts = _sync_ack_heartbeat_ts(ack)
+    try:
+        status = str((ack or {}).get("status", "")).strip().lower()
+        sync_wait = bool((ack or {}).get("sync_wait", False))
+    except Exception:
+        status, sync_wait = "", False
+    if status == "closed" and sync_wait and hb_ts > 0:
+        return hb_ts
+    return close_ts
+
 def _sync_round_collect_closed_acks(round_id: int) -> tuple[dict, dict]:
     closed = {}
     reasons = {}
@@ -8464,7 +8495,7 @@ def _sync_round_collect_closed_acks(round_id: int) -> tuple[dict, dict]:
             reasons[bot] = f"status_no_closed_{status or 'empty'}"
             continue
         try:
-            ack_ts = float(ack.get("ts", 0.0) or 0.0)
+            ack_ts = float(_sync_ack_effective_ts(ack) or 0.0)
         except Exception:
             ack_ts = 0.0
         if ack_ts <= 0:
@@ -8502,6 +8533,8 @@ def _sync_round_collect_closed_acks(round_id: int) -> tuple[dict, dict]:
         closed[bot] = {
             "resultado": res,
             "ts": ack_ts,
+            "close_ts": _sync_ack_close_ts(ack),
+            "heartbeat_ts": _sync_ack_heartbeat_ts(ack),
             "contract_id": ack.get("contract_id"),
             "asset": ack.get("asset"),
             "ciclo": ack.get("ciclo"),
@@ -8540,7 +8573,7 @@ def _sync_round_collect_closed_acks_any_round(target_round: int) -> tuple[dict, 
             reasons[bot] = f"resultado_invalid_{resultado or 'empty'}"
             continue
         try:
-            ack_ts = float(ack.get("ts", 0.0) or 0.0)
+            ack_ts = float(_sync_ack_effective_ts(ack) or 0.0)
         except Exception:
             ack_ts = 0.0
         if ack_ts <= 0:
@@ -8566,6 +8599,8 @@ def _sync_round_collect_closed_acks_any_round(target_round: int) -> tuple[dict, 
         closed[bot] = {
             "resultado": resultado,
             "ts": ack_ts,
+            "close_ts": _sync_ack_close_ts(ack),
+            "heartbeat_ts": _sync_ack_heartbeat_ts(ack),
             "contract_id": ack.get("contract_id"),
             "asset": ack.get("asset"),
             "ciclo": ack.get("ciclo"),
@@ -8614,7 +8649,7 @@ def _sync_round_resolver_ronda_canonica(closed_current, reasons_current, target_
             reasons_by_bot[bot] = f"resultado_invalid_{resultado or 'empty'}"
             continue
         try:
-            ack_ts = float(ack.get("ts", 0.0) or 0.0)
+            ack_ts = float(_sync_ack_effective_ts(ack) or 0.0)
         except Exception:
             ack_ts = 0.0
         if ack_ts <= 0:
@@ -8626,7 +8661,7 @@ def _sync_round_resolver_ronda_canonica(closed_current, reasons_current, target_
             reasons_by_bot[bot] = "stale"
             continue
         valid_by_round.setdefault(ack_round, {})[bot] = {
-            "resultado": resultado, "ts": ack_ts, "contract_id": ack.get("contract_id"),
+            "resultado": resultado, "ts": ack_ts, "close_ts": _sync_ack_close_ts(ack), "heartbeat_ts": _sync_ack_heartbeat_ts(ack), "contract_id": ack.get("contract_id"),
             "asset": ack.get("asset"), "ciclo": ack.get("ciclo"),
         }
         reasons_by_bot[bot] = "ok"
@@ -8700,7 +8735,7 @@ def _sync_round_detect_future_ack_consensus(current_round=None, expected=None, m
         if mode == "REAL" or source in ("ORDEN_REAL", "REAL", "REAL_ORDER"):
             continue
         try:
-            ack_ts = float(ack.get("ts", 0.0) or 0.0)
+            ack_ts = float(_sync_ack_effective_ts(ack) or 0.0)
         except Exception:
             ack_ts = 0.0
         if ack_ts <= 0:
@@ -26805,6 +26840,28 @@ def _selftest_dq_visual_unico():
 
 if os.environ.get("RUN_DQ_VISUAL_UNICO_SELFTEST") == "1":
     _selftest_dq_visual_unico()
+
+def _selftest_ack_heartbeat_freshness():
+    now = float(time.time())
+    ttl = float(globals().get("TTL_ACK_SYNC_ROUND_S", 300.0) or 300.0)
+    a = {"status": "closed", "sync_wait": True, "ts": now - 300.0, "last_seen_ts": now - 2.0}
+    assert abs(_sync_ack_effective_ts(a) - float(a["last_seen_ts"])) < 0.01
+    assert (now - _sync_ack_effective_ts(a)) < ttl
+    b = {"status": "closed", "sync_wait": True, "ts": now - 300.0, "last_seen_ts": now - (ttl + 10.0)}
+    assert (now - _sync_ack_effective_ts(b)) > ttl
+    c = {"status": "closed", "sync_wait": False, "ts": now - 300.0, "last_seen_ts": now - 2.0}
+    assert abs(_sync_ack_effective_ts(c) - float(c["ts"])) < 0.01
+    assert (now - _sync_ack_effective_ts(c)) > 100.0
+    d = {f"b{i}": {"resultado": "GANANCIA" if i < 5 else "PÉRDIDA", "ts": now - 400.0, "status": "closed", "sync_wait": True, "last_seen_ts": now - 2.0} for i in range(6)}
+    dsum = _sync_round_build_canonical_summary(1, d, expected=list(d.keys()))
+    assert int(dsum.get("closed_count", 0)) == 6 and str(dsum.get("data_quality", "")) == "ok"
+    e = {f"b{i}": {"resultado": "GANANCIA" if i < 5 else "PÉRDIDA", "ts": now - 400.0, "status": "closed", "sync_wait": True, "last_seen_ts": (now - 2.0 if i < 5 else now - (ttl + 10.0))} for i in range(6)}
+    exp_n = sum(1 for v in e.values() if (now - _sync_ack_effective_ts(v)) > ttl)
+    assert exp_n >= 1
+    print("SELFTEST ACK_HEARTBEAT_FRESHNESS OK")
+
+if os.environ.get("RUN_ACK_HEARTBEAT_FRESHNESS_SELFTEST") == "1":
+    _selftest_ack_heartbeat_freshness()
 
 def _selftest_round_drift_ahead_promotion():
     original_read = globals().get("_sync_round_safe_read_json")
