@@ -3876,6 +3876,10 @@ def _ack_live_snapshot():
     for bot in bots:
         ack_path = _sync_round_ack_path(bot)
         ack = _sync_round_safe_read_json(ack_path)
+        if isinstance(closed_override, dict) and bot in closed_override and isinstance(closed_override.get(bot), dict):
+            ack = dict(closed_override.get(bot) or {})
+            ack.setdefault("round_id", obj_round)
+            ack.setdefault("status", "closed")
         raw_exists = os.path.exists(ack_path)
         ack_err = False
         if raw_exists and ack is None:
@@ -4236,9 +4240,104 @@ def _hud_get_gp_stats(bot):
     return int(g), int(p), porc, int(total)
 
 
-def _ack_live_build_rows():
+def _lxv_normalizar_patron_txt(patron):
+    try:
+        txt = str(patron or "").upper().replace("/", " ")
+        txt = " ".join(txt.split())
+        m = re.search(r"(\d+)\s*V\s*(\d+)\s*X", txt)
+        if m:
+            return f"{int(m.group(1))}V{int(m.group(2))}X"
+        return txt.replace(" ", "")
+    except Exception:
+        return ""
+
+
+def _sync_round_build_canonical_summary(round_id, closed, expected=None, source="CANONICAL_ROUND"):
+    rid = int(round_id or 0)
+    closed = dict(closed or {})
+    expected_bots = [b for b in list(expected or BOT_NAMES) if b in BOT_NAMES] or list(BOT_NAMES)
+    expected_count = len(expected_bots)
+    verdes, rojas = 0, 0
+    bot_x_actual = ""
+    bots_x_actual = []
+    lag_values = []
+    for bot in expected_bots:
+        row = closed.get(bot, {}) if isinstance(closed.get(bot, {}), dict) else {}
+        norm = _ack_live_norm_resultado(row.get("resultado"))
+        if norm == "WIN":
+            verdes += 1
+        elif norm == "LOSS":
+            rojas += 1
+            bots_x_actual.append(bot)
+        ts = row.get("ts")
+        try:
+            if ts is not None:
+                age = time.time() - float(ts)
+                if age >= 0:
+                    lag_values.append(float(age))
+        except Exception:
+            pass
+    pattern = _lxv_normalizar_patron_txt(f"{verdes}V{rojas}X") or "0V0X"
+    if rojas == 1:
+        bot_x_actual = bots_x_actual[0]
+    closed_count = verdes + rojas
+    return {
+        "source": "CANONICAL_ROUND",
+        "obj_round": rid,
+        "round_id": rid,
+        "round_closed_eval": rid,
+        "released_round": rid + 1,
+        "closed_count": closed_count,
+        "expected_count": expected_count,
+        "faltan_count": max(0, expected_count - closed_count),
+        "expired_count": 0,
+        "fresh_count": closed_count,
+        "max_lag_s": (max(lag_values) if lag_values else None),
+        "avg_lag_s": ((sum(lag_values) / len(lag_values)) if lag_values else None),
+        "data_quality": "ok" if closed_count >= expected_count else "partial",
+        "partial_pattern": pattern,
+        "pattern": pattern,
+        "missing_bots": [],
+        "canonical": True,
+        "canonical_source": str(source or "CANONICAL_ROUND"),
+        "closed_bots": closed,
+        "bot_x_actual": bot_x_actual,
+        "bots_x_actual": bots_x_actual,
+        "verdes_count": verdes,
+        "rojas_count": rojas,
+        "complete": bool(closed_count >= expected_count),
+        "has_expired_closed": False,
+    }
+
+
+
+
+def _lxv_green_opportunity_sync_diag(summary, rows_pack=None):
+    try:
+        ss = summary if isinstance(summary, dict) else {}
+        det = int(globals().get("LXV_OPORTUNIDADES_VERDES_DETECTADAS", 0) or 0)
+        col = int(globals().get("LXV_OPORTUNIDADES_VERDES_BLOQUEADAS_SYNC", 0) or 0)
+        if det <= 0 or col <= 0:
+            return
+        cause = "unknown"
+        dq = str(ss.get("data_quality", "") or "").lower()
+        if dq == "closed_expired":
+            cause = "expired"
+        elif dq == "missing":
+            cause = "missing"
+        elif dq == "partial":
+            cause = "partial"
+        ack_best = int(((rows_pack or {}).get("obj_round", 0) if isinstance(rows_pack, dict) else 0) or 0)
+        oficial = int(ss.get("round_closed_eval", ss.get("round_id", 0)) or 0)
+        cerr = int(ss.get("closed_count", 0) or 0)
+        exp = int(ss.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
+        agregar_evento(f"OPORTUNIDADES BLOQUEADAS POR SYNC: det={det} col={col} causa={cause} oficial={oficial} ack_best={ack_best} cerrados={cerr}/{exp}")
+    except Exception:
+        pass
+
+def _ack_live_build_rows(obj_round_override=None, closed_override=None):
     state = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
-    obj_round = int(state.get("round_id", state.get("released_round", 1)) or 1)
+    obj_round = int(obj_round_override if obj_round_override is not None else state.get("round_id", state.get("released_round", 1)) or 1)
     released_round = int(state.get("released_round", obj_round) or obj_round)
     rows = []
     now = time.time()
@@ -4246,6 +4345,10 @@ def _ack_live_build_rows():
     for bot in BOT_NAMES:
         ack_path = _sync_round_ack_path(bot)
         ack = _sync_round_safe_read_json(ack_path)
+        if isinstance(closed_override, dict) and bot in closed_override and isinstance(closed_override.get(bot), dict):
+            ack = dict(closed_override.get(bot) or {})
+            ack.setdefault("round_id", obj_round)
+            ack.setdefault("status", "closed")
 
         if not isinstance(ack, dict):
             ack_round = 0
@@ -4378,6 +4481,10 @@ def _ack_live_build_rows():
 
 
 def _ack_live_calc_summary(rows_pack):
+    if isinstance(rows_pack, dict) and (rows_pack.get("canonical") or rows_pack.get("summary_override")):
+        so = rows_pack.get("summary_override")
+        if isinstance(so, dict):
+            return dict(so)
     rows = list((rows_pack or {}).get("rows", []) or [])
     st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
     obj_round = int((rows_pack or {}).get("obj_round", 1) or 1)
@@ -4396,7 +4503,7 @@ def _ack_live_calc_summary(rows_pack):
     expected_count = len(BOT_NAMES)
     faltan_count = max(0, expected_count - closed_count)
 
-    partial_pattern = f"{verdes_count}V{rojas_count}X"
+    partial_pattern = _lxv_normalizar_patron_txt(f"{verdes_count}V{rojas_count}X") or f"{verdes_count}V{rojas_count}X"
     bot_x_actual = ""
     if rojas_count == 1:
         for row in valid_current:
@@ -4623,6 +4730,10 @@ def _round_live_estado_display(row: dict) -> str:
 def _ack_live_format_lines(snapshot):
     rows_pack = _ack_live_build_rows()
     summary = _ack_live_calc_summary(rows_pack)
+    last_sync = globals().get("LAST_SYNC_ROUND_SUMMARY") if isinstance(globals().get("LAST_SYNC_ROUND_SUMMARY"), dict) else {}
+    if bool(last_sync.get("canonical")) and (time.time() - float(last_sync.get("ts", 0.0) or 0.0) <= 120.0):
+        summary = dict(last_sync)
+        rows_pack["canonical"] = True
     rows = rows_pack.get("rows", [])
 
     obj_round = int(summary.get("obj_round", 1) or 1)
@@ -4639,7 +4750,9 @@ def _ack_live_format_lines(snapshot):
 
     lines = []
     lag_txt = max_txt if max_txt != "--" else avg_txt
-    lines.append(f"⚡ ROUND #{obj_round} | Cerrados {closed_count}/{expected_count} | Faltan {faltan_count} | Calidad {summary.get('data_quality','missing')} | Patrón {summary.get('partial_pattern','0V0X')}")
+    lines.append(f"⚡ ROUND #{obj_round} | Cerrados {closed_count}/{expected_count} | Faltan {faltan_count} | Calidad {summary.get('data_quality','missing')} | Patrón {_lxv_normalizar_patron_txt(summary.get('partial_pattern','0V0X')) or '0V0X'}")
+    if bool((rows_pack or {}).get("canonical")):
+        lines.append("🧭 RONDA CANÓNICA ACTIVA")
     if bool(globals().get("HUD_SHOW_LEGACY_DIAGNOSTICS", False)) or bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False)):
         lines.append(f"SYNC STATE | status={summary.get('status_state','')} | rel={released_round} | lag={lag_txt}")
     if bool(globals().get("HUD_SHOW_ROUND_DETAIL", False)) or bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False)):
@@ -4722,7 +4835,7 @@ def _ack_live_format_lines(snapshot):
         min_txt = f"{int(max(0.0, float(min_lag_s)))}s" if isinstance(min_lag_s, (int, float)) else "--"
         max_txt = f"{int(max(0.0, float(max_lag_s)))}s" if isinstance(max_lag_s, (int, float)) else "--"
         lines.append(f"FRESCURA ACK: expired={exp_cnt}/{expected_count} | max_age={max_txt} | min_age={min_txt} | motivo=closed_expired")
-    parcial_txt = str(summary.get("partial_pattern", "0V0X") or "0V0X").strip().upper()
+    parcial_txt = _lxv_normalizar_patron_txt(summary.get("partial_pattern", "0V0X")) or "0V0X"
     columna_lista = bool(closed_count >= expected_count and faltan_count <= 0 and dq_txt == "ok")
     if fresh_count < expected_count:
         lines.append("⏳ REAL NO EVALUADO:")
@@ -6606,7 +6719,7 @@ def actualizar_real_locks_panel_desde_round_live():
         closed_count = int(summary.get("closed_count", 0) or 0)
         expected_count = int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
         dq = str(summary.get("data_quality", "missing") or "missing").strip().lower()
-        partial = str(summary.get("partial_pattern", "0V0X") or "0V0X").strip().upper()
+        partial = _lxv_normalizar_patron_txt(summary.get("partial_pattern", "0V0X")) or "0V0X"
         round_complete = bool(closed_count == expected_count and expected_count > 0)
         zi = resolver_zona_lxv_para_round_live(
             rid=rid,
@@ -6719,7 +6832,7 @@ def obtener_zona_lxv_hud_actual():
         if expected_count <= 0:
             expected_count = int(len(BOT_NAMES) or 6)
         dq = str(summary.get("data_quality", "missing") or "missing").strip().lower()
-        partial = str(summary.get("partial_pattern", "0V0X") or "0V0X").strip().upper()
+        partial = _lxv_normalizar_patron_txt(summary.get("partial_pattern", "0V0X")) or "0V0X"
         round_complete = bool(closed_count == expected_count and expected_count > 0)
         info = resolver_zona_lxv_para_round_live(rid=rid, round_complete=round_complete, partial_pattern=partial)
         info = dict(info) if isinstance(info, dict) else {}
@@ -8718,9 +8831,25 @@ def _sync_round_tick_maestro():
             msg=f"⚠️ SYNC sigue esperando #{round_id}: faltan={missing} motivos={miss_short}",
             cooldown_s=10.0,
         )
-    rows_pack = _ack_live_build_rows()
-    summary = _ack_live_calc_summary(rows_pack)
+    canonical_active = False
+    canonical_summary = None
+    if canonical and canonical.get("ok"):
+        canonical_active = True
+        round_id = int(canonical.get("round_closed_eval", round_id) or round_id)
+        closed = dict(canonical.get("closed") or closed or {})
+        canonical_summary = _sync_round_build_canonical_summary(round_id, closed, expected=BOT_NAMES, source=canonical.get("reason", "CANONICAL_ROUND"))
+        rows_pack = _ack_live_build_rows(obj_round_override=round_id, closed_override=closed)
+        rows_pack["canonical"] = True
+        rows_pack["summary_override"] = canonical_summary
+        summary = dict(canonical_summary)
+        agregar_evento(f"✅ CANONICAL_SUMMARY_ACTIVE: round={round_id} closed={int(summary.get('closed_count',0))}/{int(summary.get('expected_count',len(BOT_NAMES)))} dq={summary.get('data_quality','missing')} pattern={summary.get('partial_pattern','0V0X')}")
+    else:
+        rows_pack = _ack_live_build_rows()
+        summary = _ack_live_calc_summary(rows_pack)
     rows_live = list((rows_pack or {}).get("rows", []) if isinstance(rows_pack, dict) else [])
+    globals()["LAST_SYNC_ROUND_SUMMARY"] = dict(summary or {})
+    globals()["LAST_SYNC_ROUND_SUMMARY"]["ts"] = time.time()
+    _lxv_green_opportunity_sync_diag(summary, rows_pack)
     real_emitido = False
     closed_count = int(summary.get("closed_count", 0) or 0)
     expected_count = int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
@@ -8732,10 +8861,14 @@ def _sync_round_tick_maestro():
     except Exception:
         max_lag_s = None
     data_quality = str(summary.get("data_quality", "") or "").strip().lower()
-    partial_pattern = str(summary.get("partial_pattern", "") or "").strip().upper()
+    partial_pattern = _lxv_normalizar_patron_txt(summary.get("partial_pattern", "")) or "0V0X"
     incomplete_round = bool(closed_count < expected_count)
     has_expired_closed = bool(expired_count > 0)
     too_old_round = bool(max_lag_s is not None and float(max_lag_s) > float(ROUND_LIVE_INVEST_WINDOW_S))
+    if canonical_active and closed_count >= expected_count and data_quality == "ok":
+        incomplete_round = False
+        has_expired_closed = False
+        too_old_round = False
     if incomplete_round and (has_expired_closed or too_old_round):
         release_state = "RELEASE_BLOQUEADO_POR_INCOMPLETA"
         missing_bots = [str(b) for b in BOT_NAMES if b not in set(closed.keys())]
@@ -8785,7 +8918,9 @@ def _sync_round_tick_maestro():
         completed_normal = True
         completed_failsafe = False
         missing = []
-    if direct_ack_full and data_quality and data_quality != "ok":
+    if canonical_active and data_quality == "ok":
+        round_live_release_no_real_reason = ""
+    elif direct_ack_full and data_quality and data_quality != "ok":
         round_live_release_no_real_reason = f"turbo_sync_6_6_no_real_release:{data_quality}"
     elif round_live_real_ok:
         completed = True
