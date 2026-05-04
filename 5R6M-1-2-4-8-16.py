@@ -429,6 +429,10 @@ LXV_ZONAS_BLOQUEANTES = {
     "ERROR",
     "UNKNOWN",
 }
+LXV_ZONA_V3_ENABLE = True
+LXV_ZONA_V3_SHADOW_ONLY = True
+LXV_ZONA_V3_CAN_BLOCK = False
+LXV_ZONA_V3_CAN_UNLOCK = False
 LXV_SYNC_GENERIC_REAL_ENABLE = False
 LXV_REAL_SIMPLE_ROUTE_ENABLE = True
 LXV_REAL_LOCKS_PANEL_ENABLE = True
@@ -7895,6 +7899,60 @@ def evaluar_fase_zona_verde_lxv(rows=None, round_id_objetivo=None):
     _LXV_FASE_ZV_LAST_INFO = dict(info)
     return info
 
+def detectar_zona_lxv_v3(rows=None, expected=6):
+    out = {"zona_macro":"INSUFICIENTE","subzona":"INSUFICIENTE","allow_real_v3":False,"motivo_v3":"historial_insuficiente","ok":True}
+    try:
+        norm = []
+        for i, rr in enumerate(list(rows or [])):
+            if not isinstance(rr, dict):
+                continue
+            v = _mrv_5v1x_to_int(rr.get("n_verdes", rr.get("verdes", -1)), -1)
+            r = _mrv_5v1x_to_int(rr.get("n_rojos", rr.get("rojos", -1)), -1)
+            rid = _mrv_5v1x_to_int(rr.get("round_id", i + 1), i + 1)
+            if v < 0 or r < 0 or (v + r) != int(expected):
+                continue
+            norm.append({"round_id": rid, "n_verdes": v, "n_rojos": r})
+        norm = sorted(norm, key=lambda x: int(x.get("round_id", 0)))
+        min_cols = int(globals().get("LXV_ZONA_MIN_COLUMNS", 3) or 3)
+        if len(norm) < min_cols:
+            return out
+        metrics = _lxv_zona_dynamic_metrics(norm, expected)
+        prom3 = float(metrics.get("prom3", 0.0) or 0.0)
+        prom8 = float(metrics.get("prom8", 0.0) or 0.0)
+        prom20 = float(metrics.get("prom20", 0.0) or 0.0)
+        d38 = float(metrics.get("delta_3_8", prom3 - prom8) or 0.0)
+        d820 = float(metrics.get("delta_8_20", prom8 - prom20) or 0.0)
+        prev_full = int(metrics.get("prev_full_green_streak", 0) or 0)
+        cur = norm[-1]
+        verdes_actuales = int(cur.get("n_verdes", 0) or 0)
+        rojas_actuales = int(cur.get("n_rojos", 0) or 0)
+        g_col = float(verdes_actuales / float(expected))
+        r_col = float(rojas_actuales / float(expected))
+        last3 = norm[-4:-1] if len(norm) >= 4 else norm[:-1]
+        rojas_previas_3 = float(sum(int(x.get("n_rojos", 0) or 0) for x in last3) / max(1, len(last3))) if last3 else 0.0
+        green_drop = float(prom8 - prom3)
+        red_pressure = bool(rojas_actuales >= 2 or (len(last3) > 0 and rojas_actuales > rojas_previas_3))
+        out.update({"prom3":prom3,"prom8":prom8,"prom20":prom20,"d38":d38,"d820":d820,"g_col_actual":g_col,"r_col_actual":r_col,"rojas_actuales":rojas_actuales,"rojas_previas_3":rojas_previas_3,"green_drop":green_drop,"red_pressure":red_pressure,"prev_full_green_streak":prev_full,"cols_usadas":len(norm)})
+        if prev_full >= 3 or prom8 >= 0.92:
+            out.update({"zona_macro":"VERDE_ABUNDANTE","subzona":"VERDE_SATURADO_TARDIO","allow_real_v3":False,"motivo_v3":"verde_saturado_tardio"}); return out
+        if prom8 >= 0.70 and (d38 <= -0.08 or rojas_actuales >= 3 or green_drop >= 0.08 or prom3 < (prom8 - 0.08)):
+            out.update({"zona_macro":"VERDE_ABUNDANTE","subzona":"VERDE_FINAL","allow_real_v3":False,"motivo_v3":"verde_final_perdiendo_fuerza"}); return out
+        if prom8 < 0.45 and prom20 < 0.50:
+            out.update({"zona_macro":"ROJA_POBRE","subzona":"ROJO_MADURO","allow_real_v3":False,"motivo_v3":"rojo_maduro_promedios"}); return out
+        if prom3 < prom8 and rojas_actuales >= 3:
+            out.update({"zona_macro":"ROJA_POBRE","subzona":"ROJA_TEMPRANO","allow_real_v3":False,"motivo_v3":"roja_temprano_presion"}); return out
+        if g_col >= 0.66 and prom3 >= 0.55 and 0.50 <= prom8 <= 0.88 and d38 >= -0.05 and prev_full < 3 and rojas_actuales <= 2:
+            out.update({"zona_macro":"VERDE_ABUNDANTE","subzona":"VERDE_MADURO_SANO","allow_real_v3":True,"motivo_v3":"verde_maduro_sano"}); return out
+        if g_col >= 0.50 and prom3 >= 0.45 and 0.45 <= prom8 <= 0.70 and d38 >= -0.03 and prev_full < 2:
+            out.update({"zona_macro":"VERDE_ABUNDANTE","subzona":"VERDE_TEMPRANO","allow_real_v3":True,"motivo_v3":"verde_temprano"}); return out
+        if 0.50 <= prom8 <= 0.88 and 0.50 <= g_col <= 0.66 and rojas_actuales <= 3 and d38 >= -0.06:
+            out.update({"zona_macro":"VERDE_ABUNDANTE","subzona":"VERDE_MADURO_CON_RUIDO","allow_real_v3":False,"motivo_v3":"verde_con_ruido_observar"}); return out
+        out.update({"zona_macro":"MIXTA","subzona":"NEUTRO","allow_real_v3":False,"motivo_v3":"sin_match_v3"})
+        return out
+    except Exception as e:
+        out.update({"zona_macro":"INSUFICIENTE","subzona":"INSUFICIENTE","allow_real_v3":False,"motivo_v3":f"error_v3:{e.__class__.__name__}","ok":False})
+        return out
+
 def normalizar_zona_lxv_oficial(info):
     zonas_validas = {
         "VERDE_TEMPRANO", "VERDE_MADURO", "VERDE_TARDIO", "VERDE_SATURADO_TARDIO",
@@ -8126,6 +8184,29 @@ def _selftest_mrv_zona_v2():
         ok_all=ok_all and ok
     return ok_all
 
+def _selftest_zona_lxv_v3():
+    tests = [
+        ("A_VERDE_TEMPRANO", [2,3,4,4], {"VERDE_TEMPRANO"}, True),
+        ("B_VERDE_MADURO_SANO", [4,5,4,5,4,5], {"VERDE_MADURO_SANO"}, True),
+        ("C_VERDE_FINAL", [5,5,5,4,3], {"VERDE_FINAL","VERDE_TARDIO"}, False),
+        ("D_VERDE_SATURADO_TARDIO", [6,6,6,4], {"VERDE_SATURADO_TARDIO"}, False),
+        ("E_ROJO_MADURO", [2,1,2,2], {"ROJO_MADURO"}, False),
+        ("F_ROJA_TEMPRANO", [4,3,2], {"ROJA_TEMPRANO"}, False),
+        ("G_VERDE_MADURO_CON_RUIDO", [3,4,5,3,4,5,4,4], {"VERDE_MADURO_CON_RUIDO"}, False),
+    ]
+    all_ok = True
+    for n, seq, expected_subzonas, expected_allow in tests:
+        rows = [{"round_id":i+1,"n_verdes":v,"n_rojos":6-v,"round_complete":True,"data_quality":"ok"} for i,v in enumerate(seq)]
+        r = detectar_zona_lxv_v3(rows=rows, expected=6)
+        ok = str(r.get("subzona", "UNKNOWN")) in set(expected_subzonas) and bool(r.get("allow_real_v3", False)) == bool(expected_allow)
+        print(f"[SELFTEST_ZONA_LXV_V3] {n} {'OK' if ok else 'FAIL'} subzona={r.get('subzona')} allow={r.get('allow_real_v3')} motivo={r.get('motivo_v3')}")
+        all_ok = all_ok and ok
+    diver = {"zona":"VERDE_MADURO","allow_real":True}
+    v3 = {"subzona":"VERDE_FINAL","allow_real_v3":False,"motivo_v3":"verde_final_perdiendo_fuerza"}
+    divergence_ok = str(diver.get("zona")) != str(v3.get("subzona")) and bool(diver.get("allow_real")) is True
+    print(f"[SELFTEST_ZONA_LXV_V3] H_DIVERGENCIA {'OK' if divergence_ok else 'FAIL'} oficial={diver.get('zona')} v3={v3.get('subzona')} allow_oficial={diver.get('allow_real')}")
+    return bool(all_ok and divergence_ok)
+
 def _selftest_lxv_live_row_mapping():
     try:
         rid = 100
@@ -8286,6 +8367,11 @@ if str(os.getenv("RUN_LXV_ZONE_SELFTEST", "0")).strip() == "1":
 if str(os.getenv("RUN_MRV_ZONA_V2_SELFTEST", "0")).strip() == "1":
     try:
         _selftest_mrv_zona_v2()
+    except Exception:
+        pass
+if str(os.getenv("RUN_ZONA_LXV_V3_SELFTEST", "0")).strip() == "1":
+    try:
+        _selftest_zona_lxv_v3()
     except Exception:
         pass
 if str(os.getenv("RUN_LXV_LIVE_ROW_SELFTEST", "0")).strip() == "1":
@@ -20226,11 +20312,19 @@ def _hud_zona_operativa_lxv_line(width=None):
         ronda_previa = str(info.get("ronda_liberada_previa", "no") or "no")
         g_col_parcial = _calcular_g_columna_parcial(patron_live)
         g_hud = f"g_columna={g_txt}" if cerrados >= esperados else f"g_columna_parcial={g_col_parcial:.2f} | g_regional={g_txt}"
+        v3_line = ""
+        if bool(globals().get("LXV_ZONA_V3_ENABLE", True)):
+            v3 = detectar_zona_lxv_v3(rows=globals().get("LXV_FASE_COLUMNS_CACHE", []) or [], expected=esperados)
+            info["zona_lxv_v3"] = dict(v3 or {})
+            oficial = str(zona_final.get("subzona", zona))
+            v3_line = f" | 🧭 ZONA V3: macro={v3.get('zona_macro','--')} | subzona={v3.get('subzona','--')} | allow={bool(v3.get('allow_real_v3',False))} | motivo={v3.get('motivo_v3','--')} | oficial={oficial}"
+            if str(v3.get("subzona", "UNKNOWN")) not in {"UNKNOWN", oficial}:
+                print(f"⚠️ ZONA_DIVERGENCIA: oficial={oficial} v3={v3.get('subzona','UNKNOWN')} motivo_v3={v3.get('motivo_v3','--')}")
         line_hud = (
             f"{emoji} ZONA LXV HUD GLOBAL: ZONA OFICIAL REAL={zona} | DECISIÓN ZONA={decision} | MOTIVO={motivo} | FUENTE={zona_final.get('fuente_zona','LXV')} | "
             f"rid_zona={rid_zona if rid_zona > 0 else '--'} | rid_live={rid_live if rid_live > 0 else '--'} | "
             f"cols={cols_usadas}/{cols_req} | cerrados={cerrados}/{esperados} | patrón={patron_live} | dq={dq} | {g_hud} | prom3={prom3:.2f} prom8={prom8:.2f} prom20={prom20:.2f} d38={d38:+.2f} | "
-            f"prev_full={prev_full} | SUBZONA/VISUAL={zona_final.get('subzona','--')} | regional={reg_visual} | columna_visual={col_visual} | VISUAL/REGIONAL=SOLO_DIAGNOSTICO,NO_HABILITA_REAL | ronda_liberada_previa={ronda_previa} | source={source}"
+            f"prev_full={prev_full} | SUBZONA/VISUAL={zona_final.get('subzona','--')} | regional={reg_visual} | columna_visual={col_visual} | VISUAL/REGIONAL=SOLO_DIAGNOSTICO,NO_HABILITA_REAL | ronda_liberada_previa={ronda_previa} | source={source}{v3_line}"
         )
         gate = dict(globals().get("_LXV_LAST_REAL_GATE_INFO", {}) or {})
         rid_gate = int(gate.get("round_id", 0) or 0)
