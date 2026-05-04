@@ -7939,7 +7939,7 @@ def detectar_zona_lxv_v3(rows=None, expected=6):
             out.update({"zona_macro":"VERDE_ABUNDANTE","subzona":"VERDE_FINAL","allow_real_v3":False,"motivo_v3":"verde_final_perdiendo_fuerza"}); return out
         if prom8 < 0.45 and prom20 < 0.50:
             out.update({"zona_macro":"ROJA_POBRE","subzona":"ROJO_MADURO","allow_real_v3":False,"motivo_v3":"rojo_maduro_promedios"}); return out
-        recent_window = norm[-3:] if len(norm) >= 3 else list(norm)
+        recent_window = norm[-4:] if len(norm) >= 4 else list(norm)
         recent_green_seq = [int(x.get("n_verdes", 0) or 0) for x in recent_window]
         primer_verde_reciente = int(recent_green_seq[0]) if recent_green_seq else verdes_actuales
         ultimo_verde = int(recent_green_seq[-1]) if recent_green_seq else verdes_actuales
@@ -7954,7 +7954,8 @@ def detectar_zona_lxv_v3(rows=None, expected=6):
             out.update({"zona_macro":"ROJA_POBRE","subzona":"ROJA_TEMPRANO","allow_real_v3":False,"motivo_v3":"roja_temprano_presion"}); return out
         if g_col >= 0.50 and prom3 >= 0.45 and 0.45 <= prom8 <= 0.70 and d38 >= -0.03 and prev_full < 2 and (len(norm) <= 4 or prom8 < 0.60):
             out.update({"zona_macro":"VERDE_ABUNDANTE","subzona":"VERDE_TEMPRANO","allow_real_v3":True,"motivo_v3":"verde_temprano"}); return out
-        if 0.50 <= prom8 <= 0.88 and 0.50 <= g_col <= 0.66 and rojas_actuales <= 3 and d38 >= -0.06 and (red_pressure or rojas_actuales == 2 or alternancia_reciente_alta):
+        g_ruido_max = (4.0 / float(expected)) + 1e-9
+        if 0.50 <= prom8 <= 0.88 and 0.50 <= g_col <= g_ruido_max and rojas_actuales <= 3 and d38 >= -0.06 and (red_pressure or rojas_actuales == 2 or alternancia_reciente_alta):
             out.update({"zona_macro":"VERDE_ABUNDANTE","subzona":"VERDE_MADURO_CON_RUIDO","allow_real_v3":False,"motivo_v3":"verde_con_ruido_observar"}); return out
         if g_col >= 0.66 and prom3 >= 0.55 and 0.50 <= prom8 <= 0.88 and d38 >= -0.05 and prev_full < 3 and rojas_actuales <= 2 and (not red_pressure):
             out.update({"zona_macro":"VERDE_ABUNDANTE","subzona":"VERDE_MADURO_SANO","allow_real_v3":True,"motivo_v3":"verde_maduro_sano"}); return out
@@ -20329,8 +20330,14 @@ def _hud_zona_operativa_lxv_line(width=None):
             info["zona_lxv_v3"] = dict(v3 or {})
             oficial = str(zona_final.get("subzona", zona))
             v3_line = f" | 🧭 ZONA V3: macro={v3.get('zona_macro','--')} | subzona={v3.get('subzona','--')} | allow={bool(v3.get('allow_real_v3',False))} | motivo={v3.get('motivo_v3','--')} | oficial={oficial}"
-            if str(v3.get("subzona", "UNKNOWN")) not in {"UNKNOWN", oficial}:
-                print(f"⚠️ ZONA_DIVERGENCIA: oficial={oficial} v3={v3.get('subzona','UNKNOWN')} motivo_v3={v3.get('motivo_v3','--')}")
+            v3_sub = str(v3.get("subzona", "UNKNOWN") or "UNKNOWN")
+            oficial_txt = str(oficial or "UNKNOWN")
+            if (
+                v3_sub not in {"INSUFICIENTE", "UNKNOWN", "ERROR"}
+                and oficial_txt not in {"PRE_ZONA_VISUAL", "UNKNOWN", "INSUFICIENTE", "--", ""}
+                and v3_sub != oficial_txt
+            ):
+                print(f"⚠️ ZONA_DIVERGENCIA: oficial={oficial_txt} v3={v3_sub} motivo_v3={v3.get('motivo_v3','--')}")
         line_hud = (
             f"{emoji} ZONA LXV HUD GLOBAL: ZONA OFICIAL REAL={zona} | DECISIÓN ZONA={decision} | MOTIVO={motivo} | FUENTE={zona_final.get('fuente_zona','LXV')} | "
             f"rid_zona={rid_zona if rid_zona > 0 else '--'} | rid_live={rid_live if rid_live > 0 else '--'} | "
