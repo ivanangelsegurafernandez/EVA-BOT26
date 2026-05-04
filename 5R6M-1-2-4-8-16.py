@@ -263,7 +263,9 @@ HUD_TABLE_COMPACT_WIDTH = True
 HUD_SIDE_PANEL_INLINE = True
 HUD_SHOW_SALDO_DEBUG = False
 HUD_EVENT_MAX_CHARS = 150
-HUD_ULTRA_COMPACT_MODE = True
+HUD_ULTRA_COMPACT_MODE = False
+# HUD compacto/premium congelado temporalmente por estabilidad.
+# Rehabilitar solo después de corregir ROUND_DRIFT y candados.
 HUD_LXV_COLOR_DYNAMIC_ONLY = True
 HUD_DEBUG_VERBOSE_PANEL = False
 HUD_SHOW_LONG_ZONE_LINE = False
@@ -6737,6 +6739,27 @@ def obtener_zona_lxv_hud_actual():
     except Exception:
         return {"zona":"INSUFICIENTE","fase":"INSUFICIENTE","decision":ZONA_NO_INVERTIR,"motivo":"sin_info_round_live","emoji":"⬜","source":"HUD_GLOBAL/none"}
 
+def _hud_round_summary_safe():
+    try:
+        s = globals().get("_ACK_LIVE_SUMMARY", {})
+        if isinstance(s, dict):
+            return {
+                "round_id": s.get("round_id", s.get("rid", "--")),
+                "cerrados": s.get("closed_count", s.get("cerrados", "--")),
+                "expected": s.get("expected_count", s.get("expected", 6)),
+                "dq": s.get("data_quality", s.get("dq", "--")),
+                "patron": s.get("patron", s.get("pattern", s.get("partial_pattern", "--"))),
+            }
+    except Exception:
+        pass
+    return {
+        "round_id": "--",
+        "cerrados": "--",
+        "expected": "--",
+        "dq": "--",
+        "patron": "--",
+    }
+
 def render_real_locks_panel():
     try:
         if not bool(globals().get("LXV_REAL_LOCKS_PANEL_ENABLE", True)):
@@ -6766,12 +6789,18 @@ def render_real_locks_panel():
 
         res_ok = bool(p.get("ready_pre_real", False))
         falta = str(p.get("falta_principal") or "---")
+        hs = _hud_round_summary_safe()
+        round_show = hs.get("round_id", "--")
+        patron_show = hs.get("patron", "--")
+        dq_show = hs.get("dq", "--")
+        cerr_show = hs.get("cerrados", "--")
+        exp_show = hs.get("expected", "--")
 
         out = [
             "╔" + "═"*(W-2) + "╗",
             row(ctext(Fore.CYAN, "🔐 CANDADOS REAL LXV")),
-            row(f"Ronda: {str(p.get('round_id') or '--')} | Bot: {str(p.get('bot') or '--')}"),
-            row(f"Patrón: {str(p.get('patron') or '--')} | Zona: {str(p.get('zona') or '--')}"),
+            row(f"Ronda: {str(round_show or '--')} | Bot: {str(p.get('bot') or '--')}"),
+            row(f"Patrón: {str(patron_show or '--')} | Zona: {str(p.get('zona') or '--')}"),
             "╠" + "═"*(W-2) + "╣",
             row(ctext(Fore.WHITE, f"BLOQUEO PRINCIPAL: {falta}")),
             row(ctext(Fore.GREEN if res_ok else Fore.RED, ("ESTADO FINAL: ✅ LISTO PARA REAL" if res_ok else f"ESTADO FINAL: ⛔ BLOQUEADO POR {falta}"))),
@@ -6799,9 +6828,9 @@ def render_real_locks_panel():
             diag_txt = _diagnostico_candados_lxv(
                 locks,
                 patron=str(p.get("patron") or "--"),
-                cerrados=int(p.get("closed_count", p.get("cerrados", 0)) or 0),
-                expected=int(p.get("expected_count", p.get("esperados", 6)) or 6),
-                dq=str(p.get("data_quality", p.get("dq", "missing")) or "missing"),
+                cerrados=int(cerr_show) if str(cerr_show).isdigit() else 0,
+                expected=int(exp_show) if str(exp_show).isdigit() else 6,
+                dq=str(dq_show or "--"),
                 zona=str(p.get("zona") or "--"),
                 bot=str(p.get("bot") or "--"),
                 motivo=str(p.get("motivo") or "--"),
@@ -6810,11 +6839,11 @@ def render_real_locks_panel():
         out += [
             "╠" + "═"*(W-2) + "╣",
             row(ctext(Fore.WHITE, "Motivo:")),
-            row(ctext(Fore.LIGHTBLACK_EX, f"- dq={trunc(p.get('data_quality', p.get('dq', '--')), 60)}")),
-            row(ctext(Fore.LIGHTBLACK_EX, f"- patrón={trunc(p.get('patron', '--'), 60)}")),
+            row(ctext(Fore.LIGHTBLACK_EX, f"- dq={trunc(dq_show, 60)}")),
+            row(ctext(Fore.LIGHTBLACK_EX, f"- patrón={trunc(patron_show, 60)}")),
             row(ctext(Fore.LIGHTBLACK_EX, f"- zona={trunc(p.get('zona', '--'), 60)}")),
             row(ctext(Fore.LIGHTBLACK_EX, f"- bot={trunc(p.get('bot', '--'), 60)}")),
-            row(ctext(Fore.LIGHTBLACK_EX, f"- cerrados={int(p.get('closed_count', p.get('cerrados', 0)) or 0)}/{int(p.get('expected_count', p.get('esperados', 6)) or 6)}")),
+            row(ctext(Fore.LIGHTBLACK_EX, f"- cerrados={trunc(cerr_show, 20)}/{trunc(exp_show, 20)}")),
         ]
         if diag_txt:
             out.append(row(ctext(Fore.WHITE, f"diag={trunc(diag_txt, 70)}")))
@@ -8109,6 +8138,13 @@ def _sync_round_tick_maestro():
         if candidate_round != int(round_id):
             agregar_evento(f"⚠️ LXV_SYNC_COLUMN release_mismatch: detectada=#{released_round} | destino=#{round_id} | usada=#{candidate_round}")
         resync_future_closed, resync_future_reasons = _sync_round_collect_closed_acks_any_round(candidate_round)
+        future_acks = len(resync_future_closed) if isinstance(resync_future_closed, dict) else 0
+        if _print_once(f"round_drift_audit:{round_id}:{released_round}", ttl=12.0):
+            action = "resync_si_6de6" if future_acks >= len(BOT_NAMES) else "esperar_obj_actual"
+            agregar_evento(
+                f"🧾 ROUND_DRIFT AUDIT: obj={round_id} | released={released_round} | "
+                f"candidate={candidate_round} | future_acks={future_acks}/{len(BOT_NAMES)} | action={action}"
+            )
         if isinstance(resync_future_closed, dict) and len(resync_future_closed) >= len(BOT_NAMES):
             agregar_evento(f"🧭 SYNC RESYNC FUTURE_ACK_FULL: obj #{round_id} -> #{candidate_round}; ACK 6/6 ya cerrados.")
             round_id = int(candidate_round)
@@ -20095,16 +20131,21 @@ def mostrar_panel():
         meta_str = "--"
 
 
-    if bool(globals().get("HUD_ULTRA_COMPACT_MODE", True)):
+    if bool(globals().get("HUD_ULTRA_COMPACT_MODE", False)):
         try:
-            compact_lines = list(render_hud_ultra_compacto(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str) or [])
-            for line in compact_lines:
-                print(line)
+            fn = globals().get("render_hud_ultra_compacto")
+            if callable(fn):
+                compact_lines = list(fn(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str) or [])
+                for line in compact_lines:
+                    print(line)
+                if bool(globals().get("HUD_DEBUG_VERBOSE_PANEL", False)):
+                    print(f"HUD lines={len(compact_lines)}")
+                return
+        except Exception as e:
             if bool(globals().get("HUD_DEBUG_VERBOSE_PANEL", False)):
-                print(f"HUD lines={len(compact_lines)}")
-            return
-        except Exception:
-            agregar_evento("⚠️ HUD compacto falló; fallback clásico")
+                agregar_evento(f"⚠️ HUD compacto falló: {type(e).__name__}: {str(e)[:80]}")
+            # NO hacer spam en modo normal.
+            # Continuar al HUD clásico estable.
 
     if not bool(globals().get("HUD_MINIMAL_MODE", True)):
         print(padding + Fore.GREEN + f"💰 SALDO INICIAL {inicial_str} 🎯 META {meta_str}")
