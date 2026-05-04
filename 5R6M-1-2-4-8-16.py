@@ -4674,11 +4674,38 @@ def _ack_live_format_lines(snapshot):
     )
     if bool(globals().get("HUD_SHOW_LEGACY_DIAGNOSTICS", False)) or bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False)):
         lines.append(resumen)
+    vis = int(summary.get("n_visible_results", fresh_count) or fresh_count)
+    preboot_n = int(summary.get("preboot_count", 0) or 0)
+    mismatch_n = int(summary.get("round_mismatch_count", 0) or 0)
+    stale_n = int(summary.get("stale_count", summary.get("expired_count", 0)) or 0)
+    no_cuentan = preboot_n + mismatch_n + stale_n
+    motivo_hist = []
+    if preboot_n > 0:
+        motivo_hist.append("preboot")
+    if mismatch_n > 0:
+        motivo_hist.append("round_mismatch")
+    if stale_n > 0:
+        motivo_hist.append("stale")
+    if not motivo_hist:
+        motivo_hist.append("missing" if fresh_count < expected_count else "ok")
+    lines.append("HISTORIAL VISUAL ≠ COLUMNA OFICIAL")
+    lines.append(f"visibles={vis}/6")
+    lines.append(f"oficiales={closed_count}/{expected_count}")
+    lines.append(f"no_cuentan={no_cuentan}")
+    lines.append(f"motivo={'+'.join(motivo_hist)}")
     dq_txt = str(summary.get("data_quality", "missing") or "").strip().lower()
     parcial_txt = str(summary.get("partial_pattern", "0V0X") or "0V0X").strip().upper()
     columna_lista = bool(closed_count >= expected_count and faltan_count <= 0 and dq_txt == "ok")
     if fresh_count < expected_count:
-        lines.append(f"⏳ Aún no se evalúa REAL: round_live_preboot_no_cuenta | faltan={expected_count-fresh_count}")
+        lines.append("⏳ REAL NO EVALUADO:")
+        lines.append(f"   columna_oficial={closed_count}/{expected_count}")
+        lines.append(f"   visibles_no_contables={fresh_count}/{expected_count}")
+        lines.append("   motivo=preboot_o_ronda_no_valida")
+    if bool(summary.get("round_drift", False)):
+        lines.append("⚠️ ROUND DRIFT:")
+        lines.append(f"   ronda_objetivo={obj_round}")
+        lines.append(f"   ronda_liberada={released_round}")
+        lines.append("   acción=esperando ACK válidos de ronda oficial")
     elif bool(summary.get("has_expired_closed", False)):
         lines.append(f"⏳ Esperando cierre útil: {closed_count}/{expected_count} | expired={expired_count}")
     elif (not columna_lista) or parcial_txt == "0V0X":
@@ -6701,21 +6728,59 @@ def render_real_locks_panel():
     try:
         if not bool(globals().get("LXV_REAL_LOCKS_PANEL_ENABLE", True)):
             return []
+
+        W = 78
         p = globals().get("REAL_LOCKS_PANEL", {})
         locks = p.get("locks", {}) if isinstance(p, dict) else {}
-        def mk(v):
-            if v is True: return f"{Fore.GREEN}ON  {Fore.RESET}"
-            if v is False: return f"{Fore.RED}OFF {Fore.RESET}"
-            return f"{Fore.YELLOW}--  {Fore.RESET}"
+
+        def ctext(color, txt):
+            return f"{color}{txt}{Style.RESET_ALL}"
+
         def row(txt):
-            return f"║ {str(txt)[:36].ljust(36)} ║"
-        out = ["╔════════════════════════════════════════╗","║ 🔐 CANDADOS REAL LXV                  ║",
-               row(f"Ronda: {str(p.get('round_id') or '--')} | Bot: {str(p.get('bot') or '--')}"),
-               row(f"Patrón: {str(p.get('patron') or '--')} | Zona: {str(p.get('zona') or '--')}"),
-               "╠════════════════════════════════════════╣"]
-        for name in list(globals().get("LXV_REAL_REQUIRED_LOCKS", [])) + ["ORDEN_REAL_OK"]:
-            out.append(row(f"{name:<20} [ {mk(locks.get(name))}]"))
+            body = str(txt)[:W-4]
+            return "║ " + body.ljust(W-4) + " ║"
+
+        def estado_lock(v):
+            if v is True:
+                return Fore.GREEN + "✅ ON " + Style.RESET_ALL
+            if v is False:
+                return Fore.RED + "❌ OFF" + Style.RESET_ALL
+            return Fore.YELLOW + "⚪ -- " + Style.RESET_ALL
+
+        def trunc(v, n=48):
+            t = str(v or "--")
+            return t if len(t) <= n else (t[:max(0, n-1)] + "…")
+
         res_ok = bool(p.get("ready_pre_real", False))
+        falta = str(p.get("falta_principal") or "---")
+
+        out = [
+            "╔" + "═"*(W-2) + "╗",
+            row(ctext(Fore.CYAN, "🔐 CANDADOS REAL LXV")),
+            row(f"Ronda: {str(p.get('round_id') or '--')} | Bot: {str(p.get('bot') or '--')}"),
+            row(f"Patrón: {str(p.get('patron') or '--')} | Zona: {str(p.get('zona') or '--')}"),
+            "╠" + "═"*(W-2) + "╣",
+            row(ctext(Fore.WHITE, f"BLOQUEO PRINCIPAL: {falta}")),
+            row(ctext(Fore.GREEN if res_ok else Fore.RED, ("ESTADO FINAL: ✅ LISTO PARA REAL" if res_ok else f"ESTADO FINAL: ⛔ BLOQUEADO POR {falta}"))),
+            "╠" + "═"*(W-2) + "╣",
+        ]
+
+        groups = [
+            (Fore.CYAN, "🔵 SINCRONIZACIÓN", ["REAL_CLOSE_LIBRE", "COLUMNA_COMPLETA", "DATA_QUALITY_OK"]),
+            (Fore.YELLOW, "🟡 PATRÓN", ["PATRON_VALIDO", "CANDIDATO_VALIDO"]),
+            (Fore.MAGENTA, "🟣 ZONA", ["ZONA_OK"]),
+            (Fore.GREEN, "🟢 EJECUCIÓN", ["NO_DUPLICADO_RONDA", "TOKEN_REAL_LIBRE", "ORDEN_REAL_OK"]),
+        ]
+        for color, title, names in groups:
+            out.append(row(ctext(color, title)))
+            for name in names:
+                if name == "ORDEN_REAL_OK":
+                    color_row = Fore.GREEN if locks.get(name) is True else (Fore.RED if locks.get(name) is False else Fore.YELLOW)
+                else:
+                    color_row = Fore.WHITE
+                out.append(row(ctext(color_row, f"  {name:<22} {estado_lock(locks.get(name))}")))
+            out.append(row(""))
+
         diag_txt = str(p.get("diag_visual") or "")
         if (not diag_txt) and (not res_ok):
             diag_txt = _diagnostico_candados_lxv(
@@ -6729,19 +6794,19 @@ def render_real_locks_panel():
                 motivo=str(p.get("motivo") or "--"),
                 real="sí" if bool(p.get("ready_pre_real", False)) else "no",
             )
-        diag1 = diag_txt
-        diag2 = ""
-        if (not res_ok) and (" | " in str(diag_txt)):
-            parts = str(diag_txt).split(" | ")
-            diag1 = " | ".join(parts[:2])
-            diag2 = " | ".join(parts[2:])
-        out += ["╠════════════════════════════════════════╣",
-                row(f"RESULTADO: {'✅ LISTO PARA REAL' if res_ok else '⛔ BLOQUEADO'}"),
-                row(f"FALTA: {str(p.get('falta_principal') or '---')}"),
-                row(f"DIAG 1: {diag1 or '---'}")]
-        if diag2:
-            out.append(row(f"DIAG 2: {diag2}"))
-        out.append("╚════════════════════════════════════════╝")
+        out += [
+            "╠" + "═"*(W-2) + "╣",
+            row(ctext(Fore.WHITE, "Motivo:")),
+            row(ctext(Fore.LIGHTBLACK_EX, f"- dq={trunc(p.get('data_quality', p.get('dq', '--')), 60)}")),
+            row(ctext(Fore.LIGHTBLACK_EX, f"- patrón={trunc(p.get('patron', '--'), 60)}")),
+            row(ctext(Fore.LIGHTBLACK_EX, f"- zona={trunc(p.get('zona', '--'), 60)}")),
+            row(ctext(Fore.LIGHTBLACK_EX, f"- bot={trunc(p.get('bot', '--'), 60)}")),
+            row(ctext(Fore.LIGHTBLACK_EX, f"- cerrados={int(p.get('closed_count', p.get('cerrados', 0)) or 0)}/{int(p.get('expected_count', p.get('esperados', 6)) or 6)}")),
+        ]
+        if diag_txt:
+            out.append(row(ctext(Fore.WHITE, f"diag={trunc(diag_txt, 70)}")))
+
+        out.append("╚" + "═"*(W-2) + "╝")
         return out
     except Exception:
         return []
