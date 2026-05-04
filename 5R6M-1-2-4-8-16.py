@@ -4703,15 +4703,25 @@ def _ack_live_format_lines(snapshot):
         motivo_hist.append("stale")
     if not motivo_hist:
         motivo_hist.append("missing" if fresh_count < expected_count else "ok")
+    dq_txt = str(summary.get("data_quality", "missing") or "").strip().lower()
     if vis == int(closed_count) and int(no_cuentan) == 0:
         lines.append(f"COLUMNA OFICIAL: {closed_count}/{expected_count} | dq={summary.get('data_quality', 'missing')} | esperando bots")
     else:
-        lines.append("HISTORIAL VISUAL ≠ COLUMNA OFICIAL")
+        if vis == int(closed_count) and int(closed_count) >= int(expected_count) and int(no_cuentan) > 0:
+            lines.append(f"HISTORIAL VISUAL = {vis}/{expected_count}, pero ACKs no frescos")
+        else:
+            lines.append("HISTORIAL VISUAL ≠ COLUMNA OFICIAL")
         lines.append(f"visibles={vis}/6")
         lines.append(f"oficiales={closed_count}/{expected_count}")
         lines.append(f"no_cuentan={no_cuentan}")
         lines.append(f"motivo={'+'.join(motivo_hist)}")
-    dq_txt = str(summary.get("data_quality", "missing") or "").strip().lower()
+    if dq_txt == "closed_expired":
+        min_lag_s = summary.get("min_lag_s", None)
+        max_lag_s = summary.get("max_lag_s", None)
+        exp_cnt = int(summary.get("expired_count", 0) or 0)
+        min_txt = f"{int(max(0.0, float(min_lag_s)))}s" if isinstance(min_lag_s, (int, float)) else "--"
+        max_txt = f"{int(max(0.0, float(max_lag_s)))}s" if isinstance(max_lag_s, (int, float)) else "--"
+        lines.append(f"FRESCURA ACK: expired={exp_cnt}/{expected_count} | max_age={max_txt} | min_age={min_txt} | motivo=closed_expired")
     parcial_txt = str(summary.get("partial_pattern", "0V0X") or "0V0X").strip().upper()
     columna_lista = bool(closed_count >= expected_count and faltan_count <= 0 and dq_txt == "ok")
     if fresh_count < expected_count:
@@ -6835,7 +6845,25 @@ def render_ack_audit_panel(round_id_objetivo=None):
             motivos[m] = motivos.get(m, 0) + 1
             if not bool(d.get('cuenta', False)):
                 faltan.append(b)
+        ok_n = expired_n = stale_n = mismatch_n = missing_n = 0
+        max_age_s = 0
         for d in rows[:6]:
+            mot = str(d.get('motivo', 'missing') or 'missing')
+            age_raw = str(d.get('age_s', '--') or '--').strip().lower()
+            age_num = 0
+            if age_raw.endswith('s') and age_raw[:-1].strip().isdigit():
+                age_num = int(age_raw[:-1].strip() or 0)
+            max_age_s = max(max_age_s, age_num)
+            if bool(d.get('cuenta', False)) and mot == 'ok':
+                ok_n += 1
+            elif mot == 'expired':
+                expired_n += 1
+            elif mot == 'round_mismatch':
+                mismatch_n += 1
+            elif mot in ('stale', 'preboot', 'no_result', 'invalid_result', 'session_mismatch'):
+                stale_n += 1
+            else:
+                missing_n += 1
             lines.append(f"{str(d.get('bot','--')):<7} {str(d.get('ack_round','--')):<9} {str(d.get('result','--')):<4} {str(d.get('age_s','--')):<5} {'SI' if d.get('cuenta') else 'NO':<6} {str(d.get('motivo','--'))}")
         rs = globals().get('_SYNC_ROUND_STATE', {}) if isinstance(globals().get('_SYNC_ROUND_STATE', {}), dict) else {}
         rel = int(rs.get('released_round', 0) or 0)
@@ -6844,6 +6872,7 @@ def render_ack_audit_panel(round_id_objetivo=None):
         if _print_once(f"ack_audit:{rid}:summary", ttl=12.0):
             mot_txt = ','.join(f"{k}:{v}" for k,v in sorted(motivos.items()))
             agregar_evento(f"ACK AUDIT #{rid}: {cerr}/{exp} válidos | faltan={','.join(faltan)} | motivos={mot_txt}")
+        lines.append(f"resumen: ok={ok_n} expired={expired_n} stale={stale_n} mismatch={mismatch_n} missing={missing_n} max_age={max_age_s}s")
         return lines[:10]
     except Exception:
         return lines
@@ -21117,12 +21146,49 @@ def mostrar_panel():
     mostrar_ack_live()
     try:
         rs_ack = _hud_round_summary_safe()
-        round_id_ack = rs_ack.get("round_id")
     except Exception:
         rs_ack = {}
-        round_id_ack = None
-    if round_id_ack in ("--", "", None):
-        round_id_ack = globals().get("ROUND_LIVE_CURRENT_ID", None)
+    round_live_id = None
+    try:
+        round_live_id = int((globals().get("ROUND_LIVE_CURRENT_ID", None) or 0))
+    except Exception:
+        round_live_id = None
+    if not isinstance(round_live_id, int) or round_live_id <= 0:
+        round_live_id = None
+    ack_live_summary = globals().get("_ACK_LIVE_SUMMARY", None)
+    ack_summary_id = None
+    if isinstance(ack_live_summary, dict):
+        try:
+            ack_summary_id = int(ack_live_summary.get("round_id", 0) or 0)
+        except Exception:
+            ack_summary_id = None
+        if not isinstance(ack_summary_id, int) or ack_summary_id <= 0:
+            ack_summary_id = None
+    hud_summary_id = None
+    try:
+        hud_summary_id = int(rs_ack.get("round_id", 0) or 0) if isinstance(rs_ack, dict) else None
+    except Exception:
+        hud_summary_id = None
+    if not isinstance(hud_summary_id, int) or hud_summary_id <= 0:
+        hud_summary_id = None
+    release_id = None
+    try:
+        release_state = globals().get("REAL_LOCKS_PANEL", None)
+        if isinstance(release_state, dict):
+            release_id = int(release_state.get("round_id", 0) or 0)
+    except Exception:
+        release_id = None
+    if not isinstance(release_id, int) or release_id <= 0:
+        release_id = None
+    round_id_ack = round_live_id or ack_summary_id or hud_summary_id
+    if round_id_ack is None and release_id is not None and (round_live_id is None or release_id == round_live_id):
+        round_id_ack = release_id
+    if round_id_ack is None and release_id is not None and round_live_id is None:
+        round_id_ack = release_id
+    if round_live_id is not None and round_id_ack is not None and int(round_id_ack) != int(round_live_id):
+        if _print_once(f"ack_audit_round_fix:{round_live_id}:{round_id_ack}", ttl=12.0) or bool(globals().get("HUD_DEBUG_VERBOSE_PANEL", False)):
+            print(f"⚠️ ACK AUDIT ROUND_FIX: audit={round_id_ack} live={round_live_id} usando live")
+        round_id_ack = round_live_id
     try:
         panel_ack = render_ack_audit_panel(round_id_objetivo=round_id_ack)
         if panel_ack:
