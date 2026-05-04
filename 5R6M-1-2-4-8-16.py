@@ -7939,14 +7939,25 @@ def detectar_zona_lxv_v3(rows=None, expected=6):
             out.update({"zona_macro":"VERDE_ABUNDANTE","subzona":"VERDE_FINAL","allow_real_v3":False,"motivo_v3":"verde_final_perdiendo_fuerza"}); return out
         if prom8 < 0.45 and prom20 < 0.50:
             out.update({"zona_macro":"ROJA_POBRE","subzona":"ROJO_MADURO","allow_real_v3":False,"motivo_v3":"rojo_maduro_promedios"}); return out
-        if prom3 < prom8 and rojas_actuales >= 3:
+        recent_window = norm[-3:] if len(norm) >= 3 else list(norm)
+        recent_green_seq = [int(x.get("n_verdes", 0) or 0) for x in recent_window]
+        primer_verde_reciente = int(recent_green_seq[0]) if recent_green_seq else verdes_actuales
+        ultimo_verde = int(recent_green_seq[-1]) if recent_green_seq else verdes_actuales
+        alternancia_reciente_alta = False
+        if len(recent_green_seq) >= 4:
+            try:
+                cambios = sum(1 for i in range(1, len(recent_green_seq)) if recent_green_seq[i] != recent_green_seq[i - 1])
+                alternancia_reciente_alta = bool(cambios >= 3)
+            except Exception:
+                alternancia_reciente_alta = False
+        if rojas_actuales >= 4 and g_col <= 0.50 and (ultimo_verde < primer_verde_reciente or verdes_actuales <= 2):
             out.update({"zona_macro":"ROJA_POBRE","subzona":"ROJA_TEMPRANO","allow_real_v3":False,"motivo_v3":"roja_temprano_presion"}); return out
-        if g_col >= 0.66 and prom3 >= 0.55 and 0.50 <= prom8 <= 0.88 and d38 >= -0.05 and prev_full < 3 and rojas_actuales <= 2:
-            out.update({"zona_macro":"VERDE_ABUNDANTE","subzona":"VERDE_MADURO_SANO","allow_real_v3":True,"motivo_v3":"verde_maduro_sano"}); return out
-        if g_col >= 0.50 and prom3 >= 0.45 and 0.45 <= prom8 <= 0.70 and d38 >= -0.03 and prev_full < 2:
+        if g_col >= 0.50 and prom3 >= 0.45 and 0.45 <= prom8 <= 0.70 and d38 >= -0.03 and prev_full < 2 and (len(norm) <= 4 or prom8 < 0.60):
             out.update({"zona_macro":"VERDE_ABUNDANTE","subzona":"VERDE_TEMPRANO","allow_real_v3":True,"motivo_v3":"verde_temprano"}); return out
-        if 0.50 <= prom8 <= 0.88 and 0.50 <= g_col <= 0.66 and rojas_actuales <= 3 and d38 >= -0.06:
+        if 0.50 <= prom8 <= 0.88 and 0.50 <= g_col <= 0.66 and rojas_actuales <= 3 and d38 >= -0.06 and (red_pressure or rojas_actuales == 2 or alternancia_reciente_alta):
             out.update({"zona_macro":"VERDE_ABUNDANTE","subzona":"VERDE_MADURO_CON_RUIDO","allow_real_v3":False,"motivo_v3":"verde_con_ruido_observar"}); return out
+        if g_col >= 0.66 and prom3 >= 0.55 and 0.50 <= prom8 <= 0.88 and d38 >= -0.05 and prev_full < 3 and rojas_actuales <= 2 and (not red_pressure):
+            out.update({"zona_macro":"VERDE_ABUNDANTE","subzona":"VERDE_MADURO_SANO","allow_real_v3":True,"motivo_v3":"verde_maduro_sano"}); return out
         out.update({"zona_macro":"MIXTA","subzona":"NEUTRO","allow_real_v3":False,"motivo_v3":"sin_match_v3"})
         return out
     except Exception as e:
