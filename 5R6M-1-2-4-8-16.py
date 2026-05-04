@@ -263,6 +263,16 @@ HUD_TABLE_COMPACT_WIDTH = True
 HUD_SIDE_PANEL_INLINE = True
 HUD_SHOW_SALDO_DEBUG = False
 HUD_EVENT_MAX_CHARS = 150
+HUD_ULTRA_COMPACT_MODE = True
+HUD_DEBUG_VERBOSE_PANEL = False
+HUD_SHOW_LONG_ZONE_LINE = False
+HUD_SHOW_FULL_LOCKS_PANEL = False
+HUD_SHOW_FULL_LXV_PANEL = False
+HUD_SHOW_EVENTS_ANTERIORES = False
+HUD_BOT_HISTORY_COMPACT_LEN = 24
+HUD_MAX_EVENT_LINES_COMPACT = 2
+HUD_PANEL_WIDTH_COMPACT = 118
+HUD_COMPACT_MAX_LINES_TARGET = 30
 HUD_EVENTS_CURRENT_ROUND_ONLY = True
 HUD_SHOW_CONTROL_PANEL = False
 HUD_MARTI_CLEAN_LAYOUT = True
@@ -19584,6 +19594,144 @@ def mostrar_ia_resumen_compacto():
         print(Fore.CYAN + "IA RESUMEN | AUC=N/A | Thr=-- | Conf=-- | Warmup=-- | Cierres=--")
 
 
+
+
+def _hud_color_estado(txt, estado):
+    try:
+        t = str(txt or "--")
+        e = str(estado or "").lower()
+        if "fore" not in globals():
+            return t
+        if e in ("ok", "si", "yes", "true", "1"):
+            return f"{Fore.GREEN}{t}{Style.RESET_ALL}"
+        if e in ("warn", "aviso", "pending"):
+            return f"{Fore.YELLOW}{t}{Style.RESET_ALL}"
+        if e in ("no", "false", "0", "error", "bloq", "block"):
+            return f"{Fore.RED}{t}{Style.RESET_ALL}"
+        return t
+    except Exception:
+        return str(txt or "--")
+
+
+def _hud_trim(txt, max_len):
+    try:
+        t = str(txt or "--")
+        n = max(1, int(max_len or 1))
+        return t if len(t) <= n else (t[: max(0, n - 1)] + "…")
+    except Exception:
+        return "--"
+
+
+def _hud_lock_icon(value):
+    try:
+        if value is True:
+            return "✅"
+        if value is False:
+            return "❌"
+        return "⚪"
+    except Exception:
+        return "⚪"
+
+
+def _hud_safe_get(d, key, default="--"):
+    try:
+        return d.get(key, default) if isinstance(d, dict) else default
+    except Exception:
+        return default
+
+
+def render_real_locks_compact_line():
+    try:
+        lk = dict((globals().get("REAL_LOCKS_PANEL", {}) or {}).get("locks", {}) or {})
+        mapa = [("REAL_CLOSE_LIBRE", "RC"), ("COLUMNA_COMPLETA", "COL"), ("DATA_QUALITY_OK", "DQ"), ("PATRON_VALIDO", "PAT"), ("CANDIDATO_VALIDO", "CAND"), ("ZONA_OK", "ZONA"), ("NO_DUPLICADO_RONDA", "DUP"), ("TOKEN_REAL_LIBRE", "TOK"), ("ORDEN_REAL_OK", "ORD")]
+        return "Locks: " + " ".join([f"{k}{_hud_lock_icon(lk.get(src, None))}" for src, k in mapa])
+    except Exception:
+        return "Locks: RC⚪ COL⚪ DQ⚪ PAT⚪ CAND⚪ ZONA⚪ DUP⚪ TOK⚪ ORD⚪"
+
+
+def render_zona_compacta():
+    try:
+        info = obtener_zona_lxv_hud_actual() or {}
+        zf = resolver_zona_final_lxv(round_id_objetivo=info.get("round_id"), zona_info_previa=info)
+        z = _hud_safe_get(zf, "zona_base", "UNKNOWN")
+        d = _hud_safe_get(zf, "decision", "ESPERANDO_COLUMNA")
+        m = _hud_safe_get(zf, "motivo", "--")
+        vis = _extraer_zona_visual_lxv(info) or "SOLO_DIAG"
+        if "SOLO" not in str(vis).upper() and str(vis).upper() in ("", "--", "MIXTO_O_INSUFICIENTE"):
+            vis = "SOLO_DIAG"
+        real = "SI" if bool(_hud_safe_get(zf, "allow_real", False)) else "NO"
+        return f"Zona: OFICIAL={z} | DEC={d} | VISUAL={vis} | REAL={real} | motivo={m}"
+    except Exception:
+        return "Zona: OFICIAL=-- | DEC=-- | VISUAL=SOLO_DIAG | REAL=NO | motivo=--"
+
+
+def render_bots_compacto():
+    rows=[]
+    try:
+        order=list(BOT_NAMES)
+        real_bot = REAL_OWNER_LOCK if REAL_OWNER_LOCK in order else next((b for b in order if str(estado_bots.get(b,{}).get("token","DEMO")).upper().startswith("REAL")), None)
+        if real_bot in order:
+            order=[real_bot]+[b for b in order if b!=real_bot]
+        for b in order:
+            st=estado_bots.get(b,{})
+            tk=str(st.get("token","DEMO") or "DEMO").upper()
+            p=st.get("prob_ia",None)
+            ptxt="--" if not isinstance(p,(int,float)) else f"{float(p)*100:.1f}%"
+            modo=f"{str(st.get('modo_ia','OFF')).upper()} S{int(st.get('step',st.get('ciclo_actual',1)) or 1)}"
+            hist=''.join([str(x) for x in list(st.get('historial',[]) or [])])
+            hist=_hud_trim(hist if hist else '·'*int(HUD_BOT_HISTORY_COMPACT_LEN), int(HUD_BOT_HISTORY_COMPACT_LEN))
+            g=int(st.get('ganadas',0) or 0); pdd=int(st.get('perdidas',0) or 0)
+            rend = ""
+            if (g+pdd)>0:
+                pct=(g*100.0/max(1,g+pdd))
+                rend=f" | {g}/{pdd} {pct:.0f}%"
+            rows.append(_hud_trim(f"{b:<7} {tk:<4} {ptxt:<6} {modo:<8} {hist}{rend}", 54))
+        return rows
+    except Exception:
+        return ["bots: --"]
+
+
+def render_decision_real_compacta():
+    try:
+        ss=dict(globals().get('_ACK_LIVE_SUMMARY',{}) or {})
+        lk=dict((globals().get('REAL_LOCKS_PANEL',{}) or {}).get('locks',{}) or {})
+        rid=int(ss.get('round_id',0) or 0); cc=int(ss.get('closed_count',0) or 0); ex=int(ss.get('expected_count',len(BOT_NAMES)) or len(BOT_NAMES))
+        dq=str(ss.get('data_quality','missing') or 'missing'); patron=str(ss.get('partial_pattern','0V0X') or '0V0X')
+        cand=diagnosticar_candado_bloqueante_lxv(lk, ss)
+        estado=f"⛔ BLOQ {cand}" if cand!='DESCONOCIDO' else "✅ OK"
+        zline=render_zona_compacta()
+        return [f"Estado : {estado}", f"Ronda  : #{rid} | cerrados {cc}/{ex} | dq={dq} | patrón={patron}", zline.replace('Zona: ','Zona   : '), render_real_locks_compact_line().replace('Locks: ','Locks  : '), f"Motivo : {str(ss.get('reason', ss.get('missing_reason', '--')))}"]
+    except Exception:
+        return ["Estado : --", "Ronda  : --", "Zona   : --", "Locks  : --", "Motivo : --"]
+
+
+def render_hud_ultra_compacto(valor_saldo=None, saldo_str="--", meta_str="--"):
+    w=int(globals().get('HUD_PANEL_WIDTH_COMPACT',118) or 118)
+    inw=max(20,w-2)
+    def box(t):
+        return f"║ {_hud_trim(t, inw-2).ljust(inw-2)} ║"
+    try:
+        meta_num=float(META) if isinstance(globals().get('META'),(int,float)) else None
+        saldo_num=float(valor_saldo) if isinstance(valor_saldo,(int,float)) else None
+        falta='--' if (meta_num is None or saldo_num is None) else f"{max(0.0,meta_num-saldo_num):.2f}"
+        tok=leer_token_actual() if callable(globals().get('leer_token_actual')) else None
+        tok_txt='DEMO' if tok in (None,'none','') else 'REAL'
+        real_on='SI' if hay_real_activo_global()[0] else 'NO'
+        ss=dict(globals().get('_ACK_LIVE_SUMMARY',{}) or {})
+        head=f"SALDO {saldo_str} | META {meta_str} | FALTA {falta} | TOKEN {tok_txt} | REAL {real_on} | C{ciclo_martingala_actual()}→C{ciclo_martingala_siguiente()} | R#{int(ss.get('round_id',0) or 0)} {int(ss.get('closed_count',0) or 0)}/{int(ss.get('expected_count',len(BOT_NAMES)) or len(BOT_NAMES))} {str(ss.get('partial_pattern','0V0X'))}"
+        bots=render_bots_compacto()
+        dec=render_decision_real_compacta()
+        lines=["╔"+"═"*inw+"╗", box(head), "╠"+"═"*inw+"╣", box("BOTS"), *[box("  "+b) for b in bots[:len(BOT_NAMES)]], box("DECISIÓN REAL"), *[box("  "+d) for d in dec]]
+        ev=list(eventos_recientes)[-int(globals().get('HUD_MAX_EVENT_LINES_COMPACT',2) or 2):] if 'eventos_recientes' in globals() else []
+        lines.append(box(_hud_trim(f"IA {mostrar_ia_resumen_compacto.__name__ if False else 'AUC/Thr/Conf en modo compacto'}", inw-2)))
+        for e in ev:
+            lines.append(box(f"Evento: {_hud_trim(e, inw-10)}"))
+        lines.append("╚"+"═"*inw+"╝")
+        return lines[:max(10,int(globals().get('HUD_COMPACT_MAX_LINES_TARGET',30) or 30))]
+    except Exception:
+        raise
+
+
 def mostrar_panel_lateral_compacto():
     if not bool(globals().get("HUD_SHOW_CONTROL_PANEL", False)):
         return []
@@ -19857,6 +20005,18 @@ def mostrar_panel():
         meta_str = f"{float(META):.2f}" if META is not None else "--"
     except Exception:
         meta_str = "--"
+
+
+    if bool(globals().get("HUD_ULTRA_COMPACT_MODE", True)):
+        try:
+            compact_lines = list(render_hud_ultra_compacto(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str) or [])
+            for line in compact_lines:
+                print(line)
+            if bool(globals().get("HUD_DEBUG_VERBOSE_PANEL", False)):
+                print(f"HUD lines={len(compact_lines)}")
+            return
+        except Exception as e:
+            agregar_evento(f"⚠️ HUD compacto falló: {type(e).__name__}; usando HUD clásico")
 
     if not bool(globals().get("HUD_MINIMAL_MODE", True)):
         print(padding + Fore.GREEN + f"💰 SALDO INICIAL {inicial_str} 🎯 META {meta_str}")
