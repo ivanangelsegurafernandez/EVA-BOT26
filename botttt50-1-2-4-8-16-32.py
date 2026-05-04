@@ -452,6 +452,28 @@ def _sync_round_write_release_heartbeat(round_id: int, next_round: int):
     _sync_round_write_json_atomic(path, payload)
 
 
+
+
+def _sync_round_write_recovery_request(bot, round_id, next_round, released, reason, any_real_active=False, any_real_owner="", any_real_reason="") -> bool:
+    try:
+        req_dir = os.path.join(SYNC_ROUND_DIR, "recovery_requests")
+        os.makedirs(req_dir, exist_ok=True)
+        path = os.path.join(req_dir, f"{str(bot or NOMBRE_BOT)}.json")
+        payload = {
+            "bot": str(bot or NOMBRE_BOT),
+            "round_id": int(round_id),
+            "next_round": int(next_round),
+            "released": int(released),
+            "reason": str(reason or ""),
+            "ts": time.time(),
+            "any_real_active": bool(any_real_active),
+            "any_real_owner": str(any_real_owner or ""),
+            "any_real_reason": str(any_real_reason or ""),
+        }
+        return _sync_round_write_json_atomic(path, payload)
+    except Exception:
+        return False
+
 def _sync_any_real_owner_active() -> tuple[bool, str, str]:
     """
     Devuelve (True, owner_bot, motivo) si hay REAL global activo o pendiente.
@@ -740,10 +762,34 @@ async def _sync_round_wait_release(round_id: int) -> int:
                 last_progress_ts = now_ts
                 await asyncio.sleep(1.0)
                 continue
-            print(Fore.YELLOW + Style.BRIGHT + f"🟨 LXV_SYNC_COLUMN escape DEMO seguro: {NOMBRE_BOT} sale de standby por timeout visual, sin REAL global activo.")
+            if released < next_round:
+                _sync_round_write_recovery_request(
+                    bot=NOMBRE_BOT,
+                    round_id=rid,
+                    next_round=next_round,
+                    released=released,
+                    reason="demo_wait_timeout_no_release",
+                    any_real_active=any_real_active,
+                    any_real_owner=any_real_owner,
+                    any_real_reason=any_real_reason,
+                )
+                if (now_ts - last_global_hold_print_ts) >= 10.0:
+                    print(
+                        Fore.YELLOW + Style.BRIGHT +
+                        f"⏳ SYNC DEMO HOLD RECOVERY:\n"
+                        f"{NOMBRE_BOT} espera released_round >= {next_round};\n"
+                        f"actual={released};\n"
+                        f"recovery_request=SI;\n"
+                        f"real_global={'SI' if any_real_active else 'NO'};\n"
+                        f"owner={any_real_owner or '--'};\n"
+                        f"no compra DEMO."
+                    )
+                    last_global_hold_print_ts = now_ts
+                last_progress_ts = now_ts
+                first_wait_tick = True
+                await asyncio.sleep(1.0)
+                continue
             estado_bot["sync_wait"] = False
-            if "sync_wait_round" in estado_bot:
-                estado_bot["sync_wait_round"] = None
             try:
                 _sync_round_write_release_heartbeat(rid, next_round)
             except Exception:
