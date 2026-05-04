@@ -8660,6 +8660,76 @@ def _sync_round_resolver_ronda_canonica(closed_current, reasons_current, target_
         reason = "missing"
     return {"ok": False, "reason": reason, "best_round": int(best_round), "best_closed": int(max(0, best_closed))}
 
+def _sync_round_detect_future_ack_consensus(current_round=None, expected=None, max_ahead=3):
+    expected_bots = [b for b in (expected if isinstance(expected, list) and expected else BOT_NAMES) if b in BOT_NAMES]
+    if not expected_bots:
+        expected_bots = list(BOT_NAMES)
+    expected_count = len(expected_bots)
+    now_ts = float(time.time())
+    try:
+        current_round = int(current_round or 0)
+    except Exception:
+        current_round = 0
+    valid_by_round, expired_by_round = {}, {}
+    for bot in expected_bots:
+        ack = _sync_round_safe_read_json(_sync_round_ack_path(bot))
+        if not isinstance(ack, dict):
+            continue
+        try:
+            ack_round = int(ack.get("round_id", 0) or 0)
+        except Exception:
+            ack_round = 0
+        if ack_round <= 0:
+            continue
+        if current_round > 0 and ack_round <= current_round:
+            continue
+        if current_round > 0 and max_ahead and ack_round > (current_round + int(max_ahead)):
+            continue
+        status = str(ack.get("status", "")).strip().lower()
+        if status != "closed":
+            continue
+        res = str(ack.get("resultado", "") or "").strip().upper()
+        if res in ("PERDIDA", "PÉRDIDA", "LOSS", "X", "✗"):
+            res = "PÉRDIDA"
+        elif res in ("GANANCIA", "WIN", "✓"):
+            res = "GANANCIA"
+        if res not in ("GANANCIA", "PÉRDIDA"):
+            continue
+        mode = str(ack.get("mode", "") or "").strip().upper()
+        source = str(ack.get("source", "") or "").strip().upper()
+        if mode == "REAL" or source in ("ORDEN_REAL", "REAL", "REAL_ORDER"):
+            continue
+        try:
+            ack_ts = float(ack.get("ts", 0.0) or 0.0)
+        except Exception:
+            ack_ts = 0.0
+        if ack_ts <= 0:
+            continue
+        age = now_ts - ack_ts
+        item = {"resultado": res, "ts": ack_ts, "age_s": age, "contract_id": ack.get("contract_id"), "asset": ack.get("asset"), "ciclo": ack.get("ciclo")}
+        if age > float(TTL_ACK_SYNC_ROUND_S):
+            expired_by_round.setdefault(ack_round, {})[bot] = dict(item)
+            continue
+        valid_by_round.setdefault(ack_round, {})[bot] = dict(item)
+    best = {"ok": False, "future_round": 0, "closed_count": 0, "expected_count": expected_count, "bots_ok": [], "bots_missing": list(expected_bots), "closed": {}, "pattern": "0V0X", "data_quality": "missing", "reason": "no_future_consensus", "ahead_count": 0}
+    for rr in sorted(set(list(valid_by_round.keys()) + list(expired_by_round.keys()))):
+        valid = dict(valid_by_round.get(rr, {}))
+        expired = dict(expired_by_round.get(rr, {}))
+        closed_count = len(valid)
+        expired_count = len(expired)
+        dq = "ok" if closed_count >= expected_count else ("partial" if closed_count > 0 else "missing")
+        p = _sync_round_build_canonical_summary(rr, valid, expected=expected_bots, source="ROUND_DRIFT_AHEAD_SCAN")
+        bots_ok = [b for b in expected_bots if b in valid]
+        bots_missing = [b for b in expected_bots if b not in valid]
+        candidate = {"ok": bool(closed_count >= expected_count and expired_count <= 0), "future_round": int(rr), "closed_count": int(closed_count), "expected_count": int(expected_count), "bots_ok": bots_ok, "bots_missing": bots_missing, "closed": valid, "pattern": _lxv_normalizar_patron_txt(p.get("partial_pattern", "")) or "0V0X", "data_quality": dq, "reason": "future_full_consensus" if (closed_count >= expected_count and expired_count <= 0) else ("future_partial_consensus" if closed_count > 0 else "no_future_consensus"), "ahead_count": int(closed_count), "expired_count": int(expired_count), "max_age": p.get("max_lag_s")}
+        if expired_count > 0 and (closed_count + expired_count) >= expected_count:
+            candidate["reason"] = "future_expired_consensus"
+        if candidate["ok"]:
+            return candidate
+        if (candidate["closed_count"] > best["closed_count"]) or (candidate["closed_count"] == best["closed_count"] and candidate["future_round"] > 0 and (best["future_round"] <= 0 or candidate["future_round"] < best["future_round"])):
+            best = candidate
+    return best
+
 def _sync_round_pending_blocks_real_only(pending_on: bool) -> bool:
     return bool(pending_on)
 
@@ -8938,6 +9008,34 @@ def _sync_round_tick_maestro():
             msg=f"⚠️ SYNC sigue esperando #{round_id}: faltan={missing} motivos={miss_short}",
             cooldown_s=10.0,
         )
+    round_drift_future = _sync_round_detect_future_ack_consensus(current_round=round_id, expected=BOT_NAMES, max_ahead=3) or {}
+    old_round_id = int(round_id)
+    if int(round_drift_future.get("future_round", 0) or 0) > int(old_round_id):
+        future_status = "FUTURE_FULL" if bool(round_drift_future.get("ok")) else ("FUTURE_PARTIAL" if int(round_drift_future.get("closed_count", 0) or 0) >= (len(BOT_NAMES) - 1) else "FUTURE_WAIT")
+        agregar_evento(
+            f"🧾 ACK AUDIT ROUND_DRIFT: current_round={old_round_id} future_round={int(round_drift_future.get('future_round', 0) or 0)} "
+            f"ahead={int(round_drift_future.get('closed_count', 0) or 0)} status={future_status}"
+        )
+    if bool(round_drift_future.get("ok")) and int(round_drift_future.get("closed_count", 0) or 0) >= len(BOT_NAMES):
+        round_id = int(round_drift_future.get("future_round", round_id) or round_id)
+        closed = dict(round_drift_future.get("closed") or {})
+        sync_debug_missing = {b: ("ok" if b in closed else "ack_missing") for b in BOT_NAMES}
+        n_closed = len(closed)
+        missing = [b for b in BOT_NAMES if b not in closed]
+        completed = True
+        completed_normal = True
+        completed_failsafe = False
+        canonical = {"ok": True, "closed": dict(closed), "round_closed_eval": int(round_id), "reason": "ROUND_DRIFT_AHEAD_PROMOTED"}
+        agregar_evento(f"🧭 ROUND_DRIFT_AHEAD_PROMOTED: vieja=#{old_round_id} nueva=#{round_id} closed=6/6 patrón={round_drift_future.get('pattern','0V0X')} dq=ok")
+    elif int(round_drift_future.get("closed_count", 0) or 0) >= (len(BOT_NAMES) - 1):
+        ff = int(round_drift_future.get("future_round", 0) or 0)
+        faltante = ",".join(round_drift_future.get("bots_missing", [])[:2]) or "--"
+        agregar_evento(f"🧭 RONDA FUTURA EN FORMACIÓN: target_old={old_round_id} future={ff} closed={int(round_drift_future.get('closed_count',0) or 0)}/{len(BOT_NAMES)} faltante={faltante} reason=future_partial_consensus")
+    if str(round_drift_future.get("reason", "")) == "future_expired_consensus":
+        agregar_evento(
+            f"⚠️ ROUND_DRIFT_AHEAD_EXPIRED: future={int(round_drift_future.get('future_round',0) or 0)} "
+            f"expired={int(round_drift_future.get('expired_count',0) or 0)}/{len(BOT_NAMES)} max_age={round_drift_future.get('max_age')}"
+        )
     canonical_active = False
     canonical_summary = None
     if canonical and canonical.get("ok"):
@@ -8945,6 +9043,11 @@ def _sync_round_tick_maestro():
         round_id = int(canonical.get("round_closed_eval", round_id) or round_id)
         closed = dict(canonical.get("closed") or closed or {})
         canonical_summary = _sync_round_build_canonical_summary(round_id, closed, expected=BOT_NAMES, source=canonical.get("reason", "CANONICAL_ROUND"))
+        if str(canonical.get("reason", "")) == "ROUND_DRIFT_AHEAD_PROMOTED":
+            canonical_summary["canonical"] = True
+            canonical_summary["canonical_source"] = "ROUND_DRIFT_AHEAD_PROMOTED"
+            canonical_summary["drift_promoted"] = True
+            canonical_summary["previous_round"] = int(old_round_id)
         rows_pack = _ack_live_build_rows(obj_round_override=round_id, closed_override=closed)
         rows_pack["canonical"] = True
         rows_pack["summary_override"] = canonical_summary
@@ -9280,6 +9383,8 @@ def _sync_round_tick_maestro():
                     )
                     if _lxv_real_round_already_emitted(round_id):
                         motivo_no_emit = "lxv_duplicado"
+                        if bool(summary.get("drift_promoted")):
+                            agregar_evento("⛔ DUPLICADO_RONDA_PROMOVIDA_BLOQUEADO")
                         _lxv_5v1x_event_cooldown(
                             key=f"dup_emit:{round_id}",
                             msg=f"⛔ LXV duplicado evitado rid={int(round_id)}",
@@ -26523,3 +26628,38 @@ def _selftest_dq_visual_unico():
 
 if os.environ.get("RUN_DQ_VISUAL_UNICO_SELFTEST") == "1":
     _selftest_dq_visual_unico()
+
+def _selftest_round_drift_ahead_promotion():
+    original_read = globals().get("_sync_round_safe_read_json")
+    original_path = globals().get("_sync_round_ack_path")
+    original_ttl = float(globals().get("TTL_ACK_SYNC_ROUND_S", 300.0) or 300.0)
+    now = float(time.time())
+    try:
+        globals()["TTL_ACK_SYNC_ROUND_S"] = 300.0
+        def _mk(round_id, res="GANANCIA", age=5.0):
+            return {"round_id": int(round_id), "status": "closed", "resultado": res, "ts": now - float(age), "mode": "DEMO", "source": "SYNC_DEMO"}
+        def _run_case(data, current_round):
+            def _fake_path(bot): return bot
+            def _fake_read(path):
+                return dict(data.get(path, {})) if isinstance(data.get(path), dict) else None
+            globals()["_sync_round_ack_path"] = _fake_path
+            globals()["_sync_round_safe_read_json"] = _fake_read
+            return _sync_round_detect_future_ack_consensus(current_round=current_round, expected=list(BOT_NAMES), max_ahead=3)
+        data_a = {b: _mk(313, "GANANCIA" if i < 5 else "PÉRDIDA") for i, b in enumerate(BOT_NAMES)}
+        out_a = _run_case(data_a, 312); assert out_a.get("ok") and int(out_a.get("future_round", 0)) == 313 and int(out_a.get("closed_count", 0)) == 6 and str(out_a.get("pattern", "")) == "5V1X"
+        data_b = {b: _mk(315, "GANANCIA") for b in BOT_NAMES[:-1]}
+        out_b = _run_case(data_b, 314); assert int(out_b.get("closed_count", 0)) == 5 and str(out_b.get("data_quality", "")) == "partial"
+        data_c = {b: _mk(317, "GANANCIA") for b in BOT_NAMES}; data_c[BOT_NAMES[-1]] = _mk(317, "PÉRDIDA", age=600.0)
+        out_c = _run_case(data_c, 316); assert (not out_c.get("ok")) and str(out_c.get("reason", "")) in ("future_expired_consensus", "future_partial_consensus")
+        data_d = {b: _mk(319, "GANANCIA" if i < 4 else "PÉRDIDA") for i, b in enumerate(BOT_NAMES)}
+        out_d = _run_case(data_d, 318); assert int(out_d.get("future_round", 0)) == 319 and int(out_d.get("closed_count", 0)) == 6
+        data_e = {b: _mk(321, "GANANCIA" if i < 4 else "PÉRDIDA") for i, b in enumerate(BOT_NAMES)}
+        out_e = _run_case(data_e, 320); assert out_e.get("ok") and str(out_e.get("pattern", "")) == "4V2X"
+        print("SELFTEST ROUND_DRIFT_AHEAD_PROMOTION OK")
+    finally:
+        globals()["_sync_round_safe_read_json"] = original_read
+        globals()["_sync_round_ack_path"] = original_path
+        globals()["TTL_ACK_SYNC_ROUND_S"] = original_ttl
+
+if os.environ.get("RUN_ROUND_DRIFT_AHEAD_SELFTEST") == "1":
+    _selftest_round_drift_ahead_promotion()
