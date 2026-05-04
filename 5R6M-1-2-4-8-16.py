@@ -8730,6 +8730,64 @@ def _sync_round_detect_future_ack_consensus(current_round=None, expected=None, m
             best = candidate
     return best
 
+def _sync_round_precheck_future_ahead(current_round=None, expected=None):
+    expected_bots = [b for b in (expected if isinstance(expected, list) and expected else BOT_NAMES) if b in BOT_NAMES]
+    if not expected_bots:
+        expected_bots = list(BOT_NAMES)
+    expected_count = len(expected_bots)
+    out = {
+        "has_future": False, "promote_now": False, "future_round": 0,
+        "closed_count": 0, "expected_count": expected_count,
+        "fresh_count": 0, "expired_count": 0, "near_expired_count": 0,
+        "max_age": 0.0, "pattern": "0V0X", "data_quality": "missing",
+        "closed": {}, "bots_missing": list(expected_bots), "reason": "no_future_consensus",
+    }
+    cand = _sync_round_detect_future_ack_consensus(current_round=current_round, expected=expected_bots, max_ahead=3) or {}
+    future_round = int(cand.get("future_round", 0) or 0)
+    out["future_round"] = future_round
+    out["has_future"] = bool(future_round > int(current_round or 0))
+    if not out["has_future"]:
+        return out
+    closed = dict(cand.get("closed") or {})
+    closed_count = int(cand.get("closed_count", len(closed)) or len(closed))
+    expired_count = int(cand.get("expired_count", 0) or 0)
+    fresh_count = int(min(closed_count, expected_count))
+    near_expired_count = 0
+    max_age = 0.0
+    ttl = float(TTL_ACK_SYNC_ROUND_S)
+    for _bot, _ack in closed.items():
+        try:
+            age = float((_ack or {}).get("age_s", 0.0) or 0.0)
+        except Exception:
+            age = 0.0
+        max_age = max(max_age, age)
+        if age >= (0.80 * ttl):
+            near_expired_count += 1
+    if expired_count > 0 and max_age <= 0.0:
+        try:
+            max_age = float(cand.get("max_age", 0.0) or 0.0)
+        except Exception:
+            max_age = 0.0
+    pattern = _lxv_normalizar_patron_txt(cand.get("pattern", "") or "") or "0V0X"
+    dq = str(cand.get("data_quality", "missing") or "missing").strip().lower()
+    if dq not in ("ok", "partial", "closed_expired", "missing"):
+        dq = "missing"
+    if closed_count >= expected_count:
+        dq = "closed_expired" if expired_count > 0 else "ok"
+    elif closed_count > 0:
+        dq = "partial"
+    else:
+        dq = "missing"
+    out.update({
+        "closed": closed, "closed_count": closed_count, "fresh_count": fresh_count,
+        "expired_count": expired_count, "near_expired_count": near_expired_count,
+        "max_age": float(max_age), "pattern": pattern, "data_quality": dq,
+        "bots_missing": list(cand.get("bots_missing") or [b for b in expected_bots if b not in closed]),
+        "reason": str(cand.get("reason", "no_future_consensus") or "no_future_consensus"),
+    })
+    out["promote_now"] = bool(closed_count == expected_count and expired_count == 0 and dq == "ok")
+    return out
+
 def _sync_round_pending_blocks_real_only(pending_on: bool) -> bool:
     return bool(pending_on)
 
@@ -9008,37 +9066,61 @@ def _sync_round_tick_maestro():
             msg=f"⚠️ SYNC sigue esperando #{round_id}: faltan={missing} motivos={miss_short}",
             cooldown_s=10.0,
         )
-    round_drift_future = _sync_round_detect_future_ack_consensus(current_round=round_id, expected=BOT_NAMES, max_ahead=3) or {}
     old_round_id = int(round_id)
-    if int(round_drift_future.get("future_round", 0) or 0) > int(old_round_id):
-        future_status = "FUTURE_FULL" if bool(round_drift_future.get("ok")) else ("FUTURE_PARTIAL" if int(round_drift_future.get("closed_count", 0) or 0) >= (len(BOT_NAMES) - 1) else "FUTURE_WAIT")
-        agregar_evento(
-            f"🧾 ACK AUDIT ROUND_DRIFT: current_round={old_round_id} future_round={int(round_drift_future.get('future_round', 0) or 0)} "
-            f"ahead={int(round_drift_future.get('closed_count', 0) or 0)} status={future_status}"
-        )
-    if bool(round_drift_future.get("ok")) and int(round_drift_future.get("closed_count", 0) or 0) >= len(BOT_NAMES):
-        round_id = int(round_drift_future.get("future_round", round_id) or round_id)
-        closed = dict(round_drift_future.get("closed") or {})
-        sync_debug_missing = {b: ("ok" if b in closed else "ack_missing") for b in BOT_NAMES}
-        n_closed = len(closed)
-        missing = [b for b in BOT_NAMES if b not in closed]
-        completed = True
-        completed_normal = True
-        completed_failsafe = False
-        canonical = {"ok": True, "closed": dict(closed), "round_closed_eval": int(round_id), "reason": "ROUND_DRIFT_AHEAD_PROMOTED"}
-        agregar_evento(f"🧭 ROUND_DRIFT_AHEAD_PROMOTED: vieja=#{old_round_id} nueva=#{round_id} closed=6/6 patrón={round_drift_future.get('pattern','0V0X')} dq=ok")
-    elif int(round_drift_future.get("closed_count", 0) or 0) >= (len(BOT_NAMES) - 1):
-        ff = int(round_drift_future.get("future_round", 0) or 0)
-        faltante = ",".join(round_drift_future.get("bots_missing", [])[:2]) or "--"
-        agregar_evento(f"🧭 RONDA FUTURA EN FORMACIÓN: target_old={old_round_id} future={ff} closed={int(round_drift_future.get('closed_count',0) or 0)}/{len(BOT_NAMES)} faltante={faltante} reason=future_partial_consensus")
-    if str(round_drift_future.get("reason", "")) == "future_expired_consensus":
-        agregar_evento(
-            f"⚠️ ROUND_DRIFT_AHEAD_EXPIRED: future={int(round_drift_future.get('future_round',0) or 0)} "
-            f"expired={int(round_drift_future.get('expired_count',0) or 0)}/{len(BOT_NAMES)} max_age={round_drift_future.get('max_age')}"
-        )
+    pre_future = _sync_round_precheck_future_ahead(current_round=old_round_id, expected=BOT_NAMES)
+    early_promoted = False
+    summary_source_locked = False
     canonical_active = False
     canonical_summary = None
-    if canonical and canonical.get("ok"):
+    summary = None
+    rows_pack = None
+    if pre_future.get("has_future"):
+        future_round = int(pre_future.get("future_round", 0) or 0)
+        closed_ahead = int(pre_future.get("closed_count", 0) or 0)
+        expired_ahead = int(pre_future.get("expired_count", 0) or 0)
+        if bool(pre_future.get("promote_now")):
+            agregar_evento(f"🧾 ACK AUDIT ROUND_DRIFT: current_round={old_round_id} future_round={future_round} ahead={closed_ahead} status=EARLY_PROMOTED")
+            round_id = future_round
+            closed = dict(pre_future.get("closed") or {})
+            summary = _sync_round_build_canonical_summary(round_id, closed, expected=BOT_NAMES, source="ROUND_DRIFT_AHEAD_EARLY_PROMOTED")
+            summary["canonical"] = True
+            summary["canonical_source"] = "ROUND_DRIFT_AHEAD_EARLY_PROMOTED"
+            summary["drift_promoted"] = True
+            summary["early_promoted"] = True
+            summary["previous_round"] = old_round_id
+            summary["data_quality"] = "ok"
+            rows_pack = _ack_live_build_rows(obj_round_override=round_id, closed_override=closed)
+            rows_pack["canonical"] = True
+            rows_pack["summary_override"] = summary
+            _sync_round_publish_summary(summary, rows_pack=rows_pack, source="ROUND_DRIFT_AHEAD_EARLY_PROMOTED")
+            completed = True; completed_normal = True; completed_failsafe = False
+            data_quality = "ok"
+            partial_pattern = _lxv_normalizar_patron_txt(summary.get("partial_pattern") or summary.get("pattern")) or "0V0X"
+            agregar_evento(f"🧭 ROUND_DRIFT_AHEAD_EARLY_PROMOTED: vieja=#{old_round_id} nueva=#{round_id} closed=6/6 patrón={partial_pattern} dq=ok")
+            early_promoted = True
+            summary_source_locked = True
+            canonical = {"ok": True, "closed": dict(closed), "round_closed_eval": int(round_id), "reason": "ROUND_DRIFT_AHEAD_EARLY_PROMOTED"}
+        elif closed_ahead >= (len(BOT_NAMES) - 1):
+            if closed_ahead >= len(BOT_NAMES) and expired_ahead > 0:
+                agregar_evento(f"🧾 ACK AUDIT ROUND_DRIFT: current_round={old_round_id} future_round={future_round} ahead={closed_ahead} status=LATE_EXPIRED expired={expired_ahead}/{len(BOT_NAMES)}")
+                pattern = _lxv_normalizar_patron_txt(pre_future.get("pattern", "")) or "0V0X"
+                agregar_evento(f"🧊 ROUND_DRIFT_AHEAD_LATE_EXPIRED: vieja=#{old_round_id} futura=#{future_round} closed=6/6 expired={expired_ahead}/6 max_age={pre_future.get('max_age')} patrón={pattern}")
+                summary = _sync_round_build_canonical_summary(future_round, dict(pre_future.get("closed") or {}), expected=BOT_NAMES, source="ROUND_DRIFT_AHEAD_LATE_EXPIRED")
+                summary["data_quality"] = "closed_expired"; summary["drift_late_expired"] = True; summary["previous_round"] = old_round_id
+                rows_pack = _ack_live_build_rows(obj_round_override=future_round, closed_override=dict(pre_future.get("closed") or {}))
+                rows_pack["summary_override"] = summary
+                _sync_round_publish_summary(summary, rows_pack=rows_pack, source="ROUND_DRIFT_AHEAD_LATE_EXPIRED")
+                summary_source_locked = True
+            else:
+                faltante = ",".join((pre_future.get("bots_missing") or [])[:2]) or "--"
+                agregar_evento(f"🧾 ACK AUDIT ROUND_DRIFT: current_round={old_round_id} future_round={future_round} ahead={closed_ahead} status=FUTURE_PARTIAL faltan={faltante}")
+                agregar_evento(f"🧭 ROUND_DRIFT_AHEAD_EARLY_PARTIAL: vieja=#{old_round_id} futura=#{future_round} closed={closed_ahead}/{len(BOT_NAMES)} faltan={faltante}")
+                summary = {"round_id": future_round, "round_closed_eval": future_round, "closed_count": closed_ahead, "expected_count": len(BOT_NAMES), "data_quality": "partial", "partial_pattern": _lxv_normalizar_patron_txt(pre_future.get('pattern', '')) or "0V0X", "canonical": False, "drift_future_partial": True, "previous_round": old_round_id, "source": "ROUND_DRIFT_AHEAD_EARLY_PARTIAL"}
+                rows_pack = _ack_live_build_rows(obj_round_override=future_round, closed_override=dict(pre_future.get("closed") or {}))
+                rows_pack["summary_override"] = summary
+                _sync_round_publish_summary(summary, rows_pack=rows_pack, source="ROUND_DRIFT_AHEAD_EARLY_PARTIAL")
+                summary_source_locked = True
+    if (not early_promoted) and canonical and canonical.get("ok"):
         canonical_active = True
         round_id = int(canonical.get("round_closed_eval", round_id) or round_id)
         closed = dict(canonical.get("closed") or closed or {})
@@ -9053,9 +9135,11 @@ def _sync_round_tick_maestro():
         rows_pack["summary_override"] = canonical_summary
         summary = dict(canonical_summary)
         agregar_evento(f"✅ CANONICAL_SUMMARY_ACTIVE: round={round_id} closed={int(summary.get('closed_count',0))}/{int(summary.get('expected_count',len(BOT_NAMES)))} dq={summary.get('data_quality','missing')} pattern={summary.get('partial_pattern','0V0X')}")
-    else:
+    elif not summary_source_locked:
         rows_pack = _ack_live_build_rows()
         summary = _ack_live_calc_summary(rows_pack)
+    elif not isinstance(summary, dict):
+        summary = dict(globals().get("LAST_SYNC_ROUND_SUMMARY", {}) or {})
     rows_live = list((rows_pack or {}).get("rows", []) if isinstance(rows_pack, dict) else [])
     _sync_round_publish_summary(
         summary,
@@ -26645,6 +26729,9 @@ def _selftest_round_drift_ahead_promotion():
             globals()["_sync_round_ack_path"] = _fake_path
             globals()["_sync_round_safe_read_json"] = _fake_read
             return _sync_round_detect_future_ack_consensus(current_round=current_round, expected=list(BOT_NAMES), max_ahead=3)
+        def _run_pre(data, current_round):
+            _run_case(data, current_round)
+            return _sync_round_precheck_future_ahead(current_round=current_round, expected=list(BOT_NAMES))
         data_a = {b: _mk(313, "GANANCIA" if i < 5 else "PÉRDIDA") for i, b in enumerate(BOT_NAMES)}
         out_a = _run_case(data_a, 312); assert out_a.get("ok") and int(out_a.get("future_round", 0)) == 313 and int(out_a.get("closed_count", 0)) == 6 and str(out_a.get("pattern", "")) == "5V1X"
         data_b = {b: _mk(315, "GANANCIA") for b in BOT_NAMES[:-1]}
@@ -26655,7 +26742,23 @@ def _selftest_round_drift_ahead_promotion():
         out_d = _run_case(data_d, 318); assert int(out_d.get("future_round", 0)) == 319 and int(out_d.get("closed_count", 0)) == 6
         data_e = {b: _mk(321, "GANANCIA" if i < 4 else "PÉRDIDA") for i, b in enumerate(BOT_NAMES)}
         out_e = _run_case(data_e, 320); assert out_e.get("ok") and str(out_e.get("pattern", "")) == "4V2X"
-        print("SELFTEST ROUND_DRIFT_AHEAD_PROMOTION OK")
+        # CASO F
+        data_f = {b: _mk(322, "GANANCIA" if i < 4 else "PÉRDIDA", age=4.0) for i, b in enumerate(BOT_NAMES)}
+        out_f = _run_pre(data_f, 321); assert out_f["promote_now"] and out_f["data_quality"] == "ok" and out_f["future_round"] == 322
+        # CASO G
+        data_g = {b: _mk(315, "GANANCIA", age=5.0) for b in BOT_NAMES[:-1]}
+        out_g = _run_pre(data_g, 314); assert (not out_g["promote_now"]) and out_g["data_quality"] == "partial" and out_g["closed_count"] == 5
+        # CASO H
+        data_h = {b: _mk(322, "GANANCIA", age=5.0) for b in BOT_NAMES}; data_h[BOT_NAMES[0]] = _mk(322, "GANANCIA", age=400.0)
+        out_h = _run_pre(data_h, 321); assert (not out_h["promote_now"]) and out_h["data_quality"] == "closed_expired" and out_h["expired_count"] >= 1
+        # CASO I
+        fake_last = {"round_id": 330, "closed_count": 6, "data_quality": "ok", "source": "ROUND_DRIFT_AHEAD_EARLY_PROMOTED"}
+        globals()["LAST_SYNC_ROUND_SUMMARY"] = dict(fake_last)
+        assert int((globals().get("LAST_SYNC_ROUND_SUMMARY") or {}).get("round_id", 0)) == 330
+        # CASO J
+        pending_release = _sync_round_pending_blocks_real_only(True)
+        assert pending_release is True and out_f["promote_now"] is True
+        print("SELFTEST ROUND_DRIFT_AHEAD_EARLY_PROMOTION OK")
     finally:
         globals()["_sync_round_safe_read_json"] = original_read
         globals()["_sync_round_ack_path"] = original_path
