@@ -4270,15 +4270,43 @@ def _sync_round_is_released(summary=None, state=None, round_id=None) -> bool:
 def _dq_visual_lxv(summary, state=None):
     try:
         ss = summary if isinstance(summary, dict) else {}
+        st = state if isinstance(state, dict) else {}
         dq_operativa = str(ss.get("data_quality", "missing") or "missing").strip().lower()
-        rid = int(ss.get("round_id", ss.get("obj_round", 0)) or 0)
-        if _sync_round_is_released(ss, state=state, round_id=rid):
-            if dq_operativa == "closed_expired":
-                return "released_post_eval"
-            return "released"
+
+        try:
+            rid = int(ss.get("round_id", ss.get("obj_round", st.get("round_id", 0))) or 0)
+        except Exception:
+            rid = 0
+
+        try:
+            released_round = int(ss.get("released_round", st.get("released_round", rid)) or rid)
+        except Exception:
+            released_round = rid
+
+        try:
+            closed_count = int(ss.get("closed_count", ss.get("cerrados", 0)) or 0)
+        except Exception:
+            closed_count = 0
+
+        try:
+            expected_count = int(ss.get("expected_count", ss.get("esperados", len(BOT_NAMES))) or len(BOT_NAMES))
+        except Exception:
+            expected_count = 6
+
+        if expected_count > 0 and closed_count < expected_count:
+            if dq_operativa in ("missing", "partial", "mixed_rounds", "future_partial", "waiting_bots"):
+                return dq_operativa
+            return "partial"
+
+        if rid > 0 and expected_count > 0 and closed_count >= expected_count and released_round >= rid + 1:
+            return "released_post_eval"
+
         return dq_operativa
     except Exception:
-        return str((summary or {}).get("data_quality", "missing") or "missing").strip().lower()
+        try:
+            return str((summary or {}).get("data_quality", "missing") or "missing").strip().lower()
+        except Exception:
+            return "missing"
 
 def _sync_round_build_canonical_summary(round_id, closed, expected=None, source="CANONICAL_ROUND"):
     rid = int(round_id or 0)
@@ -26984,9 +27012,44 @@ if os.environ.get("RUN_SYNC_RECOVERY_RELEASE_SELFTEST") == "1":
 
 def _selftest_dq_released_hud():
     sa = {"round_id": 360, "released_round": 361, "data_quality": "closed_expired"}
-    assert _dq_visual_lxv(sa) == "released_post_eval"
+    assert _dq_visual_lxv(sa) == "partial"
     sb = {"round_id": 360, "released_round": 360, "data_quality": "closed_expired"}
-    assert _dq_visual_lxv(sb) == "closed_expired"
+    assert _dq_visual_lxv(sb) == "partial"
+    assert _dq_visual_lxv({
+        "round_id": 388,
+        "released_round": 389,
+        "closed_count": 4,
+        "expected_count": 6,
+        "data_quality": "ok",
+    }) == "partial"
+    assert _dq_visual_lxv({
+        "round_id": 389,
+        "released_round": 390,
+        "closed_count": 1,
+        "expected_count": 6,
+        "data_quality": "released",
+    }) == "partial"
+    assert _dq_visual_lxv({
+        "round_id": 390,
+        "released_round": 391,
+        "closed_count": 5,
+        "expected_count": 6,
+        "data_quality": "future_partial",
+    }) == "future_partial"
+    assert _dq_visual_lxv({
+        "round_id": 394,
+        "released_round": 395,
+        "closed_count": 6,
+        "expected_count": 6,
+        "data_quality": "ok",
+    }) == "released_post_eval"
+    assert _dq_visual_lxv({
+        "round_id": 395,
+        "released_round": 395,
+        "closed_count": 6,
+        "expected_count": 6,
+        "data_quality": "ok",
+    }) == "ok"
     assert (_lxv_normalizar_patron_txt("5V/1X") or "") == "5V1X"
     pat = _lxv_normalizar_patron_txt("5V1X") or "0V0X"
     zona = "ROJO_MADURO"
