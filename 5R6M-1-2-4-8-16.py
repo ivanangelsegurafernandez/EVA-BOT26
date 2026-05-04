@@ -8798,6 +8798,70 @@ def _dq_oficial_lxv(summary):
         return dq
     return dq
 
+
+
+def _sync_round_read_recovery_requests(max_age_s=90.0) -> dict:
+    out = {}
+    now_ts = time.time()
+    req_dir = os.path.join(SYNC_ROUND_DIR, "recovery_requests")
+    try:
+        paths = glob.glob(os.path.join(req_dir, "*.json"))
+    except Exception:
+        return out
+    valid_bots = set(BOT_NAMES)
+    for path in paths:
+        try:
+            data = _sync_round_safe_read_json(path) or {}
+            if not isinstance(data, dict):
+                continue
+            bot = str(data.get("bot") or "").strip()
+            if bot not in valid_bots:
+                continue
+            rid = int(data.get("round_id", 0) or 0)
+            ts = float(data.get("ts", 0.0) or 0.0)
+            if rid <= 0 or ts <= 0:
+                continue
+            if (now_ts - ts) > float(max_age_s):
+                continue
+            out[bot] = data
+        except Exception:
+            continue
+    return out
+
+def _sync_round_should_recovery_release(round_id, released_round, requests, st) -> tuple[bool, str]:
+    if not isinstance(requests, dict) or not requests:
+        return False, "no_requests"
+    if int(released_round) > int(round_id):
+        return False, "already_released"
+    real_on, _, _ = _sync_real_turn_activo()
+    if real_on:
+        return False, "real_turn_active"
+    if bool(_hay_real_close_pending_activo()[0]):
+        return False, "real_close_pending"
+    try:
+        tok = str(leer_token_actual() or "").strip().upper()
+    except Exception:
+        tok = ""
+    if tok.startswith("REAL:"):
+        return False, "token_real_active"
+    req_bots = []
+    target = int(round_id) + 1
+    for b,r in requests.items():
+        try:
+            if int(r.get("next_round", 0) or 0) == target:
+                req_bots.append(b)
+        except Exception:
+            pass
+    if not req_bots:
+        return False, "no_target_next_round_request"
+    status_now = str((st or {}).get("status","")).strip().lower()
+    if status_now in ("holding_real_result","holding_real_turn"):
+        return False, "holding_real"
+    elapsed = max(0.0, time.time() - float((st or {}).get("started_at",0.0) or 0.0))
+    if elapsed < float(globals().get("ROUND_INCOMPLETE_RECOVERY_TIMEOUT_S", LXV_SYNC_ROUND_MAX_WAIT_S) or LXV_SYNC_ROUND_MAX_WAIT_S):
+        return False, "round_not_stale_yet"
+    return True, "demo_wait_timeout_recovery_no_real"
+
 def _sync_round_tick_maestro():
     global _SYNC_ROUND_LAST_ANNOUNCED, _LXV_LAST_EMITTED_ROUND
     _sync_round_bootstrap_state(force=False)
@@ -9195,6 +9259,21 @@ def _sync_round_tick_maestro():
             and (not real_order_pending_now)
             and hold_status not in ("holding_real_result", "holding_real_turn")
         )
+        reqs = _sync_round_read_recovery_requests(max_age_s=90.0)
+        req_ok, req_reason = _sync_round_should_recovery_release(round_id, released_round, reqs, st)
+        req_bots = [b for b, r in (reqs or {}).items() if int((r or {}).get("next_round", 0) or 0) == int(round_id) + 1]
+        if req_bots:
+            agregar_evento(f"🧾 RECOVERY_REQUESTS: ronda={round_id} bots={len(req_bots)} release_actual={released_round} acción={'liberar' if req_ok else 'esperar'}")
+        if req_ok:
+            payload2 = dict(st) if isinstance(st, dict) else {}
+            payload2["released_round"] = int(round_id) + 1
+            payload2["status"] = "released_recovery_demo_timeout"
+            payload2["reason"] = "demo_wait_timeout_recovery_no_real"
+            payload2["ts"] = time.time()
+            payload2["last_recovery_requests"] = list(req_bots)
+            _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload2)
+            agregar_evento(f"🟨 RELEASE_RECOVERY_DEMO_TIMEOUT: ronda #{round_id} → #{round_id + 1} bots={','.join(req_bots) or '--'} motivo=demo_wait_timeout_recovery_no_real real=NO pending=NO")
+            return
         if not can_recover:
             return
         release_state = "RECOVERY_RONDA_INCOMPLETA"
