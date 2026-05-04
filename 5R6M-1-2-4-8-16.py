@@ -19593,7 +19593,15 @@ def render_estado_lxv_actual_panel(info_zona: dict, summary: dict, locks: dict |
         decision = str(info.get("decision", "ESPERANDO_COLUMNA") or "ESPERANDO_COLUMNA")
         motivo = str(info.get("motivo", "columna_incompleta") or "columna_incompleta")
         zona_visual_txt = str((info.get('zona_visual_info',{}) or {}).get('zona_visual','--'))
-        oficial_forzada_unknown = (str(decision).upper() == "ESPERANDO_COLUMNA") or ("columna_incompleta" in str(motivo).lower()) or (str(dq).lower() != "ok")
+        oficial_forzada_unknown = (
+            (str(decision).upper() == "ESPERANDO_COLUMNA")
+            or ("columna_incompleta" in str(motivo).lower())
+            or (str(dq).lower() != "ok")
+            or (int(closed_count) < int(expected_count))
+        )
+        zona_upper = str(zona or "").strip().upper()
+        if zona_upper in ("PRE_ZONA_VISUAL", "VERDE_TEMPRANO_VISUAL", "VERDE_EN_FORMACION", "VERDE_EN_FORMACION_VISUAL"):
+            oficial_forzada_unknown = True
         zona_oficial_show = "UNKNOWN" if oficial_forzada_unknown else zona
         decision_show = "ESPERANDO_COLUMNA" if oficial_forzada_unknown else decision
         motivo_show = "columna_incompleta" if oficial_forzada_unknown else motivo
@@ -21107,8 +21115,22 @@ def mostrar_panel():
 
     # Eventos recientes
     mostrar_ack_live()
-    for _ack_line in render_ack_audit_panel(None):
-        print(_ack_line)
+    try:
+        rs_ack = _hud_round_summary_safe()
+        round_id_ack = rs_ack.get("round_id")
+    except Exception:
+        rs_ack = {}
+        round_id_ack = None
+    if round_id_ack in ("--", "", None):
+        round_id_ack = globals().get("ROUND_LIVE_CURRENT_ID", None)
+    try:
+        panel_ack = render_ack_audit_panel(round_id_objetivo=round_id_ack)
+        if panel_ack:
+            for _ack_line in panel_ack:
+                print(_ack_line)
+    except Exception as e:
+        if bool(globals().get("HUD_DEBUG_VERBOSE_PANEL", False)):
+            agregar_evento(f"⚠️ ACK AUDIT HUD falló: {type(e).__name__}: {str(e)[:80]}")
     mostrar_eventos()
 
     mostrar_ia_resumen_compacto()
