@@ -19655,6 +19655,70 @@ def _c_muted(txt):
     return _c_dim(txt)
 
 
+def _ui_reset():
+    try:
+        return str(Style.RESET_ALL) if "Style" in globals() else ""
+    except Exception:
+        return ""
+
+
+def _ui_ok(txt):
+    try:
+        return f"{Fore.GREEN}{txt}{_ui_reset()}" if "Fore" in globals() else str(txt)
+    except Exception:
+        return str(txt)
+
+
+def _ui_bad(txt):
+    try:
+        return f"{Fore.RED}{txt}{_ui_reset()}" if "Fore" in globals() else str(txt)
+    except Exception:
+        return str(txt)
+
+
+def _ui_warn(txt):
+    try:
+        return f"{Fore.YELLOW}{txt}{_ui_reset()}" if "Fore" in globals() else str(txt)
+    except Exception:
+        return str(txt)
+
+
+def _ui_info(txt):
+    try:
+        return f"{Fore.CYAN}{txt}{_ui_reset()}" if "Fore" in globals() else str(txt)
+    except Exception:
+        return str(txt)
+
+
+def _ui_dim(txt):
+    return _c_dim(txt)
+
+
+def _ui_title(txt):
+    try:
+        return f"{Style.BRIGHT}{txt}{_ui_reset()}" if "Style" in globals() else str(txt)
+    except Exception:
+        return str(txt)
+
+
+def _ui_safe(fn_or_value=None, default="--"):
+    try:
+        if callable(fn_or_value):
+            return fn_or_value()
+        if fn_or_value is None:
+            return default
+        return fn_or_value
+    except Exception:
+        return default
+
+
+def _ui_get_global(name, default="--"):
+    try:
+        return globals().get(name, default)
+    except Exception:
+        return default
+
+
 def _hud_trim(txt, max_len):
     try:
         t = str(txt or "--")
@@ -19664,161 +19728,197 @@ def _hud_trim(txt, max_len):
         return "--"
 
 
-def _hud_lock_icon(value):
+def _ui_color_by_text(value, default="info"):
+    t = str(value or "--")
+    u = t.upper()
+    if any(k in u for k in ["LISTO", "SI_INVERTIR", "TOKEN_REAL_LIBRE", "REAL=SI", "OK"]):
+        return _ui_ok(t)
+    if any(k in u for k in ["NO_INVERTIR", "BLOQ", "MISSING", "ERROR", "INCOMPLETA", "OFF", "REAL=NO"]):
+        return _ui_bad(t)
+    if any(k in u for k in ["ESPERANDO", "PRE_", "PARCIAL", "VIGILANDO", "DEMO"]):
+        return _ui_warn(t)
+    if any(k in u for k in ["VISUAL", "REGIONAL", "DIAG", "SYNC"]):
+        return _ui_info(t)
+    return _ui_info(t) if default == "info" else _ui_dim(t)
+
+
+def render_locks_premium_line():
     try:
-        if value is True:
-            return "✅"
-        if value is False:
-            return "❌"
-        return "⚪"
-    except Exception:
-        return "⚪"
-
-
-def _hud_safe_get(d, key, default="--"):
-    try:
-        return d.get(key, default) if isinstance(d, dict) else default
-    except Exception:
-        return default
-
-
-def render_real_locks_compact_line():
-    try:
-        lk = dict((globals().get("REAL_LOCKS_PANEL", {}) or {}).get("locks", {}) or {})
+        panel = dict(_ui_get_global("REAL_LOCKS_PANEL", {}) or {})
+        lk = dict(panel.get("locks", {}) or {})
         mapa = [("REAL_CLOSE_LIBRE", "RC"), ("COLUMNA_COMPLETA", "COL"), ("DATA_QUALITY_OK", "DQ"), ("PATRON_VALIDO", "PAT"), ("CANDIDATO_VALIDO", "CAND"), ("ZONA_OK", "ZONA"), ("NO_DUPLICADO_RONDA", "DUP"), ("TOKEN_REAL_LIBRE", "TOK"), ("ORDEN_REAL_OK", "ORD")]
-        return "Locks: " + " ".join([f"{k}{_hud_lock_icon(lk.get(src, None))}" for src, k in mapa])
+        chunks = []
+        for src, k in mapa:
+            v = lk.get(src, None)
+            icon = "✅" if v is True else ("❌" if v is False else "⚪")
+            val = _ui_ok(icon) if v is True else (_ui_bad(icon) if v is False else _ui_dim(icon))
+            chunks.append(f"{k}{val}")
+        return f"{_ui_dim('Locks:')} " + " ".join(chunks)
     except Exception:
-        return "Locks: RC⚪ COL⚪ DQ⚪ PAT⚪ CAND⚪ ZONA⚪ DUP⚪ TOK⚪ ORD⚪"
+        return f"{_ui_dim('Locks:')} RC⚪ COL⚪ DQ⚪ PAT⚪ CAND⚪ ZONA⚪ DUP⚪ TOK⚪ ORD⚪"
 
 
-def render_zona_compacta():
+def render_header_premium(valor_saldo=None, saldo_str="--", meta_str="--"):
     try:
-        info = obtener_zona_lxv_hud_actual() or {}
-        zf = resolver_zona_final_lxv(round_id_objetivo=info.get("round_id"), zona_info_previa=info)
-        z = _hud_safe_get(zf, "zona_base", "UNKNOWN")
-        d = _hud_safe_get(zf, "decision", "ESPERANDO_COLUMNA")
-        m = _hud_safe_get(zf, "motivo", "--")
-        vis = _extraer_zona_visual_lxv(info) or "SOLO_DIAG"
-        if "SOLO" not in str(vis).upper() and str(vis).upper() in ("", "--", "MIXTO_O_INSUFICIENTE"):
-            vis = "SOLO_DIAG"
-        real = "SI" if bool(_hud_safe_get(zf, "allow_real", False)) else "NO"
-        return f"Zona: OFICIAL={z} | DEC={d} | VISUAL={vis} | REAL={real} | motivo={m}"
+        meta = _ui_safe(lambda: float(_ui_get_global("META", 0.0)), None)
+        saldo = _ui_safe(lambda: float(valor_saldo), None) if isinstance(valor_saldo, (int, float)) else None
+        falta = "--" if (meta is None or saldo is None) else f"{max(0.0, meta - saldo):.2f}"
+        avance = "--"
+        base = _ui_safe(lambda: float(_ui_get_global("SALDO_INICIAL", 0.0)), None)
+        if all(isinstance(v, float) for v in [meta, saldo, base]) and abs(meta - base) > 1e-9:
+            avance = f"{max(0.0, min(100.0, ((saldo - base) / (meta - base)) * 100.0)):.1f}%"
+        ss = dict(_ui_get_global("_ACK_LIVE_SUMMARY", {}) or {})
+        tok = _ui_safe(_ui_get_global("leer_token_actual"), None)
+        token_txt = _ui_ok("TOKEN REAL") if tok not in (None, "none", "") else _ui_warn("TOKEN DEMO")
+        real_on = _ui_ok("SI") if _ui_safe(lambda: hay_real_activo_global()[0], False) else _ui_bad("NO")
+        ciclo = f"C{_ui_safe(ciclo_martingala_actual, '--')}→C{_ui_safe(ciclo_martingala_siguiente, '--')}"
+        head = f"EVA 5R6M │ {_ui_dim('SALDO')} {_ui_info(saldo_str)} │ {_ui_dim('META')} {_ui_info(meta_str)} │ {_ui_dim('FALTA')} {_ui_warn(falta)} │ {token_txt} │ {_ui_dim('REAL')} {real_on} │ {_ui_dim(ciclo)} │ {_ui_dim('R#')}{_ui_color_by_text(ss.get('round_id','--'))}"
+        aux = f"{_ui_dim('Avance')} {_ui_info(avance)} │ {_ui_dim('cerrados')} {_ui_color_by_text(str(ss.get('closed_count','--'))+'/'+str(ss.get('expected_count','--')))} │ {_ui_dim('patrón')} {_ui_color_by_text(ss.get('partial_pattern','--'))} │ {_ui_dim('dq')} {_ui_color_by_text(ss.get('data_quality','--'))}"
+        return [head, aux]
     except Exception:
-        return "Zona: OFICIAL=-- | DEC=-- | VISUAL=SOLO_DIAG | REAL=NO | motivo=--"
+        return ["EVA 5R6M | --", "--"]
 
 
-def render_bots_compacto():
-    rows=[]
+def render_bots_premium_compacto():
+    rows = ["🤖 BOTS"]
     try:
-        order=list(BOT_NAMES)
-        real_bot = REAL_OWNER_LOCK if REAL_OWNER_LOCK in order else next((b for b in order if str(estado_bots.get(b,{}).get("token","DEMO")).upper().startswith("REAL")), None)
-        if real_bot in order:
-            order=[real_bot]+[b for b in order if b!=real_bot]
-        rows.append(f"{_c_dim('BOT'):7} {_c_dim('TK'):4} {_c_dim('IA'):6} {_c_dim('MODO'):8} {_c_dim('HIST24')}")
-        for b in order:
-            st=estado_bots.get(b,{})
-            tk=str(st.get("token","DEMO") or "DEMO").upper()
-            p=st.get("prob_ia",None)
-            ptxt="--" if not isinstance(p,(int,float)) else f"{float(p)*100:.1f}%"
-            modo=f"{str(st.get('modo_ia','OFF')).upper()} S{int(st.get('step',st.get('ciclo_actual',1)) or 1)}"
-            hist=''.join([str(x) for x in list(st.get('historial',[]) or [])])
-            hist=_hud_trim(hist if hist else '·'*int(HUD_BOT_HISTORY_COMPACT_LEN), int(HUD_BOT_HISTORY_COMPACT_LEN))
-            rows.append(_hud_trim(f"{b:<7} {tk:<4} {ptxt:<6} {modo:<8} {hist}", 54))
-        return rows
+        names = list(_ui_get_global("BOT_NAMES", []) or [])
+        st_all = dict(_ui_get_global("estado_bots", {}) or {})
+        real_bot = next((b for b in names if str((st_all.get(b, {}) or {}).get("token", "")).upper().startswith("REAL")), None)
+        if real_bot in names:
+            names = [real_bot] + [b for b in names if b != real_bot]
+        for b in names[:6]:
+            st = dict(st_all.get(b, {}) or {})
+            tk = str(st.get("token", "DEMO") or "DEMO").upper()
+            p = st.get("prob_ia", None)
+            pval = "--" if not isinstance(p, (int, float)) else f"{float(p)*100:.1f}%"
+            pnum = float(p)*100.0 if isinstance(p, (int,float)) else -1
+            ptxt = _ui_ok(pval) if pnum >= 60 else (_ui_warn(pval) if pnum >= 52 else _ui_bad(pval))
+            tkc = _ui_ok(tk) if tk.startswith("REAL") else _ui_warn(tk)
+            step = int(st.get("step", st.get("ciclo_actual", 1)) or 1)
+            hist = ''.join([str(x) for x in list(st.get("historial", []) or [])])
+            hist = _hud_trim(hist if hist else '·'*int(_ui_get_global("HUD_BOT_HISTORY_COMPACT_LEN",24)), int(_ui_get_global("HUD_BOT_HISTORY_COMPACT_LEN",24)))
+            rows.append(f"{b:<7} {tkc} {ptxt} {_ui_dim('LWD')} S{step} {_ui_dim(hist)}")
     except Exception:
-        return ["bots: --"]
+        rows.append("--")
+    return rows[:7]
 
 
-def render_decision_real_compacta():
+def render_decision_real_premium():
     try:
-        ss=dict(globals().get('_ACK_LIVE_SUMMARY',{}) or {})
-        lk=dict((globals().get('REAL_LOCKS_PANEL',{}) or {}).get('locks',{}) or {})
-        rid=int(ss.get('round_id',0) or 0); cc=int(ss.get('closed_count',0) or 0); ex=int(ss.get('expected_count',len(BOT_NAMES)) or len(BOT_NAMES))
-        dq=str(ss.get('data_quality','missing') or 'missing'); patron=str(ss.get('partial_pattern','0V0X') or '0V0X')
-        cand=diagnosticar_candado_bloqueante_lxv(lk, ss)
-        estado=f"{_c_bad('BLOQ')} {cand}" if cand!='DESCONOCIDO' else f"{_c_ok('NINGUNO')} | {_c_ok('LISTO PARA REAL')}"
-        zline=render_zona_compacta()
-        return [f"{_c_dim('BLOQ')} : {estado}", f"{_c_dim('RONDA')}: #{rid} | cerrados {cc}/{ex} | dq={dq} | patrón={patron}", zline.replace('Zona: ',f"{_c_dim('ZONA')} : "), render_real_locks_compact_line().replace('Locks: ',f"{_c_dim('LOCKS')}: "), f"{_c_dim('MOT'):<6}: {str(ss.get('reason', ss.get('missing_reason', '--')))}"]
-    except Exception:
-        return ["Estado : --", "Ronda  : --", "Zona   : --", "Locks  : --", "Motivo : --"]
-
-def render_estado_lxv_actual_compacto():
-    try:
-        info = obtener_zona_lxv_hud_actual() or {}
-        summary = dict(globals().get("_ACK_LIVE_SUMMARY", {}) or {})
-        locks = dict((globals().get("REAL_LOCKS_PANEL", {}) or {}).get("locks", {}) or {})
-        zf = resolver_zona_final_lxv(round_id_objetivo=info.get("round_id"), zona_info_previa=info)
-        zona = str(zf.get("zona_base", "INSUFICIENTE"))
-        decision = str(zf.get("decision", "NO_INVERTIR"))
-        vis = str((_extraer_zona_visual_lxv(info) or "SOLO_DIAGNOSTICO"))
-        dq = str(summary.get("data_quality", "missing"))
-        patron = str(summary.get("partial_pattern", "0V0X"))
-        cc = int(summary.get("closed_count", 0) or 0); ex = int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
-        faltan = int(summary.get("missing_total", max(0, ex-cc)) or 0)
-        real_activo, bot_real = hay_real_activo_global()
-        prearm = "SI" if bool(locks.get("CANDIDATO_VALIDO", False)) else "NO"
+        ss = dict(_ui_get_global("_ACK_LIVE_SUMMARY", {}) or {})
+        rp = dict(_ui_get_global("REAL_LOCKS_PANEL", {}) or {})
+        ready = bool(rp.get("ready_pre_real", False))
+        falta = str(rp.get("falta_principal", "--") or "--")
+        estado = _ui_ok("✅ LISTO PARA REAL") if ready else _ui_bad(f"⛔ BLOQ {falta}")
+        zona = _ui_safe(lambda: obtener_zona_lxv_hud_actual(), {}) or {}
+        ofi = str(zona.get("zona_base", zona.get("zona_oficial", "--")) or "--")
+        dec = str(zona.get("decision", "ESPERANDO_COLUMNA") or "ESPERANDO_COLUMNA")
+        vis = str((_ui_safe(lambda: _extraer_zona_visual_lxv(zona), "SOLO_DIAG") or "SOLO_DIAG"))
         return [
-            f"{_c_dim('OFICIAL')}: {_c_warn(zona)}",
-            f"{_c_dim('REGION') :8}: {_c_info(vis)} | {_c_muted('SOLO_DIAGNÓSTICO')}",
-            f"{_c_dim('COLUMNA')}: visual {(_c_bad('INSUFICIENTE') if cc < ex else _c_ok('OK'))} | patrón={patron} | cerrados={cc}/{ex} | dq={_c_bad(dq) if dq!='ok' else _c_ok(dq)}",
-            f"{_c_dim('SYNC')   :8}: {(_c_warn('ESPERANDO_BOTS') if faltan>0 else _c_ok('OK'))} | missing_total={faltan}",
-            f"{_c_dim('REAL')   :8}: ACTIVO={_c_warn('NO') if not real_activo else _c_ok('SI')} | TOKEN={_c_warn('DEMO') if not real_activo else _c_ok('REAL')} | BOT={bot_real or 'ninguno'}",
-            f"{_c_dim('FINAL')  :8}: {_c_bad(decision)}",
-            f"{_c_dim('PRE-ARM')}: {_c_warn(prearm) if prearm=='NO' else _c_ok(prearm)}",
+            "🎯 DECISIÓN REAL",
+            f"{_ui_dim('Estado :')} {estado}",
+            f"{_ui_dim('Ronda  :')} #{ss.get('round_id','--')} | cerrados {ss.get('closed_count','--')}/{ss.get('expected_count','--')} | dq={_ui_color_by_text(ss.get('data_quality','--'))} | patrón={_ui_color_by_text(ss.get('partial_pattern','--'))}",
+            f"{_ui_dim('Zona   :')} {_ui_color_by_text(ofi)} | {_ui_color_by_text(dec)} | REAL={_ui_ok('SI') if ready else _ui_bad('NO')}",
+            f"{_ui_dim('Visual :')} {_ui_info(vis)} | {_ui_dim('SOLO_DIAG')}",
+            f"{render_locks_premium_line()}",
+            f"{_ui_dim('Motivo :')} {_ui_color_by_text(rp.get('resultado', ss.get('reason', '--')))}",
         ]
     except Exception:
-        return [f"{_c_dim('LXV')}: --"]
+        return ["🎯 DECISIÓN REAL", "Estado: --"]
 
-def render_panels_side_by_side(left_lines, right_lines, width_total=118, gap=3):
+
+def render_lxv_premium_compacto():
     try:
-        if (not bool(globals().get("HUD_PARALLEL_PANELS", True))) or int(width_total or 0) < int(globals().get("HUD_PARALLEL_MIN_WIDTH", 110) or 110):
+        info = _ui_safe(obtener_zona_lxv_hud_actual, {}) or {}
+        ss = dict(_ui_get_global("_ACK_LIVE_SUMMARY", {}) or {})
+        ofi = str(info.get("zona_base", info.get("zona_oficial", "--")) or "--")
+        dec = str(info.get("decision", "ESPERANDO_COLUMNA") or "ESPERANDO_COLUMNA")
+        vis = str((_ui_safe(lambda: _extraer_zona_visual_lxv(info), "SOLO_DIAG") or "SOLO_DIAG"))
+        missing = ss.get("missing_total", "--")
+        real_eval = "evaluado" if ss.get("data_quality", "missing") == "ok" else "no_evaluado"
+        final = str(ss.get("decision_final", "NO_INVERTIR_AÚN") or "NO_INVERTIR_AÚN")
+        motivo = str(ss.get("missing_reason", "columna oficial incompleta") or "--")
+        return [
+            "🧭 LXV",
+            f"{_ui_dim('Oficial :')} {_ui_color_by_text(ofi)} | {_ui_color_by_text(dec)}",
+            f"{_ui_dim('Regional:')} {_ui_info(vis)} | {_ui_dim('SOLO_DIAG')}",
+            f"{_ui_dim('Sync    :')} {_ui_warn('ESPERANDO_BOTS' if str(missing) != '0' else 'OK')} | missing={_ui_dim(missing)} | REAL={_ui_dim(real_eval)}",
+            f"{_ui_dim('Final   :')} {_ui_color_by_text(final)} | {_ui_color_by_text(motivo)}",
+        ]
+    except Exception:
+        return ["🧭 LXV", "--"]
+
+
+def render_ia_footer_premium():
+    md = dict(_ui_get_global("IA_MODEL_METADATA", {}) or {})
+    auc = md.get("auc", _ui_get_global("IA_AUC_LAST", "--"))
+    thr = md.get("thr", _ui_get_global("IA_ACTIVACION_REAL_THR", "--"))
+    conf = md.get("conf", "--")
+    warm = f"{md.get('warmup_ok','--')}/{md.get('warmup_target','--')}"
+    cierres = _ui_get_global("IA_CIERRES_TOTAL", "--")
+    return f"{_ui_dim('IA:')} AUC={auc} | Thr={thr} | Conf={conf} | Warmup={warm} | Cierres={cierres}"
+
+
+def render_eventos_premium():
+    out=[]
+    try:
+        ev=list(_ui_get_global('eventos_recientes',[]) or [])
+        mx=int(_ui_get_global('HUD_MAX_EVENT_LINES_COMPACT',2) or 2)
+        for e in ev[-mx:]:
+            out.append(f"{_ui_dim('Evento:')} {_hud_trim(e, 96)}")
+        extra=max(0, len(ev)-mx)
+        if extra>0:
+            out.append(f"{_ui_dim('Evento:')} +{extra} ocultos")
+    except Exception:
+        out=["Evento: --"]
+    return out[:3]
+
+
+def render_panels_parallel_premium(left_lines, right_lines, width_total=118, gap=3):
+    try:
+        if (not bool(_ui_get_global("HUD_PARALLEL_PANELS", True))) or int(width_total or 0) < int(_ui_get_global("HUD_PARALLEL_MIN_WIDTH", 110) or 110):
             return list(left_lines or []) + [""] + list(right_lines or [])
-        lns = list(left_lines or [])
-        rns = list(right_lines or [])
-        left_w = max(20, (int(width_total) - int(gap) - 2) // 2)
-        right_w = max(20, int(width_total) - int(gap) - left_w)
-        n = max(len(lns), len(rns))
-        out = []
+        lw=max(20,(int(width_total)-int(gap)-2)//2); rw=max(20,int(width_total)-int(gap)-lw)
+        n=max(len(left_lines or []),len(right_lines or [])); out=[]
         for i in range(n):
-            l = _hud_trim(lns[i], left_w) if i < len(lns) else ""
-            r = _hud_trim(rns[i], right_w) if i < len(rns) else ""
-            out.append(f"{l.ljust(left_w)}{' '*int(gap)}{r.ljust(right_w)}")
+            l=_hud_trim((left_lines or [""])[i] if i < len(left_lines or []) else "", lw)
+            r=_hud_trim((right_lines or [""])[i] if i < len(right_lines or []) else "", rw)
+            out.append(f"{l.ljust(lw)}{' '*int(gap)}{r.ljust(rw)}")
         return out
     except Exception:
-        return list(left_lines or []) + list(right_lines or [])
+        return list(left_lines or []) + [""] + list(right_lines or [])
 
 
-def render_hud_ultra_compacto(valor_saldo=None, saldo_str="--", meta_str="--"):
-    w=int(globals().get('HUD_PANEL_WIDTH_COMPACT',118) or 118)
-    inw=max(20,w-2)
-    def box(t):
-        return f"║ {_hud_trim(t, inw-2).ljust(inw-2)} ║"
+def render_hud_premium_compacto(valor_saldo=None, saldo_str="--", meta_str="--"):
     try:
-        meta_num=float(META) if isinstance(globals().get('META'),(int,float)) else None
-        saldo_num=float(valor_saldo) if isinstance(valor_saldo,(int,float)) else None
-        falta='--' if (meta_num is None or saldo_num is None) else f"{max(0.0,meta_num-saldo_num):.2f}"
-        tok=leer_token_actual() if callable(globals().get('leer_token_actual')) else None
-        tok_txt='DEMO' if tok in (None,'none','') else 'REAL'
-        real_on='SI' if hay_real_activo_global()[0] else 'NO'
-        ss=dict(globals().get('_ACK_LIVE_SUMMARY',{}) or {})
-        lk=dict((globals().get('REAL_LOCKS_PANEL',{}) or {}).get('locks',{}) or {})
-        faltante = diagnosticar_candado_bloqueante_lxv(lk, ss)
-        head1=f"SALDO {saldo_str} | META {meta_str} | FALTA {falta} | TOKEN {tok_txt} | REAL {real_on} | C{ciclo_martingala_actual()}→C{ciclo_martingala_siguiente()}"
-        head2=f"R#{int(ss.get('round_id',0) or 0)} | cerrados {int(ss.get('closed_count',0) or 0)}/{int(ss.get('expected_count',len(BOT_NAMES)) or len(BOT_NAMES))} | patrón={str(ss.get('partial_pattern','0V0X'))} | dq={str(ss.get('data_quality','missing'))} | BLOQ: {faltante if faltante!='DESCONOCIDO' else 'NINGUNO | LISTO PARA REAL'}"
-        bots=render_bots_compacto()
-        right=["DECISIÓN REAL"] + render_decision_real_compacta() + ["ESTADO LXV"] + render_estado_lxv_actual_compacto()
-        parallel = render_panels_side_by_side(bots, right, width_total=inw-2, gap=3)
-        lines=["╔"+"═"*inw+"╗", box(head1), box(head2), "╠"+"═"*inw+"╣", *[box(p) for p in parallel]]
-        ev=list(eventos_recientes)[-int(globals().get('HUD_MAX_EVENT_LINES_COMPACT',2) or 2):] if 'eventos_recientes' in globals() else []
+        w=int(_ui_get_global('HUD_PANEL_WIDTH_COMPACT',118) or 118)
+        inw=max(40,w-2)
+        def box(t): return f"║ {_hud_trim(t, inw-2).ljust(inw-2)} ║"
+        lines=["╔"+"═"*inw+"╗"]
+        for h in render_header_premium(valor_saldo=valor_saldo, saldo_str=saldo_str, meta_str=meta_str)[:2]:
+            lines.append(box(h))
         lines.append("╠"+"═"*inw+"╣")
-        lines.append(box(_hud_trim("IA: resumen AUC/Thr/Conf", inw-2)))
-        for e in ev:
-            lines.append(box(f"Evento: {_hud_trim(e, inw-10)}"))
+        left = render_bots_premium_compacto()
+        right = render_decision_real_premium() + render_lxv_premium_compacto()
+        for ln in render_panels_parallel_premium(left, right, width_total=inw-2, gap=3):
+            lines.append(box(ln))
+        lines.append("╠"+"═"*inw+"╣")
+        lines.append(box(render_ia_footer_premium()))
+        for ev in render_eventos_premium():
+            lines.append(box(ev))
         lines.append("╚"+"═"*inw+"╝")
-        return lines[:max(10,int(globals().get('HUD_COMPACT_MAX_LINES_TARGET',30) or 30))]
-    except Exception:
-        raise
-
+        return lines[:int(_ui_get_global('HUD_COMPACT_MAX_LINES_TARGET',30) or 30)]
+    except Exception as e:
+        err=f"{type(e).__name__}: {_hud_trim(e, 34)}"
+        return [
+            "╔════════════════════════════════════════════════════════════╗",
+            "║ EVA HUD COMPACTO                                         ║",
+            "║ Estado: HUD parcial seguro                               ║",
+            f"║ Error: {_hud_trim(err, 50):<50} ║",
+            "║ REAL: -- | TOKEN: -- | RONDA: -- | BLOQ: --               ║",
+            "╚════════════════════════════════════════════════════════════╝",
+        ]
 
 def mostrar_panel_lateral_compacto():
     if not bool(globals().get("HUD_SHOW_CONTROL_PANEL", False)):
@@ -20097,14 +20197,19 @@ def mostrar_panel():
 
     if bool(globals().get("HUD_ULTRA_COMPACT_MODE", True)):
         try:
-            compact_lines = list(render_hud_ultra_compacto(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str) or [])
+            compact_lines = list(render_hud_premium_compacto(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str) or [])
             for line in compact_lines:
                 print(line)
             if bool(globals().get("HUD_DEBUG_VERBOSE_PANEL", False)):
                 print(f"HUD lines={len(compact_lines)}")
             return
-        except Exception:
-            agregar_evento("⚠️ HUD compacto falló; fallback clásico")
+        except Exception as e:
+            if bool(globals().get("HUD_DEBUG_VERBOSE_PANEL", False)):
+                agregar_evento(f"⚠️ HUD compacto falló; verbose clásico: {type(e).__name__}")
+            else:
+                for line in render_hud_premium_compacto(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str):
+                    print(line)
+                return
 
     if not bool(globals().get("HUD_MINIMAL_MODE", True)):
         print(padding + Fore.GREEN + f"💰 SALDO INICIAL {inicial_str} 🎯 META {meta_str}")
