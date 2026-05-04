@@ -6578,6 +6578,9 @@ def actualizar_real_locks_panel_desde_round_live():
             p["decision"] = str((zi_norm or {}).get("decision", "") or "")
             p.setdefault("locks", {})
             p["locks"]["ZONA_OK"] = bool(zona_ok_live)
+            p["ready_pre_real"] = bool(_real_locks_ready_pre_real())
+            p["falta_principal"] = _real_locks_first_off() or "---"
+            p["resultado"] = "LISTO PARA REAL" if p["ready_pre_real"] else "BLOQUEADO"
             p["updated_ts"] = float(time.time())
             p["source_diag"] = "ROUND_LIVE"
             return
@@ -7039,7 +7042,7 @@ def combinar_zona_lxv_con_mrv2(info):
     comp=bool(int(out.get('cerrados',0) or 0)==int(out.get('esperados',0) or 0) and int(out.get('esperados',0) or 0)>0)
     if dq!='ok': out.update({'allow_real':False,'decision':'NO_INVERTIR'}); return out
     if not comp and str(out.get('zona','')).upper()=='PRE_ZONA_VISUAL': out.update({'allow_real':False,'decision':'ESPERANDO_COLUMNA'}); return out
-    if z2 in {'VERDE_TARDIO','VERDE_SATURADO_TARDIO','ROJA_TEMPRANO'}: out.update({'decision':'NO_INVERTIR','allow_real':False,'motivo':m2,'bloqueo_mrv_v2':True}); return out
+    if z2 in {'VERDE_TARDIO','VERDE_SATURADO_TARDIO','ROJA_TEMPRANO'}: out.update({'decision':'NO_INVERTIR','allow_real':False,'motivo':m2,'bloqueo_mrv_v2':True,'subzona':z2,'zona_mrv_bloqueante':z2}); return out
     if str(out.get('decision','')).upper()=='SI_INVERTIR' and d2=='SI_INVERTIR': out['confirmacion_mrv_v2']=True; return out
     if str(out.get('decision','')).upper()!='SI_INVERTIR' and z2 in {'VERDE_TEMPRANO_CONFIRMADO','VERDE_MADURO_SANO','VERDE_MADURO_CON_RUIDO'} and bool(globals().get('MRV_ZONA_V2_CAN_UNLOCK_ZONE',True)) and comp and dq=='ok':
         out.update({'zona':z2,'fase':z2,'decision':'SI_INVERTIR','allow_real':True,'motivo':f'mrv2_unlock:{m2}','desbloqueo_mrv_v2':True})
@@ -7355,16 +7358,33 @@ def normalizar_zona_lxv_oficial(info):
         zona_raw = str(raw.get("zona", raw.get("fase", "")) or "").strip().upper()
         subzona = zona_raw or "UNKNOWN"
         motivo_raw = str(raw.get("motivo", "") or "").strip()
-        allow_raw = bool(raw.get("allow_real", False))
+        raw_has_allow = "allow_real" in raw
+        raw_allow = bool(raw.get("allow_real", False))
+        raw_decision = str(raw.get("decision", "") or "").strip().upper()
+        dq_raw = str(raw.get("dq0", raw.get("data_quality", "")) or "").strip().lower()
+        motivo_l = motivo_raw.lower()
+        bloqueo_duro = (
+            bool(raw.get("bloqueo_mrv_v2", False))
+            or raw_decision == "NO_INVERTIR"
+            or (raw_has_allow and raw_allow is False)
+            or dq_raw in ("missing", "partial", "closed_expired", "expired", "incomplete", "error")
+            or any(tok in motivo_l for tok in ("bloq", "block", "tardio", "saturacion", "roja", "error", "expired", "incompleta", "missing", "partial"))
+        )
         zona_base = zona_raw if zona_raw in zonas_validas else "UNKNOWN"
         if zona_raw == "VERDE_TEMPRANO_CONFIRMADO":
             zona_base = "VERDE_TEMPRANO"
         elif zona_raw == "VERDE_MADURO_SANO":
             zona_base = "VERDE_MADURO"
         elif zona_raw == "VERDE_MADURO_CON_RUIDO":
-            zona_base = "VERDE_MADURO" if (allow_raw and "bloq" not in motivo_raw.lower() and "block" not in motivo_raw.lower()) else "UNKNOWN"
+            zona_base = "VERDE_MADURO" if raw_allow else "UNKNOWN"
+        elif zona_raw in {"VERDE_TARDIO", "VERDE_SATURADO_TARDIO", "ROJA_TEMPRANO"}:
+            zona_base = zona_raw if zona_raw in zonas_validas else "UNKNOWN"
         zonas_ok = set(globals().get("LXV_ZONAS_INVERTIBLES", {"VERDE_TEMPRANO", "VERDE_MADURO"}))
-        allow_final = bool(zona_base in zonas_ok)
+        allow_final = bool(zona_base in zonas_ok and not bloqueo_duro)
+        if zona_raw in {"VERDE_TARDIO", "VERDE_SATURADO_TARDIO", "ROJA_TEMPRANO"}:
+            allow_final = False
+        if zona_raw == "VERDE_MADURO_CON_RUIDO":
+            allow_final = bool(raw_allow and (zona_base in zonas_ok) and not bloqueo_duro)
         decision = str(raw.get("decision", "") or "").strip().upper()
         if not decision:
             decision = ZONA_SI_INVERTIR if allow_final else ZONA_NO_INVERTIR
@@ -7386,6 +7406,24 @@ def normalizar_zona_lxv_oficial(info):
             "zona": "ERROR", "zona_base": "ERROR", "subzona": "ERROR", "decision": ZONA_NO_INVERTIR,
             "allow_real": False, "motivo": f"normalizacion_error:{str(e)[:80]}", "fuente_zona": "LXV",
         }
+
+
+
+def _selftest_normalizador_no_reabre_bloqueos():
+    casos = [
+        ({"zona":"VERDE_MADURO", "decision":"NO_INVERTIR", "allow_real":False, "bloqueo_mrv_v2":True, "motivo":"verde_perdiendo_fuerza"}, lambda o: bool(o.get("allow_real", True)) is False),
+        ({"zona":"VERDE_TEMPRANO", "allow_real":False, "motivo":"closed_expired"}, lambda o: bool(o.get("allow_real", True)) is False),
+        ({"zona":"VERDE_MADURO_SANO", "allow_real":True, "decision":"SI_INVERTIR"}, lambda o: str(o.get("zona_base", ""))=="VERDE_MADURO" and bool(o.get("allow_real", False)) is True),
+        ({"zona":"VERDE_MADURO_CON_RUIDO", "allow_real":False, "motivo":"bloqueo_ruido"}, lambda o: bool(o.get("allow_real", True)) is False),
+    ]
+    for i, (entrada, check) in enumerate(casos, 1):
+        out = normalizar_zona_lxv_oficial(dict(entrada))
+        if not check(out):
+            raise AssertionError(f"selftest_normalizador_no_reabre_bloqueos caso={i} out={out}")
+
+
+if str(os.environ.get("RUN_NORMALIZADOR_BLOQUEOS_SELFTEST", "0") or "0").strip() == "1":
+    _selftest_normalizador_no_reabre_bloqueos()
 
 def resolver_zona_final_lxv(round_id_objetivo=None, zona_info_previa=None):
     try:
@@ -19387,8 +19425,8 @@ def render_zona_lxv_panel():
         real_txt = "POSIBLE si patrón/candidato/token/cierre están OK"
         if dq != "ok": real_txt = "NO, data_quality no ok"
         elif esp <= 0 or cerr < esp: real_txt = "NO, esperando columna completa"
+        elif bool(zf.get("bloqueo_mrv_v2", False)): real_txt = "NO, bloqueo MRV_ZONA_V2"
         elif not zona_allow: real_txt = "NO, zona oficial no invertible"
-        elif bool(info.get("bloqueo_mrv_v2", False)): real_txt = "NO, bloqueo MRV_ZONA_V2"
         reg_line = f"ZONA REGIONAL: {str(info.get('zona_regional','NEUTRO_REGIONAL'))} | R1={float(info.get('green_ratio_r1',0.0)):.2f} R2={float(info.get('green_ratio_r2',0.0)):.2f} R3={float(info.get('green_ratio_r3',0.0)):.2f} | decisión={str(info.get('decision_regional','NO_INVERTIR'))}"
         return ["╔════════════════════════════════════════════════════════════╗","║ 🧭 ZONA LXV / MRV_ZONA_V2                                ║","╠════════════════════════════════════════════════════════════╣",f"║ ZONA OFICIAL REAL : {z[:37].ljust(37)}║",f"║ SUBZONA / VISUAL  : {subz[:37].ljust(37)}║",f"║ DECISIÓN ZONA     : {d[:37].ljust(37)}║",f"║ MOTIVO            : {m[:37].ljust(37)}║",f"║ FUENTE            : {fuente[:37].ljust(37)}║",f"║ MRV_V2      : {z2[:43].ljust(43)}║",f"║ Decisión V2 : {d2[:43].ljust(43)}║",f"║ Motivo V2   : {m2[:43].ljust(43)}║",f"║ Columna     : {cerr}/{esp} | dq={dq} | patrón={patron}"[:61].ljust(61)+"║",f"║ Regional    : SOLO_DIAGNOSTICO, NO_HABILITA_REAL"[:61].ljust(61)+"║",f"║ Regional+   : {reg_line[:47].ljust(47)}║",f"║ REAL        : {real_txt[:47].ljust(47)}║","╚════════════════════════════════════════════════════════════╝"]
     except Exception:
