@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import asyncio
 import json
+import glob
 import csv
 import os
 import sys
@@ -451,6 +452,167 @@ def _sync_round_write_release_heartbeat(round_id: int, next_round: int):
     _sync_round_write_json_atomic(path, payload)
 
 
+def _sync_any_real_owner_active() -> tuple[bool, str, str]:
+    """
+    Devuelve (True, owner_bot, motivo) si hay REAL global activo o pendiente.
+    """
+    def _valid_bot(name: str) -> bool:
+        b = str(name or "").strip()
+        return bool(b) and b.lower() not in {"none", "null", "demo", ""}
+
+    now_ts = time.time()
+    base_dir = globals().get("script_dir", os.path.dirname(os.path.abspath(__file__)))
+
+    try:
+        tok = str(leer_token_actual() or "").strip()
+        if tok.upper().startswith("REAL:"):
+            owner = tok.split(":", 1)[1].strip() if ":" in tok else ""
+            if _valid_bot(owner):
+                return True, owner, "token_actual"
+    except Exception:
+        pass
+
+    try:
+        candidates = []
+        if "_orden_real_candidate_paths" in globals():
+            try:
+                candidates.extend(_orden_real_candidate_paths() or [])
+            except Exception:
+                pass
+        patterns = [
+            os.path.join(base_dir, "orden_real", "*.json"),
+            os.path.join(base_dir, "orden_real_*.json"),
+            os.path.join(base_dir, "orden_real.json"),
+        ]
+        for pat in patterns:
+            try:
+                candidates.extend(glob.glob(pat))
+            except Exception:
+                continue
+        seen = set()
+        for path in candidates:
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            try:
+                data = _sync_round_safe_read_json(path) or {}
+                if not isinstance(data, dict) or bool(data.get("consumed", False)):
+                    continue
+                owner = str(data.get("bot") or data.get("target_bot") or data.get("owner_bot") or "").strip()
+                if not _valid_bot(owner):
+                    continue
+                ts = float(data.get("ts") or data.get("created_ts") or data.get("created_at") or 0.0)
+                ttl = float(data.get("ttl_s") or data.get("ttl") or globals().get("REAL_ORDER_TTL_S", 90) or 90)
+                if ts > 0 and (now_ts - ts) <= max(1.0, ttl):
+                    return True, owner, "orden_real_viva"
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    try:
+        fresh_owner = max(
+            float(globals().get("REAL_ORDER_TTL_S", 90) or 90),
+            float(globals().get("REAL_CLOSE_MAX_AGE_S", 120) or 120),
+            120.0,
+        )
+        for name in ("real_owner_state.json", "owner_real_state.json", "real_owner.json"):
+            path = os.path.join(base_dir, name)
+            try:
+                data = _sync_round_safe_read_json(path) or {}
+                if not isinstance(data, dict):
+                    continue
+                owner = str(data.get("owner_bot") or data.get("bot") or "").strip()
+                ts = float(data.get("assigned_ts") or data.get("ts") or 0.0)
+                if _valid_bot(owner) and ts > 0 and (now_ts - ts) <= fresh_owner:
+                    return True, owner, "real_owner_state"
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    try:
+        fresh_close = max(float(globals().get("REAL_CLOSE_MAX_AGE_S", 120) or 120), 120.0)
+        for name in ("real_close_pending.json", "real_close_state.json", "close_pending_real.json"):
+            path = os.path.join(base_dir, name)
+            try:
+                data = _sync_round_safe_read_json(path) or {}
+                if not isinstance(data, dict):
+                    continue
+                owner = str(data.get("bot") or data.get("owner_bot") or "").strip()
+                ts = float(data.get("ts") or data.get("created_ts") or data.get("updated_ts") or 0.0)
+                if _valid_bot(owner) and ts > 0 and (now_ts - ts) <= fresh_close:
+                    return True, owner, "real_close_pending"
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    try:
+        st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
+        if isinstance(st, dict):
+            status = str(st.get("status") or "").strip().lower()
+            if status in {"holding_real_result", "holding_real_turn", "real_pending", "waiting_real_close"}:
+                owner = str(st.get("real_bot") or st.get("bot") or st.get("owner_bot") or "").strip()
+                if _valid_bot(owner):
+                    return True, owner, "sync_round_state"
+    except Exception:
+        pass
+
+    return False, "", ""
+
+
+def _selftest_sync_demo_hold_global():
+    if str(os.environ.get("RUN_SYNC_DEMO_HOLD_GLOBAL_SELFTEST", "0")).strip() != "1":
+        return
+    import tempfile
+
+    base_dir = tempfile.mkdtemp(prefix="sync_demo_hold_global_")
+    old_script_dir = globals().get("script_dir")
+    old_token = globals().get("ARCHIVO_TOKEN")
+    try:
+        globals()["script_dir"] = base_dir
+        globals()["ARCHIVO_TOKEN"] = os.path.join(base_dir, "token_actual.txt")
+        os.makedirs(os.path.join(base_dir, "orden_real"), exist_ok=True)
+
+        def wr(path, data):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+
+        def wt(v):
+            with open(globals()["ARCHIVO_TOKEN"], "w", encoding="utf-8") as f:
+                f.write(v)
+
+        now = time.time()
+        wt("REAL:fulll47")
+        ok, owner, reason = _sync_any_real_owner_active(); assert ok and owner=="fulll47" and reason=="token_actual"
+
+        wt("REAL:none")
+        ok, owner, reason = _sync_any_real_owner_active(); assert not ok
+
+        wr(os.path.join(base_dir, "orden_real", "fulll47.json"), {"bot":"fulll47", "consumed":False, "created_ts":now, "ttl_s":90})
+        ok, owner, reason = _sync_any_real_owner_active(); assert ok and owner=="fulll47" and reason=="orden_real_viva"
+
+        os.remove(os.path.join(base_dir, "orden_real", "fulll47.json"))
+        wr(os.path.join(base_dir, "real_owner_state.json"), {"owner_bot":"fulll47", "assigned_ts":now})
+        ok, owner, reason = _sync_any_real_owner_active(); assert ok and owner=="fulll47" and reason=="real_owner_state"
+
+        os.remove(os.path.join(base_dir, "real_owner_state.json"))
+        wr(os.path.join(base_dir, "real_close_pending.json"), {"bot":"fulll47", "ts":now})
+        ok, owner, reason = _sync_any_real_owner_active(); assert ok and owner=="fulll47" and reason=="real_close_pending"
+
+        print("SELFTEST SYNC_DEMO_HOLD_GLOBAL OK")
+        raise SystemExit(0)
+    finally:
+        if old_script_dir is not None:
+            globals()["script_dir"] = old_script_dir
+        if old_token is not None:
+            globals()["ARCHIVO_TOKEN"] = old_token
+
+
+
+
 SYNC_WAIT_POLL_S = 0.15
 SYNC_WAIT_HEARTBEAT_S = 1.0
 SYNC_WAIT_STALE_S = 45.0
@@ -504,6 +666,7 @@ async def _sync_round_wait_release(round_id: int) -> int:
     last_state_ts = 0.0
     first_wait_tick = True
     last_standby_print_ts = 0.0
+    last_global_hold_print_ts = 0.0
     while not stop_event.is_set():
         st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
         try:
@@ -555,7 +718,29 @@ async def _sync_round_wait_release(round_id: int) -> int:
             print(Fore.YELLOW + f"⚠️ LXV_SYNC_COLUMN no_progress: {NOMBRE_BOT} ronda #{rid} released={released} esperando #{next_round}")
             last_progress_ts = now_ts
         if total_wait_s >= SYNC_WAIT_ABSOLUTE_MAX_S and (not owner_real) and (not pending_contract_resolution) and (not contrato_pendiente) and (not en_modo_real):
-            print(Fore.YELLOW + Style.BRIGHT + f"🟨 LXV_SYNC_COLUMN escape DEMO seguro: {NOMBRE_BOT} sale de standby por timeout visual, sin REAL activo.")
+            any_real_active, any_real_owner, any_real_reason = _sync_any_real_owner_active()
+            if any_real_active:
+                if (now_ts - last_global_hold_print_ts) >= 10.0:
+                    print(
+                        Fore.YELLOW + Style.BRIGHT +
+                        f"⏳ SYNC DEMO HOLD GLOBAL:\n"
+                        f"bot={NOMBRE_BOT}\n"
+                        f"ronda={rid}\n"
+                        f"espera_release={next_round}\n"
+                        f"released={released}\n"
+                        f"owner_real={any_real_owner or '--'}\n"
+                        f"motivo={any_real_reason or '--'}\n"
+                        f"acción=no_escape_demo"
+                    )
+                    last_global_hold_print_ts = now_ts
+                try:
+                    _sync_round_write_release_heartbeat(rid, next_round)
+                except Exception:
+                    pass
+                last_progress_ts = now_ts
+                await asyncio.sleep(1.0)
+                continue
+            print(Fore.YELLOW + Style.BRIGHT + f"🟨 LXV_SYNC_COLUMN escape DEMO seguro: {NOMBRE_BOT} sale de standby por timeout visual, sin REAL global activo.")
             estado_bot["sync_wait"] = False
             if "sync_wait_round" in estado_bot:
                 estado_bot["sync_wait_round"] = None
@@ -563,7 +748,7 @@ async def _sync_round_wait_release(round_id: int) -> int:
                 _sync_round_write_release_heartbeat(rid, next_round)
             except Exception:
                 pass
-            return released
+            return next_round
         if (idle_s >= SYNC_WAIT_MAX_IDLE_S) and (
             stale_state or total_wait_s >= (SYNC_WAIT_STALE_S + SYNC_WAIT_MAX_IDLE_S)
         ):
