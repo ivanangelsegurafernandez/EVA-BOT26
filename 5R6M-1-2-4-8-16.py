@@ -9262,9 +9262,23 @@ def _sync_round_tick_maestro():
         reqs = _sync_round_read_recovery_requests(max_age_s=90.0)
         req_ok, req_reason = _sync_round_should_recovery_release(round_id, released_round, reqs, st)
         req_bots = [b for b, r in (reqs or {}).items() if int((r or {}).get("next_round", 0) or 0) == int(round_id) + 1]
+        can_req_recover = bool(req_ok and can_recover)
         if req_bots:
-            agregar_evento(f"🧾 RECOVERY_REQUESTS: ronda={round_id} bots={len(req_bots)} release_actual={released_round} acción={'liberar' if req_ok else 'esperar'}")
-        if req_ok:
+            accion = "liberar" if can_req_recover else "esperar"
+            agregar_evento(
+                f"🧾 RECOVERY_REQUESTS: ronda={round_id} bots={len(req_bots)} "
+                f"release_actual={released_round} acción={accion} "
+                f"req_ok={req_ok} req_reason={req_reason} can_recover={can_recover}"
+            )
+        if req_ok and not can_recover:
+            agregar_evento(
+                f"⛔ RECOVERY_REQUEST_BLOQUEADO: ronda={round_id} "
+                f"req_reason={req_reason} can_recover=NO "
+                f"real_on={real_on_now} pending={real_close_pending_now} "
+                f"orden_real={real_order_pending_now} hold={hold_status}"
+            )
+            return
+        if can_req_recover:
             payload2 = dict(st) if isinstance(st, dict) else {}
             payload2["released_round"] = int(round_id) + 1
             payload2["status"] = "released_recovery_demo_timeout"
@@ -26845,3 +26859,23 @@ def _selftest_round_drift_ahead_promotion():
 
 if os.environ.get("RUN_ROUND_DRIFT_AHEAD_SELFTEST") == "1":
     _selftest_round_drift_ahead_promotion()
+
+def _selftest_sync_recovery_release_gate():
+    def _can_release(req_ok, can_recover):
+        return bool(req_ok and can_recover)
+    cases = [
+        ("A_req_ok_can_recover", True, True, True),
+        ("B_req_ok_bloq_real_order", True, False, False),
+        ("C_req_ok_bloq_real_close_pending", True, False, False),
+        ("D_req_not_ok_can_recover", False, True, False),
+    ]
+    for name, req_ok, can_recover, expected in cases:
+        got = _can_release(req_ok=req_ok, can_recover=can_recover)
+        if got != expected:
+            raise AssertionError(
+                f"{name} FAIL expected={expected} got={got} req_ok={req_ok} can_recover={can_recover}"
+            )
+    print("SELFTEST SYNC_RECOVERY_RELEASE_GATE OK")
+
+if os.environ.get("RUN_SYNC_RECOVERY_RELEASE_SELFTEST") == "1":
+    _selftest_sync_recovery_release_gate()
