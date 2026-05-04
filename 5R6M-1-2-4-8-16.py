@@ -6742,6 +6742,112 @@ def obtener_zona_lxv_hud_actual():
     except Exception:
         return {"zona":"INSUFICIENTE","fase":"INSUFICIENTE","decision":ZONA_NO_INVERTIR,"motivo":"sin_info_round_live","emoji":"⬜","source":"HUD_GLOBAL/none"}
 
+
+
+def _diagnosticar_ack_bot_round(bot, round_id_objetivo=None):
+    try:
+        b = str(bot or '').strip()
+        rid_obj = int(round_id_objetivo or 0) if round_id_objetivo is not None else 0
+        if b not in list(globals().get('BOT_NAMES', []) or []):
+            return {"bot": b or str(bot), "round_obj": rid_obj or round_id_objetivo, "ack_round": "--", "result": "--", "age_s": "--", "cuenta": False, "motivo": "invalid_bot"}
+        ack_path = _sync_round_ack_path(b)
+        if not os.path.exists(ack_path):
+            return {"bot": b, "round_obj": rid_obj or round_id_objetivo, "ack_round": "--", "result": "--", "age_s": "--", "cuenta": False, "motivo": "file_missing"}
+        ack = _sync_round_safe_read_json(ack_path)
+        if not isinstance(ack, dict):
+            return {"bot": b, "round_obj": rid_obj or round_id_objetivo, "ack_round": "--", "result": "--", "age_s": "--", "cuenta": False, "motivo": "read_error"}
+        try:
+            ack_round = int(ack.get('round_id', 0) or 0)
+        except Exception:
+            ack_round = 0
+        raw_res = str(ack.get('resultado', '') or '').strip().upper()
+        res_sym = '✓' if raw_res == 'GANANCIA' else ('X' if raw_res in ('PÉRDIDA', 'PERDIDA') else '--')
+        try:
+            ack_ts = float(ack.get('ts', 0.0) or 0.0)
+        except Exception:
+            ack_ts = 0.0
+        age = (time.time() - ack_ts) if ack_ts > 0 else None
+        age_txt = f"{int(max(0.0, age))}s" if isinstance(age, (int, float)) else '--'
+        motivo = 'ok'
+        cuenta = True
+        st_bot = estado_bots.get(b, {}) if isinstance(estado_bots.get(b, {}), dict) else {}
+        if bool(st_bot.get('pending_contract_resolution', False) or ack.get('pending_contract_resolution', False)):
+            cuenta = False; motivo = 'preboot'
+        elif rid_obj > 0 and ack_round != rid_obj:
+            cuenta = False; motivo = 'round_mismatch'
+        else:
+            status = str(ack.get('status', '') or '').strip().lower()
+            if status != 'closed':
+                cuenta = False; motivo = 'stale'
+            elif raw_res == '':
+                cuenta = False; motivo = 'no_result'
+            elif raw_res not in ('GANANCIA', 'PÉRDIDA', 'PERDIDA'):
+                cuenta = False; motivo = 'invalid_result'
+            elif ack_ts <= 0:
+                cuenta = False; motivo = 'stale'
+            elif age is not None and age > float(globals().get('TTL_ACK_SYNC_ROUND_S', 300.0) or 300.0):
+                cuenta = False; motivo = 'expired'
+            elif ack_ts > (time.time() + float(globals().get('ACK_SYNC_ROUND_FUTURE_DRIFT_S', 20.0) or 20.0)):
+                cuenta = False; motivo = 'stale'
+            else:
+                ack_mode = str(ack.get('mode', '') or '').strip().upper()
+                ack_source = str(ack.get('source', '') or '').strip().upper()
+                explicit_real_ack = (ack_mode == 'REAL' or ack_source in ('ORDEN_REAL', 'REAL', 'REAL_ORDER'))
+                explicit_demo_ack = (ack_mode == 'DEMO' or ack_source in ('SYNC_DEMO', 'DEMO', 'LXV_SYNC'))
+                if explicit_real_ack and not explicit_demo_ack:
+                    cuenta = False; motivo = 'session_mismatch'
+        return {"bot": b, "round_obj": rid_obj or round_id_objetivo, "ack_round": ack_round if ack_round > 0 else '--', "result": res_sym, "age_s": age_txt, "cuenta": bool(cuenta), "motivo": str(motivo)}
+    except Exception as e:
+        return {
+            "bot": str(bot),
+            "round_obj": round_id_objetivo,
+            "ack_round": "--",
+            "result": "--",
+            "age_s": "--",
+            "cuenta": False,
+            "motivo": f"diag_error:{type(e).__name__}",
+        }
+
+
+def render_ack_audit_panel(round_id_objetivo=None):
+    lines = []
+    try:
+        hs = _hud_round_summary_safe()
+        rid = int(round_id_objetivo or hs.get('round_id') or 0)
+        cerr = int(hs.get('cerrados', 0) or 0) if str(hs.get('cerrados', '')).isdigit() else 0
+        exp = int(hs.get('expected', len(BOT_NAMES)) or len(BOT_NAMES) or 6)
+        dq = str(hs.get('dq', 'missing') or 'missing').strip().lower()
+        patron = str(hs.get('patron', '0V0X') or '0V0X').strip().upper()
+        col_ok = bool(cerr >= exp)
+        dq_ok = dq == 'ok'
+        show = (not col_ok) or (not dq_ok) or patron == '0V0X'
+        if not show:
+            return ["ACK AUDIT: 6/6 OK"]
+        lines.append(f"🧾 ACK AUDIT ROUND #{rid if rid>0 else '--'}")
+        lines.append("bot     ack_round  res  age   cuenta  motivo")
+        rows = []
+        motivos = {}
+        faltan = []
+        for b in list(BOT_NAMES):
+            d = _diagnosticar_ack_bot_round(b, rid if rid > 0 else None)
+            rows.append(d)
+            m = str(d.get('motivo', 'missing') or 'missing')
+            motivos[m] = motivos.get(m, 0) + 1
+            if not bool(d.get('cuenta', False)):
+                faltan.append(b)
+        for d in rows[:6]:
+            lines.append(f"{str(d.get('bot','--')):<7} {str(d.get('ack_round','--')):<9} {str(d.get('result','--')):<4} {str(d.get('age_s','--')):<5} {'SI' if d.get('cuenta') else 'NO':<6} {str(d.get('motivo','--'))}")
+        rs = globals().get('_SYNC_ROUND_STATE', {}) if isinstance(globals().get('_SYNC_ROUND_STATE', {}), dict) else {}
+        rel = int(rs.get('released_round', 0) or 0)
+        if rid > 0 and rel > 0 and rel != rid:
+            lines.append(f"drift: obj={rid} released={rel} action=esperando_ack_validos")
+        if _print_once(f"ack_audit:{rid}:summary", ttl=12.0):
+            mot_txt = ','.join(f"{k}:{v}" for k,v in sorted(motivos.items()))
+            agregar_evento(f"ACK AUDIT #{rid}: {cerr}/{exp} válidos | faltan={','.join(faltan)} | motivos={mot_txt}")
+        return lines[:10]
+    except Exception:
+        return lines
+
 def _hud_round_summary_safe():
     try:
         fuentes = []
@@ -6884,7 +6990,7 @@ def render_real_locks_panel():
             row(ctext(Fore.LIGHTBLACK_EX, f"- dq={trunc(dq_show, 60)}")),
             row(ctext(Fore.LIGHTBLACK_EX, f"- patrón={trunc(patron_show, 60)}")),
             row(ctext(Fore.LIGHTBLACK_EX, f"- zona={trunc(zona_show, 60)}")),
-            row(ctext(Fore.LIGHTBLACK_EX, f"- bot={trunc(p.get('bot', '--'), 60)}")),
+            row(ctext(Fore.LIGHTBLACK_EX, f"- bot={trunc((p.get('bot') or '--'), 60)}")),
             row(ctext(Fore.LIGHTBLACK_EX, f"- cerrados={trunc(cerr_show, 20)}/{trunc(exp_show, 20)}")),
         ]
         if diag_txt:
@@ -19486,6 +19592,11 @@ def render_estado_lxv_actual_panel(info_zona: dict, summary: dict, locks: dict |
         zona = str(info.get("zona", info.get("fase", "PRE_ZONA_VISUAL")) or "PRE_ZONA_VISUAL")
         decision = str(info.get("decision", "ESPERANDO_COLUMNA") or "ESPERANDO_COLUMNA")
         motivo = str(info.get("motivo", "columna_incompleta") or "columna_incompleta")
+        zona_visual_txt = str((info.get('zona_visual_info',{}) or {}).get('zona_visual','--'))
+        oficial_forzada_unknown = (str(decision).upper() == "ESPERANDO_COLUMNA") or ("columna_incompleta" in str(motivo).lower()) or (str(dq).lower() != "ok")
+        zona_oficial_show = "UNKNOWN" if oficial_forzada_unknown else zona
+        decision_show = "ESPERANDO_COLUMNA" if oficial_forzada_unknown else decision
+        motivo_show = "columna_incompleta" if oficial_forzada_unknown else motivo
         reg = info.get("zona_regional_temprana_info", {}) if isinstance(info.get("zona_regional_temprana_info", {}), dict) else {}
         reg_z = str(reg.get("zona_regional_temprana", info.get("visual_hint", "--")) or "--")
         prom3 = float(reg.get("prom3", info.get("prom3", 0.0)) or 0.0); prom8 = float(reg.get("prom8", info.get("prom8", 0.0)) or 0.0); d38 = float(reg.get("d38", info.get("delta_3_8", 0.0)) or 0.0)
@@ -19528,8 +19639,7 @@ def render_estado_lxv_actual_panel(info_zona: dict, summary: dict, locks: dict |
         w=92
         row=lambda t: f"║ {_hud_fit(str(t), w-4).ljust(w-4)} ║"
         no_habilita = " | NO_HABILITA_REAL" if (str(reg_z).startswith("VERDE_") and oficial_bloquea) else ""
-        zona_visual_txt = str((info.get('zona_visual_info',{}) or {}).get('zona_visual','--'))
-        lines=["╔"+"═"*(w-2)+"╗",row("🧭 ESTADO LXV ACTUAL"),row(f"OFICIAL REAL : {zona} | decisión={decision} | motivo={motivo}"),row(f"VISUAL       : {zona_visual_txt} | NO_MANDA_REAL"),row(f"REGIONAL     : {reg_z} | SOLO_DIAGNÓSTICO | NO_HABILITA_REAL | acción={action} | prom3={prom3:.2f} prom8={prom8:.2f} d38={d38:+.2f}"),row(f"COLUMNA_VISUAL: {zona_visual_txt} | patrón={patron} | cerrados={closed_count}/{expected_count} | dq={dq} | g_columna={g_col_txt}"),row(f"PATRÓN_REAL: {'VALIDO' if patron_real_valido else 'NO_VALIDO'} | patrón={patron} | válidos=5V1X/4V2X"),row(f"SYNC    : {'ESPERANDO_BOTS' if faltan_count>0 else 'OK'} | {sync_txt} | REAL={'no_evaluado' if faltan_count>0 else 'evaluable'}"),row(f"REAL    : ACTIVO={'SI' if real_activo else 'NO'} | TOKEN={'DEMO' if tok in (None,'none','') else 'REAL'} | BOT_REAL={bot_real}"),row(f"FINAL   : {final}")]
+        lines=["╔"+"═"*(w-2)+"╗",row("🧭 ESTADO LXV ACTUAL"),row(f"OFICIAL REAL : {zona_oficial_show} | decisión={decision_show} | motivo={motivo_show}"),row(f"VISUAL       : {zona_visual_txt} | NO_MANDA_REAL"),row(f"REGIONAL     : {reg_z} | SOLO_DIAGNÓSTICO | NO_HABILITA_REAL | acción={action} | prom3={prom3:.2f} prom8={prom8:.2f} d38={d38:+.2f}"),row(f"COLUMNA_VISUAL: {zona_visual_txt} | patrón={patron} | cerrados={closed_count}/{expected_count} | dq={dq} | g_columna={g_col_txt}"),row(f"PATRÓN_REAL: {'VALIDO' if patron_real_valido else 'NO_VALIDO'} | patrón={patron} | válidos=5V1X/4V2X"),row(f"SYNC    : {'ESPERANDO_BOTS' if faltan_count>0 else 'OK'} | {sync_txt} | REAL={'no_evaluado' if faltan_count>0 else 'evaluable'}"),row(f"REAL    : ACTIVO={'SI' if real_activo else 'NO'} | TOKEN={'DEMO' if tok in (None,'none','') else 'REAL'} | BOT_REAL={bot_real}"),row(f"FINAL   : {final}")]
         if str(reg_z).startswith("VERDE_") and oficial_bloquea:
             lines.append(row(f"⚠️ VERDE REGIONAL IGNORADO PARA REAL: zona oficial manda | oficial={zona} | motivo={motivo}"))
         if info_prearmado.get("prearmado"):
@@ -20997,6 +21107,8 @@ def mostrar_panel():
 
     # Eventos recientes
     mostrar_ack_live()
+    for _ack_line in render_ack_audit_panel(None):
+        print(_ack_line)
     mostrar_eventos()
 
     mostrar_ia_resumen_compacto()
