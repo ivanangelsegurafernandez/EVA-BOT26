@@ -277,13 +277,6 @@ HUD_MAX_EVENT_LINES_COMPACT = 2
 HUD_PANEL_WIDTH_COMPACT = 118
 HUD_PARALLEL_PANELS = True
 HUD_PARALLEL_MIN_WIDTH = 110
-HUD_PREMIUM_V2_ENABLE = True
-HUD_PREMIUM_V2_FALLBACK_LEGACY = True
-HUD_PREMIUM_V2_SHOW_FULL_ZONE_DATA = False
-HUD_PREMIUM_V2_SHOW_FULL_LOCKS = False
-HUD_PREMIUM_V2_EVENTS_MAX = 3
-HUD_PREMIUM_V2_MIN_WIDTH = 110
-HUD_PREMIUM_V2_SHOW_DETAILS = False
 HUD_COMPACT_MAX_LINES_TARGET = 30
 HUD_EVENTS_CURRENT_ROUND_ONLY = True
 HUD_SHOW_CONTROL_PANEL = False
@@ -21232,145 +21225,6 @@ def mostrar_panel_confirmacion_riesgo(bot):
         print(Fore.YELLOW + ln)
 
 # Mostrar panel
-
-
-def _hud_safe_str(value, default="--"):
-    try:
-        if value is None:
-            return default
-        txt = str(value).strip()
-        return txt if txt else default
-    except Exception:
-        return default
-
-
-def _hud_strip_ansi_len(text):
-    try:
-        clean = re.sub(r"\x1b\[[0-9;]*m", "", str(text or ""))
-        return len(clean)
-    except Exception:
-        return len(str(text or ""))
-
-
-def _hud_pad(text, width):
-    t = str(text or "")
-    w = max(1, int(width or 1))
-    d = w - _hud_strip_ansi_len(t)
-    return t + (" " * max(0, d))
-
-
-def _hud_fit(text, width):
-    t = str(text or "")
-    w = max(1, int(width or 1))
-    if _hud_strip_ansi_len(t) <= w:
-        return t
-    raw = re.sub(r"\x1b\[[0-9;]*m", "", t)
-    return raw[:max(0, w-1)] + "…"
-
-
-def _hud_kv(label, value, width=None):
-    kv = f"{_hud_safe_str(label)}: {_hud_safe_str(value)}"
-    return _hud_fit(kv, width) if width else kv
-
-
-def _hud_box(title, lines, width, color=None):
-    w = max(24, int(width or 24))
-    ttl = _hud_fit(_hud_safe_str(title), w-4)
-    out = ["┌" + "─"*(w-2) + "┐", f"│ {_hud_pad(ttl, w-4)} │", "├" + "─"*(w-2) + "┤"]
-    for ln in list(lines or []) or ["--"]:
-        out.append(f"│ {_hud_pad(_hud_fit(ln, w-4), w-4)} │")
-    out.append("└" + "─"*(w-2) + "┘")
-    return out
-
-
-def _hud_join_cols(blocks, gap=2):
-    bs=[list(b or []) for b in list(blocks or []) if b]
-    if not bs:
-        return []
-    h=max(len(b) for b in bs)
-    ws=[max((_hud_strip_ansi_len(x) for x in b), default=0) for b in bs]
-    for i,b in enumerate(bs):
-        b.extend([" "*ws[i]]*(h-len(b)))
-    out=[]
-    for r in range(h):
-        out.append((" "*gap).join(_hud_pad(bs[i][r], ws[i]) for i in range(len(bs))))
-    return out
-
-
-def _hud_color_zone(zona):
-    z=str(zona or '').upper()
-    if 'VERDE_TEMPRANO' in z or 'VERDE_MADURO' in z: return Fore.GREEN if 'Fore' in globals() else ''
-    if 'VERDE_TARDIO' in z or 'SATURADO' in z: return Fore.YELLOW if 'Fore' in globals() else ''
-    if 'ROJA' in z or 'ROJO' in z: return Fore.RED if 'Fore' in globals() else ''
-    return Fore.LIGHTBLACK_EX if 'Fore' in globals() else ''
-
-
-def _hud_color_bool_estado(valor):
-    v=str(valor or '').upper()
-    if v in ('ON','OK','TRUE','SI'): return (Fore.GREEN if 'Fore' in globals() else '') + v + (Style.RESET_ALL if 'Style' in globals() else '')
-    if v in ('OFF','NO','FALSE'): return (Fore.RED if 'Fore' in globals() else '') + v + (Style.RESET_ALL if 'Style' in globals() else '')
-    return v or '--'
-
-
-def _hud_get_snapshot_premium_v2():
-    s={}
-    try:
-        now=time.localtime()
-        marti=_marti_hud_snapshot() if callable(globals().get('_marti_hud_snapshot')) else {}
-        real_on, real_bot = hay_real_activo_global() if callable(globals().get('hay_real_activo_global')) else (False,'--')
-        zline = _hud_zona_operativa_lxv_line() if callable(globals().get('_hud_zona_operativa_lxv_line')) else '--'
-        s['general']={
-            'round':globals().get('round_actual',0),'ciclo':f"C{int(globals().get('marti_ciclos_perdidos',0) or 0)+1}",'token':leer_token_actual() if callable(globals().get('leer_token_actual')) else '--',
-            'hora':time.strftime('%H:%M',now),'fecha':time.strftime('%d/%m/%Y',now),'saldo':globals().get('saldo_actual','--'),'meta':globals().get('META','--'),'falta':'--','avance':'--',
-            'modo':'PAUSA' if callable(globals().get('maestro_en_pausa')) and maestro_en_pausa() else 'ACTIVO','r':globals().get('INTERVALO_ACTUAL','--'),'base':globals().get('SALDO_INICIAL','--'),'objetivo':'--','estado':'--','marti_total':sum(globals().get('MARTI_ESCALADO',[0,0,0,0,0]) or [0]),'cobertura':'--'}
-        s['martingala']={'ciclos':globals().get('MARTI_ESCALADO',[1,2,4,8,16]),'ciclo_actual':marti.get('ciclo_actual','--'),'proxima_real':marti.get('proxima_real','--'),'estado':marti.get('estado','--'),'bot_real':real_bot,'ultimo_resultado':marti.get('ultimo_resultado','--'),'monto_actual':marti.get('monto_actual','--'),'monto_proximo':marti.get('monto_proximo','--')}
-        s['real']={'real_activo':real_on,'bot':real_bot,'ciclo':marti.get('ciclo_actual','--'),'fuente':globals().get('REAL_ACTIVO_FUENTE','--'),'tiempo':globals().get('REAL_ACTIVO_TIEMPO','--'),'token':s['general']['token'],'estado':('ACTIVO' if real_on else 'SIN REAL ACTIVO'),'ultima_orden':globals().get('ULTIMA_ORDEN_REAL','--'),'owner_lock':globals().get('REAL_OWNER_LOCK','--'),'close_pending':globals().get('REAL_CLOSE_PENDING','--')}
-        lista=[]
-        for b in list(globals().get('BOT_NAMES',[]) or []):
-            eb=(globals().get('estado_bots',{}) or {}).get(b,{})
-            lista.append({'nombre':b,'historial':eb.get('historial_live_ack',eb.get('historial','--')),'token':eb.get('token','--'),'g':eb.get('ganadas','--'),'p':eb.get('perdidas','--'),'pct':eb.get('porcentaje_acierto','--'),'probia':eb.get('prob_ia','--'),'modo':eb.get('modo_ia','--'),'is_real': b==real_bot})
-        s['bots']={'lista_bots':lista}
-        s['zona']={'oficial':zline,'visual':'--','regional':'--','columna':'--','patron_real':'--','sync':'--','real':'--','final':'--','motivo':'--'}
-        s['round']={'cerrados':'--','faltan':'--','calidad':'--','patron':'--','auc':globals().get('auc_live','--'),'thr':globals().get('umbral_dinamico','--'),'conf':globals().get('confianza_ia','--'),'cierres':'--'}
-        s['candados']={'bloqueo_principal':'--','estado_final':'--','sync':'--','patron':'--','zona':'--','ejecucion':'--'}
-        ev=list(globals().get('eventos_recentes',[]) or [])
-        s['eventos']={'eventos_recientes':ev[-int(globals().get('HUD_PREMIUM_V2_EVENTS_MAX',3) or 3):]}
-    except Exception:
-        pass
-    return s
-
-def _hud_premium_v2_selfcheck(snapshot):
-    warns=[]
-    req={'general':['saldo','meta','falta','avance','modo','r','token','round','ciclo'],'martingala':['ciclos','ciclo_actual','proxima_real','estado','bot_real'],'real':['real_activo','bot','fuente','token','estado'],'bots':['lista_bots'],'zona':['oficial','visual','regional','columna','patron_real','sync','real','final','motivo'],'round':['cerrados','faltan','calidad','patron','auc','thr','conf','cierres'],'candados':['bloqueo_principal','estado_final','sync','patron','zona','ejecucion'],'eventos':['eventos_recientes']}
-    for sec,keys in req.items():
-        dd=(snapshot or {}).get(sec,{}) if isinstance((snapshot or {}).get(sec,{}),dict) else {}
-        for k in keys:
-            if k not in dd: warns.append(f"HUD WARN: falta campo {sec}.{k}")
-    return warns
-
-def render_hud_premium_v2(snapshot=None):
-    try:
-        snap = snapshot if isinstance(snapshot, dict) else _hud_get_snapshot_premium_v2()
-        warns=_hud_premium_v2_selfcheck(snap)
-        minw=int(globals().get('HUD_PREMIUM_V2_MIN_WIDTH',110) or 110)
-        term_w=int(shutil.get_terminal_size((132,40)).columns)
-        if term_w < minw:
-            return False
-        g=snap.get('general',{})
-        print('┌' + '─'*(term_w-2) + '┐')
-        print('│ ' + _hud_pad('⚡ TRADING BOT · MARTINGALA REAL · LXV', term_w-4) + ' │')
-        print('│ ' + _hud_pad(f"Round #{g.get('round','--')} · Ciclo {g.get('ciclo','--')} · Token {g.get('token','--')} · {g.get('hora','--')} · {g.get('fecha','--')}", term_w-4) + ' │')
-        print('└' + '─'*(term_w-2) + '┘')
-        m=snap.get('martingala',{}); r=snap.get('real',{}); z=snap.get('zona',{})
-        b1=_hud_box('MARTINGALA · CICLOS',[f"C1-C5: {m.get('ciclos','--')}",_hud_kv('Ciclo actual',m.get('ciclo_actual')),_hud_kv('Próxima real',m.get('proxima_real')),_hud_kv('Estado',m.get('estado')),_hud_kv('Bot real',m.get('bot_real'))], max(36,term_w//3-2))
-        b2=_hud_box('INVERSIÓN EN CURSO / REAL ACTIVO',[_hud_kv('Bot',r.get('bot')),_hud_kv('Ciclo',r.get('ciclo')),_hud_kv('Fuente',r.get('fuente')),_hud_kv('Activo',r.get('estado')),_hud_kv('Token',r.get('token')),_hud_kv('Última orden',r.get('ultima_orden'))], max(36,term_w//3-2))
-        b3=_hud_box('ZONA LXV / DECISIÓN',[_hud_kv('Oficial real',z.get('oficial')),_hud_kv('Visual',z.get('visual')),_hud_kv('Regional',z.get('regional')),_hud_kv('Columna',z.get('columna')),_hud_kv('Patrón real',z.get('patron_real')),_hud_kv('Sync',z.get('sync')),_hud_kv('Real',z.get('real')),_hud_kv('Final',z.get('final')),_hud_kv('Motivo',z.get('motivo'))], max(36,term_w//3-2))
-        for ln in _hud_join_cols([b1,b2,b3] if term_w>=130 else [b1,b2],2): print(ln)
-        for w in warns[:5]: print(w)
-        return True
-    except Exception:
-        return False
-
 def mostrar_panel():
     # === IA: actualizar Prob IA antes de render (NO afecta lógica de trading) ===
     try:
@@ -21462,18 +21316,6 @@ def mostrar_panel():
         meta_str = f"{float(META):.2f}" if META is not None else "--"
     except Exception:
         meta_str = "--"
-
-    try:
-        if bool(globals().get("HUD_PREMIUM_V2_ENABLE", True)):
-            snap = _hud_get_snapshot_premium_v2()
-            ok = render_hud_premium_v2(snap)
-            if ok:
-                return
-    except Exception as e:
-        try:
-            agregar_evento(f"⚠️ HUD_PREMIUM_V2 fallback: {type(e).__name__}")
-        except Exception:
-            pass
 
 
     if bool(globals().get("HUD_ULTRA_COMPACT_MODE", False)):
