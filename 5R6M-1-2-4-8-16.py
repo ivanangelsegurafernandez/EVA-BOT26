@@ -21131,9 +21131,15 @@ def mostrar_panel_teclado_activo(bot, rest_s, max_ciclos, ciclo_actual="C1", fue
     rest = max(0, int(rest_s or 0))
     ciclo_txt = str(ciclo_actual or "C1")
     src_txt = str(fuente or "--")
+    direct_force = bool(globals().get("MANUAL_REAL_DIRECT_FORCE", True))
+    accion_txt = (
+        f"Elige ciclo [1..{int(max_ciclos)}] = REAL directo | ESC cancela"
+        if direct_force
+        else f"Elige ciclo [1..{int(max_ciclos)}] | Luego confirma Y/S o cancela N/ESC"
+    )
     if not bool(globals().get("HUD_SHOW_CONTROL_PANEL", False)):
         return [
-            f"⌨️ MANUAL REAL | Bot={bot_txt.upper()} | Elige ciclo [1..{int(max_ciclos)}] | Luego confirma Y/S o cancela N/ESC | {rest}s"
+            f"⌨️ MANUAL REAL | Bot={bot_txt.upper()} | {accion_txt} | {rest}s"
         ]
     estado_txt = f"Tiempo para decidir : {rest:>3}s" if rest > 0 else "Estado            : decisión cerrada / orden enviada"
     return [
