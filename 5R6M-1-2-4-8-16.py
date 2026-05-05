@@ -3010,6 +3010,10 @@ LXV_REAL_EMITIDOS_POR_RONDA = set()
 LXV_REAL_EMITIDOS_MAX_KEEP = 300
 _SYNC_PENDING_WARN_TS = {}
 _SYNC_STALE_WARN_TS = {}
+_SYNC_REAL_OWNER_LAG_TS = {}
+SYNC_POST_REAL_EXEMPT_WINDOW_S = 180.0
+SYNC_REAL_HOLD_DIAG_COOLDOWN_S = 15.0
+SYNC_STATUS_LINE = "SYNC: NORMAL | cerrados=0/0 | release=1"
 _LXV_5V1X_EVENT_TS = {}
 _LXV_PREARMADO_EVENT_TS = {}
 _LXV_GREEN_OPPORTUNITY_SEEN = set()
@@ -5024,6 +5028,9 @@ def _ack_live_format_lines(snapshot):
             f"patrón={parcial_txt} zona={info_fase.get('zona', info_fase.get('fase', 'INSUFICIENTE'))} "
             f"decision={info_fase.get('decision', ZONA_NO_INVERTIR)} motivo={motivo}"
         )
+        sync_line = str(globals().get("SYNC_STATUS_LINE", "") or "").strip()
+        if sync_line:
+            lines.append(sync_line)
 
     if summary.get("all_prev_waiting", False) and bool(globals().get("HUD_SHOW_DEBUG_BLOCKS", False)):
         lines.append("↳ Esperando cierres de ronda objetivo; los ACK visibles aún pertenecen a ronda previa.")
@@ -8603,6 +8610,125 @@ def _sync_real_turn_activo() -> tuple[bool, str | None, str]:
             return (True, b, 'owner/token/orden')
     return (False, None, 'sin_real_activo')
 
+
+def _sync_real_order_viva_any() -> tuple[bool, str | None]:
+    try:
+        for bot in BOT_NAMES:
+            try:
+                orden = _read_json(path_orden(bot), default={})
+            except Exception:
+                orden = {}
+            if isinstance(orden, dict) and _orden_real_viva(orden) and (not bool(orden.get("consumed", False))):
+                return True, str(bot)
+    except Exception:
+        return True, None
+    return False, None
+
+
+def _sync_mark_recent_real_owner(bot: str, reason: str = "real_closed") -> None:
+    try:
+        b = str(bot or "").strip()
+        if b in BOT_NAMES:
+            _SYNC_REAL_OWNER_LAG_TS[b] = {"ts": float(time.time()), "reason": str(reason or "real_closed")}
+    except Exception:
+        pass
+
+
+def _sync_is_recent_real_owner(bot: str, state: dict | None = None) -> tuple[bool, str]:
+    b = str(bot or "").strip()
+    if b not in BOT_NAMES:
+        return False, "invalid_bot"
+    st = state if isinstance(state, dict) else {}
+    if str(st.get("real_released_after_bot", "") or "").strip() == b:
+        return True, "state_real_released_after_bot"
+    if str(st.get("real_pending_bot", "") or "").strip() == b and str(st.get("status", "")).strip().lower() in ("released_after_real_result", "released_recovery_completed_without_real_stuck"):
+        return True, "state_previous_real_pending_bot"
+    info = _SYNC_REAL_OWNER_LAG_TS.get(b)
+    if isinstance(info, dict):
+        age = float(time.time()) - float(info.get("ts", 0.0) or 0.0)
+        if 0.0 <= age <= float(globals().get("SYNC_POST_REAL_EXEMPT_WINDOW_S", 180.0) or 180.0):
+            return True, str(info.get("reason", "recent_real_close") or "recent_real_close")
+    try:
+        rp = REAL_CLOSE_PENDING.get(b)
+    except Exception:
+        rp = None
+    if isinstance(rp, dict) and rp.get("active"):
+        return True, "real_close_pending_owner"
+    if globals().get("REAL_OWNER_LOCK") == b:
+        return True, "owner_lock"
+    try:
+        tok = str(leer_token_actual() or "").strip()
+    except Exception:
+        tok = ""
+    if tok == b or tok.upper() == f"REAL:{b}".upper():
+        return True, "token_real_owner"
+    return False, "not_recent_real_owner"
+
+
+def _sync_ack_round_absurd_for_exempt(bot: str, round_id: int) -> tuple[bool, str]:
+    try:
+        ack = _sync_round_safe_read_json(_sync_round_ack_path(bot))
+        if not isinstance(ack, dict) or not ack:
+            return False, "ack_missing_ok"
+        ack_round = int(ack.get("round_id", 0) or 0)
+        if ack_round <= 0:
+            return False, "ack_round_empty_ok"
+        if abs(int(ack_round) - int(round_id)) > 2:
+            return True, f"ack_round_absurd_{ack_round}_obj_{int(round_id)}"
+        return False, f"ack_round_compatible_{ack_round}"
+    except Exception as e:
+        return True, f"ack_read_error_{type(e).__name__}"
+
+
+def _sync_eval_real_owner_lag_exempt(round_id: int, expected: list, closed: dict, reasons: dict, state: dict | None = None) -> dict:
+    expected_bots = [b for b in (expected or BOT_NAMES) if b in BOT_NAMES]
+    expected_count = len(expected_bots)
+    closed_bots = dict(closed or {})
+    missing = [b for b in expected_bots if b not in closed_bots]
+    out = {"ok": False, "bot": "", "reason": "not_evaluated", "missing": missing}
+    if expected_count <= 0:
+        out["reason"] = "no_expected_bots"; return out
+    if len(missing) != 1 or len(closed_bots) != (expected_count - 1):
+        out["reason"] = "missing_count_not_one"; return out
+    ex_bot = str(missing[0])
+    pending_on, pending_bot, _pending = _hay_real_close_pending_activo()
+    if pending_on:
+        out.update({"reason": "HOLD_POR_REAL_CLOSE_PENDING", "bot": ex_bot, "pending_bot": pending_bot}); return out
+    recent_ok, recent_reason = _sync_is_recent_real_owner(ex_bot, state)
+    if not recent_ok:
+        out.update({"reason": "missing_bot_not_real_owner", "bot": ex_bot, "owner_reason": recent_reason}); return out
+    order_on, order_bot = _sync_real_order_viva_any()
+    if order_on:
+        out.update({"reason": "orden_real_viva", "bot": ex_bot, "order_bot": order_bot}); return out
+    real_on, real_bot, _mot = _sync_real_turn_activo()
+    if real_on:
+        try:
+            tok_now = str(leer_token_actual() or "").strip().upper()
+        except Exception:
+            tok_now = ""
+        st_missing = estado_bots.get(ex_bot, {}) if isinstance(estado_bots.get(ex_bot, {}), dict) else {}
+        stale_lock_same_owner = bool(
+            real_bot == ex_bot
+            and recent_ok
+            and tok_now not in (ex_bot.upper(), f"REAL:{ex_bot}".upper())
+            and not str(st_missing.get("token", "DEMO") or "DEMO").upper().startswith("REAL")
+        )
+        if not stale_lock_same_owner:
+            out.update({"reason": "HOLD_POR_REAL_ACTIVO", "bot": ex_bot, "owner": real_bot}); return out
+    for b in expected_bots:
+        if b == ex_bot:
+            continue
+        st_bot = estado_bots.get(b, {}) if isinstance(estado_bots.get(b, {}), dict) else {}
+        if bool(st_bot.get("pending_contract_resolution", False)):
+            out.update({"reason": "pending_contract_resolution_other", "bot": ex_bot, "pending_bot": b}); return out
+        if str((reasons or {}).get(b, "ok")) != "ok" and b not in closed_bots:
+            out.update({"reason": "other_bot_not_closed", "bot": ex_bot, "other": b}); return out
+    absurd, ack_reason = _sync_ack_round_absurd_for_exempt(ex_bot, int(round_id))
+    if absurd:
+        out.update({"reason": ack_reason, "bot": ex_bot}); return out
+    out.update({"ok": True, "bot": ex_bot, "reason": "post_real_lag", "owner_reason": recent_reason, "ack_reason": ack_reason, "missing": missing})
+    return out
+
 def _sync_ack_close_ts(ack: dict) -> float:
     try:
         return float((ack or {}).get("ts") or (ack or {}).get("closed_ts") or 0.0)
@@ -9126,8 +9252,8 @@ def _sync_round_tick_maestro():
         if real_on and real_bot in BOT_NAMES:
             _lxv_5v1x_event_cooldown(
                 key=f"sync_hold_real:{round_id}:{real_bot}:{hold_status}",
-                msg=f"⏸️ ROUND HOLD REAL: esperando turno REAL bot={real_bot} | status={hold_status}",
-                cooldown_s=8.0,
+                msg=f"SYNC HOLD LEGÍTIMO: esperando cierre REAL | owner={real_bot} | HOLD_POR_REAL_ACTIVO",
+                cooldown_s=float(globals().get("SYNC_REAL_HOLD_DIAG_COOLDOWN_S", 15.0) or 15.0),
             )
             return
         agregar_evento(f"🧯 HOLD cancelado: no hay REAL activo real; liberando ronda #{round_id + 1}")
@@ -9156,8 +9282,8 @@ def _sync_round_tick_maestro():
     if real_close_pending_active:
         _lxv_5v1x_event_cooldown(
             key=f"sync_pending_block:{real_close_pending_bot}:{real_close_pending_data.get('ciclo')}",
-            msg="⏸️ TURBO_SYNC_REAL_PENDING: nueva REAL bloqueada, pero sync/release sigue activo",
-            cooldown_s=8.0,
+            msg=f"SYNC HOLD LEGÍTIMO: esperando cierre REAL | owner={real_close_pending_bot} | HOLD_POR_REAL_CLOSE_PENDING",
+            cooldown_s=float(globals().get("SYNC_REAL_HOLD_DIAG_COOLDOWN_S", 15.0) or 15.0),
         )
 
     now_ts = float(time.time())
@@ -9415,6 +9541,51 @@ def _sync_round_tick_maestro():
         max_lag_s = None
     data_quality = str(summary.get("data_quality", "") or "").strip().lower()
     partial_pattern = _lxv_normalizar_patron_txt(summary.get("partial_pattern", "")) or "0V0X"
+    real_on_diag, real_owner_diag, _ = _sync_real_turn_activo()
+    if real_close_pending_active:
+        globals()["SYNC_STATUS_LINE"] = f"SYNC: HOLD_REAL_CLOSE_PENDING | owner={real_close_pending_bot or '--'} | ronda={round_id} | release={released_round}"
+    elif real_on_diag:
+        globals()["SYNC_STATUS_LINE"] = f"SYNC: HOLD_REAL_ACTIVO | owner={real_owner_diag or '--'} | ronda={round_id} | release={released_round}"
+    else:
+        globals()["SYNC_STATUS_LINE"] = f"SYNC: NORMAL | cerrados={closed_count}/{expected_count} | release={released_round}"
+    post_real_exempt = _sync_eval_real_owner_lag_exempt(round_id, expected, closed, sync_debug_missing, st)
+    if bool(post_real_exempt.get("ok", False)):
+        exento = str(post_real_exempt.get("bot") or "")
+        globals()["SYNC_STATUS_LINE"] = f"SYNC: POST_REAL_EXENTO | exento={exento} | cerrados={closed_count}/{expected_count} | release={int(round_id) + 1}"
+        _lxv_5v1x_event_cooldown(
+            key=f"sync_post_real_exento:{round_id}:{exento}",
+            msg=f"SYNC RECOVERY POST_REAL: {closed_count}/{expected_count} + ex_owner={exento} | liberando #{int(round_id) + 1}",
+            cooldown_s=float(globals().get("SYNC_REAL_HOLD_DIAG_COOLDOWN_S", 15.0) or 15.0),
+        )
+        ok_rel = _sync_round_release_next_round(
+            int(round_id),
+            "EXENTO_TEMPORAL_POST_REAL",
+            extra={
+                "post_real_exempt_bot": exento,
+                "post_real_exempt_reason": "REAL_OWNER_LAG",
+                "post_real_owner_reason": str(post_real_exempt.get("owner_reason", "")),
+                "closed_count_exempt": int(closed_count),
+                "expected_count_exempt": int(expected_count),
+            },
+        )
+        if ok_rel:
+            agregar_evento(f"🧩 RELEASE_CON_EXENTO_REAL_OWNER: ronda #{round_id} → #{int(round_id) + 1} | exento={exento} | motivo=post_real_lag")
+        return
+    elif closed_count == max(0, expected_count - 1):
+        why_exempt_no = str(post_real_exempt.get("reason", ""))
+        if why_exempt_no in ("HOLD_POR_REAL_CLOSE_PENDING", "HOLD_POR_REAL_ACTIVO"):
+            owner_hold = post_real_exempt.get("owner") or post_real_exempt.get("pending_bot") or "--"
+            _lxv_5v1x_event_cooldown(
+                key=f"sync_hold_real_legit:{round_id}:{owner_hold}:{why_exempt_no}",
+                msg=f"SYNC HOLD LEGÍTIMO: esperando cierre REAL | owner={owner_hold} | {why_exempt_no}",
+                cooldown_s=float(globals().get("SYNC_REAL_HOLD_DIAG_COOLDOWN_S", 15.0) or 15.0),
+            )
+        elif len(post_real_exempt.get("missing", []) or []) == 1:
+            _lxv_5v1x_event_cooldown(
+                key=f"sync_bloqueado_no_real_owner:{round_id}:{why_exempt_no}",
+                msg=f"SYNC BLOQUEADO: faltan bots no relacionados a REAL | no libero | motivo={why_exempt_no}",
+                cooldown_s=float(globals().get("SYNC_REAL_HOLD_DIAG_COOLDOWN_S", 15.0) or 15.0),
+            )
     incomplete_round = bool(closed_count < expected_count)
     has_expired_closed = bool(expired_count > 0)
     too_old_round = bool(max_lag_s is not None and float(max_lag_s) > float(ROUND_LIVE_INVEST_WINDOW_S))
@@ -9962,6 +10133,7 @@ def _start_sync_turbo_watcher():
     agregar_evento("⚡ SYNC_TURBO_WATCHER iniciado: tick maestro cada 0.20s")
 
 def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") -> None:
+    _sync_mark_recent_real_owner(bot, reason)
     st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
     status = str(st.get("status", "")).strip().lower()
     if status not in ("holding_real_result", "holding_real_turn"):
@@ -9988,6 +10160,7 @@ def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") 
         "ts": float(time.time()),
     }
     _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+    globals()["SYNC_STATUS_LINE"] = f"SYNC: POST_REAL_CERRADO | exento={bot} | cerrados=0/{len(BOT_NAMES)} | release={next_round}"
     agregar_evento(f"🚀 ROUND LIVE liberado tras cierre REAL: bot={bot} -> ronda #{next_round}")
 
 # === PATCH: REAL INMEDIATO EN HUD AL EMITIR ORDEN (sin esperar compra) ===
