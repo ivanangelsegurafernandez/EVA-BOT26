@@ -22723,6 +22723,9 @@ PENDIENTE_FORZAR_BOT = None
 PENDIENTE_FORZAR_INICIO = 0.0
 PENDIENTE_FORZAR_EXPIRA = 0.0
 MANUAL_REAL_ALWAYS_CONFIRM = True
+MANUAL_KEY_REPEAT_BLOCK_S = 0.08
+MANUAL_KEY_BURST_MAX = 20
+MANUAL_KEYBOARD_PATCH_SAFE = True
 KEYBOARD_LISTENER_ALIVE_TS = 0.0
 KEYBOARD_LAST_KEY_TS = 0.0
 KEYBOARD_LAST_KEY = ""
@@ -25422,6 +25425,50 @@ def _safe_render_keyboard_panel():
         pass
 
 
+def _keyboard_read_burst_safe():
+    """
+    Lee todas las teclas disponibles del buffer msvcrt sin bloquear.
+    No cambia lógica manual.
+    Solo evita perder teclas rápidas.
+    Ignora teclas extendidas Windows.
+    """
+    keys = []
+    try:
+        if not (HAVE_MSVCRT and msvcrt):
+            return keys
+
+        guard = 0
+        max_guard = int(globals().get("MANUAL_KEY_BURST_MAX", 20) or 20)
+
+        while msvcrt.kbhit() and guard < max_guard:
+            guard += 1
+            raw = msvcrt.getch()
+
+            if raw in (b"\x00", b"\xe0"):
+                try:
+                    if msvcrt.kbhit():
+                        msvcrt.getch()
+                except Exception:
+                    pass
+                continue
+
+            try:
+                k = raw.decode("utf-8", errors="ignore").lower()
+            except Exception:
+                k = ""
+
+            if k:
+                keys.append(k)
+
+    except Exception as e:
+        try:
+            _manual_key_audit(f"keyboard_read_burst_safe_error {type(e).__name__}: {e}")
+        except Exception:
+            pass
+
+    return keys
+
+
 # Escuchar teclas
 def escuchar_teclas():
     global pausado, salir, reinicio_manual, LIMPIEZA_PANEL_HASTA, HUD_VISIBLE
@@ -25429,7 +25476,8 @@ def escuchar_teclas():
     global KEYBOARD_LISTENER_ALIVE_TS, KEYBOARD_LAST_KEY_TS, KEYBOARD_LAST_KEY
 
     bot_map = {'5': 'fulll45', '6': 'fulll46', '7': 'fulll47', '8': 'fulll48', '9': 'fulll49', '0': 'fulll50'}
-    last_key_time = 0  # debounce 200 ms
+    last_key_seen = ""
+    last_key_seen_ts = 0.0
 
     while True:
         try:
@@ -25473,19 +25521,31 @@ def escuchar_teclas():
                     time.sleep(0.01)
                     continue
 
-            now = time.time()
-            if HAVE_MSVCRT and msvcrt.kbhit():
-                if now - last_key_time < 0.2:
-                    time.sleep(0.05); continue
-                last_key_time = now
+            keys = _keyboard_read_burst_safe()
 
-                try:
-                    k = msvcrt.getch()
-                    if k in (b'\x00', b'\xe0'):
-                        msvcrt.getch(); continue
-                    k = k.decode("utf-8", errors="ignore").lower()
-                except:
+            if not keys:
+                time.sleep(0.01)
+                continue
+
+            try:
+                if len(keys) > 1:
+                    _manual_key_audit(f"key_burst keys={keys}")
+            except Exception:
+                pass
+
+            for k in keys:
+                now_key = time.time()
+                repeat_block = float(globals().get("MANUAL_KEY_REPEAT_BLOCK_S", 0.08) or 0.08)
+
+                if k == last_key_seen and (now_key - last_key_seen_ts) < repeat_block:
+                    try:
+                        _manual_key_audit(f"key_repeat_ignored key={repr(k)} dt={now_key - last_key_seen_ts:.4f}")
+                    except Exception:
+                        pass
                     continue
+
+                last_key_seen = k
+                last_key_seen_ts = now_key
                 KEYBOARD_LAST_KEY_TS = time.time()
                 KEYBOARD_LAST_KEY = repr(k)
                 dt_since_last = max(0.0, KEYBOARD_LAST_KEY_TS - float(globals().get("KEYBOARD_LAST_KEY_TS_PREV", 0.0) or 0.0))
@@ -25656,8 +25716,9 @@ def escuchar_teclas():
                     _request_hud_refresh("manual_bot_selected", fast_s=2.0)
                     continue
 
-            else:
-                time.sleep(0.01)
+
+            if salir:
+                break
         except Exception as e:
             try:
                 agregar_evento(f"⚠️ Teclado recuperado tras error: {type(e).__name__}: {e}")
