@@ -10143,6 +10143,7 @@ def _escribir_orden_real_raw(bot: str, ciclo: int):
     """
     ciclo = max(1, min(int(ciclo), MAX_CICLOS))
     source_val = str(globals().get("_REAL_ROUTE_SOURCE", "LEGACY") or "LEGACY").upper()
+    ttl_s = float(globals().get("MANUAL_FORCE_ORDER_TTL_S", REAL_ORDER_TTL_S) if source_val == "MANUAL" else REAL_ORDER_TTL_S)
     now_ts = time.time()
     payload = {
         "bot": bot,
@@ -10154,7 +10155,7 @@ def _escribir_orden_real_raw(bot: str, ciclo: int):
         "source": source_val,
         "ts": now_ts,
         "created_ts": now_ts,
-        "ttl_s": REAL_ORDER_TTL_S,
+        "ttl_s": ttl_s,
         "order_id": None,
         "consumed": False,
         "manual_override": (source_val == "MANUAL"),
@@ -22722,7 +22723,16 @@ VENTANA_DECISION_IA_S = 35
 PENDIENTE_FORZAR_BOT = None
 PENDIENTE_FORZAR_INICIO = 0.0
 PENDIENTE_FORZAR_EXPIRA = 0.0
-MANUAL_REAL_ALWAYS_CONFIRM = True
+MANUAL_REAL_DIRECT_FORCE = True
+MANUAL_REAL_ALWAYS_CONFIRM = False
+MANUAL_FORCE_VERIFY_RETRIES = 3
+MANUAL_FORCE_VERIFY_SLEEP_S = 0.20
+MANUAL_FORCE_ORDER_TTL_S = max(float(REAL_ORDER_TTL_S), 120.0)
+MANUAL_KEY_LAST_ORDER = {
+    "bot": None,
+    "ciclo": None,
+    "ts": 0.0,
+}
 MANUAL_KEY_REPEAT_BLOCK_S = 0.08
 MANUAL_KEY_BURST_MAX = 20
 MANUAL_KEYBOARD_PATCH_SAFE = True
@@ -22989,6 +22999,144 @@ def _manual_status_lines() -> list[str]:
         return []
 
 
+def _manual_keyboard_emit_real(bot, ciclo, key=""):
+    """
+    Emite REAL manual directo desde teclado.
+    Salta filtros de decisión, pero respeta candados duros.
+    """
+    try:
+        bot = str(bot or "").strip()
+        try:
+            ciclo = int(ciclo)
+        except Exception:
+            ciclo = 0
+
+        if bot not in BOT_NAMES:
+            msg = f"BOT INVÁLIDO PARA REAL MANUAL: {bot}"
+            agregar_evento(f"⛔ {msg}")
+            _manual_key_audit(f"direct_invalid_bot key={repr(key)} bot={bot} ciclo={ciclo}")
+            _manual_status_set("error", bot=bot, ciclo=None, error=msg, ttl_s=10, last_key=key)
+            _request_hud_refresh("manual_direct_invalid_bot", fast_s=1.5)
+            return False
+
+        if ciclo < 1 or ciclo > int(MAX_CICLOS):
+            msg = f"CICLO INVÁLIDO PARA REAL MANUAL: {bot.upper()} C{ciclo}"
+            agregar_evento(f"⛔ {msg}")
+            _manual_key_audit(f"direct_invalid_cycle key={repr(key)} bot={bot} ciclo={ciclo}")
+            _manual_status_set("error", bot=bot, ciclo=ciclo, error=msg, ttl_s=10, last_key=key)
+            _request_hud_refresh("manual_direct_invalid_cycle", fast_s=1.5)
+            return False
+
+        now = time.time()
+        last = MANUAL_KEY_LAST_ORDER if isinstance(MANUAL_KEY_LAST_ORDER, dict) else {}
+        if (
+            str(last.get("bot") or "") == bot
+            and int(last.get("ciclo") or 0) == int(ciclo)
+            and (now - float(last.get("ts") or 0.0)) < 1.5
+        ):
+            dt = now - float(last.get("ts") or 0.0)
+            agregar_evento(f"🔁 MANUAL REAL duplicado ignorado: {bot.upper()} C{int(ciclo)} ({dt:.2f}s).")
+            _manual_key_audit(f"direct_duplicate_ignored key={repr(key)} bot={bot} ciclo={ciclo} dt={dt:.3f}")
+            _manual_status_set(
+                "error",
+                bot=bot,
+                ciclo=int(ciclo),
+                error=f"ORDEN DUPLICADA IGNORADA | BOT={bot.upper()} | CICLO=C{int(ciclo)}",
+                ttl_s=5,
+                last_key=key,
+            )
+            _request_hud_refresh("manual_direct_duplicate", fast_s=1.5)
+            return False
+
+        pending_on, pending_bot, pending = _hay_real_close_pending_activo()
+        if pending_on:
+            msg = f"REAL_CLOSE_PENDING activo: {str(pending_bot).upper()} C{pending.get('ciclo') if isinstance(pending, dict) else '?'}"
+            agregar_evento(f"⏸️ MANUAL REAL bloqueado: {msg}")
+            _manual_key_audit(f"direct_block_close_pending key={repr(key)} bot={bot} ciclo={ciclo} pending={pending_bot}")
+            _manual_status_set("error", bot=bot, ciclo=int(ciclo), error=msg, ttl_s=10, last_key=key)
+            _request_hud_refresh("manual_direct_close_pending", fast_s=1.5)
+            return False
+
+        try:
+            if FORZAR_LOCK.locked():
+                msg = "FORZAR_LOCK ocupado"
+                agregar_evento(f"🔒 MANUAL REAL bloqueado: {msg}.")
+                _manual_key_audit(f"direct_block_forzar_lock key={repr(key)} bot={bot} ciclo={ciclo}")
+                _manual_status_set("error", bot=bot, ciclo=int(ciclo), error=msg, ttl_s=8, last_key=key)
+                _request_hud_refresh("manual_direct_forzar_lock", fast_s=1.5)
+                return False
+        except Exception:
+            pass
+
+        owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+        if owner_lock in BOT_NAMES and owner_lock != bot:
+            msg = f"OTRO BOT EN REAL: {owner_lock.upper()}"
+            agregar_evento(f"🔒 MANUAL REAL bloqueado para {bot.upper()}: {msg}.")
+            _manual_key_audit(f"direct_block_owner_lock key={repr(key)} bot={bot} ciclo={ciclo} owner={owner_lock}")
+            _manual_status_set("error", bot=bot, ciclo=int(ciclo), error=msg, ttl_s=10, last_key=key)
+            _request_hud_refresh("manual_direct_owner_lock", fast_s=1.5)
+            return False
+
+        token_raw = None
+        try:
+            token_raw = leer_token_archivo_raw()
+        except Exception:
+            token_raw = None
+        if token_raw not in BOT_NAMES:
+            try:
+                token_raw = leer_token_actual()
+            except Exception:
+                token_raw = None
+        if token_raw in BOT_NAMES and token_raw != bot:
+            msg = f"TOKEN ACTUAL INDICA OTRO REAL: {token_raw.upper()}"
+            agregar_evento(f"🔒 MANUAL REAL bloqueado para {bot.upper()}: {msg}.")
+            _manual_key_audit(f"direct_block_token_other key={repr(key)} bot={bot} ciclo={ciclo} token={token_raw}")
+            _manual_status_set("error", bot=bot, ciclo=int(ciclo), error=msg, ttl_s=10, last_key=key)
+            _request_hud_refresh("manual_direct_token_other", fast_s=1.5)
+            return False
+
+        try:
+            holder_mem = next((b for b in BOT_NAMES if str(estado_bots.get(b, {}).get("token", "")).upper().startswith("REAL")), None)
+        except Exception:
+            holder_mem = None
+        if holder_mem in BOT_NAMES and holder_mem != bot:
+            msg = f"ESTADO INDICA OTRO REAL: {holder_mem.upper()}"
+            agregar_evento(f"🔒 MANUAL REAL bloqueado para {bot.upper()}: {msg}.")
+            _manual_key_audit(f"direct_block_state_other key={repr(key)} bot={bot} ciclo={ciclo} holder={holder_mem}")
+            _manual_status_set("error", bot=bot, ciclo=int(ciclo), error=msg, ttl_s=10, last_key=key)
+            _request_hud_refresh("manual_direct_state_other", fast_s=1.5)
+            return False
+
+        MANUAL_KEY_LAST_ORDER.update({"bot": bot, "ciclo": int(ciclo), "ts": now})
+        agregar_evento(f"⚡ MANUAL REAL DIRECTO: {bot.upper()} C{int(ciclo)} enviado por teclado.")
+        _manual_key_audit(f"direct_emit key={repr(key)} bot={bot} ciclo={ciclo}")
+        _manual_status_set(
+            "enviando",
+            bot=bot,
+            ciclo=int(ciclo),
+            msg=f"ENVIANDO ORDEN REAL | BOT={bot.upper()} | CICLO=C{int(ciclo)}",
+            ttl_s=8,
+            last_key=key,
+        )
+        _request_hud_refresh("manual_direct_emit", fast_s=2.0)
+        threading.Thread(
+            target=_manual_send_real_order_worker,
+            args=(bot, int(ciclo), key),
+            daemon=True,
+            name="manual-real-direct-worker",
+        ).start()
+        return True
+    except Exception as e:
+        try:
+            agregar_evento(f"⛔ MANUAL REAL directo falló: {type(e).__name__}: {e}")
+            _manual_key_audit(f"direct_exception key={repr(key)} bot={bot} ciclo={ciclo} err={type(e).__name__}:{e}")
+            _manual_status_set("error", bot=bot, ciclo=ciclo, error=f"MANUAL DIRECTO FALLÓ: {type(e).__name__}", ttl_s=10, last_key=key)
+            _request_hud_refresh("manual_direct_exception", fast_s=1.5)
+        except Exception:
+            pass
+        return False
+
+
 def _start_manual_confirm(bot: str, ciclo: int):
     try:
         now = time.time()
@@ -23147,16 +23295,28 @@ def _manual_verify_real_order(bot: str, ciclo: int, delay_s: float = 1.0):
     try:
         time.sleep(float(delay_s))
         token_raw = ""
-        try:
-            token_raw = leer_token_archivo_raw()
-        except Exception:
-            try:
-                token_raw = leer_token_actual()
-            except Exception:
-                token_raw = ""
+        owner = None
+        retries = max(1, int(globals().get("MANUAL_FORCE_VERIFY_RETRIES", 3) or 3))
+        sleep_s = max(0.0, float(globals().get("MANUAL_FORCE_VERIFY_SLEEP_S", 0.20) or 0.20))
+        ok = False
 
-        owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
-        if token_raw == bot or token_raw == f"REAL:{bot}" or owner == bot:
+        for intento in range(1, retries + 1):
+            try:
+                token_raw = leer_token_archivo_raw()
+            except Exception:
+                try:
+                    token_raw = leer_token_actual()
+                except Exception:
+                    token_raw = ""
+
+            owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+            ok = bool(token_raw == bot or token_raw == f"REAL:{bot}" or owner == bot)
+            if ok:
+                break
+            if intento < retries:
+                time.sleep(sleep_s)
+
+        if ok:
             _manual_status_set(
                 "real_confirmado",
                 bot=bot,
@@ -23165,7 +23325,7 @@ def _manual_verify_real_order(bot: str, ciclo: int, delay_s: float = 1.0):
                 ttl_s=10,
             )
             agregar_evento(f"🟢 REAL confirmado por teclado: {bot.upper()} C{ciclo}.")
-            _manual_key_audit(f"verify_ok bot={bot} ciclo={ciclo} token={token_raw} owner={owner}")
+            _manual_key_audit(f"verify_ok bot={bot} ciclo={ciclo} token={token_raw} owner={owner} retries={retries}")
         else:
             _manual_status_set(
                 "error",
@@ -23175,7 +23335,7 @@ def _manual_verify_real_order(bot: str, ciclo: int, delay_s: float = 1.0):
                 ttl_s=12,
             )
             agregar_evento(f"⚠️ Manual REAL: orden enviada pero token no confirma REAL:{bot}. token={token_raw} owner={owner}")
-            _manual_key_audit(f"verify_mismatch bot={bot} ciclo={ciclo} token={token_raw} owner={owner}")
+            _manual_key_audit(f"verify_mismatch bot={bot} ciclo={ciclo} token={token_raw} owner={owner} retries={retries}")
         _safe_render_keyboard_panel()
     except Exception as e:
         try:
@@ -25626,6 +25786,32 @@ def escuchar_teclas():
                         _request_hud_refresh("manual_cycle_cancel", fast_s=1.5)
                         continue
 
+                    if k in ("\r", "\n"):
+                        ciclo = _manual_ciclo_sugerido(bot_sel)
+
+                        PENDIENTE_FORZAR_BOT = None
+                        PENDIENTE_FORZAR_INICIO = 0.0
+                        PENDIENTE_FORZAR_EXPIRA = 0.0
+
+                        _manual_key_audit(f"cycle_enter key={repr(k)} bot={bot_sel} ciclo={ciclo} direct={bool(globals().get('MANUAL_REAL_DIRECT_FORCE', True))}")
+                        if bool(globals().get("MANUAL_REAL_DIRECT_FORCE", True)):
+                            _manual_keyboard_emit_real(str(bot_sel), int(ciclo), key=k)
+                        else:
+                            agregar_evento(
+                                f"🚨 CICLO MANUAL: {str(bot_sel).upper()} C{ciclo}. Confirma Y/S o cancela N/ESC."
+                            )
+                            _manual_status_set(
+                                "confirmar",
+                                bot=bot_sel,
+                                ciclo=ciclo,
+                                msg=f"BOT={str(bot_sel).upper()} | CICLO=C{ciclo} | CONFIRMAR Y/S",
+                                ttl_s=MANUAL_CONFIRM_TIMEOUT_S,
+                                last_key=k,
+                            )
+                            _start_manual_confirm(str(bot_sel), int(ciclo))
+                            _request_hud_refresh("manual_cycle_enter_legacy", fast_s=2.0)
+                        continue
+
                     if k.isdigit() and k in [str(i) for i in range(1, MAX_CICLOS + 1)]:
                         ciclo = int(k)
 
@@ -25633,20 +25819,23 @@ def escuchar_teclas():
                         PENDIENTE_FORZAR_INICIO = 0.0
                         PENDIENTE_FORZAR_EXPIRA = 0.0
 
-                        agregar_evento(
-                            f"🚨 CICLO MANUAL: {str(bot_sel).upper()} C{ciclo}. Confirma Y/S o cancela N/ESC."
-                        )
-                        _manual_key_audit(f"cycle_selected key={repr(k)} bot={bot_sel} ciclo={ciclo}")
-                        _manual_status_set(
-                            "confirmar",
-                            bot=bot_sel,
-                            ciclo=ciclo,
-                            msg=f"BOT={str(bot_sel).upper()} | CICLO=C{ciclo} | CONFIRMAR Y/S",
-                            ttl_s=MANUAL_CONFIRM_TIMEOUT_S,
-                            last_key=k,
-                        )
-                        _start_manual_confirm(str(bot_sel), int(ciclo))
-                        _request_hud_refresh("manual_cycle_selected", fast_s=2.0)
+                        _manual_key_audit(f"cycle_selected key={repr(k)} bot={bot_sel} ciclo={ciclo} direct={bool(globals().get('MANUAL_REAL_DIRECT_FORCE', True))}")
+                        if bool(globals().get("MANUAL_REAL_DIRECT_FORCE", True)):
+                            _manual_keyboard_emit_real(str(bot_sel), int(ciclo), key=k)
+                        else:
+                            agregar_evento(
+                                f"🚨 CICLO MANUAL: {str(bot_sel).upper()} C{ciclo}. Confirma Y/S o cancela N/ESC."
+                            )
+                            _manual_status_set(
+                                "confirmar",
+                                bot=bot_sel,
+                                ciclo=ciclo,
+                                msg=f"BOT={str(bot_sel).upper()} | CICLO=C{ciclo} | CONFIRMAR Y/S",
+                                ttl_s=MANUAL_CONFIRM_TIMEOUT_S,
+                                last_key=k,
+                            )
+                            _start_manual_confirm(str(bot_sel), int(ciclo))
+                            _request_hud_refresh("manual_cycle_selected_legacy", fast_s=2.0)
                         continue
 
                     restante = max(0, int(float(PENDIENTE_FORZAR_EXPIRA or 0) - time.time()))
