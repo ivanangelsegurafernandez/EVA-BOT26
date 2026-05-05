@@ -284,15 +284,6 @@ HUD_MARTI_CLEAN_LAYOUT = True
 HUD_LXV_CLEAN_MODE = True
 HUD_BOX_WIDTH = 92
 HUD_TABLE_WIDTH = 132
-
-HUD_PARALLEL_TOP_ENABLE = True
-HUD_ZONE_CARD_ENABLE = True
-HUD_ZONE_COLOR_CARD_ENABLE = True
-HUD_HIDE_LEGACY_LONG_ZONE_LINE = True
-HUD_PARALLEL_FALLBACK_VERTICAL = True
-HUD_PARALLEL_MIN_TERMINAL_WIDTH = 150
-HUD_PARALLEL_CARD_GAP = 2
-HUD_PARALLEL_SAFE_MODE = True
 ROUND_LIVE_INVEST_WINDOW_S = 90
 MANUAL_CONFIRM_TIMEOUT_S = 20
 MANUAL_REAL_DECISION_WINDOW_S = 35
@@ -20787,8 +20778,7 @@ def _resumen_top_hud(valor_saldo=None, saldo_str="--", meta_str="--"):
             f"SENSOR_PLANO={planos}/{len(BOT_NAMES)} | n_min_real={int(n_min_real)}/{int(n_req_real)}"
         )
         lines.append(line2)
-        if (not bool(globals().get('HUD_ZONE_CARD_ENABLE', True))) or (not bool(globals().get('HUD_HIDE_LEGACY_LONG_ZONE_LINE', True))):
-            lines.append(_hud_zona_operativa_lxv_line())
+        lines.append(_hud_zona_operativa_lxv_line())
         lines.extend(render_zona_lxv_panel())
     except Exception:
         lines.append("📊 Prob=-- | OBS=-- | REAL_SIG=-- | REAL_ACTIVO=-- | Mejor=-- | SENSOR_PLANO=-- | n_min_real=--")
@@ -20910,85 +20900,6 @@ def _hud_safe_get(d, key, default="--"):
     except Exception:
         return default
 
-
-
-_ANSI_RE_SAFE = re.compile(r"\x1b\[[0-9;]*m")
-
-def _strip_ansi_safe(s):
-    try:
-        return _ANSI_RE_SAFE.sub('', str(s or ''))
-    except Exception:
-        return str(s or '')
-
-def _ansi_len(s):
-    try:
-        return len(_strip_ansi_safe(s))
-    except Exception:
-        return len(str(s or ''))
-
-def _ansi_ljust(s, width):
-    try:
-        txt = str(s or '')
-        pad = max(0, int(width or 0) - _ansi_len(txt))
-        return txt + (' ' * pad)
-    except Exception:
-        return str(s or '').ljust(max(0, int(width or 0)))
-
-def _shorten_ansi_safe(s, width):
-    try:
-        raw = _strip_ansi_safe(s)
-        w = max(1, int(width or 1))
-        return raw if len(raw) <= w else (raw[:max(0, w-3)] + '...')
-    except Exception:
-        return str(s or '')
-
-def _box_lines(title, body_lines, width, color=None):
-    try:
-        w = max(12, int(width or 12))
-        t = _shorten_ansi_safe(title, w-4)
-        def row(txt):
-            return f"│ {_ansi_ljust(_shorten_ansi_safe(txt, w-4), w-4)} │"
-        top = f"┌{'─'* (w-2)}┐"; bot = f"└{'─'* (w-2)}┘"
-        lines=[top, row(t)]
-        for b in list(body_lines or []):
-            lines.append(row(b))
-        lines.append(bot)
-        if color:
-            lines=[f"{color}{ln}{Style.RESET_ALL}" for ln in lines]
-        return lines
-    except Exception:
-        return [str(title or '')] + [str(x) for x in (body_lines or [])]
-
-def _hstack_boxes(list_of_boxes, gap=2):
-    try:
-        boxes=[list(b or []) for b in (list_of_boxes or [])]
-        h=max((len(b) for b in boxes), default=0)
-        widths=[max((_ansi_len(x) for x in b), default=0) for b in boxes]
-        out=[]
-        for i in range(h):
-            row=[]
-            for bi,b in enumerate(boxes):
-                cell = b[i] if i < len(b) else ''
-                row.append(_ansi_ljust(cell, widths[bi]))
-            out.append((' '*int(gap or 2)).join(row))
-        return out
-    except Exception:
-        out=[]
-        for b in (list_of_boxes or []): out.extend(list(b or []))
-        return out
-
-def _color_por_zona_lxv(zona, decision=None, allow=None):
-    try:
-        z=str(zona or 'UNKNOWN').upper()
-        greens={'VERDE_TEMPRANO','EMPEZANDO_ZONA_VERDE','VERDE_MADURO','VERDE_SANO'}
-        reds={'ROJA_TEMPRANO','ROJA_POBRE','ROJO_MADURO','ROJA','ROJO'}
-        yellows={'VERDE_TARDIO','VERDE_SATURADO_TARDIO'}
-        if z in greens: return (Fore.GREEN,'🟢')
-        if z in reds: return (Fore.RED,'🔴')
-        if z in yellows: return (Fore.YELLOW,'🟡')
-        return (Fore.CYAN,'⬜')
-    except Exception:
-        return ('','⬜')
 
 def render_real_locks_compact_line():
     try:
@@ -21214,87 +21125,6 @@ def mostrar_bloque_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--
         print(padding + Fore.CYAN + "💰 Saldo/Meta: --")
 
 
-
-def render_cuadro_saldo_compacto(width=42, valor_saldo=None, saldo_str='--', meta_str='--'):
-    try:
-        owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
-        token_txt = 'DEMO' if owner in (None, 'none') else f'REAL:{owner}'
-        modo_txt = 'PAUSA' if maestro_en_pausa() else 'ACTIVO'
-        saldo_num = float(valor_saldo) if isinstance(valor_saldo,(int,float)) else None
-        meta_num = float(META) if isinstance(META,(int,float)) else None
-        base_num = float(SALDO_INICIAL) if isinstance(SALDO_INICIAL,(int,float)) else None
-        falta = f"{max(0.0, meta_num-saldo_num):.2f}" if (saldo_num is not None and meta_num is not None) else '--'
-        avance='--'
-        if saldo_num is not None and meta_num is not None and base_num is not None and abs(meta_num-base_num)>1e-12:
-            avance=f"{max(0.0,min(100.0,((saldo_num-base_num)/(meta_num-base_num))*100.0)):.1f}%"
-        rtxt=f"{float(globals().get('INTERVALO_ACTUAL',2.0) or 2.0):.1f}s"
-        return _box_lines('💰 SALDO / META',[f'SALDO: {saldo_str} | META: {meta_str}',f'MODO: {modo_txt} | TOKEN: {token_txt}',f'FALTA: {falta} | AVANCE: {avance}',f'R: {rtxt}'],width,Fore.CYAN)
-    except Exception:
-        return _box_lines('💰 SALDO / META',['--'],width)
-
-def render_cuadro_base_compacto(width=42, valor_saldo=None, saldo_str='--', meta_str='--'):
-    try:
-        lines = _resumen_saldo_meta_hud(valor_saldo=valor_saldo, saldo_str=saldo_str, meta_str=meta_str)
-        l2 = str(lines[1] if len(lines)>1 else '--')
-        return _box_lines('📈 BASE / RIESGO',[l2],width,Fore.BLUE)
-    except Exception:
-        return _box_lines('📈 BASE / RIESGO',['--'],width)
-
-def render_cuadro_zona_lxv_dinamico_compacto(width=48):
-    try:
-        info = obtener_zona_lxv_hud_actual() or {}
-        zf = resolver_zona_final_lxv(round_id_objetivo=info.get('round_id'), zona_info_previa=info)
-        zona=str(zf.get('zona_base','UNKNOWN')); dec=str(zf.get('decision','--')); mot=str(zf.get('motivo','--'))
-        col,ic = _color_por_zona_lxv(zona, dec, zf.get('allow_real')) if HUD_ZONE_COLOR_CARD_ENABLE else ('','')
-        pref = _sync_round_get_summary_preferente(max_age_s=120.0, rebuild_rows=False)
-        ss=dict(pref.get('summary',{}) or {})
-        rid=int(ss.get('round_id',info.get('round_id',0)) or 0); cc=int(ss.get('closed_count',0) or 0); ex=int(ss.get('expected_count',len(BOT_NAMES)) or len(BOT_NAMES))
-        dq=str(ss.get('data_quality',info.get('data_quality','--')) or '--'); patron=str(ss.get('partial_pattern',info.get('patron_live','--')) or '--')
-        gcol=str(info.get('g_actual','--')); greg=str(info.get('verdes0','--'))
-        body=[f'{ic} OFICIAL: {zona} | DEC: {dec}',f'MOTIVO: {mot[:28]}',f'RONDA: #{rid if rid>0 else "--"} | cerrados {cc}/{ex} | dq={dq}',f'PATRÓN: {patron} | col={gcol} | reg={greg}',f'PROM: p3={float(info.get("prom3",0.0) or 0.0):.2f} p8={float(info.get("prom8",0.0) or 0.0):.2f} p20={float(info.get("prom20",0.0) or 0.0):.2f} d38={float(info.get("delta_3_8",0.0) or 0.0):+.2f}',f"V3: {str((info.get('zona_lxv_v3',{}) or {}).get('zona_macro','--'))}/{str((info.get('zona_lxv_v3',{}) or {}).get('subzona','--'))} | allow={bool((info.get('zona_lxv_v3',{}) or {}).get('allow_real_v3',False))}",f"VISUAL: {_extraer_zona_visual_lxv(info) or '--'} | SOLO_DIAGNOSTICO"]
-        return _box_lines('🧭 ZONA LXV',body,width,col)
-    except Exception:
-        return _box_lines('🧭 ZONA LXV',['--'],width)
-
-def render_cuadro_martingala_compacto(width=46):
-    try:
-        arr=['$1','$2','$4','$8','$16']
-        c_act=ciclo_martingala_actual(); c_sig=ciclo_martingala_siguiente(); real_on, bot=hay_real_activo_global()
-        body=[f"C1 {arr[0]} | C2 {arr[1]} | C3 {arr[2]} | C4 {arr[3]} | C5 {arr[4]}",f"ACTUAL: C{c_act} | PRÓXIMA REAL: C{c_sig}",f"ESTADO: {'REAL' if real_on else 'DEMO'}",f"BOT REAL: {bot or 'ninguno'}"]
-        return _box_lines('🎯 MARTINGALA REAL',body,width,Fore.MAGENTA)
-    except Exception:
-        return _box_lines('🎯 MARTINGALA REAL',['--'],width)
-
-def render_estado_lxv_actual_mini(width=52):
-    try:
-        lines=render_estado_lxv_actual_compacto()
-        return _box_lines('🧭 ESTADO LXV ACTUAL',lines[:8],width,Fore.YELLOW)
-    except Exception:
-        return _box_lines('🧭 ESTADO LXV ACTUAL',['--'],width)
-
-def render_candados_real_lxv_mini(width=52):
-    try:
-        lk = dict((globals().get('REAL_LOCKS_PANEL',{}) or {}).get('locks',{}) or {})
-        ok=lambda k: '✅' if lk.get(k) is True else '❌'
-        cand=diagnosticar_candado_bloqueante_lxv(lk,None)
-        body=[f'BLOQUEO: {cand}',f"SYNC: REAL_CLOSE {ok('REAL_CLOSE_LIBRE')} | COLUMNA {ok('COLUMNA_COMPLETA')} | DQ {ok('DATA_QUALITY_OK')}",f"PATRÓN: PATRON {ok('PATRON_VALIDO')} | CAND {ok('CANDIDATO_VALIDO')}",f"ZONA: ZONA_OK {ok('ZONA_OK')}",f"EJEC: DUP {ok('NO_DUPLICADO_RONDA')} | TOKEN {ok('TOKEN_REAL_LIBRE')} | ORDEN {ok('ORDEN_REAL_OK')}"]
-        return _box_lines('🔐 CANDADOS REAL LXV',body,width,Fore.RED)
-    except Exception:
-        return _box_lines('🔐 CANDADOS REAL LXV',['--'],width)
-
-def render_hud_superior_parallel(valor_saldo=None, saldo_str='--', meta_str='--', padding=''):
-    try:
-        cols = os.get_terminal_size().columns
-        top=[render_cuadro_saldo_compacto(42,valor_saldo,saldo_str,meta_str),render_cuadro_base_compacto(42,valor_saldo,saldo_str,meta_str),render_cuadro_zona_lxv_dinamico_compacto(48)]
-        mid=[render_cuadro_martingala_compacto(46),render_estado_lxv_actual_mini(52),render_candados_real_lxv_mini(52)]
-        stack = _hstack_boxes(top,HUD_PARALLEL_CARD_GAP)+['']+_hstack_boxes(mid,HUD_PARALLEL_CARD_GAP) if cols>=int(HUD_PARALLEL_MIN_TERMINAL_WIDTH) else sum(([ln for ln in b]+[''] for b in top+mid),[])
-        for ln in stack:
-            print(padding + ln)
-        return True
-    except Exception:
-        print(padding + 'HUD paralelo falló, usando HUD clásico')
-        return False
-
 def mostrar_panel_teclado_activo(bot, rest_s, max_ciclos, ciclo_actual="C1", fuente="--"):
     bot_txt = str(bot or "--")
     rest = max(0, int(rest_s or 0))
@@ -21509,11 +21339,7 @@ def mostrar_panel():
 
     # Bloque visual destacado de saldo/meta + cabecera compacta secundaria
     try:
-        rendered_parallel = False
-        if bool(globals().get('HUD_PARALLEL_TOP_ENABLE', True)):
-            rendered_parallel = bool(render_hud_superior_parallel(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str, padding=padding))
-        if not rendered_parallel:
-            mostrar_bloque_saldo_meta_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str, padding=padding)
+        mostrar_bloque_saldo_meta_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str, padding=padding)
         top_lines = list(_resumen_top_hud(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str) or [])
         for _line in top_lines[1:]:
             print(padding + Fore.CYAN + _line)
