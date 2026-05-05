@@ -22722,7 +22722,14 @@ VENTANA_DECISION_IA_S = 35
 PENDIENTE_FORZAR_BOT = None
 PENDIENTE_FORZAR_INICIO = 0.0
 PENDIENTE_FORZAR_EXPIRA = 0.0
-MANUAL_REAL_ALWAYS_CONFIRM = True
+MANUAL_REAL_DIRECT_FORCE = True
+MANUAL_REAL_ALWAYS_CONFIRM = False
+MANUAL_FORCE_VERIFY_RETRIES = 3
+MANUAL_FORCE_VERIFY_SLEEP_S = 0.20
+MANUAL_FORCE_ORDER_TTL_S = max(float(REAL_ORDER_TTL_S), 120.0)
+MANUAL_KEY_REPEAT_BLOCK_S = 0.08
+MANUAL_KEY_BURST_MAX = 20
+MANUAL_KEYBOARD_PATCH_SAFE = True
 KEYBOARD_LISTENER_ALIVE_TS = 0.0
 KEYBOARD_LAST_KEY_TS = 0.0
 KEYBOARD_LAST_KEY = ""
@@ -22735,6 +22742,11 @@ PENDIENTE_CONFIRMAR_REAL = {
     "ciclo": None,
     "ts": 0.0,
     "expira": 0.0,
+}
+MANUAL_KEY_LAST_ORDER = {
+    "bot": None,
+    "ciclo": None,
+    "ts": 0.0,
 }
 MANUAL_KEYBOARD_STATUS = {
     "active": False,
@@ -23005,6 +23017,179 @@ def _start_manual_confirm(bot: str, ciclo: int):
     except Exception as e:
         try:
             agregar_evento(f"⚠️ No se pudo activar confirmación manual: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+
+
+def _manual_keyboard_emit_real(bot, ciclo, key=""):
+    """
+    Emite REAL manual directo desde teclado.
+    Salta filtros de decisión, pero respeta candados duros.
+    """
+    global REAL_OWNER_LOCK, REAL_ORDER_TTL_S
+    bot = str(bot or "").strip()
+    try:
+        ciclo = int(ciclo)
+    except Exception:
+        ciclo = 0
+
+    def _emit_error(reason, audit_reason=None):
+        try:
+            _manual_status_set(
+                "error",
+                bot=bot if bot in BOT_NAMES else None,
+                ciclo=ciclo if 1 <= int(ciclo or 0) <= int(MAX_CICLOS) else None,
+                error=str(reason),
+                ttl_s=12,
+                last_key=key,
+            )
+        except Exception:
+            pass
+        try:
+            agregar_evento(f"⛔ MANUAL REAL directo bloqueado: {reason}")
+        except Exception:
+            pass
+        try:
+            _manual_key_audit(f"direct_emit_blocked bot={bot} ciclo={ciclo} reason={audit_reason or reason}")
+        except Exception:
+            pass
+        try:
+            _request_hud_refresh("manual_direct_error", fast_s=2.0)
+        except Exception:
+            pass
+        return False
+
+    if bot not in BOT_NAMES:
+        return _emit_error(f"BOT inválido: {bot}", "invalid_bot")
+    if not (1 <= int(ciclo) <= int(MAX_CICLOS)):
+        return _emit_error(f"Ciclo inválido para {bot.upper()}: C{ciclo}", "invalid_cycle")
+
+    now = time.time()
+    try:
+        last = MANUAL_KEY_LAST_ORDER if isinstance(MANUAL_KEY_LAST_ORDER, dict) else {}
+        if (
+            str(last.get("bot") or "") == bot
+            and int(last.get("ciclo") or 0) == int(ciclo)
+            and (now - float(last.get("ts") or 0.0)) < 1.5
+        ):
+            return _emit_error(
+                f"Duplicado cercano ignorado: {bot.upper()} C{int(ciclo)}",
+                "duplicate_near",
+            )
+    except Exception:
+        pass
+
+    try:
+        pending_on, pending_bot, pending = _hay_real_close_pending_activo()
+        if pending_on:
+            return _emit_error(
+                f"REAL_CLOSE_PENDING activo: {str(pending_bot).upper()} C{(pending or {}).get('ciclo')}",
+                "real_close_pending",
+            )
+    except Exception:
+        pass
+
+    try:
+        owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+        if owner in BOT_NAMES:
+            return _emit_error(f"REAL_OWNER_LOCK ocupado por {owner.upper()}", "owner_lock_busy")
+    except Exception:
+        pass
+
+    try:
+        token_owner = leer_token_archivo_raw()
+        if token_owner in BOT_NAMES:
+            return _emit_error(f"token_actual ya indica REAL:{token_owner.upper()}", "token_owner_busy")
+    except Exception:
+        pass
+
+    try:
+        for b in BOT_NAMES:
+            st = estado_bots.get(b, {}) if isinstance(estado_bots, dict) else {}
+            if str(st.get("token", "DEMO") or "DEMO").upper().startswith("REAL"):
+                return _emit_error(f"Ya hay REAL activo en estado: {str(b).upper()}", "state_real_busy")
+    except Exception:
+        pass
+
+    try:
+        if FORZAR_LOCK.locked():
+            return _emit_error("FORZAR_LOCK ocupado", "forzar_lock_busy")
+    except Exception:
+        pass
+
+    prev_src = globals().get("_REAL_ROUTE_SOURCE", None)
+    prev_ttl = globals().get("REAL_ORDER_TTL_S", None)
+    try:
+        MANUAL_KEY_LAST_ORDER.update({"bot": bot, "ciclo": int(ciclo), "ts": now})
+        _manual_status_set(
+            "enviando",
+            bot=bot,
+            ciclo=int(ciclo),
+            msg=f"ENVIANDO ORDEN REAL DIRECTA | BOT={bot.upper()} | CICLO=C{int(ciclo)}",
+            ttl_s=8,
+            last_key=key,
+        )
+        _manual_key_audit(f"direct_emit_start bot={bot} ciclo={int(ciclo)} key={repr(key)}")
+        _request_hud_refresh("manual_direct_emit_start", fast_s=2.0)
+
+        globals()["_REAL_ROUTE_SOURCE"] = "MANUAL"
+        try:
+            REAL_ORDER_TTL_S = float(globals().get("MANUAL_FORCE_ORDER_TTL_S", REAL_ORDER_TTL_S) or REAL_ORDER_TTL_S)
+        except Exception:
+            pass
+
+        ok = bool(forzar_real_manual(bot, int(ciclo)))
+
+        verified = False
+        retries = max(1, int(globals().get("MANUAL_FORCE_VERIFY_RETRIES", 3) or 3))
+        sleep_s = max(0.0, float(globals().get("MANUAL_FORCE_VERIFY_SLEEP_S", 0.20) or 0.20))
+        for _ in range(retries):
+            try:
+                owner_mem = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+                owner_file = leer_token_archivo_raw()
+                if owner_mem == bot or owner_file == bot:
+                    verified = True
+                    break
+            except Exception:
+                pass
+            time.sleep(sleep_s)
+
+        if ok and verified:
+            _manual_status_set(
+                "orden_enviada",
+                bot=bot,
+                ciclo=int(ciclo),
+                msg=f"ORDEN REAL DIRECTA ENVIADA | BOT={bot.upper()} | CICLO=C{int(ciclo)}",
+                ttl_s=10,
+                last_key=key,
+            )
+            agregar_evento(f"⚡ MANUAL REAL directo: {bot.upper()} C{int(ciclo)} enviado desde teclado.")
+            _manual_key_audit(f"direct_emit_done ok=True bot={bot} ciclo={int(ciclo)}")
+            _request_hud_refresh("manual_direct_emit_ok", fast_s=2.0)
+            return True
+
+        _manual_status_set(
+            "error",
+            bot=bot,
+            ciclo=int(ciclo),
+            error=f"NO SE CONFIRMÓ REAL DIRECTO | BOT={bot.upper()} | CICLO=C{int(ciclo)}",
+            ttl_s=12,
+            last_key=key,
+        )
+        agregar_evento(f"⛔ MANUAL REAL directo no confirmado: {bot.upper()} C{int(ciclo)}.")
+        _manual_key_audit(f"direct_emit_done ok=False verified={verified} bot={bot} ciclo={int(ciclo)}")
+        _request_hud_refresh("manual_direct_emit_fail", fast_s=2.0)
+        return False
+    except Exception as e:
+        return _emit_error(f"ERROR MANUAL DIRECTO: {type(e).__name__}: {e}", f"exception:{type(e).__name__}")
+    finally:
+        try:
+            globals()["_REAL_ROUTE_SOURCE"] = prev_src
+        except Exception:
+            pass
+        try:
+            if prev_ttl is not None:
+                REAL_ORDER_TTL_S = prev_ttl
         except Exception:
             pass
 
@@ -25422,6 +25607,50 @@ def _safe_render_keyboard_panel():
         pass
 
 
+def _keyboard_read_burst_safe():
+    """
+    Lee todas las teclas disponibles del buffer msvcrt sin bloquear.
+    No cambia lógica manual.
+    Solo evita perder teclas rápidas.
+    Ignora teclas extendidas Windows.
+    """
+    keys = []
+    try:
+        if not (HAVE_MSVCRT and msvcrt):
+            return keys
+
+        guard = 0
+        max_guard = int(globals().get("MANUAL_KEY_BURST_MAX", 20) or 20)
+
+        while msvcrt.kbhit() and guard < max_guard:
+            guard += 1
+            raw = msvcrt.getch()
+
+            if raw in (b"\x00", b"\xe0"):
+                try:
+                    if msvcrt.kbhit():
+                        msvcrt.getch()
+                except Exception:
+                    pass
+                continue
+
+            try:
+                k = raw.decode("utf-8", errors="ignore").lower()
+            except Exception:
+                k = ""
+
+            if k:
+                keys.append(k)
+
+    except Exception as e:
+        try:
+            _manual_key_audit(f"keyboard_read_burst_safe_error {type(e).__name__}: {e}")
+        except Exception:
+            pass
+
+    return keys
+
+
 # Escuchar teclas
 def escuchar_teclas():
     global pausado, salir, reinicio_manual, LIMPIEZA_PANEL_HASTA, HUD_VISIBLE
@@ -25429,7 +25658,8 @@ def escuchar_teclas():
     global KEYBOARD_LISTENER_ALIVE_TS, KEYBOARD_LAST_KEY_TS, KEYBOARD_LAST_KEY
 
     bot_map = {'5': 'fulll45', '6': 'fulll46', '7': 'fulll47', '8': 'fulll48', '9': 'fulll49', '0': 'fulll50'}
-    last_key_time = 0  # debounce 200 ms
+    last_key_seen = ""
+    last_key_seen_ts = 0.0
 
     while True:
         try:
@@ -25473,19 +25703,31 @@ def escuchar_teclas():
                     time.sleep(0.01)
                     continue
 
-            now = time.time()
-            if HAVE_MSVCRT and msvcrt.kbhit():
-                if now - last_key_time < 0.2:
-                    time.sleep(0.05); continue
-                last_key_time = now
+            keys = _keyboard_read_burst_safe()
 
-                try:
-                    k = msvcrt.getch()
-                    if k in (b'\x00', b'\xe0'):
-                        msvcrt.getch(); continue
-                    k = k.decode("utf-8", errors="ignore").lower()
-                except:
+            if not keys:
+                time.sleep(0.01)
+                continue
+
+            try:
+                if len(keys) > 1:
+                    _manual_key_audit(f"key_burst keys={keys}")
+            except Exception:
+                pass
+
+            for k in keys:
+                now_key = time.time()
+                repeat_block = float(globals().get("MANUAL_KEY_REPEAT_BLOCK_S", 0.08) or 0.08)
+
+                if k == last_key_seen and (now_key - last_key_seen_ts) < repeat_block:
+                    try:
+                        _manual_key_audit(f"key_repeat_ignored key={repr(k)} dt={now_key - last_key_seen_ts:.4f}")
+                    except Exception:
+                        pass
                     continue
+
+                last_key_seen = k
+                last_key_seen_ts = now_key
                 KEYBOARD_LAST_KEY_TS = time.time()
                 KEYBOARD_LAST_KEY = repr(k)
                 dt_since_last = max(0.0, KEYBOARD_LAST_KEY_TS - float(globals().get("KEYBOARD_LAST_KEY_TS_PREV", 0.0) or 0.0))
@@ -25566,6 +25808,34 @@ def escuchar_teclas():
                         _request_hud_refresh("manual_cycle_cancel", fast_s=1.5)
                         continue
 
+                    if k in ("\r", "\n"):
+                        ciclo = int(_manual_ciclo_sugerido(bot_sel))
+
+                        PENDIENTE_FORZAR_BOT = None
+                        PENDIENTE_FORZAR_INICIO = 0.0
+                        PENDIENTE_FORZAR_EXPIRA = 0.0
+
+                        if bool(globals().get("MANUAL_REAL_DIRECT_FORCE", False)):
+                            _manual_key_audit(f"cycle_enter_direct key={repr(k)} bot={bot_sel} ciclo={ciclo}")
+                            _manual_keyboard_emit_real(str(bot_sel), int(ciclo), key=k)
+                            continue
+
+                        agregar_evento(
+                            f"🚨 CICLO MANUAL: {str(bot_sel).upper()} C{ciclo}. Confirma Y/S o cancela N/ESC."
+                        )
+                        _manual_key_audit(f"cycle_enter_legacy key={repr(k)} bot={bot_sel} ciclo={ciclo}")
+                        _manual_status_set(
+                            "confirmar",
+                            bot=bot_sel,
+                            ciclo=ciclo,
+                            msg=f"BOT={str(bot_sel).upper()} | CICLO=C{ciclo} | CONFIRMAR Y/S",
+                            ttl_s=MANUAL_CONFIRM_TIMEOUT_S,
+                            last_key=k,
+                        )
+                        _start_manual_confirm(str(bot_sel), int(ciclo))
+                        _request_hud_refresh("manual_cycle_selected", fast_s=2.0)
+                        continue
+
                     if k.isdigit() and k in [str(i) for i in range(1, MAX_CICLOS + 1)]:
                         ciclo = int(k)
 
@@ -25573,10 +25843,15 @@ def escuchar_teclas():
                         PENDIENTE_FORZAR_INICIO = 0.0
                         PENDIENTE_FORZAR_EXPIRA = 0.0
 
+                        if bool(globals().get("MANUAL_REAL_DIRECT_FORCE", False)):
+                            _manual_key_audit(f"cycle_selected_direct key={repr(k)} bot={bot_sel} ciclo={ciclo}")
+                            _manual_keyboard_emit_real(str(bot_sel), int(ciclo), key=k)
+                            continue
+
                         agregar_evento(
                             f"🚨 CICLO MANUAL: {str(bot_sel).upper()} C{ciclo}. Confirma Y/S o cancela N/ESC."
                         )
-                        _manual_key_audit(f"cycle_selected key={repr(k)} bot={bot_sel} ciclo={ciclo}")
+                        _manual_key_audit(f"cycle_selected_legacy key={repr(k)} bot={bot_sel} ciclo={ciclo}")
                         _manual_status_set(
                             "confirmar",
                             bot=bot_sel,
@@ -25656,8 +25931,9 @@ def escuchar_teclas():
                     _request_hud_refresh("manual_bot_selected", fast_s=2.0)
                     continue
 
-            else:
-                time.sleep(0.01)
+
+            if salir:
+                break
         except Exception as e:
             try:
                 agregar_evento(f"⚠️ Teclado recuperado tras error: {type(e).__name__}: {e}")
