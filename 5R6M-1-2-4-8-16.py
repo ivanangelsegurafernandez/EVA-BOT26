@@ -20916,15 +20916,14 @@ def render_zona_compacta():
         info = obtener_zona_lxv_hud_actual() or {}
         zf = resolver_zona_final_lxv(round_id_objetivo=info.get("round_id"), zona_info_previa=info)
         z = _hud_safe_get(zf, "zona_base", "UNKNOWN")
-        d = _hud_safe_get(zf, "decision", "ESPERANDO_COLUMNA")
         m = _hud_safe_get(zf, "motivo", "--")
         vis = _extraer_zona_visual_lxv(info) or "SOLO_DIAG"
         if "SOLO" not in str(vis).upper() and str(vis).upper() in ("", "--", "MIXTO_O_INSUFICIENTE"):
             vis = "SOLO_DIAG"
-        real = "SI" if bool(_hud_safe_get(zf, "allow_real", False)) else "NO"
-        return f"Zona: OFICIAL={z} | DEC={d} | VISUAL={vis} | REAL={real} | motivo={m}"
+        zona_permite = "SI" if bool(_hud_safe_get(zf, "allow_real", False)) else "NO"
+        return f"Zona: OFICIAL={z} | ZONA_PERMITE={zona_permite} | VISUAL={vis} | motivo={m}"
     except Exception:
-        return "Zona: OFICIAL=-- | DEC=-- | VISUAL=SOLO_DIAG | REAL=NO | motivo=--"
+        return "Zona: OFICIAL=-- | ZONA_PERMITE=NO | VISUAL=SOLO_DIAG | motivo=--"
 
 
 def render_bots_compacto():
@@ -20949,19 +20948,162 @@ def render_bots_compacto():
         return ["bots: --"]
 
 
+def _manual_real_hard_lock_status(bot: str | None = None, include_keyboard: bool = False) -> dict:
+    """
+    Estado compacto de disponibilidad MANUAL REAL.
+    No consulta zona/patrón/IA/DQ/columna: solo candados duros para evitar conflictos.
+    """
+    try:
+        if include_keyboard and not _keyboard_can_start():
+            return {"available": False, "reason": "sin_msvcrt_o_no_windows", "keyboard": False}
+        if not bool(globals().get("MANUAL_REAL_ROUTE_ENABLE", True)):
+            return {"available": False, "reason": "manual_route_disabled", "keyboard": bool(_keyboard_can_start())}
+
+        try:
+            pending_on, pending_bot, _pending = _hay_real_close_pending_activo()
+        except Exception:
+            pending_on, pending_bot = True, "desconocido"
+        if pending_on:
+            return {"available": False, "reason": "real_close_pending", "bot": pending_bot, "keyboard": bool(_keyboard_can_start())}
+
+        try:
+            if FORZAR_LOCK.locked():
+                return {"available": False, "reason": "emision_manual_en_progreso", "keyboard": bool(_keyboard_can_start())}
+        except Exception:
+            pass
+
+        bot_cmp = str(bot or "").strip()
+        try:
+            for b in BOT_NAMES:
+                orden = _sync_round_safe_read_json(path_orden(str(b))) or {}
+                if isinstance(orden, dict) and _orden_real_viva(orden) and not bool(orden.get("consumed", False)):
+                    if not bot_cmp or str(orden.get("bot") or b).strip() != bot_cmp:
+                        return {"available": False, "reason": "orden_real_viva", "bot": str(orden.get("bot") or b), "keyboard": bool(_keyboard_can_start())}
+                    return {"available": False, "reason": "orden_real_viva_mismo_bot", "bot": bot_cmp, "keyboard": bool(_keyboard_can_start())}
+        except Exception:
+            return {"available": False, "reason": "error_leyendo_orden_real", "keyboard": bool(_keyboard_can_start())}
+
+        try:
+            real_activo, motivo_real = hay_real_activo_global()
+        except Exception:
+            real_activo, motivo_real = True, "error_check_real_activo"
+        if real_activo:
+            motivo_txt = str(motivo_real or "real_activo").lower()
+            reason = "token_real_ocupado" if "token" in motivo_txt else "real_activo_en_cierre"
+            return {"available": False, "reason": reason, "detail": str(motivo_real), "keyboard": bool(_keyboard_can_start())}
+
+        owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+        if owner_lock in BOT_NAMES and (not bot_cmp or owner_lock != bot_cmp):
+            return {"available": False, "reason": "token_real_ocupado", "bot": owner_lock, "keyboard": bool(_keyboard_can_start())}
+
+        token_raw = None
+        try:
+            token_raw = leer_token_archivo_raw()
+        except Exception:
+            try:
+                token_raw = leer_token_actual()
+            except Exception:
+                token_raw = None
+        if token_raw in BOT_NAMES and (not bot_cmp or token_raw != bot_cmp):
+            return {"available": False, "reason": "token_real_ocupado", "bot": token_raw, "keyboard": bool(_keyboard_can_start())}
+        if token_raw in BOT_NAMES and bot_cmp and token_raw == bot_cmp:
+            return {"available": False, "reason": "token_real_ya_asignado_mismo_bot", "bot": bot_cmp, "keyboard": bool(_keyboard_can_start())}
+
+        try:
+            holder_mem = next((b for b in BOT_NAMES if str(estado_bots.get(b, {}).get("token", "")).upper().startswith("REAL")), None)
+        except Exception:
+            holder_mem = None
+        if holder_mem in BOT_NAMES:
+            return {"available": False, "reason": "token_real_ocupado", "bot": holder_mem, "keyboard": bool(_keyboard_can_start())}
+
+        if bot_cmp and bot_cmp not in BOT_NAMES:
+            return {"available": False, "reason": "bot_no_disponible", "bot": bot_cmp, "keyboard": bool(_keyboard_can_start())}
+
+        return {"available": True, "reason": "libre", "keyboard": bool(_keyboard_can_start())}
+    except Exception as e:
+        return {"available": False, "reason": f"error_manual_status_{type(e).__name__}", "keyboard": bool(_keyboard_can_start())}
+
+
+def _manual_real_status_compact_line() -> str:
+    try:
+        st = _manual_real_hard_lock_status(include_keyboard=True)
+        if not bool(st.get("keyboard", False)):
+            return "TECLADO: NO DISPONIBLE | motivo=sin_msvcrt_o_no_windows"
+        if st.get("available"):
+            return "MANUAL_REAL: DISPONIBLE"
+        return f"MANUAL_REAL: BLOQUEADO | motivo={st.get('reason', 'desconocido')}"
+    except Exception:
+        return "MANUAL_REAL: BLOQUEADO | motivo=error_estado_manual"
+
+
+def _resolver_decision_final_real_hud(summary: dict, locks: dict, zona_final: dict | None = None) -> dict:
+    try:
+        ss = summary if isinstance(summary, dict) else {}
+        lk = locks if isinstance(locks, dict) else {}
+        zf = zona_final if isinstance(zona_final, dict) else {}
+        cc = int(ss.get("closed_count", 0) or 0)
+        ex = int(ss.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
+        dq = _dq_oficial_lxv(ss)
+        patron = str(ss.get("partial_pattern", "0V0X") or "0V0X").strip().upper()
+        panel = globals().get("REAL_LOCKS_PANEL", {}) if isinstance(globals().get("REAL_LOCKS_PANEL", {}), dict) else {}
+        candidato = str(panel.get("bot", "") or "").strip()
+        if candidato in ("", "--", "none", "None"):
+            candidato = "ninguno"
+        zona = str(zf.get("zona_base", panel.get("zona", "UNKNOWN")) or "UNKNOWN")
+        zona_permite = bool(lk.get("ZONA_OK", False) or zf.get("allow_real", False))
+        patron_valido = bool(lk.get("PATRON_VALIDO", False) or patron in ("5V1X", "4V2X"))
+        candidato_valido = bool(lk.get("CANDIDATO_VALIDO", False) and candidato != "ninguno")
+        dq_ok = bool(lk.get("DATA_QUALITY_OK", False) or str(dq).lower() == "ok")
+
+        if ex > 0 and cc < ex:
+            return {"decision": "ESPERANDO", "motivo": f"columna_incompleta_{cc}_de_{ex}", "zona": zona, "zona_permite": zona_permite, "patron": patron, "patron_valido": patron_valido, "candidato": candidato, "dq_ok": dq_ok}
+        if not dq_ok:
+            return {"decision": "NO_INVERTIR", "motivo": f"ronda_vencida_{dq}", "zona": zona, "zona_permite": zona_permite, "patron": patron, "patron_valido": patron_valido, "candidato": candidato, "dq_ok": False}
+        if not zona_permite:
+            return {"decision": "NO_INVERTIR", "motivo": f"zona_no_permite_{zona}", "zona": zona, "zona_permite": False, "patron": patron, "patron_valido": patron_valido, "candidato": candidato, "dq_ok": True}
+        if not patron_valido:
+            return {"decision": "NO_INVERTIR", "motivo": f"zona_ok_pero_patron_no_valido_{patron}", "zona": zona, "zona_permite": True, "patron": patron, "patron_valido": False, "candidato": "ninguno", "dq_ok": True}
+        if not candidato_valido:
+            return {"decision": "NO_INVERTIR", "motivo": "patron_ok_pero_sin_candidato_valido", "zona": zona, "zona_permite": True, "patron": patron, "patron_valido": True, "candidato": candidato, "dq_ok": True}
+
+        hard = ["REAL_CLOSE_LIBRE", "COLUMNA_COMPLETA", "DATA_QUALITY_OK", "PATRON_VALIDO", "CANDIDATO_VALIDO", "ZONA_OK", "NO_DUPLICADO_RONDA", "TOKEN_REAL_LIBRE"]
+        first_off = next((k for k in hard if lk.get(k) is False), "")
+        if first_off:
+            return {"decision": "NO_INVERTIR", "motivo": f"candado_automatico_off_{first_off}", "zona": zona, "zona_permite": True, "patron": patron, "patron_valido": True, "candidato": candidato, "dq_ok": True}
+        return {"decision": "SI_INVERTIR", "motivo": f"lxv_ok_{patron.lower()}_candidato_valido", "zona": zona, "zona_permite": True, "patron": patron, "patron_valido": True, "candidato": candidato, "dq_ok": True}
+    except Exception as e:
+        return {"decision": "ESPERANDO", "motivo": f"hud_final_error_{type(e).__name__}", "zona": "--", "zona_permite": False, "patron": "--", "patron_valido": False, "candidato": "ninguno", "dq_ok": False}
+
+
 def render_decision_real_compacta():
     try:
         pref = _sync_round_get_summary_preferente(max_age_s=120.0, rebuild_rows=False)
         ss=dict(pref.get('summary',{}) or {})
-        lk=dict((globals().get('REAL_LOCKS_PANEL',{}) or {}).get('locks',{}) or {})
+        panel=dict(globals().get('REAL_LOCKS_PANEL',{}) or {})
+        lk=dict(panel.get('locks',{}) or {})
+        info = obtener_zona_lxv_hud_actual() or {}
+        zf = resolver_zona_final_lxv(round_id_objetivo=info.get("round_id"), zona_info_previa=info)
         rid=int(ss.get('round_id',0) or 0); cc=int(ss.get('closed_count',0) or 0); ex=int(ss.get('expected_count',len(BOT_NAMES)) or len(BOT_NAMES))
         dq=_dq_oficial_lxv(ss); patron=str(ss.get('partial_pattern','0V0X') or '0V0X')
         cand=diagnosticar_candado_bloqueante_lxv(lk, ss)
         estado=f"{_c_bad('BLOQ')} {cand}" if cand!='DESCONOCIDO' else f"{_c_ok('NINGUNO')} | {_c_ok('LISTO PARA REAL')}"
+        final=_resolver_decision_final_real_hud(ss, lk, zf)
+        decision_txt = str(final.get('decision', 'ESPERANDO'))
+        decision_col = _c_ok(decision_txt) if decision_txt == 'SI_INVERTIR' else (_c_warn(decision_txt) if decision_txt == 'ESPERANDO' else _c_bad(decision_txt))
         zline=render_zona_compacta()
-        return [f"{_c_dim('BLOQ')} : {estado}", f"{_c_dim('RONDA')}: #{rid} | cerrados {cc}/{ex} | dq={dq} | patrón={patron}", zline.replace('Zona: ',f"{_c_dim('ZONA')} : "), render_real_locks_compact_line().replace('Locks: ',f"{_c_dim('LOCKS')}: "), f"{_c_dim('MOT'):<6}: {str(ss.get('reason', ss.get('missing_reason', '--')))}"]
+        candidato = str(final.get('candidato') or 'ninguno')
+        return [
+            f"{_c_dim('FINAL')}: DECISIÓN FINAL REAL={decision_col}",
+            f"{_c_dim('MOTIVO')}: {str(final.get('motivo', '--'))}",
+            f"{_c_dim('BASE')}: ZONA_PERMITE={'SI' if final.get('zona_permite') else 'NO'} | PATRÓN_VALIDO={'ON' if final.get('patron_valido') else 'OFF'} | CANDIDATO={candidato}",
+            f"{_c_dim('RONDA')}: #{rid} | cerrados {cc}/{ex} | dq={dq} | DATA_QUALITY_OK={'ON' if final.get('dq_ok') else 'OFF'} | patrón={patron}",
+            zline.replace('Zona: ',f"{_c_dim('ZONA')} : "),
+            _manual_real_status_compact_line(),
+            f"{_c_dim('BLOQ')} : {estado}",
+            render_real_locks_compact_line().replace('Locks: ',f"{_c_dim('LOCKS')}: "),
+        ]
     except Exception:
-        return ["Estado : --", "Ronda  : --", "Zona   : --", "Locks  : --", "Motivo : --"]
+        return ["FINAL : DECISIÓN FINAL REAL=ESPERANDO", "MOTIVO: hud_error", "Zona   : --", "Locks  : --"]
 
 def render_estado_lxv_actual_compacto():
     try:
@@ -20986,7 +21128,7 @@ def render_estado_lxv_actual_compacto():
             f"{_c_dim('COLUMNA')}: visual {(_c_bad('INSUFICIENTE') if cc < ex else _c_ok('OK'))} | patrón={patron} | cerrados={cc}/{ex} | dq={_c_bad(dq) if dq!='ok' else _c_ok(dq)} | fuente={'CANONICAL' if canonical else 'ACK_LIVE'}",
             f"{_c_dim('SYNC')   :8}: {(_c_warn('ESPERANDO_BOTS') if faltan>0 else _c_ok('OK'))} | missing_total={faltan}",
             f"{_c_dim('REAL')   :8}: ACTIVO={_c_warn('NO') if not real_activo else _c_ok('SI')} | TOKEN={_c_warn('DEMO') if not real_activo else _c_ok('REAL')} | BOT={bot_real or 'ninguno'}",
-            f"{_c_dim('FINAL')  :8}: {_c_bad(decision)}",
+            f"{_c_dim('ZONA_PERMITE'):8}: {(_c_ok('SI') if bool(locks.get('ZONA_OK', False)) else _c_warn('NO'))} | decisión_zona={decision}",
             f"{_c_dim('PRE-ARM')}: {_c_warn(prearm) if prearm=='NO' else _c_ok(prearm)}",
         ]
     except Exception:
@@ -23031,6 +23173,16 @@ def _manual_keyboard_emit_real(bot, ciclo, key=""):
             _manual_key_audit(f"direct_invalid_cycle key={repr(key)} bot={bot} ciclo={ciclo}")
             _manual_status_set("error", bot=bot, ciclo=ciclo, error=msg, ttl_s=10, last_key=key)
             _request_hud_refresh("manual_direct_invalid_cycle", fast_s=1.5)
+            return False
+
+        hard_status = _manual_real_hard_lock_status(bot=bot, include_keyboard=False)
+        if not bool(hard_status.get("available", False)):
+            reason = str(hard_status.get("reason") or "candado_manual")
+            msg = f"MANUAL_REAL BLOQUEADO | motivo={reason}"
+            agregar_evento(f"🔒 {msg} | bot={bot.upper()} C{int(ciclo)}")
+            _manual_key_audit(f"direct_block_hard_status key={repr(key)} bot={bot} ciclo={ciclo} reason={reason}")
+            _manual_status_set("error", bot=bot, ciclo=int(ciclo), error=msg, ttl_s=10, last_key=key)
+            _request_hud_refresh("manual_direct_hard_status", fast_s=1.5)
             return False
 
         now = time.time()
