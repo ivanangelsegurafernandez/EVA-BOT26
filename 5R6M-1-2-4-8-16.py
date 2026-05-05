@@ -21010,107 +21010,6 @@ def render_panels_side_by_side(left_lines, right_lines, width_total=118, gap=3):
         return list(left_lines or []) + list(right_lines or [])
 
 
-
-
-def _hud_fit_safe(text, width):
-    try:
-        return _hud_trim(str(text if text not in (None, '') else '--'), int(width or 1))
-    except Exception:
-        return '--'
-
-
-def _hud_card(label, value, width=16, color=None):
-    try:
-        w=max(10,int(width or 10))
-        l=_hud_fit_safe(label,w-2).center(w)
-        v=_hud_fit_safe(value,w-2).center(w)
-        if callable(color):
-            v=color(v)
-        return [l,v]
-    except Exception:
-        return ['--','--']
-
-
-def _hud_box(title, lines, width=38, color=None):
-    try:
-        w=max(24,int(width or 24))
-        top=f"┌{'─'*(w-2)}┐"
-        head=f"│ {_hud_fit_safe(title,w-4).ljust(w-4)} │"
-        body=[]
-        for ln in list(lines or ['--']):
-            txt=_hud_fit_safe(ln,w-4)
-            if callable(color):
-                txt=color(txt)
-            body.append(f"│ {txt.ljust(w-4)} │")
-        bot=f"└{'─'*(w-2)}┘"
-        return [top,head,*body,bot]
-    except Exception:
-        return ['┌──┐','│--│','└──┘']
-
-
-def _hud_join_columns(blocks, gap=2):
-    try:
-        cols=[list(b or []) for b in (blocks or [])]
-        widths=[max([len(_ack_tape_strip_ansi(x)) for x in c] or [0]) for c in cols]
-        n=max([len(c) for c in cols] or [0])
-        out=[]
-        for i in range(n):
-            row=[]
-            for c,w in zip(cols,widths):
-                t=c[i] if i < len(c) else ''
-                row.append(t + (' ' * max(0, w-len(_ack_tape_strip_ansi(t)))))
-            out.append((' '*int(gap)).join(row))
-        return out
-    except Exception:
-        merged=[]
-        for b in (blocks or []):
-            merged.extend(list(b or []))
-        return merged
-
-
-def _hud_color_by_zone(zona):
-    z=str(zona or 'UNKNOWN').upper()
-    if 'VERDE_TEMPRANO' in z or 'VERDE_MADURO' in z:
-        return _c_ok
-    if 'VERDE_TARDIO' in z or 'SATURADO' in z:
-        return _c_warn
-    if 'ROJA' in z or 'ROJO' in z:
-        return _c_bad
-    return _c_warn
-
-
-def render_dashboard_premium_compacto(valor_saldo=None, saldo_str='--', meta_str='--'):
-    try:
-        pref=_sync_round_get_summary_preferente(max_age_s=120.0, rebuild_rows=False)
-        ss=dict(pref.get('summary',{}) or {})
-        zinfo=obtener_zona_lxv_hud_actual() or {}
-        zf=resolver_zona_final_lxv(round_id_objetivo=zinfo.get('round_id'), zona_info_previa=zinfo)
-        real_on, real_bot = hay_real_activo_global()
-        token_actual=leer_token_actual() if callable(globals().get('leer_token_actual')) else None
-        token_txt='DEMO' if token_actual in (None,'none','') else f'REAL:{token_actual}'
-        ciclo_act=f"C{int(ciclo_martingala_actual() or 1)}"
-        prox=f"C{int(ciclo_martingala_siguiente() or 1)}"
-        cards1=[_hud_card('SALDO',saldo_str),_hud_card('META',meta_str),_hud_card('FALTA',f"{max(0.0,float(META)-float(valor_saldo)):.2f}" if isinstance(META,(int,float)) and isinstance(valor_saldo,(int,float)) else '--'),_hud_card('AVANCE',_resumen_saldo_meta_hud(valor_saldo,saldo_str,meta_str)[0].split('Avance=')[-1] if _resumen_saldo_meta_hud(valor_saldo,saldo_str,meta_str) else '--'),_hud_card('MODO','PAUSA' if maestro_en_pausa() else 'ACTIVO'),_hud_card('R',f"{float(globals().get('INTERVALO_ACTUAL',2.0) or 2.0):.1f}s")]
-        line1=' '.join([f"[{c[0].strip()} {c[1].strip()}]" for c in cards1])
-        base_lines=_resumen_saldo_meta_hud(valor_saldo,saldo_str,meta_str)
-        head=[f"⚡ TRADING BOT · MARTINGALA REAL · LXV",f"Round #{int(ss.get('round_id',0) or 0)} · Ciclo {ciclo_act} · Token {token_txt}",line1,_ack_tape_strip_ansi(base_lines[1] if len(base_lines)>1 else '--')]
-        marti=_hud_box('MARTINGALA · CICLOS',[f"C1 $1 C2 $2 C3 $4 C4 $8 C5 $16",f"Actual {ciclo_act}",f"Próxima {prox}",f"Estado {'REAL ACTIVO' if real_on else 'EN ESPERA'}",f"Bot real {real_bot or '--'}"],width=38)
-        real_panel=_hud_box('REAL ACTIVO / INVERSIÓN',[f"Bot {real_bot or '--'}",f"Ciclo {ciclo_act}",f"Fuente {(estado_bots.get(real_bot,{}) if real_bot else {}).get('fuente','--')}",f"Token {token_txt}",f"Estado {'ACTIVO' if real_on else 'NO ACTIVO'}",f"Última orden {str((globals().get('LAST_REAL_CLOSE_TRACE',{}) or {}).get('ts','--'))}"],width=38)
-        zc=_hud_color_by_zone(zf.get('zona_base','UNKNOWN'))
-        zona=_hud_box('ZONA LXV / DECISIÓN',[f"Oficial {zf.get('zona_base','--')}",f"Visual {zinfo.get('zona_visual_info',{}).get('zona_visual','--')}",f"Regional {zinfo.get('zona_regional','--')}",f"Patrón {ss.get('partial_pattern','0V0X')}",f"Sync {ss.get('closed_count',0)}/{ss.get('expected_count',len(BOT_NAMES))}",f"Final {zf.get('decision','--')}",f"Motivo {zf.get('motivo','--')}",f"Acción {'SI_INVERTIR' if bool(zf.get('allow_real',False)) else 'NO_INVERTIR'}"],width=42,color=zc)
-        low1=_hud_box(f"ROUND LIVE #{int(ss.get('round_id',0) or 0)}",[f"Cerrados {int(ss.get('closed_count',0) or 0)}/{int(ss.get('expected_count',len(BOT_NAMES)) or len(BOT_NAMES))}",f"Faltan {int(ss.get('missing_total',0) or 0)}",f"Calidad {_dq_oficial_lxv(ss)}",f"Patrón {ss.get('partial_pattern','0V0X')}",f"AUC {_fmt_ia_auc() if '_fmt_ia_auc' in globals() else '--'}"],width=38)
-        low2=_hud_box('CANDADOS REAL',render_real_locks_panel()[:6] or ['--'],width=38)
-        ev=list(eventos_recientes)[-3:] if 'eventos_recientes' in globals() else []
-        low3=_hud_box('EVENTOS RECIENTES',[ _hud_fit_safe(e,38) for e in (ev or ['--'])],width=42)
-        bots=_hud_box('BOTS · HISTORIAL LIVE ACK',render_bots_compacto(),width=120)
-        out=[]
-        out.extend(head)
-        out.extend(_hud_join_columns([marti,real_panel,zona],gap=2))
-        out.extend(bots)
-        out.extend(_hud_join_columns([low1,low2,low3],gap=2))
-        return out
-    except Exception:
-        return ['⚠️ HUD premium fallback seguro','SALDO=-- META=--','Use render clásico']
 def render_hud_ultra_compacto(valor_saldo=None, saldo_str="--", meta_str="--"):
     w=int(globals().get('HUD_PANEL_WIDTH_COMPACT',118) or 118)
     inw=max(20,w-2)
@@ -21418,15 +21317,6 @@ def mostrar_panel():
     except Exception:
         meta_str = "--"
 
-
-    if bool(globals().get("HUD_PARALLEL_PANELS", True)) and bool(globals().get("HUD_LXV_CLEAN_MODE", True)):
-        try:
-            premium_lines = list(render_dashboard_premium_compacto(valor_saldo=valor, saldo_str=saldo_str, meta_str=meta_str) or [])
-            for line in premium_lines:
-                print(line)
-            return
-        except Exception:
-            pass
 
     if bool(globals().get("HUD_ULTRA_COMPACT_MODE", False)):
         try:
