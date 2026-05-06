@@ -8559,15 +8559,103 @@ def _sync_round_apply_post_real_rejoin(payload: dict, released_round: int | None
         pr2 = dict(pr)
         pr2["active"] = False
         pr2["completed_ts"] = float(time.time())
-        pr2["reason"] = "rejoined"
+        pr2["reason"] = "rejoined_by_released_round"
         p["post_real_rejoin"] = pr2
         bot = str(pr2.get("bot") or "")
         _lxv_5v1x_event_cooldown(
             key=f"post_real_rejoin_completed:{bot}:{target}",
-            msg=f"POST_REAL_REJOIN: completed | bot={bot} | released={released}",
+            msg=f"✅ POST_REAL_REJOIN completed by maestro: bot={bot} released={released} target={target}",
             cooldown_s=1.0,
         )
     return p
+
+def _sync_round_ensure_post_real_rejoin(bot, real_round=None, target_release=None, reason="ensure") -> bool:
+    """Publica/repara de forma idempotente el rejoin del ex-owner REAL."""
+    st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+    if not isinstance(st, dict):
+        st = {}
+    b = str(bot or st.get("last_real_owner") or st.get("real_released_after_bot") or st.get("real_pending_bot") or "").strip()
+    if b not in BOT_NAMES:
+        return False
+    try:
+        released = int(st.get("released_round", st.get("round_id", 1)) or 1)
+    except Exception:
+        released = 1
+    rr = real_round
+    if rr is None:
+        rr = st.get("last_real_round") or st.get("real_pending_round")
+    try:
+        rr_int = int(rr) if rr is not None else 0
+    except Exception:
+        rr_int = 0
+    target_candidates = [int(released)]
+    if rr_int > 0:
+        target_candidates.append(rr_int + 1)
+    try:
+        if target_release is not None:
+            target_candidates.append(int(target_release))
+    except Exception:
+        pass
+    target = max([x for x in target_candidates if x > 0] or [max(1, int(released or 1))])
+    now_ts = float(time.time())
+
+    pr = st.get("post_real_rejoin")
+    changed = False
+    if isinstance(pr, dict) and str(pr.get("bot") or "").strip() == b:
+        pr2 = dict(pr)
+        try:
+            prev_target = int(pr2.get("target_release", 0) or 0)
+        except Exception:
+            prev_target = 0
+        if prev_target <= 0 or target > prev_target:
+            pr2["target_release"] = int(target)
+            changed = True
+        else:
+            target = prev_target
+        if rr_int > 0 and not pr2.get("from_round"):
+            pr2["from_round"] = int(rr_int)
+            changed = True
+        if int(released) >= int(target):
+            if bool(pr2.get("active", False)) or pr2.get("reason") != "already_rejoined":
+                pr2["active"] = False
+                pr2["completed_ts"] = now_ts
+                pr2["reason"] = "already_rejoined"
+                changed = True
+        elif not bool(pr2.get("active", False)):
+            pr2["active"] = True
+            pr2.setdefault("created_ts", now_ts)
+            pr2["reason"] = str(reason or "ensure")
+            changed = True
+        if changed:
+            st["post_real_rejoin"] = pr2
+    elif isinstance(pr, dict) and bool(pr.get("active", False)):
+        return False
+    else:
+        rejoin = _sync_round_post_real_rejoin_payload(
+            bot=b,
+            from_round=rr_int,
+            target_release=target,
+            reason=str(reason or "ensure"),
+        )
+        if int(released) >= int(target):
+            rejoin["active"] = False
+            rejoin["completed_ts"] = now_ts
+            rejoin["reason"] = "already_rejoined"
+        st["post_real_rejoin"] = rejoin
+        changed = True
+
+    if rr_int > 0:
+        st["last_real_round"] = int(rr_int)
+    st["last_real_owner"] = b
+    st["post_real_rejoin_ensure_ts"] = now_ts
+    ok = True
+    if changed:
+        ok = bool(_sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, st))
+    if ok:
+        agregar_evento(f"🧩 POST_REAL_REJOIN ENSURE: bot={b} target={target} reason={reason}")
+        if int(released) >= int(target):
+            agregar_evento(f"✅ POST_REAL_REJOIN completed by maestro: bot={b} released={released} target={target}")
+    return bool(ok)
 
 def _sync_round_release_next_round(old_round: int, reason: str, extra: dict | None = None) -> bool:
     st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
@@ -9418,6 +9506,20 @@ def _sync_round_tick_maestro():
         if st2 != st:
             _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, st2)
             st = st2
+    except Exception:
+        pass
+    try:
+        pr_now = st.get("post_real_rejoin") if isinstance(st, dict) else None
+        last_owner = str((st or {}).get("last_real_owner") or (st or {}).get("real_released_after_bot") or "").strip()
+        if last_owner in BOT_NAMES and not (isinstance(pr_now, dict) and str(pr_now.get("bot") or "").strip() == last_owner):
+            recent_ok, recent_reason = _sync_is_recent_real_owner(last_owner, st)
+            if recent_ok:
+                _sync_round_ensure_post_real_rejoin(
+                    last_owner,
+                    real_round=(st or {}).get("last_real_round") or (st or {}).get("real_pending_round"),
+                    reason=f"repair_{recent_reason}",
+                )
+                st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or st
     except Exception:
         pass
     status_now = str(st.get("status", "")).strip().lower()
@@ -10367,6 +10469,7 @@ def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") 
     st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
     status = str(st.get("status", "")).strip().lower()
     if status not in ("holding_real_result", "holding_real_turn"):
+        _sync_round_ensure_post_real_rejoin(bot, real_round=st.get("last_real_round") or st.get("real_pending_round"), reason=reason or "real_closed")
         return
     try:
         old_round = max(1, int(st.get("round_id", 1) or 1))
@@ -10377,7 +10480,7 @@ def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") 
     rejoin = _sync_round_post_real_rejoin_payload(
         bot=str(bot),
         from_round=old_round,
-        target_release=next_round + 1,
+        target_release=next_round,
         reason="real_closed_rejoin_required",
     )
     payload = {
@@ -10399,9 +10502,11 @@ def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") 
         "started_at": now_ts,
         "ts": now_ts,
     }
+    payload = _sync_round_apply_post_real_rejoin(payload, released_round=payload.get("released_round"))
     _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+    _sync_round_ensure_post_real_rejoin(bot, real_round=old_round, target_release=next_round, reason=reason or "real_closed")
     globals()["SYNC_STATUS_LINE"] = f"SYNC: POST_REAL_CERRADO | exento={bot} | cerrados=0/{len(BOT_NAMES)} | release={next_round}"
-    agregar_evento(f"POST_REAL_REJOIN: active=true | bot={bot} | target_release={next_round + 1}")
+    agregar_evento(f"POST_REAL_REJOIN: ensured | bot={bot} | target_release={next_round}")
     agregar_evento(f"🚀 ROUND LIVE liberado tras cierre REAL: bot={bot} -> ronda #{next_round}")
 
 # === PATCH: REAL INMEDIATO EN HUD AL EMITIR ORDEN (sin esperar compra) ===
