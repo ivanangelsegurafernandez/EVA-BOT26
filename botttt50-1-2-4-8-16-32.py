@@ -353,6 +353,42 @@ def _sync_round_resolve_start_round() -> int:
         released = 1
     return max(1, released)
 
+def _sync_adopt_official_round(released_round, expected_release, old_round, motivo=""):
+    try:
+        rr = int(released_round or 0)
+        exp = int(expected_release or 0)
+        old = int(old_round or 0)
+    except Exception:
+        return old
+
+    if rr >= exp and rr > old:
+        return rr
+
+    if rr >= exp:
+        return max(rr, old)
+
+    return old
+
+def _sync_round_adopt_official_if_stale(motivo="pre_demo_buy"):
+    try:
+        st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
+        released_round = int(st.get("released_round", 0) or 0)
+        local_round = int(estado_bot.get("sync_round_id", 1) or 1)
+    except Exception:
+        return
+    if released_round >= 100 and local_round < (released_round - 5):
+        estado_bot["sync_round_id"] = int(released_round)
+        try:
+            now_ts = time.time()
+            key = f"_SYNC_ROUND_ADOPT_OFFICIAL_LOG_TS_{motivo}"
+            last_ts = float(globals().get(key, 0.0) or 0.0)
+            if (now_ts - last_ts) >= 8.0:
+                globals()[key] = now_ts
+                print(Fore.CYAN + Style.BRIGHT + f"🧭 SYNC_ROUND_ADOPT_OFFICIAL: {NOMBRE_BOT} local={local_round} → oficial={released_round}")
+        except Exception:
+            pass
+
+
 
 async def _sync_round_wait_post_real_rejoin(initial_grace_s: float = 8.0, poll_s: float = 0.5, round_id_real=None) -> None:
     """
@@ -447,18 +483,18 @@ async def _sync_round_wait_post_real_rejoin(initial_grace_s: float = 8.0, poll_s
             if target > 0:
                 target_seen = max(int(target_seen or 0), int(target))
             if target > 0 and released >= target:
-                sync_round = target
-                print(Fore.GREEN + Style.BRIGHT + f"✅ POST_REAL_REJOIN completado: {NOMBRE_BOT} sincronizado en ronda #{sync_round}")
+                sync_round = _sync_adopt_official_round(released, target, estado_bot.get("sync_round_id", target), motivo="post_real_rejoin_target")
+                print(Fore.GREEN + Style.BRIGHT + f"✅ POST_REAL_REJOIN completado: {NOMBRE_BOT} sincronizado en ronda oficial #{sync_round}")
                 try:
-                    estado_bot["sync_round_id"] = max(int(estado_bot.get("sync_round_id", 1) or 1), int(sync_round or released or 1))
+                    estado_bot["sync_round_id"] = int(sync_round or released or target or 1)
                 except Exception:
                     pass
                 return
             if (not bool(pr.get("active", False))) and target_seen > 0 and released >= target_seen:
-                sync_round = target_seen
-                print(Fore.GREEN + Style.BRIGHT + f"✅ POST_REAL_REJOIN completado: {NOMBRE_BOT} sincronizado en ronda #{sync_round}")
+                sync_round = _sync_adopt_official_round(released, target_seen, estado_bot.get("sync_round_id", target_seen), motivo="post_real_rejoin_inactive")
+                print(Fore.GREEN + Style.BRIGHT + f"✅ POST_REAL_REJOIN completado: {NOMBRE_BOT} sincronizado en ronda oficial #{sync_round}")
                 try:
-                    estado_bot["sync_round_id"] = max(int(estado_bot.get("sync_round_id", 1) or 1), int(sync_round or released or 1))
+                    estado_bot["sync_round_id"] = int(sync_round or released or target_seen or 1)
                 except Exception:
                     pass
                 return
@@ -473,24 +509,25 @@ async def _sync_round_wait_post_real_rejoin(initial_grace_s: float = 8.0, poll_s
                 print(Fore.CYAN + f"⏳ POST_REAL_REJOIN BLOQUEANTE: bot={NOMBRE_BOT} | released={released} | expected={espera} | payload_maestro=si | token={token_now} | acción=esperar_release_comun")
         else:
             if seen_own_rejoin and target_seen > 0 and released >= target_seen:
-                print(Fore.GREEN + Style.BRIGHT + f"✅ POST_REAL_REJOIN completado: {NOMBRE_BOT} sincronizado en ronda #{target_seen}")
+                sync_round = _sync_adopt_official_round(released, target_seen, estado_bot.get("sync_round_id", target_seen), motivo="post_real_rejoin_seen")
+                print(Fore.GREEN + Style.BRIGHT + f"✅ POST_REAL_REJOIN completado: {NOMBRE_BOT} sincronizado en ronda oficial #{sync_round}")
                 try:
-                    estado_bot["sync_round_id"] = max(int(estado_bot.get("sync_round_id", 1) or 1), int(target_seen or released or 1))
+                    estado_bot["sync_round_id"] = int(sync_round or released or target_seen or 1)
                 except Exception:
                     pass
                 return
             now_ts = time.time()
             elapsed = max(0.0, now_ts - start_ts)
             if elapsed >= 18.0 and _safe_exit_ready(st, released):
-                sync_round = int(expected_target or released)
+                sync_round = _sync_adopt_official_round(released, expected_target or released, estado_bot.get("sync_round_id", released), motivo="post_real_rejoin_safe_exit")
                 try:
                     token_now = str(leer_token_actual() or "").strip()
                 except Exception:
                     token_now = "?"
                 print(Fore.GREEN + Style.BRIGHT + f"✅ POST_REAL_REJOIN SAFE_EXIT: bot={NOMBRE_BOT} | released={released} | expected={expected_target or released} | token={token_now}")
-                print(Fore.GREEN + Style.BRIGHT + f"✅ POST_REAL_REJOIN completado por release ya avanzado: {NOMBRE_BOT} sincronizado en ronda #{sync_round}")
+                print(Fore.GREEN + Style.BRIGHT + f"✅ POST_REAL_REJOIN completado por release ya avanzado: {NOMBRE_BOT} sincronizado en ronda oficial #{sync_round}")
                 try:
-                    estado_bot["sync_round_id"] = max(int(estado_bot.get("sync_round_id", 1) or 1), int(sync_round or released or 1))
+                    estado_bot["sync_round_id"] = int(sync_round or released or 1)
                 except Exception:
                     pass
                 return
@@ -854,14 +891,15 @@ async def _sync_round_wait_release(round_id: int) -> int:
             except Exception:
                 after_released_to = 0
             if after_released_to >= next_round:
+                official_round = _sync_adopt_official_round(after_released_to, next_round, rid, motivo="after_real_release")
                 estado_bot["sync_wait"] = False
-                estado_bot["sync_round_id"] = after_released_to
+                estado_bot["sync_round_id"] = official_round
                 try:
-                    _sync_round_write_release_heartbeat(rid, after_released_to)
+                    _sync_round_write_release_heartbeat(rid, official_round)
                 except Exception:
                     pass
-                print(Fore.GREEN + Style.BRIGHT + f"🔓 REAL_CLOSED_RELEASE_ALL detectado: {NOMBRE_BOT} sale de standby → ronda #{after_released_to}")
-                return after_released_to
+                print(Fore.GREEN + Style.BRIGHT + f"🔓 REAL_CLOSED_RELEASE_ALL detectado: {NOMBRE_BOT} sale de standby → ronda oficial #{official_round}")
+                return official_round
         rollback_detected = bool(rid > 10 and next_round > 10 and released <= 1)
         if rollback_detected:
             if (now_ts - float(globals().get("_SYNC_STATE_ROLLBACK_LOG_TS", 0.0) or 0.0)) >= 8.0:
@@ -901,11 +939,13 @@ async def _sync_round_wait_release(round_id: int) -> int:
             )
             return rid
         if released >= next_round:
+            official_round = _sync_adopt_official_round(released, next_round, rid, motivo="normal_release")
             estado_bot["sync_wait"] = False
-            _sync_round_write_release_heartbeat(rid, next_round)
-            print(Fore.GREEN + f"🔓 LXV_SYNC_COLUMN liberación detectada: ronda #{released} (bot {NOMBRE_BOT})")
-            print(Fore.GREEN + Style.BRIGHT + f"▶️ LXV_SYNC_COLUMN salida standby: {NOMBRE_BOT} → ronda #{next_round}")
-            return next_round
+            estado_bot["sync_round_id"] = official_round
+            _sync_round_write_release_heartbeat(rid, official_round)
+            print(Fore.GREEN + f"🔓 LXV_SYNC_COLUMN liberación detectada: ronda oficial #{official_round} (bot {NOMBRE_BOT})")
+            print(Fore.GREEN + Style.BRIGHT + f"▶️ LXV_SYNC_COLUMN salida standby: {NOMBRE_BOT} → ronda oficial #{official_round}")
+            return official_round
         stale_state = (state_ts > 0) and ((now_ts - state_ts) >= SYNC_WAIT_STALE_S)
         idle_s = now_ts - last_progress_ts
         total_wait_s = now_ts - wait_start_ts
@@ -3231,6 +3271,9 @@ async def ejecutar_panel():
                         + f"\n🚨 {NOMBRE_BOT.upper()} MODO REAL ACTIVADO {hora} 🚨"
                         + Style.RESET_ALL
                     )
+
+            if not modo_real:
+                _sync_round_adopt_official_if_stale(motivo="pre_demo_buy")
 
             martingala = MARTINGALA_REAL if modo_real else MARTINGALA_DEMO
 
