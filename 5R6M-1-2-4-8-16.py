@@ -9232,7 +9232,7 @@ def _sync_round_try_recovery_release_global() -> bool:
         motivo_txt = str(motivo or "state_corrupto").strip() or "state_corrupto"
         _lxv_5v1x_event_cooldown(
             f"sync_recovery_global_force_demo_clean:{released_value}:{motivo_txt}",
-            f"RECOVERY_RELEASE_GLOBAL HOLD | motivo={motivo_txt}",
+            f"RECOVERY_FORCE_DEMO_CLEAN HOLD | motivo={motivo_txt}",
             cooldown_s=hold_cd,
         )
         return False
@@ -9301,6 +9301,7 @@ def _sync_round_try_recovery_release_global() -> bool:
             return _hold("state_corrupto", released_round)
 
         wait_bots = []
+        wait_since_candidates = []
         for bot in BOT_NAMES:
             ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
             st_bot = estado_bots.get(bot, {}) if isinstance(estado_bots.get(bot, {}), dict) else {}
@@ -9315,6 +9316,14 @@ def _sync_round_try_recovery_release_global() -> bool:
                 continue
             if bool(ack.get("sync_wait", False)) and waiting_release >= target_round and ack_round <= int(released_round):
                 wait_bots.append(bot)
+                for ts_key in ("sync_wait_ts", "wait_since_ts", "last_seen_ts", "ts"):
+                    try:
+                        ts_val = float(ack.get(ts_key, 0.0) or 0.0)
+                    except Exception:
+                        ts_val = 0.0
+                    if ts_val > 0:
+                        wait_since_candidates.append(ts_val)
+                        break
 
         reqs = _sync_round_read_recovery_requests(max_age_s=float(globals().get("SYNC_RECOVERY_GLOBAL_REQUEST_MAX_AGE_S", 120.0) or 120.0))
         req_bots = []
@@ -9324,16 +9333,24 @@ def _sync_round_try_recovery_release_global() -> bool:
                 req_round = int(req.get("round_id", released_round) or released_round)
             except Exception:
                 continue
-            if req_next == target_round and req_round <= int(released_round):
+            if req_next >= target_round and req_round <= int(released_round):
                 req_bots.append(bot)
+                try:
+                    ts_val = float(req.get("ts", req.get("created_ts", 0.0)) or 0.0)
+                except Exception:
+                    ts_val = 0.0
+                if ts_val > 0:
+                    wait_since_candidates.append(ts_val)
         if not req_bots:
             return _hold("sin_recovery_request", released_round)
         if not wait_bots:
-            return _hold("state_corrupto", released_round)
+            return _hold("sin_bots_waiting", released_round)
 
         started_at = float(st.get("started_at", st.get("ts", 0.0)) or 0.0)
         wait_elapsed = max(0.0, now_ts - started_at) if started_at > 0 else 0.0
-        threshold_s = float(globals().get("SYNC_RECOVERY_GLOBAL_MIN_WAIT_S", 20.0) or 20.0)
+        if wait_since_candidates:
+            wait_elapsed = max(wait_elapsed, max(0.0, now_ts - min(wait_since_candidates)))
+        threshold_s = float(globals().get("SYNC_RECOVERY_GLOBAL_MIN_WAIT_S", 10.0) or 10.0)
         if wait_elapsed <= threshold_s:
             return _hold("espera_minima_no_cumplida", released_round)
 
@@ -10360,7 +10377,7 @@ def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") 
     rejoin = _sync_round_post_real_rejoin_payload(
         bot=str(bot),
         from_round=old_round,
-        target_release=next_round,
+        target_release=next_round + 1,
         reason="real_closed_rejoin_required",
     )
     payload = {
@@ -10384,7 +10401,7 @@ def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") 
     }
     _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
     globals()["SYNC_STATUS_LINE"] = f"SYNC: POST_REAL_CERRADO | exento={bot} | cerrados=0/{len(BOT_NAMES)} | release={next_round}"
-    agregar_evento(f"POST_REAL_REJOIN: active=true | bot={bot} | target_release={next_round}")
+    agregar_evento(f"POST_REAL_REJOIN: active=true | bot={bot} | target_release={next_round + 1}")
     agregar_evento(f"🚀 ROUND LIVE liberado tras cierre REAL: bot={bot} -> ronda #{next_round}")
 
 # === PATCH: REAL INMEDIATO EN HUD AL EMITIR ORDEN (sin esperar compra) ===
