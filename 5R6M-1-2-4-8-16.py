@@ -5440,6 +5440,86 @@ def _sync_round_monotonic_guard_log(new_released, old_released, reason: str = ""
     except Exception:
         pass
 
+def _sync_round_enrich_real_global_state(payload: dict, reason="") -> dict:
+    """Normaliza campos REAL globales en sync_round/state.json para los bots DEMO."""
+    p = dict(payload or {})
+    now_ts = float(time.time())
+    valid_bots = set(BOT_NAMES)
+
+    def _valid_owner(value):
+        v = str(value or "").strip()
+        return v if v in valid_bots else None
+
+    token_raw = ""
+    try:
+        token_raw = str(leer_token_actual() or "").strip()
+    except Exception:
+        token_raw = ""
+    token_owner = None
+    if _token_real_ocupado(token_raw):
+        try:
+            token_owner = _valid_owner(token_raw.split(":", 1)[1].strip() if ":" in token_raw else token_raw)
+        except Exception:
+            token_owner = None
+
+    pending_on, pending_bot, _pending_payload = False, None, None
+    try:
+        pending_on, pending_bot, _pending_payload = _hay_real_close_pending_activo()
+    except Exception:
+        pending_on, pending_bot, _pending_payload = False, None, None
+    pending_owner = _valid_owner(pending_bot)
+
+    lock_owner = _valid_owner(globals().get("REAL_OWNER_LOCK"))
+    payload_owner = _valid_owner(
+        p.get("real_owner")
+        or p.get("owner_real")
+        or p.get("bot_real")
+        or p.get("real_bot")
+        or p.get("real_pending_bot")
+        or p.get("bot")
+        or p.get("owner_bot")
+    )
+    order_on, order_bot = False, None
+    try:
+        fn_order = globals().get("_sync_real_order_viva_any")
+        if callable(fn_order):
+            order_on, order_bot = fn_order()
+    except Exception:
+        order_on, order_bot = False, None
+    order_owner = _valid_owner(order_bot)
+
+    status_raw = str(p.get("status") or "").strip().lower()
+    explicit_real_status = str(p.get("real_status") or "").strip().lower()
+    active_statuses = {"holding_real_result", "holding_real_turn", "real_active", "real_pending", "waiting_real_close", "closing", "active"}
+    closing_statuses = {"holding_real_result", "waiting_real_close", "closing"}
+    real_emitido = bool(p.get("real_emitido", False))
+
+    owner = token_owner or pending_owner or lock_owner or order_owner or (payload_owner if (status_raw in active_statuses or explicit_real_status in active_statuses or real_emitido) else None)
+    active = bool(owner and (token_owner or pending_on or lock_owner or order_on or status_raw in active_statuses or explicit_real_status in active_statuses or real_emitido))
+    closing = bool(active and (pending_on or status_raw in closing_statuses or explicit_real_status in closing_statuses))
+
+    if active:
+        p["real_global"] = True
+        p["real_owner"] = owner
+        p["owner_real"] = owner
+        p["bot_real"] = owner
+        p["real_status"] = "closing" if closing else "active"
+        p["real_close_pending"] = bool(pending_on or closing)
+        p["token_status"] = f"REAL:{owner}"
+    else:
+        p["real_global"] = False
+        p["real_owner"] = None
+        p["owner_real"] = None
+        p["bot_real"] = None
+        if status_raw in {"released_after_real_close", "real_closed_release_all"} or str(reason or "").upper() == "REAL_CLOSED_RELEASE_ALL":
+            p["real_status"] = "closed"
+            p["last_real_closed_ts"] = float(p.get("last_real_closed_ts") or now_ts)
+        else:
+            p["real_status"] = "none"
+        p["real_close_pending"] = False
+        p["token_status"] = "REAL:none" if p.get("real_status") == "closed" else "DEMO"
+    return p
+
 def _sync_round_write_state_monotonic(payload, reason="") -> bool:
     """Escritura central de sync_round/state.json: released_round nunca retrocede."""
     try:
@@ -5475,6 +5555,7 @@ def _sync_round_write_state_monotonic(payload, reason="") -> bool:
         elif int(p.get("round_id", new_round_id) or 0) < int(p.get("released_round", new_released) or 0):
             p["round_id"] = int(p.get("released_round", new_released) or 1)
 
+        p = _sync_round_enrich_real_global_state(p, reason=reason)
         return _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, p)
     except Exception:
         return False
@@ -5491,6 +5572,13 @@ def _sync_round_bootstrap_state(force: bool = False):
         "completed": False,
         "status": "running",
         "reason": "boot",
+        "real_global": False,
+        "real_owner": None,
+        "real_status": "none",
+        "token_status": "DEMO",
+        "real_close_pending": False,
+        "last_real_closed_ts": None,
+        "after_real_release": {},
         "started_at": time.time(),
         "ts": time.time(),
     }
@@ -10724,6 +10812,14 @@ def _sync_round_release_all_after_real_close(bot_real, real_round=None, reason="
         "last_real_round": int(rr_int or released_from),
         "after_real_release": after_payload,
         "post_real_rejoin": rejoin,
+        "real_global": False,
+        "real_owner": None,
+        "owner_real": None,
+        "bot_real": None,
+        "real_status": "closed",
+        "token_status": "REAL:none",
+        "real_close_pending": False,
+        "last_real_closed_ts": now_ts,
         "started_at": now_ts,
         "ts": now_ts,
     })
