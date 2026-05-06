@@ -332,6 +332,19 @@ def leer_token_actual():
     except Exception:
         return "DEMO"
 
+def _token_real_ocupado(token) -> bool:
+    t = str(token or "").strip()
+    tu = t.upper()
+
+    if tu in ("", "DEMO", "REAL:NONE", "REAL:NULL", "REAL:--", "REAL:"):
+        return False
+
+    if tu.startswith("REAL:"):
+        owner = t.split(":", 1)[1].strip()
+        return owner in ("fulll45", "fulll46", "fulll47", "fulll48", "fulll49", "fulll50")
+
+    return False
+
 def _sync_round_resolve_start_round() -> int:
     st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
     try:
@@ -386,7 +399,7 @@ async def _sync_round_wait_post_real_rejoin(initial_grace_s: float = 8.0, poll_s
             token_now = str(leer_token_actual() or "").strip()
         except Exception:
             return False
-        if token_now.upper() != "DEMO":
+        if _token_real_ocupado(token_now):
             return False
         try:
             if _sync_bot_es_owner_real():
@@ -470,7 +483,11 @@ async def _sync_round_wait_post_real_rejoin(initial_grace_s: float = 8.0, poll_s
             elapsed = max(0.0, now_ts - start_ts)
             if elapsed >= 18.0 and _safe_exit_ready(st, released):
                 sync_round = int(expected_target or released)
-                print(Fore.GREEN + Style.BRIGHT + f"✅ POST_REAL_REJOIN SAFE_EXIT: {NOMBRE_BOT} release ya cumplido; vuelve a DEMO sincronizado")
+                try:
+                    token_now = str(leer_token_actual() or "").strip()
+                except Exception:
+                    token_now = "?"
+                print(Fore.GREEN + Style.BRIGHT + f"✅ POST_REAL_REJOIN SAFE_EXIT: bot={NOMBRE_BOT} | released={released} | expected={expected_target or released} | token={token_now}")
                 print(Fore.GREEN + Style.BRIGHT + f"✅ POST_REAL_REJOIN completado por release ya avanzado: {NOMBRE_BOT} sincronizado en ronda #{sync_round}")
                 try:
                     estado_bot["sync_round_id"] = max(int(estado_bot.get("sync_round_id", 1) or 1), int(sync_round or released or 1))
@@ -634,7 +651,7 @@ def _sync_any_real_owner_active() -> tuple[bool, str, str]:
 
     try:
         tok = str(leer_token_actual() or "").strip()
-        if tok.upper().startswith("REAL:"):
+        if _token_real_ocupado(tok):
             owner = tok.split(":", 1)[1].strip() if ":" in tok else ""
             if _valid_bot(owner):
                 return True, owner, "token_actual"
