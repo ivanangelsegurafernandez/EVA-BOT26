@@ -341,7 +341,7 @@ def _sync_round_resolve_start_round() -> int:
     return max(1, released)
 
 
-async def _sync_round_wait_post_real_rejoin(initial_grace_s: float = 8.0, poll_s: float = 0.5) -> None:
+async def _sync_round_wait_post_real_rejoin(initial_grace_s: float = 8.0, poll_s: float = 0.5, round_id_real=None) -> None:
     """
     Bloquea cooperativamente al ex-owner REAL hasta que el maestro confirme
     la liberación común post_real_rejoin. Mientras espera no vuelve a DEMO,
@@ -351,13 +351,80 @@ async def _sync_round_wait_post_real_rejoin(initial_grace_s: float = 8.0, poll_s
     last_log_ts = 0.0
     seen_own_rejoin = False
     target_seen = 0
-    while True:
-        st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
-        pr = st.get("post_real_rejoin") if isinstance(st, dict) else None
+
+    initial_state = _sync_round_safe_read_json(SYNC_ROUND_STATE)
+    if isinstance(initial_state, dict):
         try:
-            released = int((st or {}).get("released_round", 1) or 1)
+            start_released = int(initial_state.get("released_round", 0) or 0)
         except Exception:
-            released = 1
+            start_released = 0
+    else:
+        start_released = 0
+    rr_candidates = [round_id_real]
+    if isinstance(initial_state, dict):
+        rr_candidates.extend([
+            initial_state.get("last_real_round"),
+            initial_state.get("real_pending_round"),
+        ])
+    real_round_seen = 0
+    for candidate in rr_candidates:
+        try:
+            c = int(candidate or 0)
+        except Exception:
+            c = 0
+        if c > 0:
+            real_round_seen = c
+            break
+    expected_target = max(int(start_released or 0), int(real_round_seen + 1 if real_round_seen > 0 else 0))
+
+    def _safe_exit_ready(state: dict, released_now: int) -> bool:
+        if not isinstance(state, dict):
+            return False
+        if expected_target <= 0 or int(released_now) < int(expected_target):
+            return False
+        try:
+            token_now = str(leer_token_actual() or "").strip()
+        except Exception:
+            return False
+        if token_now.upper() != "DEMO":
+            return False
+        try:
+            if _sync_bot_es_owner_real():
+                return False
+        except Exception:
+            return False
+        try:
+            any_real, _owner, _reason = _sync_any_real_owner_active()
+            if any_real:
+                return False
+        except Exception:
+            return False
+        status_now = str(state.get("status") or "").strip().lower()
+        if status_now in {"holding_real_result", "holding_real_turn", "real_pending", "waiting_real_close"}:
+            return False
+        return True
+
+    while True:
+        st = _sync_round_safe_read_json(SYNC_ROUND_STATE)
+        if not isinstance(st, dict):
+            now_ts = time.time()
+            if (now_ts - last_log_ts) >= 15.0:
+                last_log_ts = now_ts
+                print(Fore.CYAN + f"⏳ POST_REAL_REJOIN BLOQUEANTE: bot={NOMBRE_BOT} | released=? | expected={expected_target or '?'} | payload_maestro=? | token=? | acción=esperar_state_json_valido")
+            await asyncio.sleep(max(0.2, min(float(poll_s), 1.0)))
+            continue
+        pr = st.get("post_real_rejoin")
+        try:
+            released = int(st.get("released_round", 0) or 0)
+        except Exception:
+            released = 0
+        if released <= 0:
+            now_ts = time.time()
+            if (now_ts - last_log_ts) >= 15.0:
+                last_log_ts = now_ts
+                print(Fore.CYAN + f"⏳ POST_REAL_REJOIN BLOQUEANTE: bot={NOMBRE_BOT} | released=? | expected={expected_target or '?'} | payload_maestro={'si' if isinstance(pr, dict) else 'no'} | token=? | acción=esperar_released_round_valido")
+            await asyncio.sleep(max(0.2, min(float(poll_s), 1.0)))
+            continue
         if isinstance(pr, dict) and str(pr.get("bot") or "").strip() == str(NOMBRE_BOT):
             seen_own_rejoin = True
             try:
@@ -385,8 +452,12 @@ async def _sync_round_wait_post_real_rejoin(initial_grace_s: float = 8.0, poll_s
             now_ts = time.time()
             if (now_ts - last_log_ts) >= 15.0:
                 last_log_ts = now_ts
-                espera = target if target > 0 else (target_seen if target_seen > 0 else "?")
-                print(Fore.CYAN + f"⏳ POST_REAL_REJOIN BLOQUEANTE: {NOMBRE_BOT} espera released_round >= {espera}; actual={released}; no compra DEMO")
+                espera = target if target > 0 else (target_seen if target_seen > 0 else expected_target if expected_target > 0 else "?")
+                try:
+                    token_now = str(leer_token_actual() or "?").strip()
+                except Exception:
+                    token_now = "?"
+                print(Fore.CYAN + f"⏳ POST_REAL_REJOIN BLOQUEANTE: bot={NOMBRE_BOT} | released={released} | expected={espera} | payload_maestro=si | token={token_now} | acción=esperar_release_comun")
         else:
             if seen_own_rejoin and target_seen > 0 and released >= target_seen:
                 print(Fore.GREEN + Style.BRIGHT + f"✅ POST_REAL_REJOIN completado: {NOMBRE_BOT} sincronizado en ronda #{target_seen}")
@@ -396,15 +467,24 @@ async def _sync_round_wait_post_real_rejoin(initial_grace_s: float = 8.0, poll_s
                     pass
                 return
             now_ts = time.time()
+            elapsed = max(0.0, now_ts - start_ts)
+            if elapsed >= 18.0 and _safe_exit_ready(st, released):
+                sync_round = int(expected_target or released)
+                print(Fore.GREEN + Style.BRIGHT + f"✅ POST_REAL_REJOIN SAFE_EXIT: {NOMBRE_BOT} release ya cumplido; vuelve a DEMO sincronizado")
+                print(Fore.GREEN + Style.BRIGHT + f"✅ POST_REAL_REJOIN completado por release ya avanzado: {NOMBRE_BOT} sincronizado en ronda #{sync_round}")
+                try:
+                    estado_bot["sync_round_id"] = max(int(estado_bot.get("sync_round_id", 1) or 1), int(sync_round or released or 1))
+                except Exception:
+                    pass
+                return
             if (now_ts - last_log_ts) >= 15.0:
                 last_log_ts = now_ts
-                elapsed = max(0.0, now_ts - start_ts)
-                if target_seen > 0:
-                    print(Fore.CYAN + f"⏳ POST_REAL_REJOIN BLOQUEANTE: {NOMBRE_BOT} espera released_round >= {target_seen}; actual={released}; no compra DEMO")
-                elif elapsed >= float(initial_grace_s):
-                    print(Fore.CYAN + f"⏳ POST_REAL_REJOIN BLOQUEANTE: {NOMBRE_BOT} esperando publicación del maestro; actual={released}; no compra DEMO")
-                else:
-                    print(Fore.CYAN + f"⏳ POST_REAL_REJOIN BLOQUEANTE: {NOMBRE_BOT} esperando release común; no compra DEMO")
+                espera = target_seen if target_seen > 0 else expected_target if expected_target > 0 else "?"
+                try:
+                    token_now = str(leer_token_actual() or "?").strip()
+                except Exception:
+                    token_now = "?"
+                print(Fore.CYAN + f"⏳ POST_REAL_REJOIN BLOQUEANTE: bot={NOMBRE_BOT} | released={released} | expected={espera} | payload_maestro=no | token={token_now} | acción=esperar_o_salida_segura")
         await asyncio.sleep(max(0.2, min(float(poll_s), 1.0)))
 
 def _sync_bot_es_owner_real() -> bool:
