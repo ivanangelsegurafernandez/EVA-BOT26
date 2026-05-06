@@ -759,15 +759,67 @@ def _sync_any_real_owner_active() -> tuple[bool, str, str]:
     try:
         st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
         if isinstance(st, dict):
-            status = str(st.get("status") or "").strip().lower()
-            if status in {"holding_real_result", "holding_real_turn", "real_pending", "waiting_real_close"}:
-                owner = str(st.get("real_bot") or st.get("bot") or st.get("owner_bot") or "").strip()
-                if _valid_bot(owner):
-                    return True, owner, "sync_round_state"
+            status = str(st.get("real_status") or st.get("status") or "").strip().lower()
+            owner = str(
+                st.get("real_owner")
+                or st.get("owner_real")
+                or st.get("bot_real")
+                or st.get("real_bot")
+                or st.get("bot")
+                or st.get("owner_bot")
+                or ""
+            ).strip()
+            real_global_raw = st.get("real_global", False)
+            real_global = bool(real_global_raw) or str(real_global_raw).strip().upper() in {"SI", "SÍ", "YES", "TRUE", "1", "ON"}
+            close_pending_raw = st.get("real_close_pending", st.get("REAL_CLOSE_PENDING", False))
+            close_pending = bool(close_pending_raw) or str(close_pending_raw).strip().upper() in {"SI", "SÍ", "YES", "TRUE", "1", "ON"}
+            token_status = str(st.get("token_status") or "").strip()
+            active_statuses = {
+                "holding_real_result", "holding_real_turn", "real_active", "real_pending",
+                "waiting_real_close", "closing", "active",
+            }
+            if _token_real_ocupado(token_status):
+                token_owner = token_status.split(":", 1)[1].strip() if ":" in token_status else owner
+                if _valid_bot(token_owner):
+                    return True, token_owner, "sync_round_token_status"
+            if (real_global or close_pending or status in active_statuses) and _valid_bot(owner):
+                return True, owner, "sync_round_state"
     except Exception:
         pass
 
     return False, "", ""
+
+
+async def _sync_wait_global_real_clear(contexto="", allow_owner=True):
+    """HOLD no intrusivo: bloquea solo nuevas operaciones DEMO si otro bot está en REAL."""
+    ctx = str(contexto or "").strip() or "pre_new_trade"
+    was_holding = False
+    while True:
+        active, owner, reason = _sync_any_real_owner_active()
+        owner = str(owner or "").strip()
+        if not active:
+            if was_holding:
+                print(Fore.GREEN + Style.BRIGHT + f"✅ GLOBAL_REAL_CLEAR: {NOMBRE_BOT} reanuda DEMO | contexto={ctx}")
+            return
+        if bool(allow_owner) and owner == str(NOMBRE_BOT):
+            return
+        now_ts = time.time()
+        key = f"global-real-hold:{ctx}"
+        last_ts = float(estado_bot.get(key, 0.0) or 0.0)
+        if (now_ts - last_ts) >= 12.0:
+            print(
+                Fore.YELLOW + Style.BRIGHT +
+                f"⏸️ GLOBAL_REAL_HOLD_PRE_NEW_TRADE: {NOMBRE_BOT} detenido porque REAL activo={owner or '--'} "
+                f"| contexto={ctx} | motivo={reason or '--'} | no inicia nueva compra DEMO"
+            )
+            estado_bot[key] = now_ts
+        was_holding = True
+        await asyncio.sleep(1.2 + random.uniform(0.0, 0.6))
+
+def _sync_real_active_for_other_bot():
+    active, owner, reason = _sync_any_real_owner_active()
+    owner = str(owner or "").strip()
+    return bool(active and owner and owner != str(NOMBRE_BOT)), owner, reason
 
 
 def _selftest_sync_demo_hold_global():
@@ -2591,6 +2643,7 @@ async def consultar_saldo_real(ws):
 
 # ==================== LÓGICA DE OPERACIÓN ====================
 async def buscar_estrategia(ws, ciclo, token):
+    await _sync_wait_global_real_clear("pre_search")
     print(Fore.MAGENTA + Style.BRIGHT + f"\nBuscando señal válida para Martingala #{ciclo}")
     for intento in range(1, 11):
         if reinicio_forzado.is_set():
@@ -3351,6 +3404,11 @@ async def ejecutar_panel():
                 if estado_bot.get("pending_contract_resolution"):
                     if not await _pending_contract_fence_tick(ws):
                         continue
+                    if not modo_real:
+                        await _sync_wait_global_real_clear("post_fence_before_retry")
+
+                if not modo_real:
+                    await _sync_wait_global_real_clear("pre_search")
 
                 print(Fore.CYAN + Style.BRIGHT + "=" * 80)
                 titulo = f"{NOMBRE_BOT.upper()} | MODO {'REAL' if modo_real else 'DEMO'} | CICLO #{ciclo}/{len(martingala)}"
@@ -3361,6 +3419,8 @@ async def ejecutar_panel():
                 if estado_bot.get("pending_contract_resolution"):
                     if not await _pending_contract_fence_tick(ws):
                         continue
+                    if not modo_real:
+                        await _sync_wait_global_real_clear("post_fence_before_retry")
 
                 # Salud WS (si buscar_estrategia detectó 1006 masivos)
                 if ws_reset_needed.is_set():
@@ -3421,6 +3481,8 @@ async def ejecutar_panel():
                         continue
 
                 # ========= REVALIDACIÓN PRE-BUY =========
+                if not modo_real:
+                    await _sync_wait_global_real_clear("pre_revalidation")
                 try:
                     score_sel = estado_bot.get("score_senal")
                     velas_rv = await obtener_velas(ws, symbol, current_token, reintentos=2)
@@ -3443,6 +3505,8 @@ async def ejecutar_panel():
                     pass
 
                 # ========= PROPOSAL =========
+                if not modo_real:
+                    await _sync_wait_global_real_clear("pre_demo_buy")
                 try:
                     data_proposal = await api_call(ws, {
                         "proposal": 1,
@@ -3618,6 +3682,19 @@ async def ejecutar_panel():
 
 # ==================== /VENTANA DE DECISIÓN IA ====================
 
+                if not modo_real:
+                    active_other, owner_other, _reason_other = _sync_real_active_for_other_bot()
+                    if active_other:
+                        print(
+                            Fore.RED + Style.BRIGHT +
+                            f"⛔ DEMO_BUY_BLOCKED_BY_REAL_ACTIVE: bot={NOMBRE_BOT} owner={owner_other or '--'} "
+                            f"contexto=pre_buy_final acción=esperar"
+                        )
+                    await _sync_wait_global_real_clear("pre_buy_final")
+                    active_other, owner_other, _reason_other = _sync_real_active_for_other_bot()
+                    if active_other:
+                        continue
+
                 try:
                     data_buy = await api_call(ws, {
                         "buy": 1,
@@ -3717,6 +3794,7 @@ async def ejecutar_panel():
                 # LXV_SYNC_COLUMN: standby hasta liberación global (solo DEMO)
                 if not modo_real:
                     estado_bot["sync_round_id"] = await _sync_round_wait_release(round_id_local)
+                    await _sync_wait_global_real_clear("post_release_before_continue")
                 else:
                     print(Fore.CYAN + f"ℹ️ Contrato REAL cerrado: {NOMBRE_BOT} no espera release DEMO de columna.")
 
