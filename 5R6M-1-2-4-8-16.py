@@ -9180,6 +9180,150 @@ def _sync_round_should_recovery_release(round_id, released_round, requests, st) 
         return False, "round_not_stale_yet"
     return True, "demo_wait_timeout_recovery_no_real"
 
+
+def _sync_round_try_recovery_release_global() -> bool:
+    """
+    Recovery quirúrgico del maestro: libera N+1 cuando released_round quedó
+    pegado en N, hay bots DEMO esperando esa liberación y no existe ningún
+    candado duro de REAL activo. No compra, no emite REAL y no toca tokens.
+    """
+    try:
+        now_ts = float(time.time())
+        st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH)
+        if not isinstance(st, dict) or not st:
+            _lxv_5v1x_event_cooldown("sync_recovery_global:estado_inconsistente", "SYNC_RECOVERY: HOLD | motivo=estado_inconsistente", cooldown_s=15.0)
+            return False
+        try:
+            round_id = max(1, int(st.get("round_id", st.get("released_round", 0)) or 0))
+            released_round = max(1, int(st.get("released_round", round_id) or round_id))
+        except Exception:
+            _lxv_5v1x_event_cooldown("sync_recovery_global:estado_inconsistente", "SYNC_RECOVERY: HOLD | motivo=estado_inconsistente", cooldown_s=15.0)
+            return False
+        if int(released_round) != int(round_id):
+            return False
+        target_round = int(released_round) + 1
+        status_now = str(st.get("status", "") or "").strip().lower()
+        if status_now in ("holding_real_result", "holding_real_turn") or bool(st.get("holding_real_result", False) or st.get("holding_real_turn", False)):
+            _lxv_5v1x_event_cooldown(f"sync_recovery_global:{released_round}:holding_real", "SYNC_RECOVERY: HOLD | motivo=holding_real", cooldown_s=15.0)
+            return False
+
+        pending_on, pending_bot, _pending = _hay_real_close_pending_activo()
+        if pending_on:
+            _lxv_5v1x_event_cooldown(f"sync_recovery_global:{released_round}:real_close_pending:{pending_bot}", "SYNC_RECOVERY: HOLD | motivo=real_close_pending", cooldown_s=15.0)
+            return False
+        real_on, real_bot, _motivo_real = _sync_real_turn_activo()
+        if real_on:
+            _lxv_5v1x_event_cooldown(f"sync_recovery_global:{released_round}:real_activo:{real_bot}", "SYNC_RECOVERY: HOLD | motivo=real_activo", cooldown_s=15.0)
+            return False
+        owner_mem = globals().get("REAL_OWNER_LOCK")
+        if owner_mem in BOT_NAMES:
+            _lxv_5v1x_event_cooldown(f"sync_recovery_global:{released_round}:owner:{owner_mem}", "SYNC_RECOVERY: HOLD | motivo=owner_real_activo", cooldown_s=15.0)
+            return False
+        try:
+            token_raw = str(_read_token_file_raw() if callable(globals().get("_read_token_file_raw")) else "" or "").strip()
+        except Exception:
+            token_raw = ""
+        try:
+            token_owner = str(leer_token_actual() or "").strip()
+        except Exception:
+            token_owner = ""
+        if token_raw.upper().startswith("REAL:") or token_owner in BOT_NAMES:
+            _lxv_5v1x_event_cooldown(f"sync_recovery_global:{released_round}:token_real", "SYNC_RECOVERY: HOLD | motivo=token_real_activo", cooldown_s=15.0)
+            return False
+        order_on, order_bot = _sync_real_order_viva_any()
+        if order_on:
+            _lxv_5v1x_event_cooldown(f"sync_recovery_global:{released_round}:orden_real:{order_bot}", "SYNC_RECOVERY: HOLD | motivo=orden_real_viva", cooldown_s=15.0)
+            return False
+        if bool(st.get("pending_contract_resolution", False)):
+            _lxv_5v1x_event_cooldown(f"sync_recovery_global:{released_round}:pending_contract_state", "SYNC_RECOVERY: HOLD | motivo=contrato_incierto", cooldown_s=15.0)
+            return False
+
+        wait_bots = []
+        for bot in BOT_NAMES:
+            ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
+            st_bot = estado_bots.get(bot, {}) if isinstance(estado_bots.get(bot, {}), dict) else {}
+            if bool(st_bot.get("pending_contract_resolution", False) or ack.get("pending_contract_resolution", False)):
+                _lxv_5v1x_event_cooldown(f"sync_recovery_global:{released_round}:pending_contract:{bot}", "SYNC_RECOVERY: HOLD | motivo=contrato_incierto", cooldown_s=15.0)
+                return False
+            if not isinstance(ack, dict):
+                continue
+            try:
+                ack_round = int(ack.get("round_id", 0) or 0)
+                waiting_release = int(ack.get("waiting_release_round", ack_round + 1) or (ack_round + 1))
+            except Exception:
+                continue
+            if bool(ack.get("sync_wait", False)) and ack_round == int(released_round) and waiting_release == target_round:
+                wait_bots.append(bot)
+
+        reqs = _sync_round_read_recovery_requests(max_age_s=float(globals().get("SYNC_RECOVERY_GLOBAL_REQUEST_MAX_AGE_S", 120.0) or 120.0))
+        req_bots = []
+        for bot, req in (reqs or {}).items():
+            try:
+                req_round = int(req.get("round_id", 0) or 0)
+                req_next = int(req.get("next_round", 0) or 0)
+            except Exception:
+                continue
+            if req_round == int(released_round) and req_next == target_round:
+                req_bots.append(bot)
+        if not wait_bots or not req_bots:
+            return False
+        if not (set(wait_bots) & set(req_bots)):
+            _lxv_5v1x_event_cooldown(f"sync_recovery_global:{released_round}:estado_inconsistente", "SYNC_RECOVERY: HOLD | motivo=estado_inconsistente", cooldown_s=15.0)
+            return False
+
+        started_at = float(st.get("started_at", st.get("ts", 0.0)) or 0.0)
+        wait_elapsed = max(0.0, now_ts - started_at) if started_at > 0 else 0.0
+        threshold_s = float(globals().get("SYNC_RECOVERY_GLOBAL_MIN_WAIT_S", 25.0) or 25.0)
+        if wait_elapsed < threshold_s:
+            _lxv_5v1x_event_cooldown(
+                f"sync_recovery_global:{released_round}:activo",
+                f"SYNC_RECOVERY: ACTIVO | released={released_round} | target={target_round} | bots_waiting={len(wait_bots)} | real=NO | owner=--",
+                cooldown_s=15.0,
+            )
+            return False
+
+        st_check = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+        if int(st_check.get("released_round", released_round) or released_round) != int(released_round):
+            return False
+        payload = dict(st_check)
+        payload.update({
+            "round_id": target_round,
+            "released_round": target_round,
+            "expected_bots": list(BOT_NAMES),
+            "expected_bots_effective": list(BOT_NAMES),
+            "closed_bots": {},
+            "completed": False,
+            "status": "released_recovery_global",
+            "reason": "RECOVERY_RELEASE_GLOBAL",
+            "last_release_reason": "RECOVERY_RELEASE_GLOBAL",
+            "recovery_release_ts": now_ts,
+            "recovery_from_round": int(released_round),
+            "recovery_bots_waiting": list(wait_bots),
+            "recovery_request_bots": list(req_bots),
+            "started_at": now_ts,
+            "ts": now_ts,
+            "real_pending_bot": None,
+            "real_pending_round": int(released_round),
+        })
+        ok = _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+        if ok:
+            _lxv_5v1x_event_cooldown(
+                f"sync_recovery_global:{released_round}:released",
+                f"SYNC_RECOVERY: RELEASED | {released_round}→{target_round} | reason=RECOVERY_RELEASE_GLOBAL",
+                cooldown_s=1.0,
+            )
+            agregar_evento(f"🔓 RECOVERY_RELEASE_GLOBAL: released_round {released_round} → {target_round} | bots_waiting={len(wait_bots)} | real=NO | owner=--")
+            globals()["SYNC_STATUS_LINE"] = f"SYNC_RECOVERY: RELEASED | {released_round}→{target_round} | reason=RECOVERY_RELEASE_GLOBAL"
+            return True
+        _lxv_5v1x_event_cooldown(f"sync_recovery_global:{released_round}:write_fail", "SYNC_RECOVERY: HOLD | motivo=estado_inconsistente", cooldown_s=15.0)
+        return False
+    except Exception as e:
+        try:
+            _lxv_5v1x_event_cooldown("sync_recovery_global:error", f"SYNC_RECOVERY: HOLD | motivo=estado_inconsistente ({type(e).__name__})", cooldown_s=15.0)
+        except Exception:
+            pass
+        return False
+
 def _sync_round_tick_maestro():
     global _SYNC_ROUND_LAST_ANNOUNCED, _LXV_LAST_EMITTED_ROUND
     _sync_round_bootstrap_state(force=False)
@@ -9258,6 +9402,9 @@ def _sync_round_tick_maestro():
             return
         agregar_evento(f"🧯 HOLD cancelado: no hay REAL activo real; liberando ronda #{round_id + 1}")
         _sync_round_release_next_round(round_id, "recovery_hold_sin_real_activo")
+        return
+
+    if _sync_round_try_recovery_release_global():
         return
 
     st_completed = bool(st.get("completed", False))
