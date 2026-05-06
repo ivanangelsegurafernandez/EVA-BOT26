@@ -1428,7 +1428,7 @@ def _token_real_ocupado(token) -> bool:
         return False
 
     if tu.startswith("REAL:"):
-        owner = t.split(":", 1)[1].strip()
+        owner = t.split(":", 1)[1].strip().lower()
         return owner in ("fulll45", "fulll46", "fulll47", "fulll48", "fulll49", "fulll50")
 
     return False
@@ -9467,6 +9467,12 @@ def _sync_round_try_recovery_release_global() -> bool:
         if released_check != int(released_round):
             return _hold("released_ya_avanzado", released_round)
 
+        after_real_context = bool(
+            isinstance(st_check.get("after_real_release"), dict)
+            or str(st_check.get("last_real_owner") or st_check.get("real_released_after_bot") or st_check.get("real_pending_bot") or "").strip() in BOT_NAMES
+            or str(token_raw or "").strip().upper() in ("REAL:NONE", "REAL:NULL", "REAL:--", "REAL:")
+        )
+        recovery_reason = "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_AFTER_REAL_CLOSE" if after_real_context else "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN"
         payload = dict(st_check)
         payload.update({
             "round_id": target_round,
@@ -9476,8 +9482,8 @@ def _sync_round_try_recovery_release_global() -> bool:
             "closed_bots": {},
             "completed": False,
             "status": "released_recovery_global_force_demo_clean",
-            "reason": "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN",
-            "last_release_reason": "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN",
+            "reason": recovery_reason,
+            "last_release_reason": recovery_reason,
             "recovery_release_ts": now_ts,
             "recovery_from_round": int(released_round),
             "recovery_bots_waiting": list(wait_bots),
@@ -9492,11 +9498,14 @@ def _sync_round_try_recovery_release_global() -> bool:
         if ok:
             _lxv_5v1x_event_cooldown(
                 f"sync_recovery_global_force_demo_clean:{released_round}:released",
-                f"RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN: {released_round}→{target_round} | bots_waiting={len(wait_bots)} | token={token_raw}",
+                f"{recovery_reason}: {released_round}→{target_round} | bots_waiting={len(wait_bots)} | token={token_raw}",
                 cooldown_s=1.0,
             )
-            agregar_evento(f"🔓 RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_AFTER_MANUAL_REAL: {released_round} → {target_round} | bots_waiting={len(wait_bots)} | token={token_raw} | real=NO | owner=--")
-            globals()["SYNC_STATUS_LINE"] = f"RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN: {released_round}→{target_round} | bots_waiting={len(wait_bots)} | token={token_raw}"
+            if recovery_reason.endswith("AFTER_REAL_CLOSE"):
+                agregar_evento(f"🔓 RECOVERY_FORCE_AFTER_REAL_CLOSE: {released_round} → {target_round} | bots_waiting={len(wait_bots)} | token={token_raw or 'DEMO'}")
+            else:
+                agregar_evento(f"🔓 RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN: {released_round} → {target_round} | bots_waiting={len(wait_bots)} | token={token_raw} | real=NO | owner=--")
+            globals()["SYNC_STATUS_LINE"] = f"{recovery_reason}: {released_round}→{target_round} | bots_waiting={len(wait_bots)} | token={token_raw}"
             return True
         return _hold("state_corrupto", released_round)
     except Exception:
@@ -10481,51 +10490,145 @@ def _start_sync_turbo_watcher():
     th.start()
     agregar_evento("⚡ SYNC_TURBO_WATCHER iniciado: tick maestro cada 0.20s")
 
-def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") -> None:
-    reason_txt = str(reason or "real_closed").strip() or "real_closed"
-    _sync_mark_recent_real_owner(bot, reason_txt)
-    st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
-    status = str(st.get("status", "")).strip().lower()
-    if status not in ("holding_real_result", "holding_real_turn"):
-        _sync_round_ensure_post_real_rejoin(bot, real_round=st.get("last_real_round") or st.get("real_pending_round"), reason=reason_txt)
-        return
+def _sync_real_cleanup_locks_after_close(bot: str | None, reason: str = "real_closed") -> None:
+    """Limpia candados REAL post-cierre sin tocar estrategia, compra ni Martingala."""
+    global REAL_OWNER_LOCK
+    b = str(bot or "").strip()
     try:
-        old_round = max(1, int(st.get("round_id", 1) or 1))
+        REAL_OWNER_LOCK = None
     except Exception:
-        old_round = 1
-    next_round = old_round + 1
+        pass
+    try:
+        for key in ("holding_real_result", "holding_real_turn", "real_pending", "waiting_real_close"):
+            globals()[key] = False
+    except Exception:
+        pass
+    try:
+        if b in BOT_NAMES:
+            REAL_CLOSE_PENDING[b] = None
+    except Exception:
+        pass
+    try:
+        if b in BOT_NAMES:
+            limpiar_orden_real(b, reason="real_closed")
+    except Exception:
+        pass
+    try:
+        raw = str(leer_token_actual() or "").strip()
+    except Exception:
+        raw = ""
+    try:
+        if (not raw) or raw.upper() in ("DEMO", "REAL:NONE", "REAL:NULL", "REAL:--", "REAL:") or (b in BOT_NAMES and raw.upper() == f"REAL:{b}".upper()):
+            write_token_atomic(TOKEN_FILE, "REAL:none")
+    except Exception:
+        pass
+    try:
+        _set_ui_token_holder(None)
+    except Exception:
+        pass
+
+
+def _sync_round_release_all_after_real_close(bot_real, real_round=None, reason="real_closed") -> bool:
+    """Libera inmediatamente N+1 para sacar del HOLD a todos los DEMO tras cerrar REAL."""
+    reason_txt = str(reason or "real_closed").strip() or "real_closed"
+    bot_txt = str(bot_real or "").strip()
+    if bot_txt not in BOT_NAMES:
+        bot_txt = str(bot_real or "--").strip() or "--"
+    _sync_mark_recent_real_owner(bot_txt, reason_txt)
+    st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+    if not isinstance(st, dict):
+        st = {}
+    pending_on, _pending_bot, _pending = _hay_real_close_pending_activo()
+    if pending_on:
+        return False
+    if globals().get("REAL_OWNER_LOCK") in BOT_NAMES:
+        return False
+    try:
+        token_now = str(leer_token_actual() or "").strip()
+    except Exception:
+        token_now = ""
+    if _token_real_ocupado(token_now):
+        return False
+    order_on, _order_bot = _sync_real_order_viva_any()
+    if order_on:
+        return False
+    real_on, _real_bot, _why = _sync_real_turn_activo()
+    if real_on:
+        return False
+
+    try:
+        released_from = max(1, int(st.get("released_round", st.get("round_id", real_round or 1)) or 1))
+    except Exception:
+        released_from = 1
+    try:
+        rr_int = int(real_round or st.get("last_real_round") or st.get("real_pending_round") or released_from)
+    except Exception:
+        rr_int = released_from
+    released_to = int(released_from) + 1
+    ar = st.get("after_real_release")
+    if isinstance(ar, dict):
+        try:
+            if bool(ar.get("active", False)) and int(ar.get("released_to", 0) or 0) >= released_to and int(st.get("released_round", 0) or 0) >= released_to:
+                _sync_round_ensure_post_real_rejoin(bot_txt, real_round=rr_int, target_release=int(ar.get("released_to", released_to) or released_to), reason=reason_txt)
+                return True
+        except Exception:
+            pass
     now_ts = float(time.time())
+    after_payload = {
+        "active": True,
+        "bot_real": bot_txt,
+        "released_from": int(released_from),
+        "released_to": int(released_to),
+        "created_ts": now_ts,
+        "reason": "REAL_CLOSED_RELEASE_ALL",
+    }
     rejoin = _sync_round_post_real_rejoin_payload(
-        bot=str(bot),
-        from_round=old_round,
-        target_release=next_round,
+        bot=bot_txt,
+        from_round=int(rr_int or released_from),
+        target_release=int(released_to),
         reason=f"real_closed_rejoin_required:{reason_txt}",
     )
-    payload = {
-        "round_id": next_round,
-        "released_round": next_round,
+    payload = dict(st)
+    payload.update({
+        "round_id": int(released_to),
+        "released_round": int(released_to),
         "expected_bots": list(BOT_NAMES),
         "expected_bots_effective": list(BOT_NAMES),
         "closed_bots": {},
         "completed": False,
-        "status": "released_after_real_result",
-        "reason": reason_txt,
+        "status": "released_after_real_close",
+        "reason": "REAL_CLOSED_RELEASE_ALL",
+        "last_release_reason": "REAL_CLOSED_RELEASE_ALL",
         "real_pending_bot": None,
         "real_pending_cycle": None,
-        "real_pending_round": old_round,
-        "real_released_after_bot": str(bot),
-        "last_real_owner": str(bot),
-        "last_real_round": int(old_round),
+        "real_pending_round": int(released_from),
+        "real_released_after_bot": bot_txt,
+        "last_real_owner": bot_txt,
+        "last_real_round": int(rr_int or released_from),
+        "after_real_release": after_payload,
         "post_real_rejoin": rejoin,
         "started_at": now_ts,
         "ts": now_ts,
-    }
+    })
     payload = _sync_round_apply_post_real_rejoin(payload, released_round=payload.get("released_round"))
-    _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
-    _sync_round_ensure_post_real_rejoin(bot, real_round=old_round, target_release=next_round, reason=reason_txt)
-    globals()["SYNC_STATUS_LINE"] = f"SYNC: POST_REAL_CERRADO | exento={bot} | cerrados=0/{len(BOT_NAMES)} | release={next_round}"
-    agregar_evento(f"POST_REAL_REJOIN: ensured | bot={bot} | target_release={next_round}")
-    agregar_evento(f"🚀 ROUND LIVE liberado tras cierre REAL: bot={bot} -> ronda #{next_round}")
+    ok = bool(_sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload))
+    if ok:
+        _sync_round_ensure_post_real_rejoin(bot_txt, real_round=rr_int, target_release=released_to, reason=reason_txt)
+        globals()["SYNC_STATUS_LINE"] = f"SYNC: REAL_CLOSED_RELEASE_ALL | bot={bot_txt} | release={released_from}→{released_to}"
+        agregar_evento(f"🔓 REAL_CLOSED_RELEASE_ALL: released_round {released_from} → {released_to} | bot_real={bot_txt} | todos_liberados=SI")
+    return ok
+
+
+def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") -> None:
+    reason_txt = str(reason or "real_closed").strip() or "real_closed"
+    st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+    real_round = None
+    if isinstance(st, dict):
+        real_round = st.get("last_real_round") or st.get("real_pending_round") or st.get("released_round") or st.get("round_id")
+    _sync_real_cleanup_locks_after_close(bot, reason_txt)
+    _sync_round_ensure_post_real_rejoin(bot, real_round=real_round, reason=reason_txt)
+    if not _sync_round_release_all_after_real_close(bot, real_round=real_round, reason=reason_txt):
+        agregar_evento(f"⚠️ REAL_CLOSED_RELEASE_ALL pendiente: bot_real={bot} reason={reason_txt} | candado REAL aún activo")
 
 # === PATCH: REAL INMEDIATO EN HUD AL EMITIR ORDEN (sin esperar compra) ===
 # Objetivo:
@@ -10538,6 +10641,10 @@ _last_real_push_ts = {bot: 0.0 for bot in BOT_NAMES}
 
 def _orden_real_viva(payload: dict) -> bool:
     try:
+        if not isinstance(payload, dict):
+            return False
+        if bool(payload.get("consumed", False)) or bool(payload.get("closed", False)):
+            return False
         ts = float(payload.get("created_ts") or payload.get("ts") or 0.0)
         ttl = float(payload.get("ttl_s") or REAL_ORDER_TTL_S)
         if ts <= 0:
@@ -10567,6 +10674,7 @@ def limpiar_orden_real(bot: str | None = None, reason: str = "manual_clear"):
                 "created_ts": 0,
                 "ttl_s": REAL_ORDER_TTL_S,
                 "consumed": True,
+                "closed": True,
                 "reason": reason,
                 "order_id": None,
             }
@@ -10593,6 +10701,7 @@ def limpiar_orden_real_vencida(reason="ttl_vencido"):
                     "created_ts": 0,
                     "ttl_s": REAL_ORDER_TTL_S,
                     "consumed": True,
+                    "closed": True,
                     "reason": reason,
                 }, ensure_ascii=False, indent=2))
         except Exception:

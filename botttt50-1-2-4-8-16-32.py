@@ -340,7 +340,7 @@ def _token_real_ocupado(token) -> bool:
         return False
 
     if tu.startswith("REAL:"):
-        owner = t.split(":", 1)[1].strip()
+        owner = t.split(":", 1)[1].strip().lower()
         return owner in ("fulll45", "fulll46", "fulll47", "fulll48", "fulll49", "fulll50")
 
     return False
@@ -644,7 +644,7 @@ def _sync_any_real_owner_active() -> tuple[bool, str, str]:
     """
     def _valid_bot(name: str) -> bool:
         b = str(name or "").strip()
-        return bool(b) and b.lower() not in {"none", "null", "demo", ""}
+        return b in {"fulll45", "fulll46", "fulll47", "fulll48", "fulll49", "fulll50"}
 
     now_ts = time.time()
     base_dir = globals().get("script_dir", os.path.dirname(os.path.abspath(__file__)))
@@ -682,7 +682,7 @@ def _sync_any_real_owner_active() -> tuple[bool, str, str]:
             seen.add(path)
             try:
                 data = _sync_round_safe_read_json(path) or {}
-                if not isinstance(data, dict) or bool(data.get("consumed", False)):
+                if not isinstance(data, dict) or bool(data.get("consumed", False)) or bool(data.get("closed", False)):
                     continue
                 owner = str(data.get("bot") or data.get("target_bot") or data.get("owner_bot") or "").strip()
                 if not _valid_bot(owner):
@@ -727,6 +727,9 @@ def _sync_any_real_owner_active() -> tuple[bool, str, str]:
                     continue
                 owner = str(data.get("bot") or data.get("owner_bot") or "").strip()
                 ts = float(data.get("ts") or data.get("created_ts") or data.get("updated_ts") or 0.0)
+                active_flag = data.get("active", True)
+                if bool(data.get("consumed", False)) or bool(data.get("closed", False)) or active_flag is False:
+                    continue
                 if _valid_bot(owner) and ts > 0 and (now_ts - ts) <= fresh_close:
                     return True, owner, "real_close_pending"
             except Exception:
@@ -862,6 +865,21 @@ async def _sync_round_wait_release(round_id: int) -> int:
             released = 1
         state_ts = _sync_round_state_ts(st)
         now_ts = time.time()
+        after_real_release = st.get("after_real_release") if isinstance(st, dict) else None
+        if isinstance(after_real_release, dict) and bool(after_real_release.get("active", False)):
+            try:
+                after_released_to = int(after_real_release.get("released_to", 0) or 0)
+            except Exception:
+                after_released_to = 0
+            if after_released_to >= next_round:
+                estado_bot["sync_wait"] = False
+                estado_bot["sync_round_id"] = after_released_to
+                try:
+                    _sync_round_write_release_heartbeat(rid, after_released_to)
+                except Exception:
+                    pass
+                print(Fore.GREEN + Style.BRIGHT + f"🔓 REAL_CLOSED_RELEASE_ALL detectado: {NOMBRE_BOT} sale de standby → ronda #{after_released_to}")
+                return after_released_to
         if first_wait_tick or (released != last_released) or (state_ts > 0 and state_ts != last_state_ts):
             last_progress_ts = now_ts
         should_write = first_wait_tick or (released != last_released) or ((now_ts - last_hb_ts) >= SYNC_WAIT_HEARTBEAT_S)
