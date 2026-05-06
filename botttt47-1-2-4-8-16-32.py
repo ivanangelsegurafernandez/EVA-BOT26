@@ -696,26 +696,8 @@ def _sync_any_real_owner_active() -> tuple[bool, str, str]:
     except Exception:
         pass
 
-    try:
-        fresh_owner = max(
-            float(globals().get("REAL_ORDER_TTL_S", 90) or 90),
-            float(globals().get("REAL_CLOSE_MAX_AGE_S", 120) or 120),
-            120.0,
-        )
-        for name in ("real_owner_state.json", "owner_real_state.json", "real_owner.json"):
-            path = os.path.join(base_dir, name)
-            try:
-                data = _sync_round_safe_read_json(path) or {}
-                if not isinstance(data, dict):
-                    continue
-                owner = str(data.get("owner_bot") or data.get("bot") or "").strip()
-                ts = float(data.get("assigned_ts") or data.get("ts") or 0.0)
-                if _valid_bot(owner) and ts > 0 and (now_ts - ts) <= fresh_owner:
-                    return True, owner, "real_owner_state"
-            except Exception:
-                continue
-    except Exception:
-        pass
+    # real_owner_state.json por sí solo no bloquea DEMO: tras REAL:none debe considerarse libre.
+    # Solo token REAL:fulllXX, orden REAL viva, REAL_CLOSE_PENDING o estado explícito de cierre retienen HOLD.
 
     try:
         fresh_close = max(float(globals().get("REAL_CLOSE_MAX_AGE_S", 120) or 120), 120.0)
@@ -880,6 +862,30 @@ async def _sync_round_wait_release(round_id: int) -> int:
                     pass
                 print(Fore.GREEN + Style.BRIGHT + f"🔓 REAL_CLOSED_RELEASE_ALL detectado: {NOMBRE_BOT} sale de standby → ronda #{after_released_to}")
                 return after_released_to
+        rollback_detected = bool(rid > 10 and next_round > 10 and released <= 1)
+        if rollback_detected:
+            if (now_ts - float(globals().get("_SYNC_STATE_ROLLBACK_LOG_TS", 0.0) or 0.0)) >= 8.0:
+                globals()["_SYNC_STATE_ROLLBACK_LOG_TS"] = now_ts
+                print(Fore.YELLOW + Style.BRIGHT + f"⚠️ SYNC_STATE_ROLLBACK_DETECTED: bot={NOMBRE_BOT} | rid={rid} | released={released} | esperando={next_round}")
+            try:
+                _sync_round_write_recovery_request(
+                    bot=NOMBRE_BOT,
+                    round_id=rid,
+                    next_round=next_round,
+                    released=released,
+                    reason="released_round_rollback_detected",
+                    any_real_active=False,
+                    any_real_owner="",
+                    any_real_reason="released_round_rollback_detected",
+                )
+            except Exception:
+                pass
+            try:
+                _sync_round_write_wait_heartbeat(rid, next_round)
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+            continue
         if first_wait_tick or (released != last_released) or (state_ts > 0 and state_ts != last_state_ts):
             last_progress_ts = now_ts
         should_write = first_wait_tick or (released != last_released) or ((now_ts - last_hb_ts) >= SYNC_WAIT_HEARTBEAT_S)

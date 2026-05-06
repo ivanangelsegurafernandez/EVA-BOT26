@@ -5413,6 +5413,72 @@ def _sync_round_write_json_atomic(path: str, payload: dict) -> bool:
     except Exception:
         return False
 
+_SYNC_MONOTONIC_GUARD_LAST_TS = {}
+
+def _sync_round_int_or_none(value):
+    try:
+        if value is None:
+            return None
+        if isinstance(value, str) and value.strip() == "":
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+def _sync_round_monotonic_guard_log(new_released, old_released, reason: str = "") -> None:
+    try:
+        key = f"{int(new_released or 0)}:{int(old_released or 0)}:{str(reason or '')[:80]}"
+        now_ts = float(time.time())
+        last = float(_SYNC_MONOTONIC_GUARD_LAST_TS.get(key, 0.0) or 0.0)
+        if (now_ts - last) < 8.0:
+            return
+        _SYNC_MONOTONIC_GUARD_LAST_TS[key] = now_ts
+        agregar_evento(
+            f"🛡️ SYNC_MONOTONIC_GUARD: bloqueado retroceso released_round "
+            f"new={new_released} old={old_released} reason={reason}"
+        )
+    except Exception:
+        pass
+
+def _sync_round_write_state_monotonic(payload, reason="") -> bool:
+    """Escritura central de sync_round/state.json: released_round nunca retrocede."""
+    try:
+        p = dict(payload or {})
+        if bool(p.pop("reset_sync_state", False)):
+            return _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, p)
+
+        current = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+        if not isinstance(current, dict):
+            current = {}
+        old_released = _sync_round_int_or_none(current.get("released_round"))
+        old_round_id = _sync_round_int_or_none(current.get("round_id"))
+        new_released_raw = p.get("released_round")
+        new_round_raw = p.get("round_id")
+        new_released = _sync_round_int_or_none(new_released_raw)
+        new_round_id = _sync_round_int_or_none(new_round_raw)
+
+        if new_released is None:
+            new_released = old_released if old_released is not None else 1
+            p["released_round"] = int(new_released)
+        if new_round_id is None:
+            new_round_id = _sync_round_int_or_none(p.get("round_id"))
+            if new_round_id is None:
+                new_round_id = old_round_id if old_round_id is not None else new_released
+            p["round_id"] = int(new_round_id)
+
+        corrupt_default = bool(old_released is not None and old_released > 10 and new_released in (0, 1))
+        rollback = bool(old_released is not None and new_released < old_released)
+        if corrupt_default or rollback:
+            _sync_round_monotonic_guard_log(new_released, old_released, reason)
+            p["released_round"] = int(old_released)
+            p["round_id"] = int(max(old_round_id or 0, old_released, new_round_id or 0))
+        elif int(p.get("round_id", new_round_id) or 0) < int(p.get("released_round", new_released) or 0):
+            p["round_id"] = int(p.get("released_round", new_released) or 1)
+
+        return _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, p)
+    except Exception:
+        return False
+
 def _sync_round_bootstrap_state(force: bool = False):
     _ensure_dir(SYNC_ROUND_DIR)
     if (not force) and os.path.exists(SYNC_ROUND_STATE_PATH):
@@ -5428,7 +5494,7 @@ def _sync_round_bootstrap_state(force: bool = False):
         "started_at": time.time(),
         "ts": time.time(),
     }
-    _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+    _sync_round_write_state_monotonic({**payload, "reset_sync_state": bool(force)}, reason="bootstrap_state")
 
 def _sync_round_apply_visual_heartbeat(bot: str) -> None:
     """
@@ -8663,7 +8729,7 @@ def _sync_round_ensure_post_real_rejoin(bot, real_round=None, target_release=Non
     st["post_real_rejoin_ensure_ts"] = now_ts
     ok = True
     if changed:
-        ok = bool(_sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, st))
+        ok = bool(_sync_round_write_state_monotonic(st, reason="post_real_rejoin_ensure"))
     if ok:
         agregar_evento(f"🧩 POST_REAL_REJOIN ENSURE: bot={b} target={target} reason={reason}")
         if int(released) >= int(target):
@@ -8698,7 +8764,7 @@ def _sync_round_release_next_round(old_round: int, reason: str, extra: dict | No
                 continue
             payload[k]=v
     payload = _sync_round_apply_post_real_rejoin(payload, released_round=payload.get('released_round'))
-    ok = _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+    ok = _sync_round_write_state_monotonic(payload, reason=str(reason or "release_next_round"))
     if ok:
         agregar_evento(f'🚀 ROUND RELEASE: #{rid} -> #{next_round} | reason={reason}')
     return bool(ok)
@@ -8725,7 +8791,7 @@ def _sync_round_release_now(round_id, payload, reason="release_now", real_emitid
             "released_ts": now_ts,
         })
         p = _sync_round_apply_post_real_rejoin(p, released_round=p.get("released_round"))
-        ok = _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, p)
+        ok = _sync_round_write_state_monotonic(p, reason=str(reason or "release_now"))
         try:
             agregar_evento(
                 f"🔓 LXV_SYNC_COLUMN RELEASE_NOW ronda #{rid} → #{next_round} "
@@ -9366,10 +9432,8 @@ def _sync_round_try_recovery_release_global() -> bool:
             released_round = max(1, int(st.get("released_round", round_id) or round_id))
         except Exception:
             return _hold("state_corrupto")
-        if int(released_round) != int(round_id):
-            if int(released_round) > int(round_id):
-                return _hold("released_ya_avanzado", released_round)
-            return _hold("state_corrupto", released_round)
+        if int(released_round) > int(round_id):
+            return _hold("released_ya_avanzado", released_round)
 
         target_round = int(released_round) + 1
         status_now = str(st.get("status", "") or "").strip().lower()
@@ -9403,6 +9467,58 @@ def _sync_round_try_recovery_release_global() -> bool:
             return _hold("orden_real_viva", released_round)
 
         if bool(st.get("pending_contract_resolution", False)):
+            return _hold("state_corrupto", released_round)
+
+        # Blindaje post-REAL: si state.json fue sobrescrito a 1 pero los ACKs
+        # muestran bots esperando N+1 con ACK en N, reconstruye desde ACKs.
+        if int(released_round) <= 1:
+            rebuild_wait_bots = []
+            rebuild_ack_rounds = []
+            for bot in BOT_NAMES:
+                ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
+                if not isinstance(ack, dict):
+                    continue
+                try:
+                    ack_round = int(ack.get("round_id", 0) or 0)
+                    waiting_release = int(ack.get("waiting_release_round", 0) or 0)
+                except Exception:
+                    continue
+                if bool(ack.get("sync_wait", False)) and ack_round > 10 and waiting_release >= (ack_round + 1):
+                    rebuild_wait_bots.append(bot)
+                    rebuild_ack_rounds.append(ack_round)
+            if rebuild_ack_rounds:
+                rebuilt_round = max(rebuild_ack_rounds)
+                target_round = rebuilt_round + 1
+                payload = dict(st)
+                payload.update({
+                    "round_id": int(target_round),
+                    "released_round": int(target_round),
+                    "expected_bots": list(BOT_NAMES),
+                    "expected_bots_effective": list(BOT_NAMES),
+                    "closed_bots": {},
+                    "completed": False,
+                    "status": "released_recovery_rebuilt_from_acks",
+                    "reason": "RECOVERY_REBUILD_RELEASE_FROM_ACKS",
+                    "last_release_reason": "RECOVERY_REBUILD_RELEASE_FROM_ACKS",
+                    "recovery_rebuild_old_release": int(released_round),
+                    "recovery_rebuild_from_ack_round": int(rebuilt_round),
+                    "recovery_bots_waiting": list(rebuild_wait_bots),
+                    "started_at": now_ts,
+                    "ts": now_ts,
+                    "real_pending_bot": None,
+                    "real_pending_round": int(rebuilt_round),
+                })
+                payload = _sync_round_apply_post_real_rejoin(payload, released_round=payload.get("released_round"))
+                ok = _sync_round_write_state_monotonic(payload, reason="RECOVERY_REBUILD_RELEASE_FROM_ACKS")
+                if ok:
+                    agregar_evento(
+                        f"🧯 RECOVERY_REBUILD_RELEASE_FROM_ACKS: old_release={released_round} | "
+                        f"rebuilt={rebuilt_round} | release={target_round}"
+                    )
+                    globals()["SYNC_STATUS_LINE"] = f"RECOVERY_REBUILD_RELEASE_FROM_ACKS: {released_round}→{target_round}"
+                    return True
+
+        if int(released_round) != int(round_id):
             return _hold("state_corrupto", released_round)
 
         wait_bots = []
@@ -9494,7 +9610,7 @@ def _sync_round_try_recovery_release_global() -> bool:
             "real_pending_round": int(released_round),
         })
         payload = _sync_round_apply_post_real_rejoin(payload, released_round=payload.get("released_round"))
-        ok = _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+        ok = _sync_round_write_state_monotonic(payload, reason=recovery_reason)
         if ok:
             _lxv_5v1x_event_cooldown(
                 f"sync_recovery_global_force_demo_clean:{released_round}:released",
@@ -9530,7 +9646,7 @@ def _sync_round_tick_maestro():
     try:
         st2 = _sync_round_apply_post_real_rejoin(st, released_round=released_round)
         if st2 != st:
-            _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, st2)
+            _sync_round_write_state_monotonic(st2, reason="post_real_rejoin_apply_tick")
             st = st2
     except Exception:
         pass
@@ -10006,7 +10122,7 @@ def _sync_round_tick_maestro():
             payload2["reason"] = "demo_wait_timeout_recovery_no_real"
             payload2["ts"] = time.time()
             payload2["last_recovery_requests"] = list(req_bots)
-            _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload2)
+            _sync_round_write_state_monotonic(payload2, reason="demo_wait_timeout_recovery_no_real")
             agregar_evento(f"🟨 RELEASE_RECOVERY_DEMO_TIMEOUT: ronda #{round_id} → #{round_id + 1} bots={','.join(req_bots) or '--'} motivo=demo_wait_timeout_recovery_no_real real=NO pending=NO")
             return
         if not can_recover:
@@ -10392,7 +10508,7 @@ def _sync_round_tick_maestro():
         if data_quality == "ok" and int(closed_count) >= int(expected_count):
             payload["reason"] = "real_close_pending_no_real_release"
             payload["last_no_real_reason"] = "real_close_pending_active"
-            _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+            _sync_round_write_state_monotonic(payload, reason=str(payload.get("reason", "pending_release")))
             agregar_evento(
                 f"⚡ RELEASE_PENDING_NO_REAL: ronda #{round_id} → #{round_id + 1} | "
                 f"motivo=real_close_pending_active | patrón={partial_pattern} | dq={data_quality} | pending={real_close_pending_bot}"
@@ -10401,7 +10517,7 @@ def _sync_round_tick_maestro():
         if data_quality == "closed_expired":
             payload["reason"] = "release_expired_due_to_pending"
             payload["last_no_real_reason"] = "closed_expired_while_real_pending"
-            _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+            _sync_round_write_state_monotonic(payload, reason=str(payload.get("reason", "pending_release")))
             agregar_evento(
                 f"🧊 RELEASE_EXPIRED_PENDING: ronda #{round_id} → #{round_id + 1} | "
                 f"vencida por espera pending | max_age={max_lag_s} | patrón={partial_pattern}"
@@ -10457,7 +10573,7 @@ def _sync_round_tick_maestro():
         agregar_evento("🧯 SYNC invariant recovery: completed=True sin HOLD/RELEASE; liberando next_round")
         _sync_round_release_next_round(round_id, "sync_invariant_completed_no_release")
         return
-    _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload)
+    _sync_round_write_state_monotonic(payload, reason=str(payload.get("reason", "tick_maestro")))
 # === /LXV_SYNC_COLUMN ===
 
 def _sync_turbo_watcher_loop():
@@ -10535,6 +10651,7 @@ def _sync_round_release_all_after_real_close(bot_real, real_round=None, reason="
     if bot_txt not in BOT_NAMES:
         bot_txt = str(bot_real or "--").strip() or "--"
     _sync_mark_recent_real_owner(bot_txt, reason_txt)
+    _sync_real_cleanup_locks_after_close(bot_txt if bot_txt in BOT_NAMES else bot_real, reason_txt)
     st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
     if not isinstance(st, dict):
         st = {}
@@ -10564,7 +10681,7 @@ def _sync_round_release_all_after_real_close(bot_real, real_round=None, reason="
         rr_int = int(real_round or st.get("last_real_round") or st.get("real_pending_round") or released_from)
     except Exception:
         rr_int = released_from
-    released_to = int(released_from) + 1
+    released_to = int(max(int(released_from), int(rr_int or released_from))) + 1
     ar = st.get("after_real_release")
     if isinstance(ar, dict):
         try:
@@ -10611,7 +10728,7 @@ def _sync_round_release_all_after_real_close(bot_real, real_round=None, reason="
         "ts": now_ts,
     })
     payload = _sync_round_apply_post_real_rejoin(payload, released_round=payload.get("released_round"))
-    ok = bool(_sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, payload))
+    ok = bool(_sync_round_write_state_monotonic(payload, reason="REAL_CLOSED_RELEASE_ALL"))
     if ok:
         _sync_round_ensure_post_real_rejoin(bot_txt, real_round=rr_int, target_release=released_to, reason=reason_txt)
         globals()["SYNC_STATUS_LINE"] = f"SYNC: REAL_CLOSED_RELEASE_ALL | bot={bot_txt} | release={released_from}→{released_to}"
