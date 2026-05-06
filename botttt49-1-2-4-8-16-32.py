@@ -340,6 +340,49 @@ def _sync_round_resolve_start_round() -> int:
         released = 1
     return max(1, released)
 
+
+async def _sync_round_wait_post_real_rejoin(initial_grace_s: float = 8.0, poll_s: float = 0.5) -> None:
+    """
+    Bloquea solo al ex-owner REAL hasta que el maestro publique/libere
+    post_real_rejoin para reincorporarlo a la ronda común DEMO.
+    """
+    start_ts = time.time()
+    last_log_ts = 0.0
+    seen_own_rejoin = False
+    while True:
+        st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
+        pr = st.get("post_real_rejoin") if isinstance(st, dict) else None
+        try:
+            released = int((st or {}).get("released_round", 1) or 1)
+        except Exception:
+            released = 1
+        if isinstance(pr, dict) and str(pr.get("bot") or "").strip() == str(NOMBRE_BOT):
+            seen_own_rejoin = True
+            try:
+                target = int(pr.get("target_release", 0) or 0)
+            except Exception:
+                target = 0
+            if target <= 0 or released >= target or not bool(pr.get("active", False)):
+                sync_round = target if target > 0 else released
+                print(Fore.GREEN + Style.BRIGHT + f"✅ POST_REAL_REJOIN completado: {NOMBRE_BOT} sincronizado en ronda #{sync_round}")
+                try:
+                    estado_bot["sync_round_id"] = max(int(estado_bot.get("sync_round_id", 1) or 1), int(sync_round or released or 1))
+                except Exception:
+                    pass
+                return
+            now_ts = time.time()
+            if (now_ts - last_log_ts) >= 15.0:
+                last_log_ts = now_ts
+                print(Fore.CYAN + f"⏳ POST_REAL_REJOIN: {NOMBRE_BOT} espera released_round >= {target}; actual={released}; no compra DEMO")
+        else:
+            if seen_own_rejoin or (time.time() - start_ts) >= float(initial_grace_s):
+                return
+            now_ts = time.time()
+            if (now_ts - last_log_ts) >= 15.0:
+                last_log_ts = now_ts
+                print(Fore.CYAN + f"⏳ POST_REAL_REJOIN: {NOMBRE_BOT} esperando release común")
+        await asyncio.sleep(max(0.2, min(float(poll_s), 1.0)))
+
 def _sync_bot_es_owner_real() -> bool:
     """
     True solo si este bot es dueño REAL real.
@@ -657,6 +700,7 @@ def _sync_round_state_ts(st: dict) -> float:
 
 
 async def _sync_round_wait_release(round_id: int) -> int:
+    
     def _sync_bot_es_owner_real() -> bool:
         try:
             tok = str(leer_token_actual() or '').strip().upper()
@@ -3510,6 +3554,7 @@ async def ejecutar_panel():
                         except Exception:
                             pass
 
+                        await _sync_round_wait_post_real_rejoin()
                         reinicio_forzado.set()
                         break
 
@@ -3543,6 +3588,7 @@ async def ejecutar_panel():
                     estado_bot["token_msg_mostrado"] = False
                     estado_bot["ciclo_en_progreso"] = False
 
+                    await _sync_round_wait_post_real_rejoin()
                     reinicio_forzado.set()
                     break
 
