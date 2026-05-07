@@ -222,8 +222,9 @@ CTT_LAG_MAX_S = 120                # rezago máximo válido (evita "arqueología
 CTT_DENSITY_MIN_CPM = 1.6          # densidad mínima de cierres/min para verde operable
 CTT_RED_WEAK_SCORE_PENALTY = 0.02  # castigo suave en rojo débil
 CTT_GREEN_OPERABLE_SCORE_BONUS = 0.01  # premio leve en verde operable
-CTT_REQUIRE_SAME_ASSET = True      # no mezclar activos en consenso
-CTT_ACTIVO_UNICO = "1HZ50V"         # opción 1: todos los bots operan el mismo sintético
+CTT_REQUIRE_SAME_ASSET = False     # compat: CTT multiactivo, sin filtro operativo por asset
+CTT_ACTIVO_UNICO = ""                # compat: sin activo único obligatorio
+CTT_OPERATIVE_GATE_ENABLE = False    # CTT queda solo como telemetría/HUD
 CTT_NEUTRAL_POLICY = "normal"      # normal | block
 CTT_CIERRE_LOOKBACK_MAX = 600       # higiene memoria eventos
 CTT_ENABLE_GREEN_IN_MARTI_ADVANCED = False  # C2..C{MAX_CICLOS}: CTT actúa como freno más que como habilitador
@@ -1702,6 +1703,8 @@ CTT_STATE = {
     "sample": 0,
     "roof_policy": "normal",
     "roof_delta": 0.0,
+    "operativo": False,
+    "influencia": "telemetria_only",
     "reason": "init",
 }
 REAL_OWNER_LOCK = None  # owner REAL en memoria (evita carreras de lectura de archivo)
@@ -9718,6 +9721,54 @@ def _sync_round_try_recovery_release_global() -> bool:
         except Exception:
             return False
 
+def _sync_round_hard_hold_real_pending(round_id, released_round, pending_bot, pending_data, st):
+    """Congela SYNC mientras REAL_CLOSE_PENDING siga activo y dentro de TTL."""
+    try:
+        rid = max(1, int(round_id))
+    except Exception:
+        rid = 1
+    try:
+        rel = max(1, int(released_round))
+    except Exception:
+        rel = rid
+    owner = str(pending_bot or "--").strip() or "--"
+    pdata = pending_data if isinstance(pending_data, dict) else {}
+    ciclo = pdata.get("ciclo", "?")
+    globals()["SYNC_STATUS_LINE"] = (
+        f"SYNC: HOLD_REAL_CLOSE_PENDING | owner={owner} | ronda={rid} | "
+        f"release={rel} | sync_sigue=NO"
+    )
+    try:
+        _real_lock_set("REAL_CLOSE_LIBRE", False, f"pending_owner={owner}")
+        _real_lock_set("ORDEN_REAL_OK", False, f"pending_owner={owner}")
+        _real_lock_set("TOKEN_REAL_LIBRE", False, f"pending_owner={owner}")
+    except Exception:
+        pass
+    _lxv_5v1x_event_cooldown(
+        key=f"real_close_pending_hard_hold:{owner}:{ciclo}:{rid}:{rel}",
+        msg=(
+            f"⏸️ REAL_CLOSE_PENDING_HARD_HOLD: owner={owner} C{ciclo} | "
+            f"ronda={rid} | release={rel} | sync_sigue=NO"
+        ),
+        cooldown_s=8.0,
+    )
+    try:
+        payload = dict(st) if isinstance(st, dict) else {}
+        payload["round_id"] = rid
+        payload["released_round"] = rel
+        payload["status"] = "hold_real_close_pending"
+        payload["reason"] = "hold_real_close_pending"
+        payload["real_pending_bot"] = owner if owner in BOT_NAMES else owner
+        payload["real_close_pending_owner"] = owner
+        payload["sync_sigue"] = False
+        payload["release_congelado"] = True
+        payload["ts"] = time.time()
+        _sync_round_write_state_monotonic(payload, reason="hold_real_close_pending")
+    except Exception:
+        pass
+    return True
+
+
 def _sync_round_tick_maestro():
     global _SYNC_ROUND_LAST_ANNOUNCED, _LXV_LAST_EMITTED_ROUND
     _sync_round_bootstrap_state(force=False)
@@ -9731,6 +9782,12 @@ def _sync_round_tick_maestro():
         released_round = max(1, int(st.get("released_round", round_id) or round_id))
     except Exception:
         released_round = round_id
+
+    pending_on_early, pending_bot_early, pending_data_early = _hay_real_close_pending_activo()
+    if bool(pending_on_early):
+        _sync_round_hard_hold_real_pending(round_id, released_round, pending_bot_early, pending_data_early, st)
+        return
+
     try:
         st2 = _sync_round_apply_post_real_rejoin(st, released_round=released_round)
         if st2 != st:
@@ -9786,7 +9843,7 @@ def _sync_round_tick_maestro():
             key=f"sync_real_pending_active:{real_close_pending_bot}:{real_close_pending_data.get('ciclo')}",
             msg=(
                 f"⏸️ REAL_CLOSE_PENDING_ACTIVO: bot={real_close_pending_bot} ciclo={real_close_pending_data.get('ciclo')} | "
-                f"bloquea_nueva_REAL=SI | sync_sigue=SI"
+                f"bloquea_nueva_REAL=SI | sync_sigue=NO | release_congelado=SI"
             ),
             cooldown_s=8.0,
         )
@@ -10591,26 +10648,13 @@ def _sync_round_tick_maestro():
             except Exception:
                 pass
     if completed and real_close_pending_active and (not real_emitido) and hold_status not in ("holding_real_result", "holding_real_turn"):
-        payload["released_round"] = int(round_id) + 1
-        payload["status"] = "released"
-        if data_quality == "ok" and int(closed_count) >= int(expected_count):
-            payload["reason"] = "real_close_pending_no_real_release"
-            payload["last_no_real_reason"] = "real_close_pending_active"
-            _sync_round_write_state_monotonic(payload, reason=str(payload.get("reason", "pending_release")))
-            agregar_evento(
-                f"⚡ RELEASE_PENDING_NO_REAL: ronda #{round_id} → #{round_id + 1} | "
-                f"motivo=real_close_pending_active | patrón={partial_pattern} | dq={data_quality} | pending={real_close_pending_bot}"
-            )
-            return
         if data_quality == "closed_expired":
-            payload["reason"] = "release_expired_due_to_pending"
-            payload["last_no_real_reason"] = "closed_expired_while_real_pending"
-            _sync_round_write_state_monotonic(payload, reason=str(payload.get("reason", "pending_release")))
-            agregar_evento(
-                f"🧊 RELEASE_EXPIRED_PENDING: ronda #{round_id} → #{round_id + 1} | "
-                f"vencida por espera pending | max_age={max_lag_s} | patrón={partial_pattern}"
-            )
-            return
+            payload["last_no_real_reason"] = "closed_expired_but_pending_holds_sync"
+        else:
+            payload["last_no_real_reason"] = "real_close_pending_active"
+        payload["reason"] = "hold_real_close_pending"
+        _sync_round_hard_hold_real_pending(round_id, released_round, real_close_pending_bot, real_close_pending_data, st)
+        return
     if completed and (not real_emitido) and hold_status not in ("holding_real_result", "holding_real_turn"):
         payload["released_round"] = int(round_id) + 1
         payload["status"] = "released"
@@ -10654,6 +10698,8 @@ def _sync_round_tick_maestro():
             motivo_no_release = "pending_contract_resolution"
         elif _hay_real_close_pending_activo()[0]:
             motivo_no_release = "real_close_pending"
+            _sync_round_hard_hold_real_pending(round_id, released_round, real_close_pending_bot, real_close_pending_data, st)
+            return
         elif (not real_emitido) and str(payload.get("released_round", round_id)) == str(round_id):
             motivo_no_release = "write_state_failed"
         if motivo_no_release:
@@ -22460,7 +22506,7 @@ def mostrar_panel():
                     ctt_gate_h = str(CTT_STATE.get("gate", "NEUTRAL") or "NEUTRAL")
                     ctt_reason_h = str(CTT_STATE.get("reason", "na") or "na")
                     if ctt_gate_h == "BLOCK":
-                        why_reasons.append(f"ctt_block({ctt_status_h.lower()}:{ctt_reason_h})")
+                        why_reasons.append(f"ctt_telemetria({ctt_status_h.lower()}:{ctt_reason_h}:sin_efecto_operativo)")
                     elif ctt_status_h in {"RED_WEAK", "GREEN_DIAGNOSTIC"}:
                         why_reasons.append(f"ctt_{ctt_status_h.lower()}({ctt_reason_h})")
                 except Exception:
@@ -26080,6 +26126,9 @@ def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
             "wave_ttl_ok": False,
             "roof_policy": "not_evaluated",
             "roof_delta": 0.0,
+            "asset": "MULTI_ASSET",
+            "operativo": False,
+            "influencia": "telemetria_only",
         }
         CTT_STATE.update(st)
         return list(candidatos), st
@@ -26087,7 +26136,8 @@ def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
     eventos.sort(key=lambda x: float(x.get("ts", 0.0)), reverse=True)
     base = eventos[0]
     asset_target = str(CTT_ACTIVO_UNICO or "").strip().upper()
-    asset = asset_target if asset_target else str(base.get("asset", "") or "").upper()
+    asset_filter_enabled = bool(CTT_REQUIRE_SAME_ASSET and asset_target)
+    asset = asset_target if asset_filter_enabled else "MULTI_ASSET"
     t_front = float(base.get("ts", 0.0) or 0.0)
 
     # Ola activa anclada al frente temporal del grupo.
@@ -26097,7 +26147,7 @@ def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
         if (t_front - ts) > W:
             continue
         ev_asset = str(ev.get("asset", "") or "").upper()
-        if asset and ev_asset != asset:
+        if asset_filter_enabled and ev_asset != asset_target:
             continue
         ola.append(ev)
 
@@ -26215,16 +26265,18 @@ def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
         return tuple(tmp)
 
     filtrados = list(candidatos)
-    if gate == "BLOCK":
-        filtrados = []
-    elif gate == "ALLOW_REZAGADOS":
-        rez_set = set(rezagados_validos)
-        filtrados = [_adj_score(c, roof_delta) for c in candidatos if len(c) > 1 and str(c[1]) in rez_set]
-    else:
-        if roof_policy == "harden" and abs(roof_delta) > 0:
-            filtrados = [_adj_score(c, roof_delta) for c in candidatos]
-        if str(CTT_NEUTRAL_POLICY).lower() == "block":
+    ctt_operativo = bool(globals().get("CTT_OPERATIVE_GATE_ENABLE", False))
+    if ctt_operativo:
+        if gate == "BLOCK":
             filtrados = []
+        elif gate == "ALLOW_REZAGADOS":
+            rez_set = set(rezagados_validos)
+            filtrados = [_adj_score(c, roof_delta) for c in candidatos if len(c) > 1 and str(c[1]) in rez_set]
+        else:
+            if roof_policy == "harden" and abs(roof_delta) > 0:
+                filtrados = [_adj_score(c, roof_delta) for c in candidatos]
+            if str(CTT_NEUTRAL_POLICY).lower() == "block":
+                filtrados = []
 
     st = {
         "status": status,
@@ -26247,9 +26299,13 @@ def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
         "sample": int(sample),
         "roof_policy": roof_policy,
         "roof_delta": float(roof_delta),
+        "operativo": bool(ctt_operativo),
+        "influencia": "operativa" if bool(ctt_operativo) else "telemetria_only",
         "reason": reason,
     }
     CTT_STATE.update(st)
+    if not ctt_operativo:
+        return list(candidatos), st
     return filtrados, st
 
 # Cargar datos bot
@@ -27519,8 +27575,7 @@ async def main():
                                 pattern_col_eval = dict(PATTERN_COL_LAST_STATE)
                         globals()["PATTERN_COL_LAST_STATE"] = dict(pattern_col_eval)
                         diag_gate = _leer_gate_desde_diagnostico(ttl_s=60.0)
-                        # CTT como autoridad contextual superior: si hay veto duro,
-                        # no se evalúan señales individuales/techo en este tick.
+                        # CTT queda como telemetría contextual multiactivo; no bloquea señales.
                         ctt_pre_eval = None
                         try:
                             _dummy, ctt_pre_eval = evaluar_ctt_fase([])
@@ -27531,7 +27586,7 @@ async def main():
                             ctt_status_pre = str((ctt_pre_eval or {}).get("status", "RED_STRONG"))
                             ctt_reason_pre = str((ctt_pre_eval or {}).get("reason", "ctt_block"))
                             agregar_evento(
-                                f"🟫 CTT modo prudente ({ctt_status_pre}): embudo pasa a evaluación blanda ({ctt_reason_pre})."
+                                f"🟫 CTT telemetría: sin efecto operativo ({ctt_status_pre}): {ctt_reason_pre}."
                             )
                         _log_operational_degradation_runtime(ttl_s=60.0)
 
@@ -28262,21 +28317,21 @@ def _selftest_real_pending_release_policy():
             locks["REAL_CLOSE_LIBRE"] = False
             locks["ORDEN_REAL_OK"] = False
             reason = "real_close_pending_active"
-        if closed_count >= expected_count and dq == "ok" and pending_on and not real_emitido and patron in ("5V1X", "4V2X"):
-            return {"emit": False, "released_round": rid + 1, "release_reason": "real_close_pending_no_real_release", "locks": locks, "reason": reason}
-        if closed_count >= expected_count and dq == "closed_expired" and pending_on and not real_emitido:
-            return {"emit": False, "released_round": rid + 1, "release_reason": "release_expired_due_to_pending", "locks": locks, "reason": "closed_expired_while_real_pending"}
-        return {"emit": False, "released_round": None, "release_reason": "", "locks": locks, "reason": reason}
+        if closed_count >= expected_count and pending_on and not real_emitido:
+            if dq == "closed_expired":
+                reason = "closed_expired_but_pending_holds_sync"
+            return {"emit": False, "released_round": released_round, "release_reason": "hold_real_close_pending", "locks": locks, "reason": reason}
+        return {"emit": False, "released_round": released_round, "release_reason": "", "locks": locks, "reason": reason}
     a = _simulate(500, True, 6, 6, "ok", "5V1X")
-    assert (not a["emit"]) and a["locks"]["REAL_CLOSE_LIBRE"] is False and a["locks"]["ORDEN_REAL_OK"] is False and a["release_reason"] == "real_close_pending_no_real_release" and a["released_round"] == 501
+    assert (not a["emit"]) and a["locks"]["REAL_CLOSE_LIBRE"] is False and a["locks"]["ORDEN_REAL_OK"] is False and a["release_reason"] == "hold_real_close_pending" and a["released_round"] is None
     b = _simulate(501, True, 6, 6, "closed_expired", "5V1X")
-    assert (not b["emit"]) and b["released_round"] == 502 and b["release_reason"] == "release_expired_due_to_pending"
+    assert (not b["emit"]) and b["released_round"] is None and b["release_reason"] == "hold_real_close_pending" and b["reason"] == "closed_expired_but_pending_holds_sync"
     c = _simulate(502, False, 6, 6, "ok", "5V1X")
     assert c["reason"] == "" and c["locks"]["REAL_CLOSE_LIBRE"] is True
     d = _simulate(503, True, 5, 6, "partial", "5V1X")
     assert d["released_round"] is None and (not d["emit"])
     e = _simulate(504, True, 6, 6, "ok", "4V2X")
-    assert e["release_reason"] == "real_close_pending_no_real_release"
+    assert e["release_reason"] == "hold_real_close_pending" and e["released_round"] is None
     print("SELFTEST REAL_PENDING_RELEASE_POLICY OK")
 
 if os.environ.get("RUN_REAL_PENDING_RELEASE_SELFTEST") == "1":
