@@ -440,7 +440,7 @@ LXV_REAL_SIMPLE_ROUTE_ENABLE = True
 LXV_REAL_LOCKS_PANEL_ENABLE = True
 LXV_REAL_LOCKS_PANEL_ENFORCE = True
 LXV_REAL_LOCKS_FAIL_SAFE = True
-IA_AUTO_REAL_ROUTE_ENABLE = True
+IA_AUTO_REAL_ROUTE_ENABLE = False
 IA_AUTO_REAL_SOURCE = "IA_AUTO"
 
 LXV_REAL_REQUIRED_LOCKS = [
@@ -855,8 +855,7 @@ def _purificacion_real_activa() -> bool:
             allowed_sources.add(allow_4v2x)
         if bool(globals().get("MANUAL_REAL_ROUTE_ENABLE", False)):
             allowed_sources.add("MANUAL")
-        if bool(globals().get("IA_AUTO_REAL_ROUTE_ENABLE", True)):
-            allowed_sources.add(str(globals().get("IA_AUTO_REAL_SOURCE", "IA_AUTO")).upper())
+        # IA_AUTO es solo indicador/telemetría: nunca habilita bypass ni emisión REAL.
         if route_src in allowed_sources:
             try:
                 _lxv_5v1x_event_cooldown(
@@ -5615,6 +5614,31 @@ def _sync_round_write_state_monotonic(payload, reason="") -> bool:
                 new_round_id = old_round_id if old_round_id is not None else new_released
             p["round_id"] = int(new_round_id)
 
+        reason_l = str(reason or "").lower()
+        hold_reason = ("hold_real_close_pending" in reason_l) or ("incident_lock" in reason_l)
+        try:
+            pending_on, pending_bot, _pending_data = _hay_real_close_pending_activo()
+        except Exception:
+            pending_on, pending_bot = False, None
+        if pending_on and not hold_reason:
+            advances_release = bool(old_released is not None and new_released is not None and int(new_released) > int(old_released))
+            advances_round = bool(old_round_id is not None and new_round_id is not None and int(new_round_id) > int(old_round_id))
+            if advances_release or advances_round:
+                p["released_round"] = int(old_released or new_released or 1)
+                p["round_id"] = int(old_round_id or old_released or new_round_id or 1)
+                p["status"] = "HOLD_REAL_CLOSE_PENDING" if not _real_close_incident_active() else "INCIDENT_LOCK_REAL_CLOSE"
+                p["reason"] = "SYNC congelado: cierre REAL pendiente/incidente"
+                p["sync_sigue"] = False
+                p["release_congelado"] = True
+                p["real_close_pending_owner"] = pending_bot
+                _lxv_5v1x_event_cooldown(
+                    key=f"sync_write_freeze_real_pending:{pending_bot}",
+                    msg="SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI" if not _real_close_incident_active() else "🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro",
+                    cooldown_s=10.0,
+                )
+                new_released = _sync_round_int_or_none(p.get("released_round"))
+                new_round_id = _sync_round_int_or_none(p.get("round_id"))
+
         corrupt_default = bool(old_released is not None and old_released > 10 and new_released in (0, 1))
         rollback = bool(old_released is not None and new_released < old_released)
         if corrupt_default or rollback:
@@ -5933,13 +5957,7 @@ def _lxv_4v2x_gate_ok(candidate: dict | None) -> tuple[bool, str]:
         return False, "sin_2_x_validas"
     if bot not in x_bots:
         return False, "bot_x_debil_fuera_de_dupla"
-    if len(x_probs) != 2:
-        return False, "prob_ia_incompleta"
-    for xb in x_bots:
-        try:
-            float(x_probs.get(xb))
-        except Exception:
-            return False, "prob_ia_incompleta"
+    # IA solo apoya ranking: la ausencia de probabilidad no bloquea 4V2X.
     if not bot:
         return False, "bot_x_debil_vacio"
     if bot not in BOT_NAMES:
@@ -5970,15 +5988,17 @@ def _lxv_4v2x_pick_real_bot(candidate: dict | None) -> str | None:
     p2 = _prob_for(bot_x2)
     if p1 is not None and p2 is not None:
         picked = bot_x1 if p1 <= p2 else bot_x2
-    elif p1 is not None:
-        picked = bot_x1
-    elif p2 is not None:
-        picked = bot_x2
+        picked_val = p1 if picked == bot_x1 else p2
+        _lxv_5v1x_event_cooldown(
+            key=f"4v2x_pick_min_ia:{rid}",
+            msg=f"🧩 4V2X: X elegida por menor IA: {picked} valor={picked_val}",
+            cooldown_s=8.0,
+        )
     else:
         picked = str(c.get("bot_x_debil", "") or "").strip()
         _lxv_5v1x_event_cooldown(
             key=f"4v2x_pick_prob_missing:{rid}",
-            msg=f"ℹ️ 4V2X sin probabilidad válida en ambas X | rid={rid} | fallback={picked}",
+            msg=f"ℹ️ 4V2X sin probabilidad IA completa en ambas X | rid={rid} | fallback_conservador={picked}",
             cooldown_s=8.0,
         )
     _lxv_5v1x_event_cooldown(
@@ -8894,6 +8914,14 @@ def _sync_round_ensure_post_real_rejoin(bot, real_round=None, target_release=Non
     return bool(ok)
 
 def _sync_round_release_next_round(old_round: int, reason: str, extra: dict | None = None) -> bool:
+    pending_on, pending_bot, _pending = _hay_real_close_pending_activo()
+    if pending_on:
+        _lxv_5v1x_event_cooldown(
+            key=f"release_next_frozen:{pending_bot}",
+            msg="🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro" if _real_close_incident_active() else "SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI",
+            cooldown_s=10.0,
+        )
+        return False
     st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
     try:
         rid = max(1, int(old_round or st.get('round_id', 1) or 1))
@@ -8927,6 +8955,14 @@ def _sync_round_release_next_round(old_round: int, reason: str, extra: dict | No
     return bool(ok)
 
 def _sync_round_release_now(round_id, payload, reason="release_now", real_emitido=False, real_bot=None, motivo_no_real=""):
+    pending_on, pending_bot, _pending = _hay_real_close_pending_activo()
+    if pending_on:
+        _lxv_5v1x_event_cooldown(
+            key=f"release_now_frozen:{pending_bot}",
+            msg="🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro" if _real_close_incident_active() else "SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI",
+            cooldown_s=10.0,
+        )
+        return False
     try:
         rid = int(round_id or 0)
         if rid <= 0:
@@ -9800,9 +9836,11 @@ def _sync_round_hard_hold_real_pending(round_id, released_round, pending_bot, pe
     owner = str(pending_bot or "--").strip() or "--"
     pdata = pending_data if isinstance(pending_data, dict) else {}
     ciclo = pdata.get("ciclo", "?")
+    incident_on = _real_close_incident_active()
     globals()["SYNC_STATUS_LINE"] = (
-        f"SYNC: HOLD_REAL_CLOSE_PENDING | owner={owner} | ronda={rid} | "
-        f"release={rel} | sync_sigue=NO"
+        f"🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro"
+        if incident_on else
+        f"SYNC: HOLD_REAL_CLOSE_PENDING | owner={owner} | ronda={rid} | release={rel} | sync_sigue=NO | release_congelado=SI"
     )
     try:
         _real_lock_set("REAL_CLOSE_LIBRE", False, f"pending_owner={owner}")
@@ -9813,8 +9851,9 @@ def _sync_round_hard_hold_real_pending(round_id, released_round, pending_bot, pe
     _lxv_5v1x_event_cooldown(
         key=f"real_close_pending_hard_hold:{owner}:{ciclo}:{rid}:{rel}",
         msg=(
-            f"⏸️ REAL_CLOSE_PENDING_HARD_HOLD: owner={owner} C{ciclo} | "
-            f"ronda={rid} | release={rel} | sync_sigue=NO"
+            "🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro"
+            if incident_on else
+            f"SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI | owner={owner} C{ciclo} | ronda={rid} | release={rel}"
         ),
         cooldown_s=8.0,
     )
@@ -10855,8 +10894,13 @@ def _sync_round_release_all_after_real_close(bot_real, real_round=None, reason="
     st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
     if not isinstance(st, dict):
         st = {}
-    pending_on, _pending_bot, _pending = _hay_real_close_pending_activo()
+    pending_on, pending_bot, _pending = _hay_real_close_pending_activo()
     if pending_on:
+        _lxv_5v1x_event_cooldown(
+            key=f"release_all_frozen:{pending_bot}",
+            msg="🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro" if _real_close_incident_active() else "SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI",
+            cooldown_s=10.0,
+        )
         return False
     if globals().get("REAL_OWNER_LOCK") in BOT_NAMES:
         return False
@@ -10950,6 +10994,14 @@ def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") 
     real_round = None
     if isinstance(st, dict):
         real_round = st.get("last_real_round") or st.get("real_pending_round") or st.get("released_round") or st.get("round_id")
+    pending_on, pending_bot, _pending = _hay_real_close_pending_activo()
+    if pending_on:
+        _lxv_5v1x_event_cooldown(
+            key=f"release_after_close_frozen:{pending_bot}",
+            msg="🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro" if _real_close_incident_active() else "SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI",
+            cooldown_s=10.0,
+        )
+        return
     _sync_real_cleanup_locks_after_close(bot, reason_txt)
     _sync_round_ensure_post_real_rejoin(bot, real_round=real_round, reason=reason_txt)
     if not _sync_round_release_all_after_real_close(bot, real_round=real_round, reason=reason_txt):
@@ -11465,6 +11517,13 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
     Conserva la infraestructura existente (orden_real/token/HUD), pero restringe la decisión.
     """
     src = str(source or "LEGACY").strip().upper()
+    if src == str(globals().get("IA_AUTO_REAL_SOURCE", "IA_AUTO")).upper():
+        _lxv_5v1x_event_cooldown(
+            key=f"ia_auto_real_blocked_policy:{bot}:{int(ciclo or 0)}",
+            msg="ℹ️ IA_AUTO es solo indicador; emisión REAL bloqueada por política oficial",
+            cooldown_s=15.0,
+        )
+        return False
     pending_on, pending_bot, pending = _hay_real_close_pending_activo()
     if pending_on:
         reason_pending = "INCIDENT_LOCK_REAL_CLOSE" if _real_close_incident_active() else "CIERRE_REAL_PENDIENTE"
@@ -11501,8 +11560,7 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
         allow_sources.add(allow_4v2x)
     if bool(globals().get("MANUAL_REAL_ROUTE_ENABLE", False)):
         allow_sources.add("MANUAL")
-    if bool(globals().get("IA_AUTO_REAL_ROUTE_ENABLE", True)):
-        allow_sources.add(str(globals().get("IA_AUTO_REAL_SOURCE", "IA_AUTO")).upper())
+    # IA_AUTO es solo indicador/telemetría: no pertenece a sources operativas REAL.
     if src not in allow_sources:
         agregar_evento(
             f"🧊 REAL source rechazada: {src} (permitidas={','.join(sorted(allow_sources))})."
@@ -11512,7 +11570,6 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
         str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper(),
         str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X")).upper(),
         str(globals().get("LXV_4V2X_REAL_SOURCE", "LXV_4V2X")).upper(),
-        str(globals().get("IA_AUTO_REAL_SOURCE", "IA_AUTO")).upper(),
     }
     if src in auto_lxv_sources:
         try:
@@ -11537,14 +11594,7 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
                 f"hard_zone_{zona_info.get('zona_base', zona_info.get('fase', zona_info.get('zona')))}_{zona_info.get('motivo')}"
             )
             return False
-    if src == str(globals().get("IA_AUTO_REAL_SOURCE", "IA_AUTO")).upper():
-        _lxv_5v1x_event_cooldown(
-            key=f"ia_auto_source_autorizada:{bot}:{int(ciclo or 0)}",
-            msg=f"🤖 IA_AUTO source autorizada: {bot} C{int(ciclo or 0)}",
-            cooldown_s=15.0,
-        )
-    else:
-        agregar_evento(f"✅ REAL source autorizada: {src}.")
+    agregar_evento(f"✅ REAL source autorizada: {src}.")
     prev_src = globals().get("_REAL_ROUTE_SOURCE", None)
     globals()["_REAL_ROUTE_SOURCE"] = src
     try:
@@ -27404,7 +27454,10 @@ async def main():
                 # liberamos lock fantasma para permitir nuevas asignaciones REAL correctas.
                 owner_mem_now = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
                 owner_file_now = leer_token_archivo_raw()
-                if owner_mem_now and (owner_file_now is None):
+                pending_reconcile_on, _pending_reconcile_bot, _pending_reconcile_data = _hay_real_close_pending_activo()
+                if pending_reconcile_on:
+                    REAL_LOCK_MISMATCH_SINCE = 0.0
+                elif owner_mem_now and (owner_file_now is None):
                     if REAL_LOCK_MISMATCH_SINCE <= 0.0:
                         REAL_LOCK_MISMATCH_SINCE = time.time()
                     elif (time.time() - REAL_LOCK_MISMATCH_SINCE) >= float(REAL_LOCK_RECONCILE_S):
@@ -27478,7 +27531,14 @@ async def main():
                         if sig == LAST_REAL_CLOSE_SIG.get(bot) or sig == REAL_CLOSE_PROCESSED_SIG.get(bot):
                             _lxv_5v1x_event_cooldown(
                                 key=f"real_close_duplicate_pending:{bot}:{int(ciclo or 0)}",
-                                msg=f"⚠️ Cierre REAL duplicado detectado; pending conservado hasta cierre idempotente/incidente: {bot} C{int(ciclo or 0)}",
+                                msg=f"⚠️ Cierre REAL duplicado detectado; no se repite cierre ni release: {bot} C{int(ciclo or 0)}",
+                                cooldown_s=15.0,
+                            )
+                            continue
+                        if res not in ("GANANCIA", "PÉRDIDA"):
+                            _lxv_5v1x_event_cooldown(
+                                key=f"real_close_invalid_result_pending:{bot}:{int(ciclo or 0)}",
+                                msg="🚨 REAL sin cierre válido: HOLD activo, no se cierra ciclo ni se libera sync",
                                 cooldown_s=15.0,
                             )
                             continue
@@ -27499,22 +27559,22 @@ async def main():
                         if res == "GANANCIA":
                             agregar_evento(f"✅ REAL C{int(ciclo)} GANANCIA registrada por pending ({modo_detector}): {bot} -> C1")
                             cerrar_por_fin_de_ciclo(bot, "Ganancia REAL cerrada por pending; vuelve a DEMO")
-                            _sync_round_release_after_real_close(bot, reason="real_win_pending")
                             _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
+                            REAL_CLOSE_PENDING[bot] = None
+                            _sync_round_release_after_real_close(bot, reason="real_win_pending")
                             LAST_REAL_CLOSE_SIG[bot] = sig
                             REAL_CLOSE_PROCESSED_SIG[bot] = sig
-                            REAL_CLOSE_PENDING[bot] = None
                             activo_real = None
                             break
                         if res == "PÉRDIDA":
                             prox = int(ciclo_martingala_siguiente() or 1)
                             agregar_evento(f"❌ REAL C{int(ciclo)} PÉRDIDA registrada por pending ({modo_detector}): {bot} -> próxima C{prox}")
                             cerrar_por_fin_de_ciclo(bot, f"Pérdida REAL C{int(ciclo)} cerrada por pending")
-                            _sync_round_release_after_real_close(bot, reason="real_loss_pending")
                             _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
+                            REAL_CLOSE_PENDING[bot] = None
+                            _sync_round_release_after_real_close(bot, reason="real_loss_pending")
                             LAST_REAL_CLOSE_SIG[bot] = sig
                             REAL_CLOSE_PROCESSED_SIG[bot] = sig
-                            REAL_CLOSE_PENDING[bot] = None
                             activo_real = None
                             break
                     for bot in BOT_NAMES:
@@ -27527,7 +27587,7 @@ async def main():
                                 first_warn = float(estado_bots[bot].get("real_timeout_first_warn", 0.0) or 0.0)
                                 if first_warn <= 0.0:
                                     estado_bots[bot]["real_timeout_first_warn"] = ahora
-                                    agregar_evento(f"⏱️ Seguridad: {bot} sin actividad reciente en REAL. Esperando cierre por {REAL_STUCK_FORCE_RELEASE_S}s antes de liberar.")
+                                    agregar_evento(f"⏱️ Seguridad: {bot} sin actividad reciente en REAL. Esperando cierre REAL válido; si vence TTL entra en INCIDENT_LOCK, sin liberar sync.")
                                 elif (ahora - first_warn) > REAL_STUCK_FORCE_RELEASE_S:
                                     pending_timeout = REAL_CLOSE_PENDING.get(bot) if isinstance(REAL_CLOSE_PENDING.get(bot), dict) else {
                                         "bot": bot,
@@ -27563,7 +27623,7 @@ async def main():
                                 if sig == LAST_REAL_CLOSE_SIG.get(bot) or sig == REAL_CLOSE_PROCESSED_SIG.get(bot):
                                     _lxv_5v1x_event_cooldown(
                                         key=f"real_close_duplicate_direct:{bot}:{int(ciclo or 0)}",
-                                        msg=f"⚠️ Cierre REAL duplicado detectado; pending conservado hasta cierre idempotente/incidente: {bot} C{int(ciclo or 0)}",
+                                        msg=f"⚠️ Cierre REAL duplicado detectado; no se repite cierre ni release: {bot} C{int(ciclo or 0)}",
                                         cooldown_s=15.0,
                                     )
                                     continue
@@ -27592,8 +27652,9 @@ async def main():
                                         prox = int(ciclo_martingala_siguiente() or 1)
                                         agregar_evento(f"✅ REAL WIN: {bot} C{int(ciclo or 0)} -> DEMO | próximo ciclo C{prox}")
                                         cerrar_por_fin_de_ciclo(bot, "Ganancia REAL cerrada; vuelve a DEMO")
-                                        _sync_round_release_after_real_close(bot, reason="real_win")
                                         _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
+                                        REAL_CLOSE_PENDING[bot] = None
+                                        _sync_round_release_after_real_close(bot, reason="real_win")
                                         LAST_REAL_CLOSE_SIG[bot] = sig
                                         REAL_CLOSE_PROCESSED_SIG[bot] = sig
                                         activo_real = None
@@ -27605,8 +27666,9 @@ async def main():
                                         else:
                                             agregar_evento(f"❌ REAL LOSS: {bot} C{int(ciclo or 0)} -> DEMO | próximo ciclo C{prox}")
                                         cerrar_por_fin_de_ciclo(bot, f"Pérdida REAL C{int(ciclo or 0)}; vuelve a DEMO; próximo ciclo C{prox}")
-                                        _sync_round_release_after_real_close(bot, reason="real_loss_next_cycle")
                                         _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
+                                        REAL_CLOSE_PENDING[bot] = None
+                                        _sync_round_release_after_real_close(bot, reason="real_loss_next_cycle")
                                         LAST_REAL_CLOSE_SIG[bot] = sig
                                         REAL_CLOSE_PROCESSED_SIG[bot] = sig
                                         activo_real = None
@@ -27990,6 +28052,8 @@ async def main():
                         if bool(LXV_SYNC_REAL_ROUTE_ENABLE):
                             if candidatos and _print_once("lxv-route-only", ttl=20.0):
                                 agregar_evento("🧊 Modo LXV_SYNC_REAL: legado REAL en telemetría (sin emisión).")
+                            # IA_AUTO es solo indicador. Cuando LXV_SYNC está activo,
+                            # los candidatos IA no deben operar REAL.
                             candidatos = []
 
                         # ==================== AUTO-PRESELECCIÓN (MODO MANUAL) ====================
@@ -28070,30 +28134,15 @@ async def main():
                                         estado_bots[mejor_bot]["ia_prob_senal"] = None
                                         continue
 
-                                    age_ok = _real_candidate_age_ok({"edad_s": float(ev_lb or 0.0)})
-                                    if not age_ok:
-                                        _lxv_5v1x_event_cooldown(
-                                            key="real_age_block:auto",
-                                            msg="⏱️ REAL bloqueado: cierre fuera de ventana útil (>45s).",
-                                            cooldown_s=8.0,
-                                        )
-                                        ok_real = False
-                                    else:
-                                        rid_auto = _resolver_round_id_ia_auto(emb)
-                                        ok_real = emitir_real_autorizado(mejor_bot, ciclo_auto, source="IA_AUTO", round_id=rid_auto)
-                                    if ok_real:
-                                        if estado_real == "SHADOW":
-                                            try:
-                                                _REAL_SHADOW_MICRO_OPEN_TS.append(float(time.time()))
-                                            except Exception:
-                                                pass
-                                        estado_bots[mejor_bot]["fuente"] = "IA_AUTO"
-                                        estado_bots[mejor_bot]["ciclo_actual"] = ciclo_auto
-                                        activo_real = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else mejor_bot
-                                        marti_activa = True
-                                    else:
-                                        estado_bots[mejor_bot]["ia_senal_pendiente"] = False
-                                        estado_bots[mejor_bot]["ia_prob_senal"] = None
+                                    rid_auto = _resolver_round_id_ia_auto(emb)
+                                    _lxv_5v1x_event_cooldown(
+                                        key=f"ia_auto_shadow:{mejor_bot}:{rid_auto}:{int(ciclo_auto or 0)}",
+                                        msg=f"🤖 IA_AUTO SHADOW: candidato={mejor_bot} C{ciclo_auto} prob={prob:.1%} | no invierte",
+                                        cooldown_s=8.0,
+                                    )
+                                    estado_bots[mejor_bot]["fuente"] = "IA_AUTO_SHADOW"
+                                    estado_bots[mejor_bot]["ia_senal_pendiente"] = False
+                                    estado_bots[mejor_bot]["ia_prob_senal"] = None
                         else:
                             max_prob = max((_prob_ia_operativa_bot(bot, default=0.0) for bot in BOT_NAMES if estado_bots[bot]["ia_ready"]), default=0)
                             if max_prob < umbral_ia_real:
