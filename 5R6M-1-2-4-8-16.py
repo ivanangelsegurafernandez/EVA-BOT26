@@ -22621,15 +22621,27 @@ def _hud_pre_zona_verde_contexto() -> dict:
         except Exception:
             g_regional = 0.0
         visual_verde = any(tok in columna_visual for tok in ("VERDE", "PRE_ZONA")) or any(tok in regional for tok in ("VERDE", "PRE_ZONA"))
-        metricas_verdes = (g_regional >= 0.70) or (prom3 >= 0.70) or (prom8 >= 0.65)
+        fuerza_actual_suficiente = g_regional >= 0.60
+        promedios_acompanan = prom3 >= 0.60 and prom8 >= 0.55
+        historico_verde = prom3 >= 0.60 or prom8 >= 0.60 or visual_verde
         columna_incompleta = bool(cerrados < esperados or dq != "ok")
-        pre_zona = bool((not allow_real) and columna_incompleta and (visual_verde or metricas_verdes))
+        # HUD solamente: la pre-zona fuerte requiere fuerza actual/regional suficiente.
+        # Evita contradicciones con ESTADO LXV ACTUAL cuando solo hay histórico verde sin fuerza actual.
+        pre_zona = bool(
+            (not allow_real)
+            and columna_incompleta
+            and fuerza_actual_suficiente
+            and promedios_acompanan
+        )
+        tendencia_no_confirmada = bool((not allow_real) and columna_incompleta and (not pre_zona) and historico_verde)
         if allow_real:
             estado = "ZONA_VERDE_OFICIAL_ACTIVA"
         elif pre_zona:
             estado = "VERDE_EN_FORMACION"
+        elif tendencia_no_confirmada:
+            estado = "HISTÓRICO VERDE / ACTUAL DÉBIL"
         else:
-            estado = "SIN_PRE_ZONA_VERDE"
+            estado = "INSUFICIENTE / MIXTO"
         motivo_parts = []
         if cerrados < esperados:
             motivo_parts.append("columna incompleta")
@@ -22639,6 +22651,7 @@ def _hud_pre_zona_verde_contexto() -> dict:
             motivo_parts.append(str(zf.get("motivo", info.get("motivo", "--")) or "--"))
         return {
             "pre_zona": pre_zona,
+            "tendencia_no_confirmada": tendencia_no_confirmada,
             "oficial_activa": allow_real,
             "estado": estado,
             "zona": zona,
@@ -22654,7 +22667,7 @@ def _hud_pre_zona_verde_contexto() -> dict:
             "motivo": " / ".join(motivo_parts),
         }
     except Exception as e:
-        return {"pre_zona": False, "oficial_activa": False, "estado": "SIN_PRE_ZONA_VERDE", "motivo": f"hud_error:{type(e).__name__}"}
+        return {"pre_zona": False, "tendencia_no_confirmada": False, "oficial_activa": False, "estado": "INSUFICIENTE / MIXTO", "motivo": f"hud_error:{type(e).__name__}"}
 
 
 def render_pre_zona_verde_panel() -> list[str]:
@@ -22674,10 +22687,15 @@ def render_pre_zona_verde_panel() -> list[str]:
             real_line = _c_warn("REAL: NO HABILITADO TODAVÍA")
             action = "Acción: ESPERAR COLUMNA OFICIAL 6/6"
             motivo = f"Motivo: {ctx.get('motivo','columna incompleta / bots desalineados')}"
+        elif ctx.get("tendencia_no_confirmada"):
+            title = _c_warn("🟡 TENDENCIA VERDE NO CONFIRMADA")
+            real_line = _c_warn("REAL: NO HABILITADO TODAVÍA")
+            action = "Acción: ESPERAR CONFIRMACIÓN ACTUAL + COLUMNA 6/6"
+            motivo = "Motivo: fuerza actual insuficiente"
         else:
-            title = _c_dim("⚪ SIN PRE-ZONA VERDE")
-            real_line = "REAL: esperando evidencia visual/regional"
-            action = "Acción: MONITOREAR"
+            title = _c_dim("⚪ SIN PRE-ZONA VERDE CLARA")
+            real_line = "REAL: NO HABILITADO"
+            action = "Acción: ESPERAR NUEVA COLUMNA"
             motivo = f"Motivo: {ctx.get('motivo','sin contexto verde')}"
         return [
             "╔" + "═"*(W-2) + "╗",
