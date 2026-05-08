@@ -430,8 +430,9 @@ LXV_ZONAS_BLOQUEANTES = {
     "ERROR",
     "UNKNOWN",
 }
-LXV_ZONA_V3_ENABLE = True
+LXV_ZONA_V3_ENABLE = False
 LXV_ZONA_V3_SHADOW_ONLY = True
+LXV_ZONA_V3_OPERATIVE_ENABLE = False
 LXV_ZONA_V3_CAN_BLOCK = False
 LXV_ZONA_V3_CAN_UNLOCK = False
 LXV_SYNC_GENERIC_REAL_ENABLE = False
@@ -439,6 +440,9 @@ LXV_REAL_SIMPLE_ROUTE_ENABLE = True
 LXV_REAL_LOCKS_PANEL_ENABLE = True
 LXV_REAL_LOCKS_PANEL_ENFORCE = True
 LXV_REAL_LOCKS_FAIL_SAFE = True
+IA_AUTO_REAL_ROUTE_ENABLE = True
+IA_AUTO_REAL_SOURCE = "IA_AUTO"
+
 LXV_REAL_REQUIRED_LOCKS = [
     "REAL_CLOSE_LIBRE",
     "COLUMNA_COMPLETA",
@@ -851,6 +855,8 @@ def _purificacion_real_activa() -> bool:
             allowed_sources.add(allow_4v2x)
         if bool(globals().get("MANUAL_REAL_ROUTE_ENABLE", False)):
             allowed_sources.add("MANUAL")
+        if bool(globals().get("IA_AUTO_REAL_ROUTE_ENABLE", True)):
+            allowed_sources.add(str(globals().get("IA_AUTO_REAL_SOURCE", "IA_AUTO")).upper())
         if route_src in allowed_sources:
             try:
                 _lxv_5v1x_event_cooldown(
@@ -1484,9 +1490,18 @@ REAL_ENTRY_BASELINE = {bot: 0 for bot in BOT_NAMES}  # filas al entrar/reafirmar
 OCULTAR_HASTA_NUEVO = {bot: False for bot in BOT_NAMES}
 t_inicio_indef = {bot: None for bot in BOT_NAMES}
 last_update_time = {bot: time.time() for bot in BOT_NAMES}
-LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # evita procesar el mismo cierre REAL varias veces
+LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # firma del último cierre REAL completamente procesado
+REAL_CLOSE_PROCESSED_SIG = {bot: None for bot in BOT_NAMES}
 REAL_CLOSE_PENDING = {bot: None for bot in BOT_NAMES}
 REAL_CLOSE_PENDING_TTL_S = 240
+REAL_CLOSE_INCIDENT_LOCK = {
+    "active": False,
+    "bot": None,
+    "ciclo": None,
+    "round_id": None,
+    "ts": 0.0,
+    "reason": "",
+}
 REAL_MANUAL_ALERT = {
     "active": False,
     "bot": None,
@@ -1657,16 +1672,67 @@ def _marcar_real_close_pending(bot, ciclo, source="UNKNOWN", round_id=None):
     except Exception as e:
         agregar_evento(f"⚠️ Error armando REAL_CLOSE_PENDING: {bot} {e}")
 
+def _real_close_incident_active():
+    try:
+        return bool(isinstance(REAL_CLOSE_INCIDENT_LOCK, dict) and REAL_CLOSE_INCIDENT_LOCK.get("active"))
+    except Exception:
+        return False
+
+def _activar_real_close_incident_lock(bot, pending, reason="REAL_CLOSE_PENDING_TTL_EXPIRED"):
+    try:
+        if not isinstance(pending, dict):
+            pending = {}
+        REAL_CLOSE_INCIDENT_LOCK.update({
+            "active": True,
+            "bot": str(bot),
+            "ciclo": pending.get("ciclo"),
+            "round_id": pending.get("round_id"),
+            "ts": float(time.time()),
+            "reason": str(reason or "REAL_CLOSE_PENDING_TTL_EXPIRED"),
+        })
+        if isinstance(REAL_CLOSE_PENDING.get(bot), dict):
+            REAL_CLOSE_PENDING[bot]["incident"] = True
+            REAL_CLOSE_PENDING[bot]["active"] = True
+        ciclo_txt = pending.get("ciclo") if isinstance(pending, dict) else "?"
+        round_txt = pending.get("round_id") if isinstance(pending, dict) else None
+        _lxv_5v1x_event_cooldown(
+            key=f"incident_lock_real_close_expired:{bot}:{ciclo_txt}:{round_txt}",
+            msg=f"🚨 INCIDENT_LOCK_REAL_CLOSE_EXPIRED: {bot} C{ciclo_txt} | ronda={round_txt} | requiere revisión",
+            cooldown_s=15.0,
+        )
+    except Exception:
+        pass
+
+def _limpiar_real_close_incident_lock_after_valid_close(bot, sig=None):
+    try:
+        if _real_close_incident_active() and str(REAL_CLOSE_INCIDENT_LOCK.get("bot") or "") == str(bot):
+            REAL_CLOSE_INCIDENT_LOCK.update({
+                "active": False,
+                "bot": None,
+                "ciclo": None,
+                "round_id": None,
+                "ts": 0.0,
+                "reason": "",
+            })
+            _lxv_5v1x_event_cooldown(
+                key=f"incident_lock_clear_valid_close:{bot}",
+                msg=f"🧯 INCIDENT_LOCK limpiado por cierre REAL válido procesado: {bot}",
+                cooldown_s=15.0,
+            )
+    except Exception:
+        pass
+
 def _hay_real_close_pending_activo():
     try:
         now = time.time()
         for bot, p in REAL_CLOSE_PENDING.items():
             if isinstance(p, dict) and p.get("active"):
                 age = now - float(p.get("ts", 0) or 0)
-                if age <= float(REAL_CLOSE_PENDING_TTL_S):
-                    return True, bot, p
-                REAL_CLOSE_PENDING[bot] = None
-                agregar_evento(f"⚠️ REAL_CLOSE_PENDING expirado sin cierre: {bot} C{p.get('ciclo')}")
+                if age > float(REAL_CLOSE_PENDING_TTL_S) or bool(p.get("incident", False)):
+                    _activar_real_close_incident_lock(bot, p, reason="REAL_CLOSE_PENDING_TTL_EXPIRED")
+                return True, bot, p
+        if _real_close_incident_active():
+            return True, REAL_CLOSE_INCIDENT_LOCK.get("bot"), dict(REAL_CLOSE_INCIDENT_LOCK)
         return False, None, None
     except Exception:
         return False, None, None
@@ -11367,9 +11433,10 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
     src = str(source or "LEGACY").strip().upper()
     pending_on, pending_bot, pending = _hay_real_close_pending_activo()
     if pending_on:
+        reason_pending = "INCIDENT_LOCK_REAL_CLOSE" if _real_close_incident_active() else "CIERRE_REAL_PENDIENTE"
         agregar_evento(
-            f"⏸️ REAL bloqueado por cierre pendiente: no se emite {src} para {bot}; "
-            f"pendiente={pending_bot} C{pending.get('ciclo')}"
+            f"⏸️ REAL bloqueado por {reason_pending}: no se emite {src} para {bot}; "
+            f"pendiente={pending_bot} C{pending.get('ciclo') if isinstance(pending, dict) else '?'}"
         )
         return False
     real_activo, motivo_real = hay_real_activo_global()
@@ -11400,6 +11467,8 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
         allow_sources.add(allow_4v2x)
     if bool(globals().get("MANUAL_REAL_ROUTE_ENABLE", False)):
         allow_sources.add("MANUAL")
+    if bool(globals().get("IA_AUTO_REAL_ROUTE_ENABLE", True)):
+        allow_sources.add(str(globals().get("IA_AUTO_REAL_SOURCE", "IA_AUTO")).upper())
     if src not in allow_sources:
         agregar_evento(
             f"🧊 REAL source rechazada: {src} (permitidas={','.join(sorted(allow_sources))})."
@@ -11409,6 +11478,7 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
         str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper(),
         str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X")).upper(),
         str(globals().get("LXV_4V2X_REAL_SOURCE", "LXV_4V2X")).upper(),
+        str(globals().get("IA_AUTO_REAL_SOURCE", "IA_AUTO")).upper(),
     }
     if src in auto_lxv_sources:
         try:
@@ -11433,7 +11503,14 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
                 f"hard_zone_{zona_info.get('zona_base', zona_info.get('fase', zona_info.get('zona')))}_{zona_info.get('motivo')}"
             )
             return False
-    agregar_evento(f"✅ REAL source autorizada: {src}.")
+    if src == str(globals().get("IA_AUTO_REAL_SOURCE", "IA_AUTO")).upper():
+        _lxv_5v1x_event_cooldown(
+            key=f"ia_auto_source_autorizada:{bot}:{int(ciclo or 0)}",
+            msg=f"🤖 IA_AUTO source autorizada: {bot} C{int(ciclo or 0)}",
+            cooldown_s=15.0,
+        )
+    else:
+        agregar_evento(f"✅ REAL source autorizada: {src}.")
     prev_src = globals().get("_REAL_ROUTE_SOURCE", None)
     globals()["_REAL_ROUTE_SOURCE"] = src
     try:
@@ -17211,6 +17288,7 @@ def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=
     eventos_recentes.clear()
     for b in BOT_NAMES:
         LAST_REAL_CLOSE_SIG[b] = None
+        REAL_CLOSE_PROCESSED_SIG[b] = None
     marti_paso = 0
     marti_activa = False
     marti_ciclos_perdidos = 0
@@ -17268,6 +17346,7 @@ def reiniciar_bot(bot, borrar_csv=False):
     OCULTAR_HASTA_NUEVO[bot] = False  # Cambiado para no ocultar
     IA90_stats[bot] = {"n": 0, "ok": 0, "pct": 0.0, "pct_raw": 0.0, "pct_smooth": 50.0}
     LAST_REAL_CLOSE_SIG[bot] = None
+    REAL_CLOSE_PROCESSED_SIG[bot] = None
     if not isinstance(huellas_usadas.get(bot), set):
         huellas_usadas[bot] = set()
 
@@ -17762,9 +17841,8 @@ def _buscar_cierre_real_pendiente(bot):
         return None
     now = time.time()
     age = now - float(pending.get("ts", 0) or 0)
-    if age > float(REAL_CLOSE_PENDING_TTL_S):
-        agregar_evento(f"⚠️ REAL_CLOSE_PENDING expirado sin cierre: {bot} C{pending.get('ciclo')}")
-        REAL_CLOSE_PENDING[bot] = None
+    if age > float(REAL_CLOSE_PENDING_TTL_S) or bool(pending.get("incident", False)):
+        _activar_real_close_incident_lock(bot, pending, reason="REAL_CLOSE_PENDING_TTL_EXPIRED")
         return None
     ciclo = int(pending.get("ciclo", 1) or 1)
     baseline = int(pending.get("baseline", 0) or 0)
@@ -21231,19 +21309,13 @@ def _hud_zona_operativa_lxv_line(width=None):
         g_col_parcial = _calcular_g_columna_parcial(patron_live)
         g_hud = f"g_columna={g_txt}" if cerrados >= esperados else f"g_columna_parcial={g_col_parcial:.2f} | g_regional={g_txt}"
         v3_line = ""
-        if bool(globals().get("LXV_ZONA_V3_ENABLE", True)):
+        if bool(globals().get("LXV_ZONA_V3_ENABLE", False)):
             v3 = detectar_zona_lxv_v3(rows=globals().get("LXV_FASE_COLUMNS_CACHE", []) or [], expected=esperados)
             info["zona_lxv_v3"] = dict(v3 or {})
             oficial = str(zona_final.get("subzona", zona))
-            v3_line = f" | 🧭 ZONA V3: macro={v3.get('zona_macro','--')} | subzona={v3.get('subzona','--')} | allow={bool(v3.get('allow_real_v3',False))} | motivo={v3.get('motivo_v3','--')} | oficial={oficial}"
-            v3_sub = str(v3.get("subzona", "UNKNOWN") or "UNKNOWN")
-            oficial_txt = str(oficial or "UNKNOWN")
-            if (
-                v3_sub not in {"INSUFICIENTE", "UNKNOWN", "ERROR"}
-                and oficial_txt not in {"PRE_ZONA_VISUAL", "UNKNOWN", "INSUFICIENTE", "--", ""}
-                and v3_sub != oficial_txt
-            ):
-                print(f"⚠️ ZONA_DIVERGENCIA: oficial={oficial_txt} v3={v3_sub} motivo_v3={v3.get('motivo_v3','--')}")
+            v3_line = f" | 🧭 ZONA V3: OFF / sin influencia operativa | shadow_subzona={v3.get('subzona','--')} | shadow_allow={bool(v3.get('allow_real_v3',False))} | oficial={oficial}"
+        else:
+            v3_line = " | 🧭 ZONA V3: OFF / sin influencia operativa"
         line_hud = (
             f"{emoji} ZONA LXV HUD GLOBAL: ZONA OFICIAL REAL={zona} | DECISIÓN ZONA={decision} | MOTIVO={motivo} | FUENTE={zona_final.get('fuente_zona','LXV')} | "
             f"rid_zona={rid_zona if rid_zona > 0 else '--'} | rid_live={rid_live if rid_live > 0 else '--'} | "
@@ -21631,7 +21703,7 @@ def render_zona_lxv_panel():
         elif bool(zf.get("bloqueo_mrv_v2", False)): real_txt = "NO, bloqueo MRV_ZONA_V2"
         elif not zona_allow: real_txt = "NO, zona oficial no invertible"
         reg_line = f"ZONA REGIONAL: {str(info.get('zona_regional','NEUTRO_REGIONAL'))} | R1={float(info.get('green_ratio_r1',0.0)):.2f} R2={float(info.get('green_ratio_r2',0.0)):.2f} R3={float(info.get('green_ratio_r3',0.0)):.2f} | decisión={str(info.get('decision_regional','NO_INVERTIR'))}"
-        return ["╔════════════════════════════════════════════════════════════╗","║ 🧭 ZONA LXV / MRV_ZONA_V2                                ║","╠════════════════════════════════════════════════════════════╣",f"║ ZONA OFICIAL REAL : {z[:37].ljust(37)}║",f"║ SUBZONA / VISUAL  : {subz[:37].ljust(37)}║",f"║ DECISIÓN ZONA     : {d[:37].ljust(37)}║",f"║ MOTIVO            : {m[:37].ljust(37)}║",f"║ FUENTE            : {fuente[:37].ljust(37)}║",f"║ MRV_V2      : {z2[:43].ljust(43)}║",f"║ Decisión V2 : {d2[:43].ljust(43)}║",f"║ Motivo V2   : {m2[:43].ljust(43)}║",f"║ Columna     : {cerr}/{esp} | dq={dq} | patrón={patron}"[:61].ljust(61)+"║",f"║ Regional    : SOLO_DIAGNOSTICO, NO_HABILITA_REAL"[:61].ljust(61)+"║",f"║ Regional+   : {reg_line[:47].ljust(47)}║",f"║ REAL        : {real_txt[:47].ljust(47)}║","╚════════════════════════════════════════════════════════════╝"]
+        return ["╔════════════════════════════════════════════════════════════╗","║ 🧭 ZONA LXV / MRV_ZONA_V2                                ║","╠════════════════════════════════════════════════════════════╣",f"║ ZONA OFICIAL REAL : {z[:37].ljust(37)}║",f"║ SUBZONA / VISUAL  : {subz[:37].ljust(37)}║",f"║ DECISIÓN ZONA     : {d[:37].ljust(37)}║",f"║ MOTIVO            : {m[:37].ljust(37)}║",f"║ FUENTE            : {fuente[:37].ljust(37)}║",f"║ MRV_V2      : {z2[:43].ljust(43)}║",f"║ Decisión V2 : {d2[:43].ljust(43)}║",f"║ Motivo V2   : {m2[:43].ljust(43)}║",f"║ V3          : {'OFF / sin influencia operativa'[:43].ljust(43)}║",f"║ Columna     : {cerr}/{esp} | dq={dq} | patrón={patron}"[:61].ljust(61)+"║",f"║ Regional    : SOLO_DIAGNOSTICO, NO_HABILITA_REAL"[:61].ljust(61)+"║",f"║ Regional+   : {reg_line[:47].ljust(47)}║",f"║ REAL        : {real_txt[:47].ljust(47)}║","╚════════════════════════════════════════════════════════════╝"]
     except Exception:
         return []
 
@@ -27369,10 +27441,13 @@ async def main():
                         cierre_info, pending, modo_detector = pack
                         res, monto, ciclo, payout_total = cierre_info
                         sig = _real_close_sig(bot, res, monto, ciclo, payout_total, baseline=int(pending.get("baseline", 0) or 0))
-                        if sig == LAST_REAL_CLOSE_SIG.get(bot):
-                            REAL_CLOSE_PENDING[bot] = None
+                        if sig == LAST_REAL_CLOSE_SIG.get(bot) or sig == REAL_CLOSE_PROCESSED_SIG.get(bot):
+                            _lxv_5v1x_event_cooldown(
+                                key=f"real_close_duplicate_pending:{bot}:{int(ciclo or 0)}",
+                                msg=f"⚠️ Cierre REAL duplicado detectado; pending conservado hasta cierre idempotente/incidente: {bot} C{int(ciclo or 0)}",
+                                cooldown_s=15.0,
+                            )
                             continue
-                        LAST_REAL_CLOSE_SIG[bot] = sig
                         saldo_antes = obtener_valor_saldo()
                         registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo)
                         try:
@@ -27387,11 +27462,14 @@ async def main():
                             "saldo_real_antes": saldo_antes, "saldo_real_despues": saldo_despues,
                             "detector": f"REAL_CLOSE_PENDING_{modo_detector}",
                         })
-                        REAL_CLOSE_PENDING[bot] = None
                         if res == "GANANCIA":
                             agregar_evento(f"✅ REAL C{int(ciclo)} GANANCIA registrada por pending ({modo_detector}): {bot} -> C1")
                             cerrar_por_fin_de_ciclo(bot, "Ganancia REAL cerrada por pending; vuelve a DEMO")
                             _sync_round_release_after_real_close(bot, reason="real_win_pending")
+                            _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
+                            LAST_REAL_CLOSE_SIG[bot] = sig
+                            REAL_CLOSE_PROCESSED_SIG[bot] = sig
+                            REAL_CLOSE_PENDING[bot] = None
                             activo_real = None
                             break
                         if res == "PÉRDIDA":
@@ -27399,6 +27477,10 @@ async def main():
                             agregar_evento(f"❌ REAL C{int(ciclo)} PÉRDIDA registrada por pending ({modo_detector}): {bot} -> próxima C{prox}")
                             cerrar_por_fin_de_ciclo(bot, f"Pérdida REAL C{int(ciclo)} cerrada por pending")
                             _sync_round_release_after_real_close(bot, reason="real_loss_pending")
+                            _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
+                            LAST_REAL_CLOSE_SIG[bot] = sig
+                            REAL_CLOSE_PROCESSED_SIG[bot] = sig
+                            REAL_CLOSE_PENDING[bot] = None
                             activo_real = None
                             break
                     for bot in BOT_NAMES:
@@ -27440,11 +27522,14 @@ async def main():
                                 res, monto, ciclo, payout_total = cierre_info
                                 sig = _real_close_sig(bot, res, monto, ciclo, payout_total)
 
-                                # Evita reprocesar el mismo cierre en ticks consecutivos
-                                if sig == LAST_REAL_CLOSE_SIG.get(bot):
+                                # Evita reprocesar el mismo cierre en ticks consecutivos sin liberar por duplicado.
+                                if sig == LAST_REAL_CLOSE_SIG.get(bot) or sig == REAL_CLOSE_PROCESSED_SIG.get(bot):
+                                    _lxv_5v1x_event_cooldown(
+                                        key=f"real_close_duplicate_direct:{bot}:{int(ciclo or 0)}",
+                                        msg=f"⚠️ Cierre REAL duplicado detectado; pending conservado hasta cierre idempotente/incidente: {bot} C{int(ciclo or 0)}",
+                                        cooldown_s=15.0,
+                                    )
                                     continue
-
-                                LAST_REAL_CLOSE_SIG[bot] = sig
 
                                 if res in ("GANANCIA", "PÉRDIDA"):
                                     saldo_antes = obtener_valor_saldo()
@@ -27471,6 +27556,9 @@ async def main():
                                         agregar_evento(f"✅ REAL WIN: {bot} C{int(ciclo or 0)} -> DEMO | próximo ciclo C{prox}")
                                         cerrar_por_fin_de_ciclo(bot, "Ganancia REAL cerrada; vuelve a DEMO")
                                         _sync_round_release_after_real_close(bot, reason="real_win")
+                                        _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
+                                        LAST_REAL_CLOSE_SIG[bot] = sig
+                                        REAL_CLOSE_PROCESSED_SIG[bot] = sig
                                         activo_real = None
                                         break
                                     if res == "PÉRDIDA":
@@ -27481,6 +27569,9 @@ async def main():
                                             agregar_evento(f"❌ REAL LOSS: {bot} C{int(ciclo or 0)} -> DEMO | próximo ciclo C{prox}")
                                         cerrar_por_fin_de_ciclo(bot, f"Pérdida REAL C{int(ciclo or 0)}; vuelve a DEMO; próximo ciclo C{prox}")
                                         _sync_round_release_after_real_close(bot, reason="real_loss_next_cycle")
+                                        _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
+                                        LAST_REAL_CLOSE_SIG[bot] = sig
+                                        REAL_CLOSE_PROCESSED_SIG[bot] = sig
                                         activo_real = None
                                         break
 
