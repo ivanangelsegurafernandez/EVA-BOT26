@@ -11391,7 +11391,7 @@ def escribir_orden_real(bot: str, ciclo: int, round_id=None) -> bool:
                 bot=bot,
                 ciclo=int(ciclo),
                 source=str(globals().get("_REAL_ROUTE_SOURCE", "LEGACY") or "LEGACY"),
-                round_id=globals().get("SYNC_ROUND_ID", None),
+                round_id=round_id,
                 token_state=f"REAL:{bot}",
             )
         except Exception:
@@ -11424,6 +11424,40 @@ def _real_candidate_age_ok_lxv(pick: dict) -> bool:
     except Exception:
         return False
 
+
+def _resolver_round_id_ia_auto(embudo: dict | None = None) -> int:
+    """Round oficial para IA_AUTO: embudo/candidato -> SYNC_ROUND_ID -> state.json."""
+    def _as_positive_int(value) -> int:
+        try:
+            rid = int(value or 0)
+            return rid if rid > 0 else 0
+        except Exception:
+            return 0
+
+    try:
+        emb = embudo if isinstance(embudo, dict) else {}
+        for key in ("round_id", "round_closed_eval", "obj_round", "released_round"):
+            rid = _as_positive_int(emb.get(key))
+            if rid > 0:
+                return rid
+    except Exception:
+        pass
+
+    rid = _as_positive_int(globals().get("SYNC_ROUND_ID"))
+    if rid > 0:
+        return rid
+
+    try:
+        st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+        if isinstance(st, dict):
+            for key in ("round_id", "round_closed_eval", "obj_round", "released_round"):
+                rid = _as_positive_int(st.get(key))
+                if rid > 0:
+                    return rid
+    except Exception:
+        pass
+
+    return 0
 
 def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_id=None) -> bool:
     """
@@ -27495,10 +27529,13 @@ async def main():
                                     estado_bots[bot]["real_timeout_first_warn"] = ahora
                                     agregar_evento(f"⏱️ Seguridad: {bot} sin actividad reciente en REAL. Esperando cierre por {REAL_STUCK_FORCE_RELEASE_S}s antes de liberar.")
                                 elif (ahora - first_warn) > REAL_STUCK_FORCE_RELEASE_S:
-                                    agregar_evento(f"🧯 Timeout REAL en {bot}: sin cierre confirmado. Liberando a DEMO sin avanzar martingala.")
-                                    cerrar_por_fin_de_ciclo(bot, "Timeout sin cierre")
-                                    _sync_round_release_after_real_close(bot, reason="real_timeout")
-                                    activo_real = None
+                                    pending_timeout = REAL_CLOSE_PENDING.get(bot) if isinstance(REAL_CLOSE_PENDING.get(bot), dict) else {
+                                        "bot": bot,
+                                        "ciclo": estado_bots.get(bot, {}).get("ciclo_actual"),
+                                        "round_id": None,
+                                    }
+                                    _activar_real_close_incident_lock(bot, pending_timeout, reason="REAL_TIMEOUT_SIN_CIERRE_VALIDO")
+                                    agregar_evento("🚨 REAL_TIMEOUT_SIN_CIERRE_VALIDO: HOLD, no se libera sync")
                                     break
 
                     for bot in BOT_NAMES:
@@ -28024,11 +28061,14 @@ async def main():
                                     estado_bots[mejor_bot]["ia_senal_pendiente"] = True
                                     estado_bots[mejor_bot]["ia_prob_senal"] = prob
 
-                                    # Handoff entre ciclos REAL: si quedó lock residual de otro bot,
-                                    # liberarlo antes de emitir la nueva orden para no bloquear rotación.
+                                    # Handoff entre ciclos REAL: nunca autocerrar un owner residual.
+                                    # Una nueva REAL queda bloqueada hasta que exista cierre válido GANANCIA/PÉRDIDA.
                                     owner_prev = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
                                     if owner_prev and owner_prev != mejor_bot and ciclo_auto > 1:
-                                        cerrar_por_fin_de_ciclo(owner_prev, f"Handoff rotación C{ciclo_auto}→{mejor_bot}")
+                                        agregar_evento("⛔ IA_AUTO bloqueado: owner_prev activo/residual; requiere cierre válido antes de handoff")
+                                        estado_bots[mejor_bot]["ia_senal_pendiente"] = False
+                                        estado_bots[mejor_bot]["ia_prob_senal"] = None
+                                        continue
 
                                     age_ok = _real_candidate_age_ok({"edad_s": float(ev_lb or 0.0)})
                                     if not age_ok:
@@ -28039,7 +28079,8 @@ async def main():
                                         )
                                         ok_real = False
                                     else:
-                                        ok_real = emitir_real_autorizado(mejor_bot, ciclo_auto, source="IA_AUTO")
+                                        rid_auto = _resolver_round_id_ia_auto(emb)
+                                        ok_real = emitir_real_autorizado(mejor_bot, ciclo_auto, source="IA_AUTO", round_id=rid_auto)
                                     if ok_real:
                                         if estado_real == "SHADOW":
                                             try:
