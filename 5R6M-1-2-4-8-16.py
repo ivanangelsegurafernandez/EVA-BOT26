@@ -7540,10 +7540,19 @@ def render_ack_audit_panel(round_id_objetivo=None):
         if _print_once(f"ack_audit:{rid}:summary", ttl=12.0):
             mot_txt = ','.join(f"{k}:{v}" for k,v in sorted(motivos.items()))
             agregar_evento(f"ACK AUDIT #{rid}: {cerr}/{exp} válidos | faltan={','.join(faltan)} | motivos={mot_txt}")
-        lines.append(f"ALIGN: current=#{rid if rid>0 else '--'} | bots_current={align_current}/{exp} | behind={align_behind} | ahead={align_ahead}")
-        if behind_items:
-            lines.append(f"BEHIND: {', '.join(behind_items)}")
-        lines.append(f"resumen: ok={ok_n} expired={expired_n} stale={stale_n} mismatch={mismatch_n} missing={missing_n} max_age={max_age_s}s")
+        align_line = f"ALIGN: current=#{rid if rid>0 else '--'} | bots_current={align_current}/{exp} | behind={align_behind} | ahead={align_ahead}"
+        behind_line = f"BEHIND: {', '.join(behind_items[:4])}" if behind_items else ""
+        resumen_line = f"resumen: ok={ok_n} expired={expired_n} stale={stale_n} mismatch={mismatch_n} missing={missing_n} max_age={max_age_s}s"
+        if bool(globals().get("HUD_COMPACT_MODE", True)) or bool(globals().get("HUD_MINIMAL_MODE", True)):
+            compact = [f"🧾 ACK AUDIT ROUND #{rid if rid>0 else '--'} | {cerr}/{exp} válidos | dq={dq} | patrón={patron}", align_line]
+            if behind_line:
+                compact.append(behind_line)
+            compact.append(resumen_line)
+            return compact[:4]
+        lines.append(align_line)
+        if behind_line:
+            lines.append(behind_line)
+        lines.append(resumen_line)
         return lines[:10]
     except Exception:
         return lines
@@ -7650,10 +7659,13 @@ def render_real_locks_panel():
             row(f"Ronda: {str(round_show or '--')} | Bot: {str(p.get('bot') or '--')}"),
             row(f"Patrón: {str(patron_show or '--')} | Zona: {str(zona_show or '--')}"),
             "╠" + "═"*(W-2) + "╣",
-            row(ctext(Fore.WHITE, f"BLOQUEO PRINCIPAL: {falta}")),
-            row(ctext(Fore.GREEN if res_ok else Fore.RED, ("ESTADO FINAL: ✅ LISTO PARA REAL" if res_ok else f"ESTADO FINAL: ⛔ BLOQUEADO POR {falta}"))),
-            "╠" + "═"*(W-2) + "╣",
+            row(ctext(Fore.WHITE + Style.BRIGHT, f"BLOQUEO PRINCIPAL: {falta}")),
+            row(ctext((Fore.GREEN if res_ok else Fore.RED) + Style.BRIGHT, ("ESTADO FINAL: ✅ LISTO PARA REAL" if res_ok else f"ESTADO FINAL: ⛔ BLOQUEADO POR {falta}"))),
         ]
+        pre_ctx = _hud_pre_zona_verde_contexto() if callable(globals().get("_hud_pre_zona_verde_contexto")) else {}
+        if bool(pre_ctx.get("pre_zona", False)):
+            out.append(row(ctext(Fore.GREEN, f"PRE-ZONA VERDE: SI | falta columna 6/6 ({cerr_show}/{exp_show}) | REAL NO")))
+        out.append("╠" + "═"*(W-2) + "╣")
 
         groups = [
             (Fore.CYAN, "🔵 SINCRONIZACIÓN", ["REAL_CLOSE_LIBRE", "COLUMNA_COMPLETA", "DATA_QUALITY_OK"]),
@@ -21702,11 +21714,12 @@ def _hud_zona_operativa_lxv_line(width=None):
             v3_line = f" | 🧭 ZONA V3: OFF / sin influencia operativa | shadow_subzona={v3.get('subzona','--')} | shadow_allow={bool(v3.get('allow_real_v3',False))} | oficial={oficial}"
         else:
             v3_line = " | 🧭 ZONA V3: OFF / sin influencia operativa"
+        # HUD quirúrgico: la línea global queda compacta; el detalle visual/regional
+        # vive en el panel PRE-ZONA/ESTADO LXV para evitar ruido redundante.
         line_hud = (
-            f"{emoji} ZONA LXV HUD GLOBAL: ZONA OFICIAL REAL={zona} | DECISIÓN ZONA={decision} | MOTIVO={motivo} | FUENTE={zona_final.get('fuente_zona','LXV')} | "
-            f"rid_zona={rid_zona if rid_zona > 0 else '--'} | rid_live={rid_live if rid_live > 0 else '--'} | "
-            f"cols={cols_usadas}/{cols_req} | cerrados={cerrados}/{esperados} | patrón={patron_live} | dq={dq} | {g_hud} | prom3={prom3:.2f} prom8={prom8:.2f} prom20={prom20:.2f} d38={d38:+.2f} | "
-            f"prev_full={prev_full} | SUBZONA/VISUAL={zona_final.get('subzona','--')} | regional={reg_visual} | columna_visual={col_visual} | VISUAL/REGIONAL=SOLO_DIAGNOSTICO,NO_HABILITA_REAL | ronda_liberada_previa={ronda_previa} | source={source}{v3_line}"
+            f"{emoji} ZONA LXV HUD GLOBAL: oficial={zona} | decisión={decision} | motivo={_hud_trim(motivo, 42)} | "
+            f"cols={cols_usadas}/{cols_req} | cerrados={cerrados}/{esperados} | patrón={patron_live} | dq={dq} | "
+            f"columna_visual={_hud_trim(col_visual, 28)}"
         )
         gate = dict(globals().get("_LXV_LAST_REAL_GATE_INFO", {}) or {})
         rid_gate = int(gate.get("round_id", 0) or 0)
@@ -22017,7 +22030,10 @@ def render_estado_lxv_actual_panel(info_zona: dict, summary: dict, locks: dict |
         if str(dq).lower() == "closed_expired":
             final = "NO_INVERTIR | columna vencida/expirada | no se evalúa REAL"
         elif closed_count < expected_count:
-            final = "NO_INVERTIR_AÚN | columna oficial incompleta"
+            if str(reg_z).startswith("VERDE") or str(zona_visual_txt).startswith("VERDE"):
+                final = "NO_INVERTIR_AÚN | PRE-ZONA VERDE: falta columna oficial 6/6"
+            else:
+                final = "NO_INVERTIR_AÚN | columna oficial incompleta"
         elif not patron_real_valido:
             final = "NO_INVERTIR | patrón no invertible"
         elif oficial_bloquea:
@@ -22576,6 +22592,126 @@ def mostrar_panel_lateral_compacto():
     ]
 
 
+
+def _hud_pre_zona_verde_contexto() -> dict:
+    """Contexto visual para el panel PRE-ZONA; no habilita ni bloquea REAL."""
+    try:
+        info = obtener_zona_lxv_hud_actual() or {}
+        if not isinstance(info, dict):
+            info = {}
+        zf = resolver_zona_final_lxv(round_id_objetivo=info.get("round_id"), zona_info_previa=info)
+        zf = zf if isinstance(zf, dict) else {}
+        ss = dict(globals().get("_ACK_LIVE_SUMMARY", {}) or {})
+        cerrados = int(ss.get("closed_count", info.get("cerrados", 0)) or 0)
+        esperados = int(ss.get("expected_count", info.get("esperados", len(BOT_NAMES))) or len(BOT_NAMES) or 6)
+        dq = str(ss.get("data_quality", info.get("data_quality", "missing")) or "missing").strip().lower()
+        patron = str(ss.get("partial_pattern", info.get("patron_live", "0V0X")) or "0V0X").strip().upper()
+        zona = str(zf.get("zona_base", info.get("zona", "UNKNOWN")) or "UNKNOWN").strip().upper()
+        decision = str(zf.get("decision", info.get("decision", ZONA_NO_INVERTIR)) or ZONA_NO_INVERTIR).strip().upper()
+        allow_real = bool(zf.get("allow_real", False)) and zona in set(globals().get("LXV_ZONAS_INVERTIBLES", {"VERDE_TEMPRANO", "VERDE_MADURO"})) and decision == "SI_INVERTIR"
+        zv_info = info.get("zona_visual_info", {}) if isinstance(info.get("zona_visual_info", {}), dict) else {}
+        zrt_info = info.get("zona_regional_temprana_info", {}) if isinstance(info.get("zona_regional_temprana_info", {}), dict) else {}
+        columna_visual = str(zv_info.get("zona_visual", info.get("visual_hint", "--")) or "--").strip().upper()
+        regional = str(zrt_info.get("zona_regional_temprana", info.get("visual_hint", "--")) or "--").strip().upper()
+        prom3 = float(zrt_info.get("prom3", info.get("prom3", 0.0)) or 0.0)
+        prom8 = float(zrt_info.get("prom8", info.get("prom8", 0.0)) or 0.0)
+        g_val = info.get("g_actual", info.get("green_ratio", None))
+        try:
+            g_regional = float(g_val) if g_val is not None else float(_calcular_g_columna_parcial(patron))
+        except Exception:
+            g_regional = 0.0
+        visual_verde = any(tok in columna_visual for tok in ("VERDE", "PRE_ZONA")) or any(tok in regional for tok in ("VERDE", "PRE_ZONA"))
+        metricas_verdes = (g_regional >= 0.70) or (prom3 >= 0.70) or (prom8 >= 0.65)
+        columna_incompleta = bool(cerrados < esperados or dq != "ok")
+        pre_zona = bool((not allow_real) and columna_incompleta and (visual_verde or metricas_verdes))
+        if allow_real:
+            estado = "ZONA_VERDE_OFICIAL_ACTIVA"
+        elif pre_zona:
+            estado = "VERDE_EN_FORMACION"
+        else:
+            estado = "SIN_PRE_ZONA_VERDE"
+        motivo_parts = []
+        if cerrados < esperados:
+            motivo_parts.append("columna incompleta")
+        if dq != "ok":
+            motivo_parts.append("bots desalineados" if dq in ("missing", "partial", "mixed_rounds", "round_mismatch") else f"dq={dq}")
+        if not motivo_parts:
+            motivo_parts.append(str(zf.get("motivo", info.get("motivo", "--")) or "--"))
+        return {
+            "pre_zona": pre_zona,
+            "oficial_activa": allow_real,
+            "estado": estado,
+            "zona": zona,
+            "decision": decision,
+            "g_regional": g_regional,
+            "prom3": prom3,
+            "prom8": prom8,
+            "cerrados": cerrados,
+            "esperados": esperados,
+            "dq": dq,
+            "patron": patron,
+            "columna_visual": columna_visual,
+            "motivo": " / ".join(motivo_parts),
+        }
+    except Exception as e:
+        return {"pre_zona": False, "oficial_activa": False, "estado": "SIN_PRE_ZONA_VERDE", "motivo": f"hud_error:{type(e).__name__}"}
+
+
+def render_pre_zona_verde_panel() -> list[str]:
+    """Panel superior informativo; solo presenta señales ya existentes del HUD."""
+    try:
+        ctx = _hud_pre_zona_verde_contexto()
+        W = 58
+        def row(txt):
+            return "║ " + _hud_fit(str(txt), W-4).ljust(W-4) + " ║"
+        if ctx.get("oficial_activa"):
+            title = _c_ok("🟢 ZONA VERDE OFICIAL ACTIVA")
+            real_line = "REAL: evaluable por candados oficiales"
+            action = "Acción: VALIDAR CANDADOS REAL"
+            motivo = f"zona={ctx.get('zona','--')} | decisión={ctx.get('decision','--')}"
+        elif ctx.get("pre_zona"):
+            title = _c_ok("🟢 PRE-ZONA VERDE DETECTADA")
+            real_line = _c_warn("REAL: NO HABILITADO TODAVÍA")
+            action = "Acción: ESPERAR COLUMNA OFICIAL 6/6"
+            motivo = f"Motivo: {ctx.get('motivo','columna incompleta / bots desalineados')}"
+        else:
+            title = _c_dim("⚪ SIN PRE-ZONA VERDE")
+            real_line = "REAL: esperando evidencia visual/regional"
+            action = "Acción: MONITOREAR"
+            motivo = f"Motivo: {ctx.get('motivo','sin contexto verde')}"
+        return [
+            "╔" + "═"*(W-2) + "╗",
+            row(title),
+            row(f"Estado: {ctx.get('estado','--')}"),
+            row(f"g_regional={float(ctx.get('g_regional',0.0) or 0.0):.2f} | prom3={float(ctx.get('prom3',0.0) or 0.0):.2f} | prom8={float(ctx.get('prom8',0.0) or 0.0):.2f}"),
+            row(action),
+            row(real_line),
+            row(motivo),
+            "╚" + "═"*(W-2) + "╝",
+        ]
+    except Exception:
+        return []
+
+
+def _hud_print_side_by_side(left_lines: list[str], right_lines: list[str], padding: str = "", gap: str = "  ") -> None:
+    try:
+        left = list(left_lines or [])
+        right = list(right_lines or [])
+        if not right:
+            for line in left:
+                print(padding + line)
+            return
+        left_w = max((len(_ack_tape_strip_ansi(x)) for x in left), default=0)
+        n = max(len(left), len(right))
+        for i in range(n):
+            l = left[i] if i < len(left) else ""
+            r = right[i] if i < len(right) else ""
+            pad_len = max(0, left_w - len(_ack_tape_strip_ansi(l)))
+            print(padding + l + (" " * pad_len) + gap + r)
+    except Exception:
+        for line in list(left_lines or []):
+            print(padding + line)
+
 def mostrar_bloque_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--", padding=""):
     def _render_hud_balance_header(saldo_v, meta_v, falta_v, avance_v, modo_v, token_v, refresh_v):
         saldo_tag = f"SALDO={saldo_v}"
@@ -22593,11 +22729,13 @@ def mostrar_bloque_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--
             l1_col = l1_plain
             l2_col = l2_plain
             l3_col = f"  FALTA={falta_v}    AVANCE={avance_v}    R={refresh_v}"
-        print(padding + Fore.CYAN + hud_border_top(w))
-        print(padding + Fore.CYAN + hud_box_line(hud_pad(l1_col, w), w))
-        print(padding + Fore.CYAN + hud_box_line(hud_pad(l2_col, w), w))
-        print(padding + Fore.CYAN + hud_box_line(hud_pad(l3_col, w), w))
-        print(padding + Fore.CYAN + hud_border_bottom(w))
+        return [
+            Fore.CYAN + hud_border_top(w),
+            Fore.CYAN + hud_box_line(hud_pad(l1_col, w), w),
+            Fore.CYAN + hud_box_line(hud_pad(l2_col, w), w),
+            Fore.CYAN + hud_box_line(hud_pad(l3_col, w), w),
+            Fore.CYAN + hud_border_bottom(w),
+        ]
 
     try:
         owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
@@ -22613,10 +22751,11 @@ def mostrar_bloque_saldo_meta_hud(valor_saldo=None, saldo_str="--", meta_str="--
             den = float(meta_num - base_num)
             if abs(den) > 1e-12:
                 avance_txt = f"{max(0.0, min(100.0, ((saldo_num - base_num) / den) * 100.0)):.1f}%"
-        _render_hud_balance_header(
+        balance_panel = _render_hud_balance_header(
             saldo_v=str(saldo_str), meta_v=str(meta_str), falta_v=falta_txt, avance_v=avance_txt,
             modo_v=modo_txt, token_v=token_txt, refresh_v=eta_txt
         )
+        _hud_print_side_by_side(balance_panel, render_pre_zona_verde_panel(), padding=padding)
         # Línea secundaria: Base/Objetivo/Estado/Marti/Cobertura (mantiene trazabilidad existente)
         lines = _resumen_saldo_meta_hud(valor_saldo=valor_saldo, saldo_str=saldo_str, meta_str=meta_str)
         src2 = str(lines[1] if len(lines) > 1 else "")
@@ -24188,12 +24327,25 @@ def mostrar_eventos():
         if bool(globals().get("HUD_MARTI_CLEAN_LAYOUT", True)):
             filtered = []
             skip_tokens = ("ia audit tick", "orphan_rate", "why=", "gate=", "trigger=", "lxv audit", "fase_zv")
+            noisy_groups = {"round_mismatch": 0, "sync wait": 0, "canonical round not ready": 0}
             for ev in raw_events:
                 low = str(ev or "").lower()
                 if any(tok in low for tok in skip_tokens):
                     continue
+                grouped = False
+                for key in tuple(noisy_groups.keys()):
+                    if key in low:
+                        noisy_groups[key] += 1
+                        grouped = True
+                        if noisy_groups[key] > 1:
+                            break
+                else:
+                    pass
+                if grouped and any(key in low and noisy_groups[key] > 1 for key in noisy_groups):
+                    continue
                 filtered.append(ev)
-            raw_events = filtered[-max_ev:]
+            condensados = [f"[{time.strftime('%H:%M:%S')}] sync resumido: {k} x{v}" for k, v in noisy_groups.items() if v > 1]
+            raw_events = (filtered + condensados)[-max_ev:]
         else:
             raw_events = raw_events[-max_ev:]
         max_chars = 90 if bool(globals().get("HUD_MARTI_CLEAN_LAYOUT", True)) else HUD_EVENT_MAX_CHARS
