@@ -4921,6 +4921,77 @@ def _round_live_estado_display(row: dict) -> str:
             return "estado_error"
 
 
+
+def _lxv_prob_ia_valida(v):
+    try:
+        x = float(v)
+        return x if math.isfinite(x) else None
+    except Exception:
+        return None
+
+
+def _lxv_4v2x_hud_ready_line(round_id: int, rows: list | None = None) -> str:
+    """Renderiza 4V2X con el mismo candidato/fuente que usa la ruta REAL."""
+    candidate = None
+    try:
+        round_row, feat_row = _lxv_5v1x_get_exported_rows(int(round_id or 0))
+        candidate = _lxv_4v2x_candidate_from_round(round_row, feat_row)
+    except Exception:
+        candidate = None
+
+    c = candidate if isinstance(candidate, dict) else {}
+    x_bots = [str(x or "").strip() for x in list(c.get("x_bots_4v2x", []) or []) if str(x or "").strip()]
+    x_probs = c.get("x_probs_4v2x", {}) if isinstance(c.get("x_probs_4v2x", {}), dict) else {}
+
+    if len(x_bots) == 2 and all(b in BOT_NAMES for b in x_bots):
+        p1 = _lxv_prob_ia_valida(x_probs.get(x_bots[0]))
+        p2 = _lxv_prob_ia_valida(x_probs.get(x_bots[1]))
+        if p1 is not None and p2 is not None:
+            bot_pick = x_bots[0] if p1 <= p2 else x_bots[1]
+            val_pick = p1 if bot_pick == x_bots[0] else p2
+            return f"🎯 4V2X listo: X menor Prob IA={bot_pick} valor={_lxv_fmt_prob_pct(val_pick)}"
+        bot_fallback = str(c.get("bot_x_debil") or "").strip()
+        if bot_fallback in x_bots:
+            return f"🎯 4V2X listo: X={bot_fallback} fallback sin Prob IA completa"
+
+    rojos_rows = []
+    for row in list(rows or []):
+        if not isinstance(row, dict):
+            continue
+        b = str(row.get("bot") or "").strip()
+        if not (b in BOT_NAMES and bool(row.get("is_current")) and str(row.get("res")) == "X"):
+            continue
+        p = None
+        for key in ("prob_ia_oper", "prob_ia", "p_real"):
+            p = _lxv_prob_ia_valida(row.get(key))
+            if p is not None:
+                break
+        rojos_rows.append({
+            "bot": b,
+            "prob_ia_oper": p,
+            "prob_ia": p,
+            "p_real": p,
+            "score_senal": row.get("score_senal", row.get("score")),
+            "payout": row.get("payout"),
+            "winrate": row.get("winrate", row.get("porcentaje_exito")),
+            "ts": row.get("ts_round", row.get("ts", 0.0)),
+        })
+
+    if len(rojos_rows) == 2:
+        probs = [_lxv_prob_ia_valida(r.get("prob_ia_oper", r.get("prob_ia"))) for r in rojos_rows]
+        if all(p is not None for p in probs):
+            pick = _lxv_pick_bot_x_debil(rojos_rows)
+            bot_pick = str((pick or {}).get("bot") or "").strip()
+            val_pick = _lxv_prob_ia_valida((pick or {}).get("prob_ia_oper", (pick or {}).get("prob_ia")))
+            if bot_pick in BOT_NAMES and val_pick is not None:
+                return f"🎯 4V2X listo: X menor Prob IA={bot_pick} valor={_lxv_fmt_prob_pct(val_pick)}"
+        bot_fallback = str(c.get("bot_x_debil") or rojos_rows[0].get("bot") or "").strip()
+        if bot_fallback in BOT_NAMES:
+            return f"🎯 4V2X listo: X={bot_fallback} fallback sin Prob IA completa"
+
+    return "🎯 4V2X listo: X pendiente de datos IA"
+
+
 def _ack_live_format_lines(snapshot):
     pref = _sync_round_get_summary_preferente(max_age_s=120.0, rebuild_rows=True)
     rows_pack = pref.get("rows_pack", {})
@@ -5074,11 +5145,7 @@ def _ack_live_format_lines(snapshot):
             pattern_msg = "PATRÓN LXV: 5V1X | CANDIDATO_REAL"
             lines.append(fase_line)
         elif parcial_txt == "4V2X":
-            x_bots = [str(r.get("bot") or "") for r in rows if bool(r.get("is_current")) and str(r.get("res")) == "X"]
-            rojos_rows = [{"bot": b} for b in x_bots if b in BOT_NAMES]
-            pick = _lxv_pick_bot_x_debil(rojos_rows) if rojos_rows else None
-            bot_pick = str((pick or {}).get("bot", "") or (x_bots[0] if x_bots else "-"))
-            lines.append(f"🎯 4V2X listo: X menor Prob IA={bot_pick}")
+            lines.append(_lxv_4v2x_hud_ready_line(obj_round, rows))
             pattern_msg = "PATRÓN LXV: 4V2X | CANDIDATO_REAL"
             lines.append(fase_line)
         elif parcial_txt == "6V0X":
@@ -10801,14 +10868,33 @@ def _sync_round_tick_maestro():
             motivo_no_release = hold_status
         elif any(str(sync_debug_missing.get(bot, "")).strip() == "pending_contract_resolution" for bot in BOT_NAMES):
             motivo_no_release = "pending_contract_resolution"
+        elif _real_close_incident_active():
+            motivo_no_release = "real_close_incident_lock"
         elif _hay_real_close_pending_activo()[0]:
             motivo_no_release = "real_close_pending"
-            _sync_round_hard_hold_real_pending(round_id, released_round, real_close_pending_bot, real_close_pending_data, st)
-            return
-        elif (not real_emitido) and str(payload.get("released_round", round_id)) == str(round_id):
-            motivo_no_release = "write_state_failed"
+        else:
+            order_on, order_bot = _sync_real_order_viva_any()
+            real_on, real_bot, real_motivo = _sync_real_turn_activo()
+            try:
+                token_raw_now = str(_read_token_file_raw() or "").strip()
+            except Exception:
+                token_raw_now = ""
+            owner_lock_now = str(globals().get("REAL_OWNER_LOCK") or "").strip()
+            if order_on:
+                motivo_no_release = f"orden_real_viva:{order_bot or 'unknown'}"
+            elif real_on:
+                motivo_no_release = f"hold_real_activo:{real_bot or real_motivo or 'unknown'}"
+            elif _token_real_ocupado(token_raw_now):
+                motivo_no_release = "token_real_ocupado"
+            elif owner_lock_now:
+                motivo_no_release = f"owner_residual:{owner_lock_now}"
+            elif (not real_emitido) and str(payload.get("released_round", round_id)) == str(round_id):
+                motivo_no_release = "write_state_failed"
         if motivo_no_release:
-            agregar_evento(f"⛔ TURBO_SYNC_NO_RELEASE: ronda #{round_id} 6/6 pero bloqueado por {motivo_no_release}")
+            agregar_evento(f"⛔ SYNC invariant recovery bloqueado: {motivo_no_release}; no se libera ronda")
+            if motivo_no_release in ("real_close_pending", "real_close_incident_lock"):
+                _sync_round_hard_hold_real_pending(round_id, released_round, real_close_pending_bot, real_close_pending_data, st)
+            return
         agregar_evento("🧯 SYNC invariant recovery: completed=True sin HOLD/RELEASE; liberando next_round")
         _sync_round_release_next_round(round_id, "sync_invariant_completed_no_release")
         return
