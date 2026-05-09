@@ -3127,6 +3127,8 @@ LXV_SYNC_ROUND_MAX_WAIT_S = 90.0
 LXV_SYNC_BOT_STALE_S = 60.0
 LXV_SYNC_PENDING_MAX_WAIT_S = 90.0
 LXV_SYNC_MIN_CLOSED_FOR_EVAL = 4
+ROUND_BEHIND_REJOIN_WARN_S = 90.0
+LAST_ROUND_ALIGNMENT_DIAG = {}
 SYNC_TURBO_WATCHER_ENABLE = True
 SYNC_TURBO_WATCHER_INTERVAL_S = 0.20
 SYNC_TURBO_WATCHER_LOG_COOLDOWN_S = 5.0
@@ -5258,8 +5260,29 @@ def _ack_live_format_lines(snapshot):
         min_txt = f"{int(max(0.0, float(min_lag_s)))}s" if isinstance(min_lag_s, (int, float)) else "--"
         max_txt = f"{int(max(0.0, float(max_lag_s)))}s" if isinstance(max_lag_s, (int, float)) else "--"
         lines.append(f"FRESCURA ACK: expired={exp_cnt}/{expected_count} | max_age={max_txt} | min_age={min_txt} | motivo=closed_expired")
+    try:
+        diag_hud = _round_alignment_diag_from_summary(summary, rows_pack=None)
+        if isinstance(diag_hud, dict):
+            globals()["LAST_ROUND_ALIGNMENT_DIAG"] = dict(diag_hud)
+            if (not bool(diag_hud.get("ok", False))) or bool(diag_hud.get("mixed_rounds", False)) or diag_hud.get("behind"):
+                print_rate_limited(
+                    f"HUD_HISTORIAL_VISUAL_NO_OFICIAL:{diag_hud.get('best_round')}:{diag_hud.get('reason')}",
+                    "HISTORIAL VISUAL ≠ COLUMNA OFICIAL",
+                    ttl=10.0,
+                )
+            lines.extend(_format_round_alignment_panel(diag_hud))
+    except Exception:
+        pass
     parcial_txt = _lxv_normalizar_patron_txt(summary.get("partial_pattern", "0V0X")) or "0V0X"
-    columna_lista = bool(closed_count >= expected_count and faltan_count <= 0 and dq_txt == "ok")
+    diag_columna = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+    columna_lista = bool(
+        closed_count >= expected_count
+        and faltan_count <= 0
+        and dq_txt == "ok"
+        and isinstance(diag_columna, dict)
+        and bool(diag_columna.get("ok", False))
+        and int(diag_columna.get("canonical_round") or -1) == int(obj_round)
+    )
     if fresh_count < expected_count:
         lines.append("⏳ REAL NO EVALUADO:")
         lines.append(f"   columna_oficial={closed_count}/{expected_count}")
@@ -7330,6 +7353,13 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
         _real_lock_set("DATA_QUALITY_OK", dq_ok, f"dq={data_quality}")
         _real_lock_set("PATRON_VALIDO", str(patron) in ("4V2X", "5V1X"), patron)
         _real_lock_set("COLUMNA_COMPLETA", bool(round_complete), f"round_complete={bool(round_complete)}")
+        diag_panel_align = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+        if isinstance(diag_panel_align, dict) and (not bool(diag_panel_align.get("ok", False))):
+            _round_alignment_apply_real_block(
+                diag_panel_align,
+                reason_prefix="MIXED_ROUNDS" if bool(diag_panel_align.get("mixed_rounds", False)) else "COLUMNA_INCOMPLETA",
+            )
+            round_complete = False
         zona_ok, zona_reason = _lxv_zona_es_invertible(zi)
         info_regional = clasificar_zona_regional_dominante_lxv(round_id_objetivo=round_id)
         patron_ok = str(patron) in ("4V2X", "5V1X")
@@ -7366,7 +7396,12 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
             cand_ok = True
             if not ci.get("reason"):
                 ci["reason"] = f"{str(patron)}_bot_candidato_ok"
+        if isinstance(diag_panel_align, dict) and (not bool(diag_panel_align.get("ok", False))):
+            cand_ok = False
+            ci["reason"] = "columna_oficial_incompleta_mixed_rounds" if bool(diag_panel_align.get("mixed_rounds", False)) else "columna_oficial_incompleta"
         _real_lock_set("CANDIDATO_VALIDO", cand_ok, str(ci.get("reason", "")))
+        if isinstance(diag_panel_align, dict) and (not bool(diag_panel_align.get("ok", False))):
+            order_status = False
         _real_lock_set("ORDEN_REAL_OK", order_status if order_status in (True, False, None) else None, "")
         real_activo, motivo_real_activo = hay_real_activo_global()
         if real_activo:
@@ -7447,7 +7482,16 @@ def actualizar_real_locks_panel_desde_round_live():
         expected_count = int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
         dq = _dq_oficial_lxv(summary)
         partial = _lxv_normalizar_patron_txt(summary.get("partial_pattern", "0V0X")) or "0V0X"
-        round_complete = bool(closed_count == expected_count and expected_count > 0)
+        diag_live_align = _round_alignment_diag_from_summary(summary, rows_pack=rows_pack)
+        if isinstance(diag_live_align, dict):
+            globals()["LAST_ROUND_ALIGNMENT_DIAG"] = dict(diag_live_align)
+        round_complete = bool(
+            closed_count == expected_count
+            and expected_count > 0
+            and isinstance(diag_live_align, dict)
+            and bool(diag_live_align.get("ok", False))
+            and int(diag_live_align.get("canonical_round") or -1) == int(rid)
+        )
         if bool(pref.get("canonical")) and round_complete and str(dq) == "ok":
             round_complete = True
         zi = resolver_zona_lxv_para_round_live(
@@ -7466,7 +7510,7 @@ def actualizar_real_locks_panel_desde_round_live():
             and current_candidato_ok
             and ((time.time() - current_updated_ts) <= 20.0)
         )
-        if fresh_real_candidate:
+        if fresh_real_candidate and round_complete:
             zi_norm = resolver_zona_final_lxv(round_id_objetivo=rid if rid > 0 else None, zona_info_previa=zi if isinstance(zi, dict) else None)
             zona_ok_live, _zona_reason_live = _lxv_zona_es_invertible(zi_norm)
             p["round_id"] = rid
@@ -9807,6 +9851,308 @@ def _sync_round_collect_closed_acks_any_round(target_round: int) -> tuple[dict, 
         reasons[bot] = "ok"
     return closed, reasons
 
+
+def _normalizar_ack_demo_cerrado_para_alineacion(bot, ack, now_ts=None):
+    """Valida un ACK cerrado DEMO/SYNC sin efectos laterales; nunca lanza excepción."""
+    try:
+        if not isinstance(ack, dict):
+            return None, "ack_missing"
+        if bool(ack.get("pending_contract_resolution", False)):
+            return None, "pending_contract_resolution"
+        try:
+            ack_round = int(ack.get("round_id", 0) or 0)
+        except Exception:
+            ack_round = 0
+        if ack_round <= 0:
+            return None, "round_invalid"
+        status = str(ack.get("status", "")).strip().lower()
+        if status != "closed":
+            return None, f"status_no_closed_{status or 'empty'}"
+        ack_mode = str(ack.get("mode", "") or "").strip().upper()
+        ack_source = str(ack.get("source", "") or "").strip().upper()
+        if ack_mode == "REAL" or ack_source in ("ORDEN_REAL", "REAL", "REAL_ORDER"):
+            return None, "ack_real_ignored"
+        if ack_mode not in ("DEMO", "SYNC", "") and ack_source not in ("SYNC_DEMO", "DEMO", "LXV_SYNC", "SYNC"):
+            return None, "ack_mode_source_invalid"
+        resultado = str(ack.get("resultado", "") or "").strip().upper()
+        if resultado in ("PERDIDA", "PÉRDIDA", "LOSS", "X", "✗"):
+            resultado = "PÉRDIDA"
+        elif resultado in ("GANANCIA", "WIN", "✓"):
+            resultado = "GANANCIA"
+        if resultado not in ("GANANCIA", "PÉRDIDA"):
+            return None, f"resultado_invalid_{resultado or 'empty'}"
+        now = float(now_ts if now_ts is not None else time.time())
+        try:
+            ack_ts = float(_sync_ack_effective_ts(ack) or 0.0)
+        except Exception:
+            ack_ts = 0.0
+        if ack_ts <= 0:
+            return None, "ts_missing"
+        age = now - ack_ts
+        if age > float(TTL_ACK_SYNC_ROUND_S):
+            return None, f"ack_stale_age={age:.1f}"
+        if ack_ts > (now + float(ACK_SYNC_ROUND_FUTURE_DRIFT_S)):
+            return None, "ack_future"
+        return {
+            "resultado": resultado,
+            "ts": ack_ts,
+            "close_ts": _sync_ack_close_ts(ack),
+            "heartbeat_ts": _sync_ack_heartbeat_ts(ack),
+            "contract_id": ack.get("contract_id"),
+            "asset": ack.get("asset"),
+            "ciclo": ack.get("ciclo"),
+            "round_id": int(ack_round),
+            "mode": ack_mode,
+            "source": ack_source,
+            "bot": str(bot or ""),
+        }, "ok"
+    except Exception as e:
+        try:
+            return None, f"ack_validate_exception_{type(e).__name__}"
+        except Exception:
+            return None, "ack_validate_exception"
+
+
+def diagnosticar_alineacion_rounds(acks_por_bot=None, released_round=None, expected_bots=None):
+    """
+    Diagnóstico central 6/6: HISTORIAL VISUAL ≠ COLUMNA OFICIAL.
+    Solo ACKs válidos cerrados DEMO/SYNC de la misma ronda forman columna oficial.
+    No compra, no libera, no escribe token, no inventa ACK/resultados y nunca lanza excepción.
+    """
+    out = {
+        "ok": False,
+        "canonical_round": None,
+        "best_round": None,
+        "closed": 0,
+        "expected": 0,
+        "missing": [],
+        "behind": {},
+        "ahead": {},
+        "mixed_rounds": False,
+        "reason": "init",
+        "bots_by_round": {},
+        "oldest_round": None,
+        "newest_round": None,
+    }
+    try:
+        expected = [b for b in (expected_bots if isinstance(expected_bots, (list, tuple, set)) and expected_bots else BOT_NAMES) if b in BOT_NAMES]
+        if not expected:
+            expected = list(BOT_NAMES)
+        out["expected"] = int(len(expected))
+        now_ts = float(time.time())
+        valid_by_round = {}
+        reasons = {}
+        acks_src = acks_por_bot if isinstance(acks_por_bot, dict) else None
+        for bot in expected:
+            try:
+                ack = acks_src.get(bot) if isinstance(acks_src, dict) else _sync_round_safe_read_json(_sync_round_ack_path(bot))
+                valid, reason = _normalizar_ack_demo_cerrado_para_alineacion(bot, ack, now_ts=now_ts)
+                reasons[bot] = reason
+                if not isinstance(valid, dict):
+                    continue
+                rid = int(valid.get("round_id", 0) or 0)
+                valid_by_round.setdefault(rid, {})[bot] = valid
+            except Exception as e:
+                try:
+                    reasons[bot] = f"bot_exception_{type(e).__name__}"
+                except Exception:
+                    pass
+                continue
+        bots_by_round = {int(r): sorted(list(d.keys())) for r, d in valid_by_round.items() if isinstance(d, dict)}
+        out["bots_by_round"] = bots_by_round
+        rounds = sorted(int(r) for r in valid_by_round.keys() if int(r) > 0)
+        if rounds:
+            out["oldest_round"] = int(rounds[0])
+            out["newest_round"] = int(rounds[-1])
+        best_round = None
+        best_closed = 0
+        for rr, dd in valid_by_round.items():
+            cc = len(dd) if isinstance(dd, dict) else 0
+            if best_round is None or cc > best_closed or (cc == best_closed and int(rr) > int(best_round)):
+                best_round = int(rr)
+                best_closed = int(cc)
+        out["best_round"] = best_round
+        out["closed"] = int(best_closed or 0)
+        expected_n = int(out["expected"] or 0)
+        full_rounds = [int(r) for r, d in valid_by_round.items() if isinstance(d, dict) and len(d) >= expected_n and expected_n > 0]
+        if full_rounds:
+            canonical = sorted(full_rounds)[-1]
+            out["ok"] = True
+            out["canonical_round"] = int(canonical)
+            out["best_round"] = int(canonical)
+            out["closed"] = expected_n
+            out["reason"] = "ok"
+            out["mixed_rounds"] = False
+            out["missing"] = []
+            out["behind"] = {}
+            out["ahead"] = {}
+            return out
+        valid_bots = set()
+        for dd in valid_by_round.values():
+            if isinstance(dd, dict):
+                valid_bots.update(dd.keys())
+        out["missing"] = [b for b in expected if b not in valid_bots]
+        if best_round is not None:
+            for rr, dd in valid_by_round.items():
+                for bot in (dd.keys() if isinstance(dd, dict) else []):
+                    if int(rr) < int(best_round):
+                        out["behind"][bot] = int(rr)
+                    elif int(rr) > int(best_round):
+                        out["ahead"][bot] = int(rr)
+        out["mixed_rounds"] = bool(len(rounds) > 1)
+        if out["mixed_rounds"]:
+            out["reason"] = "mixed_rounds"
+        elif out["missing"] and best_closed > 0:
+            out["reason"] = "incomplete"
+        elif out["missing"]:
+            out["reason"] = "missing"
+        else:
+            out["reason"] = "incomplete"
+        return out
+    except Exception as e:
+        try:
+            out["reason"] = f"diagnostic_exception_{type(e).__name__}"
+        except Exception:
+            pass
+        return out
+
+
+def _round_alignment_diag_from_summary(summary=None, rows_pack=None):
+    try:
+        ss = summary if isinstance(summary, dict) else {}
+        closed = ss.get("closed_bots") or ss.get("closed") or None
+        if isinstance(closed, dict) and closed:
+            rid = int(ss.get("round_closed_eval", ss.get("round_id", ss.get("obj_round", 0))) or 0)
+            closed_norm = {}
+            for b, row in closed.items():
+                rr = dict(row) if isinstance(row, dict) else {}
+                if rid > 0 and int(rr.get("round_id", 0) or 0) <= 0:
+                    rr["round_id"] = rid
+                closed_norm[b] = rr
+            return diagnosticar_alineacion_rounds(closed_norm, released_round=ss.get("released_round"), expected_bots=BOT_NAMES)
+        return diagnosticar_alineacion_rounds(released_round=ss.get("released_round"), expected_bots=BOT_NAMES)
+    except Exception:
+        return diagnosticar_alineacion_rounds(expected_bots=BOT_NAMES)
+
+
+def _format_round_alignment_panel(diag=None):
+    lines = []
+    try:
+        d = diag if isinstance(diag, dict) else (globals().get("LAST_ROUND_ALIGNMENT_DIAG") if isinstance(globals().get("LAST_ROUND_ALIGNMENT_DIAG"), dict) else {})
+        if not isinstance(d, dict) or not d:
+            return lines
+        W = 60
+        def row(txt):
+            body = str(txt)[:W-4]
+            return "║ " + body.ljust(W-4) + " ║"
+        lines.append("╔" + "═"*(W-2) + "╗")
+        lines.append(row("🧷 ALINEACIÓN DE COLUMNA"))
+        expected = int(d.get("expected", len(BOT_NAMES)) or len(BOT_NAMES))
+        if bool(d.get("ok", False)):
+            cr = d.get("canonical_round")
+            lines.append(row("Estado      : OK 6/6"))
+            lines.append(row(f"Ronda       : #{cr if cr is not None else '--'}"))
+            lines.append(row("Acción      : EVALUAR_PATRÓN_LXV"))
+        else:
+            state = "MIXED_ROUNDS" if bool(d.get("mixed_rounds", False)) else str(d.get("reason", "INCOMPLETA") or "INCOMPLETA").upper()
+            br = d.get("best_round")
+            lines.append(row(f"Estado      : {state}"))
+            lines.append(row(f"Best round  : #{br if br is not None else '--'} | cerrados={int(d.get('closed', 0) or 0)}/{expected}"))
+            behind = d.get("behind") if isinstance(d.get("behind"), dict) else {}
+            if behind:
+                behind_txt = ", ".join(f"{b}=#{r}" for b, r in list(behind.items())[:4])
+                if len(behind) > 4:
+                    behind_txt += f", +{len(behind)-4}"
+                lines.append(row(f"Behind      : {behind_txt}"))
+            elif d.get("missing"):
+                lines.append(row(f"Missing     : {', '.join(list(d.get('missing') or [])[:4])}"))
+            lines.append(row("Acción      : ESPERAR_REJOIN_SEGURO | REAL bloqueado"))
+        lines.append("╚" + "═"*(W-2) + "╝")
+    except Exception:
+        return []
+    return lines
+
+
+def _round_alignment_apply_real_block(diag=None, reason_prefix="COLUMNA_INCOMPLETA"):
+    try:
+        d = diag if isinstance(diag, dict) else globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+        if not isinstance(d, dict) or bool(d.get("ok", False)):
+            return False
+        p = globals().get("REAL_LOCKS_PANEL", {})
+        if not isinstance(p, dict):
+            return True
+        locks = p.setdefault("locks", {})
+        locks["COLUMNA_COMPLETA"] = False
+        locks["CANDIDATO_VALIDO"] = False
+        locks["ORDEN_REAL_OK"] = False
+        p["ready_pre_real"] = False
+        reason = "MIXED_ROUNDS" if bool(d.get("mixed_rounds", False)) else str(reason_prefix or "COLUMNA_INCOMPLETA")
+        p["falta_principal"] = f"COLUMNA_INCOMPLETA / {reason}" if reason != "COLUMNA_INCOMPLETA" else "COLUMNA_INCOMPLETA"
+        p["resultado"] = f"BLOQUEADO POR {reason}"
+        p["diag_visual"] = "SOLO_DIAGNÓSTICO | NO_HABILITA_REAL | HISTORIAL VISUAL ≠ COLUMNA OFICIAL"
+        p["updated_ts"] = float(time.time())
+        return True
+    except Exception:
+        return False
+
+
+def _round_alignment_warn_behind(diag=None):
+    try:
+        d = diag if isinstance(diag, dict) else globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+        if not isinstance(d, dict) or bool(d.get("ok", False)):
+            return
+        best = d.get("best_round")
+        behind = d.get("behind") if isinstance(d.get("behind"), dict) else {}
+        if best is None or not behind:
+            return
+        warn_s = float(globals().get("ROUND_BEHIND_REJOIN_WARN_S", 90.0) or 90.0)
+        now_ts = float(time.time())
+        for bot, rid in behind.items():
+            ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
+            try:
+                ts = float(_sync_ack_effective_ts(ack) or ack.get("ts", 0.0) or 0.0)
+            except Exception:
+                ts = 0.0
+            age = (now_ts - ts) if ts > 0 else warn_s
+            if age >= warn_s:
+                atraso = max(0, int(best) - int(rid))
+                print_rate_limited(
+                    f"BOT_BEHIND_REJOIN_WARN:{bot}:{rid}:{best}",
+                    f"⚠️ BOT_BEHIND_REJOIN_WARN | bot={bot} | ronda_bot={rid} | best_round={best} | atraso={atraso} | acción=esperar ACK / no force buy",
+                    ttl=30.0,
+                )
+    except Exception:
+        return
+
+
+def _selftest_diagnosticar_alineacion_rounds():
+    try:
+        now = time.time()
+        bots = list(BOT_NAMES)
+        def ack(rid, res="GANANCIA"):
+            return {"round_id": int(rid), "status": "closed", "resultado": res, "ts": now, "mode": "DEMO", "source": "LXV_SYNC"}
+        a1 = {b: ack(100, "GANANCIA" if i < 5 else "PÉRDIDA") for i, b in enumerate(bots)}
+        d1 = diagnosticar_alineacion_rounds(a1, expected_bots=bots)
+        assert d1["ok"] is True and d1["canonical_round"] == 100 and d1["closed"] == 6
+
+        a2 = {b: ack(101 if i < 4 else 100) for i, b in enumerate(bots)}
+        d2 = diagnosticar_alineacion_rounds(a2, expected_bots=bots)
+        assert d2["ok"] is False and d2["mixed_rounds"] is True and d2["best_round"] == 101 and d2["closed"] == 4 and len(d2["behind"]) == 2
+
+        a3 = {b: ack(102) for b in bots[:5]}
+        d3 = diagnosticar_alineacion_rounds(a3, expected_bots=bots)
+        assert d3["ok"] is False and d3["reason"] in ("missing", "incomplete") and d3["closed"] == 5 and len(d3["missing"]) == 1
+
+        d4 = diagnosticar_alineacion_rounds(a3, released_round=1, expected_bots=bots)
+        assert isinstance(d4, dict) and "ok" in d4
+        print("SELFTEST ROUND_ALIGN_DIAGNOSTICO OK")
+    except Exception as e:
+        print(f"SELFTEST ROUND_ALIGN_DIAGNOSTICO FAIL: {type(e).__name__}: {e}")
+        raise
+
+if os.environ.get("RUN_ROUND_ALIGN_SELFTEST") == "1":
+    _selftest_diagnosticar_alineacion_rounds()
+
 def _sync_round_resolver_ronda_canonica(closed_current, reasons_current, target_round, state):
     now_ts = float(time.time())
     valid_by_round = {}
@@ -9858,7 +10204,7 @@ def _sync_round_resolver_ronda_canonica(closed_current, reasons_current, target_
             continue
         valid_by_round.setdefault(ack_round, {})[bot] = {
             "resultado": resultado, "ts": ack_ts, "close_ts": _sync_ack_close_ts(ack), "heartbeat_ts": _sync_ack_heartbeat_ts(ack), "contract_id": ack.get("contract_id"),
-            "asset": ack.get("asset"), "ciclo": ack.get("ciclo"),
+            "asset": ack.get("asset"), "ciclo": ack.get("ciclo"), "round_id": int(ack_round), "mode": ack_mode, "source": ack_source,
         }
         reasons_by_bot[bot] = "ok"
     full_need = len(BOT_NAMES)
@@ -10069,6 +10415,14 @@ def _sync_round_should_recovery_release(round_id, released_round, requests, st) 
         return False, "real_turn_active"
     if bool(_hay_real_close_pending_activo()[0]):
         return False, "real_close_pending"
+    diag_release = diagnosticar_alineacion_rounds(released_round=released_round, expected_bots=BOT_NAMES)
+    if isinstance(diag_release, dict) and bool(diag_release.get("mixed_rounds", False)):
+        print_rate_limited(
+            f"RELEASE_HOLD_MIXED_ROUNDS:should:{diag_release.get('best_round')}",
+            f"🧷 RELEASE_HOLD_MIXED_ROUNDS | best_round=#{diag_release.get('best_round')} {int(diag_release.get('closed', 0) or 0)}/{int(diag_release.get('expected', len(BOT_NAMES)) or len(BOT_NAMES))} | behind={len(diag_release.get('behind') or {})} | acción=esperar_rejoin",
+            ttl=20.0,
+        )
+        return False, "mixed_rounds_esperar_rejoin"
     try:
         tok = str(leer_token_actual() or "").strip().upper()
     except Exception:
@@ -10227,6 +10581,16 @@ def _sync_round_try_recovery_release_global() -> bool:
 
         if int(released_round) != int(round_id):
             return _hold("state_corrupto", released_round)
+
+        diag_recovery_global = diagnosticar_alineacion_rounds(released_round=released_round, expected_bots=BOT_NAMES)
+        globals()["LAST_ROUND_ALIGNMENT_DIAG"] = dict(diag_recovery_global) if isinstance(diag_recovery_global, dict) else globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+        if isinstance(diag_recovery_global, dict) and bool(diag_recovery_global.get("mixed_rounds", False)):
+            print_rate_limited(
+                f"RELEASE_HOLD_MIXED_ROUNDS:global:{diag_recovery_global.get('best_round')}",
+                f"🧷 RELEASE_HOLD_MIXED_ROUNDS | best_round=#{diag_recovery_global.get('best_round')} {int(diag_recovery_global.get('closed', 0) or 0)}/{int(diag_recovery_global.get('expected', len(BOT_NAMES)) or len(BOT_NAMES))} | behind={len(diag_recovery_global.get('behind') or {})} | acción=esperar_rejoin",
+                ttl=20.0,
+            )
+            return _hold("mixed_rounds_esperar_rejoin", released_round)
 
         wait_bots = []
         wait_since_candidates = []
@@ -10604,6 +10968,19 @@ def _sync_round_tick_maestro():
     status_now = str(st.get("status", "")).strip().lower()
     n_closed = len(closed)
     missing = [b for b in expected if b not in closed]
+    diag_align = diagnosticar_alineacion_rounds(released_round=released_round, expected_bots=expected)
+    globals()["LAST_ROUND_ALIGNMENT_DIAG"] = dict(diag_align) if isinstance(diag_align, dict) else {}
+    _round_alignment_warn_behind(diag_align)
+    if isinstance(diag_align, dict) and (bool(diag_align.get("mixed_rounds", False)) or diag_align.get("behind")):
+        best = diag_align.get("best_round")
+        print_rate_limited(
+            f"ALIGN:{best}:{diag_align.get('closed')}:{len(diag_align.get('behind') or {})}",
+            f"ALIGN: current=#{best if best is not None else '--'} | bots_current={int(diag_align.get('closed', 0) or 0)}/{int(diag_align.get('expected', len(expected)) or len(expected))} | behind={len(diag_align.get('behind') or {})} | ahead={len(diag_align.get('ahead') or {})}",
+            ttl=10.0,
+        )
+        if diag_align.get("behind"):
+            behind_txt = ", ".join(f"{b}=#{r}" for b, r in list((diag_align.get("behind") or {}).items())[:6])
+            print_rate_limited(f"BEHIND:{behind_txt}", f"BEHIND: {behind_txt}", ttl=20.0)
     if n_closed == len(expected) and int(released_round) == int(round_id) and status_now == "waiting_closures":
         _lxv_5v1x_event_cooldown(
             key=f"sync_invariant_diag:{round_id}",
@@ -10685,14 +11062,19 @@ def _sync_round_tick_maestro():
             completed_normal = bool(direct_ack_full)
             completed_failsafe = False
         else:
-            agregar_evento(
+            print_rate_limited(
+                f"CANONICAL_ROUND_NOT_READY:{canonical.get('best_round', 0)}:{canonical.get('reason', 'missing')}",
                 f"🧭 CANONICAL_ROUND_NOT_READY: best_round={int(canonical.get('best_round', 0) or 0)} "
-                f"closed={int(canonical.get('best_closed', 0) or 0)}/{len(BOT_NAMES)} reason={canonical.get('reason', 'missing')}"
+                f"closed={int(canonical.get('best_closed', 0) or 0)}/{len(BOT_NAMES)} reason={canonical.get('reason', 'missing')}",
+                ttl=10.0,
             )
-    completed_normal = bool(n_closed >= len(expected))
-    completed_failsafe = bool(stale_ignored and n_closed >= effective_need)
+    # Columna oficial: solo ACKs válidos 6/6 de la misma ronda.
+    # HISTORIAL VISUAL ≠ COLUMNA OFICIAL.
+    align_ok_for_current = bool(isinstance(globals().get("LAST_ROUND_ALIGNMENT_DIAG"), dict) and globals().get("LAST_ROUND_ALIGNMENT_DIAG", {}).get("ok") and int(globals().get("LAST_ROUND_ALIGNMENT_DIAG", {}).get("canonical_round") or -1) == int(round_id))
+    completed_normal = bool(n_closed >= len(expected) and align_ok_for_current)
+    completed_failsafe = bool(False)
     completed = bool(completed_normal or completed_failsafe)
-    if n_closed >= len(expected):
+    if n_closed >= len(expected) and align_ok_for_current:
         completed = True
         completed_normal = True
         completed_failsafe = False
@@ -10700,6 +11082,13 @@ def _sync_round_tick_maestro():
         sync_debug_missing = {b: "ok" for b in expected}
         agregar_evento(
             f"✅ SYNC FORCE COMPLETE: ronda #{round_id} cerrados={n_closed}/{len(expected)}; evaluando/liberando."
+        )
+    elif n_closed >= len(expected):
+        _round_alignment_apply_real_block(globals().get("LAST_ROUND_ALIGNMENT_DIAG", {}), reason_prefix="MIXED_ROUNDS")
+        print_rate_limited(
+            f"SYNC_MIXED_BLOCK:{round_id}",
+            f"FINAL: NO_INVERTIR_AÚN | columna oficial incompleta / mixed_rounds | round={round_id} closed={n_closed}/{len(expected)}",
+            ttl=10.0,
         )
     real_on_now, _, _ = _sync_real_turn_activo()
     elapsed_started = max(0.0, float(time.time()) - float(started_at))
@@ -10884,6 +11273,15 @@ def _sync_round_tick_maestro():
             and (not real_order_pending_now)
             and hold_status not in ("holding_real_result", "holding_real_turn")
         )
+        diag_recovery = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+        if isinstance(diag_recovery, dict) and bool(diag_recovery.get("mixed_rounds", False)):
+            _round_alignment_apply_real_block(diag_recovery, reason_prefix="MIXED_ROUNDS")
+            print_rate_limited(
+                f"RELEASE_HOLD_MIXED_ROUNDS:{diag_recovery.get('best_round')}",
+                f"🧷 RELEASE_HOLD_MIXED_ROUNDS | best_round=#{diag_recovery.get('best_round')} {int(diag_recovery.get('closed', 0) or 0)}/{int(diag_recovery.get('expected', len(BOT_NAMES)) or len(BOT_NAMES))} | behind={len(diag_recovery.get('behind') or {})} | acción=esperar_rejoin",
+                ttl=20.0,
+            )
+            return
         reqs = _sync_round_read_recovery_requests(max_age_s=90.0)
         req_ok, req_reason = _sync_round_should_recovery_release(round_id, released_round, reqs, st)
         req_bots = [b for b, r in (reqs or {}).items() if int((r or {}).get("next_round", 0) or 0) == int(round_id) + 1]
@@ -10922,7 +11320,17 @@ def _sync_round_tick_maestro():
         )
         _sync_round_release_next_round(round_id, "recovery_incomplete_timeout")
         return
-    round_live_all_closed = bool(closed_count >= expected_count and faltan_count <= 0)
+    diag_final_align = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+    align_ok_final = bool(isinstance(diag_final_align, dict) and diag_final_align.get("ok") and int(diag_final_align.get("canonical_round") or -1) == int(round_id))
+    if not align_ok_final:
+        _round_alignment_apply_real_block(diag_final_align, reason_prefix="MIXED_ROUNDS" if isinstance(diag_final_align, dict) and diag_final_align.get("mixed_rounds") else "COLUMNA_INCOMPLETA")
+        if isinstance(diag_final_align, dict) and (diag_final_align.get("mixed_rounds") or diag_final_align.get("behind") or closed_count < expected_count):
+            print_rate_limited(
+                f"SYNC_BLOCK_NO_OFFICIAL:{round_id}:{diag_final_align.get('reason') if isinstance(diag_final_align, dict) else 'missing'}",
+                f"FINAL: NO_INVERTIR_AÚN | columna oficial incompleta / mixed_rounds | best_round={diag_final_align.get('best_round') if isinstance(diag_final_align, dict) else '--'} closed={diag_final_align.get('closed') if isinstance(diag_final_align, dict) else closed_count}/{expected_count}",
+                ttl=10.0,
+            )
+    round_live_all_closed = bool(closed_count >= expected_count and faltan_count <= 0 and align_ok_final)
     round_live_real_ok = bool(round_live_all_closed and data_quality == "ok")
     round_live_closed_expired = bool(round_live_all_closed and data_quality == "closed_expired")
     round_live_release_no_real_reason = ""
