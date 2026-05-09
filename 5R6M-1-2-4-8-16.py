@@ -3120,7 +3120,16 @@ def _update_saldo_monitor_feed(valor_saldo: float):
 # === LXV_SYNC_COLUMN: sincronización de ronda/columna maestro↔bots ===
 SYNC_ROUND_DIR = "sync_round"
 SYNC_ROUND_STATE_PATH = os.path.join(SYNC_ROUND_DIR, "state.json")
+ROUND_QUARANTINE_STATE_PATH = os.path.join(SYNC_ROUND_DIR, "round_quarantine_state.json")
 TTL_ACK_SYNC_ROUND_S = 300.0
+COLUMN_QUARANTINE_ENABLE = True
+COLUMN_QUARANTINE_AFTER_S = 240.0
+COLUMN_QUARANTINE_MIN_CLOSED = 5
+COLUMN_QUARANTINE_REQUIRE_ONE_MISSING = True
+COLUMN_QUARANTINE_RELEASE_DEMO_ONLY = True
+COLUMN_QUARANTINE_BLOCK_REAL_ALWAYS = True
+COLUMN_QUARANTINE_MAX_PER_HOUR = 6
+COLUMN_QUARANTINE_LOG_COOLDOWN_S = 20.0
 ACK_SYNC_ROUND_FUTURE_DRIFT_S = 20.0
 LXV_SYNC_ROUND_FAILSAFE_ENABLE = True
 LXV_SYNC_ROUND_MAX_WAIT_S = 90.0
@@ -3158,6 +3167,20 @@ LXV_REAL_EMITIDOS_MAX_KEEP = 300
 _SYNC_PENDING_WARN_TS = {}
 _SYNC_STALE_WARN_TS = {}
 _SYNC_REAL_OWNER_LAG_TS = {}
+ROUND_QUARANTINE_STATE = {
+    "active": False,
+    "round_id": None,
+    "missing_bot": None,
+    "reason": "",
+    "since_ts": 0.0,
+    "released_to": None,
+    "closed_count": 0,
+    "expected": 0,
+    "contract_id": None,
+    "source": "",
+}
+_COLUMN_QUARANTINE_RELEASE_TS = deque(maxlen=100)
+_COLUMN_QUARANTINE_LATE_ACK_SEEN = set()
 SYNC_POST_REAL_EXEMPT_WINDOW_S = 180.0
 SYNC_REAL_HOLD_DIAG_COOLDOWN_S = 15.0
 SYNC_STATUS_LINE = "SYNC: NORMAL | cerrados=0/0 | release=1"
@@ -4528,6 +4551,9 @@ def _sync_round_build_canonical_summary(round_id, closed, expected=None, source=
 def _lxv_green_opportunity_sync_diag(summary, rows_pack=None):
     try:
         ss = summary if isinstance(summary, dict) else {}
+        rid_q = int(ss.get("round_id", ss.get("round_closed_eval", 0)) or 0)
+        if rid_q > 0 and es_ronda_cuarentenada(rid_q):
+            return
         det = int(globals().get("LXV_OPORTUNIDADES_VERDES_DETECTADAS", 0) or 0)
         col = int(globals().get("LXV_OPORTUNIDADES_VERDES_BLOQUEADAS_SYNC", 0) or 0)
         if det <= 0 or col <= 0:
@@ -5271,6 +5297,22 @@ def _ack_live_format_lines(snapshot):
                     ttl=10.0,
                 )
             lines.extend(_format_round_alignment_panel(diag_hud))
+        q_state = _column_quarantine_load_state()
+        if isinstance(q_state, dict) and q_state.get("round_id"):
+            W = 60
+            def qrow(txt):
+                return "║ " + str(txt)[:W-4].ljust(W-4) + " ║"
+            lines.extend([
+                "╔" + "═"*(W-2) + "╗",
+                qrow("🧯 COLUMNA EN CUARENTENA"),
+                qrow(f"Ronda dañada : #{q_state.get('round_id')}"),
+                qrow(f"Cerrados     : {q_state.get('closed_count', 0)}/{q_state.get('expected', expected_count)}"),
+                qrow(f"Bot faltante : {q_state.get('missing_bot') or '--'}"),
+                qrow(f"Motivo       : {q_state.get('reason') or 'contrato sin resultado confiable'}"),
+                qrow(f"Acción       : release DEMO seguro a #{q_state.get('released_to') or '--'}"),
+                qrow("REAL/LXV/IA   : BLOQUEADO para esta columna"),
+                "╚" + "═"*(W-2) + "╝",
+            ])
     except Exception:
         pass
     parcial_txt = _lxv_normalizar_patron_txt(summary.get("partial_pattern", "0V0X")) or "0V0X"
@@ -5731,6 +5773,469 @@ def _sync_round_write_json_atomic(path: str, payload: dict) -> bool:
         return True
     except Exception:
         return False
+
+def _column_quarantine_default_state():
+    return {
+        "active": False,
+        "round_id": None,
+        "missing_bot": None,
+        "reason": "",
+        "since_ts": 0.0,
+        "released_to": None,
+        "closed_count": 0,
+        "expected": 0,
+        "contract_id": None,
+        "source": "",
+    }
+
+
+def _column_quarantine_persist_state(state=None) -> bool:
+    try:
+        payload = dict(state if isinstance(state, dict) else globals().get("ROUND_QUARANTINE_STATE", {}) or {})
+        payload["ts"] = float(time.time())
+        return bool(_sync_round_write_json_atomic(ROUND_QUARANTINE_STATE_PATH, payload))
+    except Exception:
+        return False
+
+
+def _column_quarantine_load_state() -> dict:
+    try:
+        data = _sync_round_safe_read_json(ROUND_QUARANTINE_STATE_PATH)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    try:
+        return dict(globals().get("ROUND_QUARANTINE_STATE", {}) or {})
+    except Exception:
+        return _column_quarantine_default_state()
+
+
+def _column_quarantine_token_real_activo() -> bool:
+    try:
+        token_raw = ""
+        try:
+            if os.path.exists(TOKEN_FILE):
+                with open(TOKEN_FILE, encoding="utf-8", errors="replace") as f:
+                    token_raw = str(f.read() or "").strip()
+        except Exception:
+            token_raw = ""
+        try:
+            token_owner = str(leer_token_actual() or "").strip()
+        except Exception:
+            token_owner = ""
+        return bool(_token_real_ocupado(token_raw) or _token_real_ocupado(token_owner) or token_owner in BOT_NAMES)
+    except Exception:
+        return True
+
+
+def _column_quarantine_real_guard_reason() -> str:
+    try:
+        if _hay_real_close_pending_activo()[0]:
+            return "real_close_pending"
+    except Exception:
+        return "real_guard_error"
+    try:
+        if _real_close_incident_active():
+            return "real_close_incident_lock"
+    except Exception:
+        pass
+    try:
+        owner = str(globals().get("REAL_OWNER_LOCK") or "").strip()
+        if owner:
+            return f"owner_real:{owner}"
+    except Exception:
+        pass
+    try:
+        order_on, order_bot = _sync_real_order_viva_any()
+        if order_on:
+            return f"orden_real_viva:{order_bot or 'unknown'}"
+    except Exception:
+        return "real_order_guard_error"
+    try:
+        real_on, real_bot, motivo = _sync_real_turn_activo()
+        if real_on:
+            return f"hold_real_activo:{real_bot or motivo or 'unknown'}"
+    except Exception:
+        return "real_turn_guard_error"
+    if _column_quarantine_token_real_activo():
+        return "token_real_ocupado"
+    return ""
+
+
+def _column_quarantine_ack_status(bot: str) -> dict:
+    try:
+        ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
+        st_bot = estado_bots.get(bot, {}) if isinstance(estado_bots.get(bot, {}), dict) else {}
+        return {"ack": ack if isinstance(ack, dict) else {}, "state": st_bot if isinstance(st_bot, dict) else {}}
+    except Exception:
+        return {"ack": {}, "state": {}}
+
+
+def _column_quarantine_evidence(bot: str, round_id: int, reasons=None) -> dict:
+    out = {"ok": False, "reason": "missing_without_fence_evidence", "since_ts": 0.0, "elapsed_s": 0.0, "contract_id": None, "source": "none"}
+    try:
+        now_ts = float(time.time())
+        raw_reason = str((reasons or {}).get(bot, "") if isinstance(reasons, dict) else "").strip()
+        status = _column_quarantine_ack_status(bot)
+        ack = status.get("ack") if isinstance(status.get("ack"), dict) else {}
+        st_bot = status.get("state") if isinstance(status.get("state"), dict) else {}
+        compatible = {
+            "pending_contract_resolution", "fence_active", "resultado_indefinido", "contract_unknown",
+            "buy_transient_timeouterror", "buy_transient_TimeoutError", "ws_closed",
+            "ack_missing_but_pending_seen", "expired_by_pending_contract",
+        }
+        pending = bool(st_bot.get("pending_contract_resolution", False) or ack.get("pending_contract_resolution", False))
+        pending_reason = str(ack.get("pending_reason") or st_bot.get("pending_reason") or raw_reason or "").strip()
+        ack_status = str(ack.get("status", "") or "").strip().lower()
+        resultado = str(ack.get("resultado", "") or "").strip().lower()
+        source = "none"
+        reason = "missing_without_fence_evidence"
+        if pending:
+            reason = pending_reason or "pending_contract_resolution"
+            source = "pending_contract_resolution"
+        elif raw_reason in compatible or raw_reason.lower() in compatible:
+            reason = raw_reason
+            source = "sync_debug_missing"
+        elif "timeouterror" in raw_reason.lower():
+            reason = "buy_transient_TimeoutError"
+            source = "sync_debug_missing"
+        elif "ws_closed" in raw_reason.lower() or "closed without" in raw_reason.lower():
+            reason = "ws_closed"
+            source = "sync_debug_missing"
+        elif resultado in ("indefinido", "undefined", "pending"):
+            reason = "resultado_indefinido"
+            source = "ack_resultado"
+        elif ack_status in ("pending", "sync_wait", "waiting_contract", "recovery_request") and bool(ack.get("pending_contract_id") or ack.get("contract_id")):
+            reason = "ack_missing_but_pending_seen"
+            source = "ack_status"
+        elif bool(ack.get("fence_active", False) or st_bot.get("fence_active", False)):
+            reason = "fence_active"
+            source = "fence_active"
+        contract_id = ack.get("pending_contract_id") or st_bot.get("pending_contract_id") or ack.get("contract_id") or st_bot.get("contract_id")
+        since = 0.0
+        for key in ("pending_since_ts", "pending_ts", "contract_pending_since", "ts", "last_seen_ts"):
+            try:
+                val = ack.get(key, st_bot.get(key, 0.0))
+                val = float(val or 0.0)
+                if val > 0:
+                    since = val
+                    break
+            except Exception:
+                continue
+        if since <= 0.0:
+            try:
+                st_sync = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+                since = float((st_sync if isinstance(st_sync, dict) else {}).get("started_at", 0.0) or 0.0)
+            except Exception:
+                since = 0.0
+        elapsed = max(0.0, now_ts - since) if since > 0 else 0.0
+        reason_l = str(reason).lower()
+        ok = bool(source != "none" and (reason in compatible or reason_l in {x.lower() for x in compatible} or "timeouterror" in reason_l or "pending_contract" in reason_l or "fence" in reason_l or "ws_closed" in reason_l or "indefinido" in reason_l))
+        out.update({"ok": ok, "reason": reason if ok else "missing_without_fence_evidence", "since_ts": since, "elapsed_s": elapsed, "contract_id": contract_id, "source": source})
+    except Exception as e:
+        out["reason"] = f"evidence_error_{type(e).__name__}"
+    return out
+
+
+def _column_quarantine_count_recent(now_ts=None) -> int:
+    try:
+        now = float(now_ts if now_ts is not None else time.time())
+        q = globals().get("_COLUMN_QUARANTINE_RELEASE_TS")
+        if q is None:
+            return 0
+        recent = [float(x) for x in list(q) if now - float(x) <= 3600.0]
+        try:
+            q.clear()
+            q.extend(recent)
+        except Exception:
+            pass
+        return int(len(recent))
+    except Exception:
+        return 0
+
+
+def detectar_candidato_cuarentena_columna(round_id, released_round, diag_align=None, closed_acks=None, reasons=None):
+    out = {"eligible": False, "round_id": int(round_id or 0), "missing_bot": None, "reason": "init", "elapsed_s": 0.0, "closed": 0, "expected": 0, "contract_id": None, "source": ""}
+    try:
+        if not bool(globals().get("COLUMN_QUARANTINE_ENABLE", True)):
+            out["reason"] = "quarantine_disabled"; return out
+        rid = int(round_id or 0); rel = int(released_round or 0)
+        out["round_id"] = rid
+        if rid <= 0 or rel != rid:
+            out["reason"] = "released_round_mismatch"; return out
+        guard = _column_quarantine_real_guard_reason()
+        if guard:
+            out["reason"] = guard; return out
+        diag = diag_align if isinstance(diag_align, dict) else diagnosticar_alineacion_rounds(released_round=released_round, expected_bots=BOT_NAMES)
+        if bool(diag.get("ok", False)):
+            out["reason"] = "column_complete_6_6"; return out
+        if bool(diag.get("mixed_rounds", False)):
+            out["reason"] = "mixed_rounds"; return out
+        if isinstance(diag.get("ahead"), dict) and diag.get("ahead"):
+            out["reason"] = "ahead_present"; return out
+        if isinstance(diag.get("behind"), dict) and len(diag.get("behind") or {}) > 1:
+            out["reason"] = "behind_multiple"; return out
+        expected = int(diag.get("expected", len(BOT_NAMES)) or len(BOT_NAMES))
+        closed = len(closed_acks) if isinstance(closed_acks, dict) else int(diag.get("closed", 0) or 0)
+        out["closed"] = int(closed); out["expected"] = int(expected)
+        if closed >= expected:
+            out["reason"] = "column_complete_6_6"; return out
+        if closed < int(globals().get("COLUMN_QUARANTINE_MIN_CLOSED", 5) or 5):
+            out["reason"] = "closed_below_min"; return out
+        missing = list(diag.get("missing") or [])
+        if not missing and isinstance(closed_acks, dict):
+            missing = [b for b in BOT_NAMES if b not in closed_acks]
+        if bool(globals().get("COLUMN_QUARANTINE_REQUIRE_ONE_MISSING", True)) and len(missing) != 1:
+            out["reason"] = "missing_count_not_one"; return out
+        missing_bot = str(missing[0]) if missing else None
+        out["missing_bot"] = missing_bot
+        if not missing_bot or missing_bot not in BOT_NAMES:
+            out["reason"] = "missing_bot_invalid"; return out
+        ev = _column_quarantine_evidence(missing_bot, rid, reasons=reasons)
+        out.update({"reason": str(ev.get("reason", "missing_without_fence_evidence")), "elapsed_s": float(ev.get("elapsed_s", 0.0) or 0.0), "contract_id": ev.get("contract_id"), "source": str(ev.get("source", ""))})
+        if not bool(ev.get("ok", False)):
+            out["reason"] = "missing_without_fence_evidence"; return out
+        elapsed = float(ev.get("elapsed_s", 0.0) or 0.0)
+        min_s = float(globals().get("COLUMN_QUARANTINE_AFTER_S", 240.0) or 240.0)
+        if elapsed < min_s:
+            print_rate_limited(
+                f"COLUMN_QUARANTINE_WAIT:{rid}:{missing_bot}",
+                f"⏳ COLUMN_QUARANTINE_WAIT | ronda={rid} | elapsed={elapsed:.0f}s/{min_s:.0f}s | falta={missing_bot} | acción=esperar_reconciliación",
+                ttl=10.0,
+            )
+            out["reason"] = str(ev.get("reason", "pending_contract_resolution")); return out
+        if _column_quarantine_count_recent() >= int(globals().get("COLUMN_QUARANTINE_MAX_PER_HOUR", 6) or 6):
+            out["reason"] = "quarantine_rate_limit_hour"; return out
+        out["eligible"] = True
+        return out
+    except Exception as e:
+        out["eligible"] = False
+        out["reason"] = f"quarantine_detect_error_{type(e).__name__}"
+        return out
+
+
+def liberar_ronda_por_cuarentena_demo_only(round_id, target_round, quarantine_info):
+    try:
+        qi = quarantine_info if isinstance(quarantine_info, dict) else {}
+        rid = int(round_id or qi.get("round_id", 0) or 0)
+        target = int(target_round or (rid + 1))
+        if rid <= 0 or target != rid + 1 or not bool(qi.get("eligible", False)):
+            return False
+        if not bool(globals().get("COLUMN_QUARANTINE_RELEASE_DEMO_ONLY", True)):
+            return False
+        guard = _column_quarantine_real_guard_reason()
+        if guard:
+            print_rate_limited(f"RELEASE_HOLD_FENCE:{rid}:{guard}", f"🧷 RELEASE_HOLD_FENCE | ronda={rid} | motivo={guard} | no se libera", ttl=20.0)
+            return False
+        now_ts = float(time.time())
+        st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+        payload = dict(st) if isinstance(st, dict) else {}
+        payload.update({
+            "round_id": target,
+            "released_round": target,
+            "expected_bots": list(BOT_NAMES),
+            "expected_bots_effective": list(BOT_NAMES),
+            "closed_bots": {},
+            "completed": False,
+            "status": "released_quarantine_demo_only",
+            "reason": "RELEASE_QUARANTINE_DEMO_ONLY",
+            "release_reason": "RELEASE_QUARANTINE_DEMO_ONLY",
+            "quarantined_round": rid,
+            "quarantine_missing_bot": qi.get("missing_bot"),
+            "quarantine_reason": qi.get("reason"),
+            "quarantine_ts": now_ts,
+            "quarantine_real_allowed": False,
+            "quarantine_lxv_allowed": False,
+            "quarantine_ia_train_allowed": False,
+            "quarantine_note": "columna descartada para REAL/LXV/IA; release DEMO seguro",
+            "real_emitido": False,
+            "motivo_no_real": "columna_cuarentenada_no_usable_para_real",
+            "ts": now_ts,
+            "started_at": now_ts,
+        })
+        ok = bool(_sync_round_write_state_monotonic(payload, reason="RELEASE_QUARANTINE_DEMO_ONLY"))
+        if not ok:
+            return False
+        state = _column_quarantine_default_state()
+        state.update({
+            "active": True,
+            "round_id": rid,
+            "missing_bot": qi.get("missing_bot"),
+            "reason": qi.get("reason", ""),
+            "since_ts": now_ts,
+            "released_to": target,
+            "closed_count": int(qi.get("closed", 0) or 0),
+            "expected": int(qi.get("expected", len(BOT_NAMES)) or len(BOT_NAMES)),
+            "contract_id": qi.get("contract_id"),
+            "source": qi.get("source", ""),
+        })
+        globals()["ROUND_QUARANTINE_STATE"] = state
+        _column_quarantine_persist_state(state)
+        try:
+            globals().get("_COLUMN_QUARANTINE_RELEASE_TS").append(now_ts)
+        except Exception:
+            pass
+        print_rate_limited(
+            f"RELEASE_QUARANTINE_DEMO_ONLY:{rid}",
+            f"🧯 RELEASE_QUARANTINE_DEMO_ONLY | ronda={rid} | release={target} | missing={qi.get('missing_bot')} | reason={qi.get('reason')} | cerrados={int(qi.get('closed', 0) or 0)}/{int(qi.get('expected', len(BOT_NAMES)) or len(BOT_NAMES))} | REAL=NO | LXV=NO | IA=NO",
+            ttl=float(globals().get("COLUMN_QUARANTINE_LOG_COOLDOWN_S", 20.0) or 20.0),
+        )
+        _column_quarantine_print_panel(state)
+        return True
+    except Exception as e:
+        try:
+            print_rate_limited(f"RELEASE_QUARANTINE_ERROR:{type(e).__name__}", f"⚠️ RELEASE_QUARANTINE_DEMO_ONLY error: {type(e).__name__}", ttl=20.0)
+        except Exception:
+            pass
+        return False
+
+
+def es_ronda_cuarentenada(round_id):
+    try:
+        rid = int(round_id or 0)
+        if rid <= 0:
+            return False
+        st_mem = globals().get("ROUND_QUARANTINE_STATE", {})
+        if isinstance(st_mem, dict) and int(st_mem.get("round_id", 0) or 0) == rid:
+            return True
+        st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+        if isinstance(st, dict) and int(st.get("quarantined_round", 0) or 0) == rid:
+            return True
+        qf = _column_quarantine_load_state()
+        if isinstance(qf, dict) and int(qf.get("round_id", 0) or 0) == rid:
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _column_quarantine_apply_real_block(round_id, motivo="columna_cuarentenada_no_usable_para_real") -> bool:
+    try:
+        if not es_ronda_cuarentenada(round_id):
+            return False
+        p = globals().get("REAL_LOCKS_PANEL", {})
+        if isinstance(p, dict):
+            locks = p.setdefault("locks", {})
+            locks["PATRON_VALIDO"] = False
+            locks["CANDIDATO_VALIDO"] = False
+            locks["ORDEN_REAL_OK"] = False
+            locks["ZONA_OK"] = False
+            locks["COLUMNA_COMPLETA"] = False
+            p["ready_pre_real"] = False
+            p["resultado"] = "NO_INVERTIR_COLUMNA_CUARENTENA"
+            p["falta_principal"] = str(motivo)
+            p["dq"] = "quarantine"
+            p["motivo"] = str(motivo)
+            p["diag_visual"] = "SOLO_DIAGNÓSTICO | NO_HABILITA_REAL"
+            p["updated_ts"] = float(time.time())
+        print_rate_limited(
+            f"COLUMNA_EN_CUARENTENA_BLOCK:{round_id}",
+            f"🧯 COLUMNA_EN_CUARENTENA | ronda={int(round_id)} | FINAL=NO_INVERTIR_COLUMNA_CUARENTENA | motivo={motivo}",
+            ttl=float(globals().get("COLUMN_QUARANTINE_LOG_COOLDOWN_S", 20.0) or 20.0),
+        )
+        return True
+    except Exception:
+        return True
+
+
+def _column_quarantine_print_panel(state=None):
+    try:
+        q = state if isinstance(state, dict) else _column_quarantine_load_state()
+        if not isinstance(q, dict) or not q.get("round_id"):
+            return
+        W = 60
+        def row(txt):
+            return "║ " + str(txt)[:W-4].ljust(W-4) + " ║"
+        lines = [
+            "╔" + "═"*(W-2) + "╗",
+            row("🧯 COLUMNA EN CUARENTENA"),
+            row(f"Ronda dañada : #{q.get('round_id')}"),
+            row(f"Cerrados     : {q.get('closed_count', 0)}/{q.get('expected', len(BOT_NAMES))}"),
+            row(f"Bot faltante : {q.get('missing_bot') or '--'}"),
+            row(f"Motivo       : {q.get('reason') or 'contrato sin resultado confiable'}"),
+            row(f"Acción       : release DEMO seguro a #{q.get('released_to') or '--'}"),
+            row("REAL/LXV/IA   : BLOQUEADO para esta columna"),
+            "╚" + "═"*(W-2) + "╝",
+        ]
+        print_rate_limited(f"COLUMNA_EN_CUARENTENA_PANEL:{q.get('round_id')}", "\n".join(lines), ttl=20.0)
+    except Exception:
+        return
+
+
+def _column_quarantine_note_late_ack(bot, round_id, resultado="") -> bool:
+    try:
+        rid = int(round_id or 0)
+        if not es_ronda_cuarentenada(rid):
+            return False
+        key = (str(bot), rid)
+        if key in globals().get("_COLUMN_QUARANTINE_LATE_ACK_SEEN", set()):
+            return True
+        try:
+            globals().get("_COLUMN_QUARANTINE_LATE_ACK_SEEN").add(key)
+        except Exception:
+            pass
+        res = str(resultado or "").strip() or "--"
+        print_rate_limited(
+            f"LATE_RESULT_QUARANTINED_ROUND:{bot}:{rid}",
+            f"LATE_RESULT_QUARANTINED_ROUND | bot={bot} | ronda={rid} | resultado={res} | ignored_for_real=True",
+            ttl=30.0,
+        )
+        print_rate_limited(
+            f"ACK_OLD_QUARANTINED_IGNORED:{bot}:{rid}",
+            f"ACK_OLD_QUARANTINED_IGNORED | bot={bot} | ronda={rid} | ignored_for_real=True | no_retrocede_release=True",
+            ttl=30.0,
+        )
+        return True
+    except Exception:
+        return True
+
+
+def _selftest_column_quarantine():
+    try:
+        now = time.time()
+        bots = list(BOT_NAMES)
+        closed5 = {b: {"resultado": "GANANCIA", "ts": now, "round_id": 2082} for b in bots[:5]}
+        diag5 = {"ok": False, "best_round": 2082, "closed": 5, "expected": 6, "missing": [bots[5]], "behind": {}, "ahead": {}, "mixed_rounds": False, "reason": "incomplete"}
+        reasons = {bots[5]: "pending_contract_resolution"}
+        orig_read = globals().get("_sync_round_safe_read_json")
+        orig_state = globals().get("estado_bots")
+        orig_real_guard = globals().get("_column_quarantine_real_guard_reason")
+        try:
+            globals()["estado_bots"] = {bots[5]: {"pending_contract_resolution": True, "pending_since_ts": now - 30.0}}
+            globals()["_column_quarantine_real_guard_reason"] = lambda: ""
+            a = detectar_candidato_cuarentena_columna(2082, 2082, diag_align={"ok": True, "closed": 6, "expected": 6}, closed_acks={b: {} for b in bots}, reasons={})
+            assert not a["eligible"]
+            b = detectar_candidato_cuarentena_columna(2082, 2082, diag_align=diag5, closed_acks=closed5, reasons=reasons)
+            assert not b["eligible"]
+            globals()["estado_bots"] = {bots[5]: {"pending_contract_resolution": True, "pending_since_ts": now - 300.0}}
+            c = detectar_candidato_cuarentena_columna(2082, 2082, diag_align=diag5, closed_acks=closed5, reasons=reasons)
+            assert c["eligible"] and c["missing_bot"] == bots[5]
+            d = detectar_candidato_cuarentena_columna(2082, 2082, diag_align={**diag5, "closed": 4, "missing": bots[4:]}, closed_acks={b: {} for b in bots[:4]}, reasons=reasons)
+            assert not d["eligible"]
+            e = detectar_candidato_cuarentena_columna(2082, 2082, diag_align={**diag5, "mixed_rounds": True}, closed_acks=closed5, reasons=reasons)
+            assert not e["eligible"]
+            globals()["_column_quarantine_real_guard_reason"] = lambda: "real_close_pending"
+            f = detectar_candidato_cuarentena_columna(2082, 2082, diag_align=diag5, closed_acks=closed5, reasons=reasons)
+            assert not f["eligible"]
+            globals()["ROUND_QUARANTINE_STATE"] = {"round_id": 2082}
+            assert es_ronda_cuarentenada(2082)
+            assert _column_quarantine_note_late_ack(bots[5], 2082, "GANANCIA") is True
+            globals()["_column_quarantine_real_guard_reason"] = lambda: ""
+            g = detectar_candidato_cuarentena_columna(2082, 2082, diag_align=diag5, closed_acks=closed5, reasons={bots[5]: "ack_missing"})
+            assert not g["eligible"] and g["reason"] == "missing_without_fence_evidence"
+        finally:
+            if orig_read is not None:
+                globals()["_sync_round_safe_read_json"] = orig_read
+            globals()["estado_bots"] = orig_state
+            globals()["_column_quarantine_real_guard_reason"] = orig_real_guard
+        print("SELFTEST COLUMN_QUARANTINE OK")
+    except Exception as e:
+        print(f"SELFTEST COLUMN_QUARANTINE FAIL: {type(e).__name__}: {e}")
+        return False
+
+if os.environ.get("RUN_COLUMN_QUARANTINE_SELFTEST") == "1":
+    _selftest_column_quarantine()
 
 _SYNC_MONOTONIC_GUARD_LAST_TS = {}
 _SYNC_GLOBAL_REAL_HOLD_STATE = {"active": False, "owner": None, "context": "", "last_ts": 0.0}
@@ -6317,6 +6822,12 @@ def _lxv_5v1x_get_exported_rows(round_id: int) -> tuple[dict, dict]:
 
 def _lxv_5v1x_gate_ok(candidate: dict | None) -> tuple[bool, str]:
     c = candidate if isinstance(candidate, dict) else {}
+    try:
+        if es_ronda_cuarentenada(int(c.get("round_id", 0) or 0)):
+            _column_quarantine_apply_real_block(int(c.get("round_id", 0) or 0))
+            return False, "quarantine"
+    except Exception:
+        return False, "quarantine_guard_error"
     if str(c.get("patron_lxv", "")).upper() != "5V1X":
         return False, "patron_no_5v1x"
     if not bool(c.get("x_unica", False)):
@@ -6342,6 +6853,12 @@ def _lxv_5v1x_pick_real_bot(candidate: dict | None) -> str | None:
 
 def _lxv_4v2x_gate_ok(candidate: dict | None) -> tuple[bool, str]:
     c = candidate if isinstance(candidate, dict) else {}
+    try:
+        if es_ronda_cuarentenada(int(c.get("round_id", 0) or 0)):
+            _column_quarantine_apply_real_block(int(c.get("round_id", 0) or 0))
+            return False, "quarantine"
+    except Exception:
+        return False, "quarantine_guard_error"
     patron_norm = str(c.get("patron_lxv", "") or "").upper().replace("/", "")
     if patron_norm != "4V2X":
         return False, "patron_no_4v2x"
@@ -8755,6 +9272,10 @@ def _fase_zv_gate_allow_real(origen="LXV", rid=0):
     except Exception:
         rid_ok = False
     automatic_origins = {"LXV_4V2X", "LXV_5V1X", "LXV_SYNC"}
+    if rid_ok and es_ronda_cuarentenada(rid_int):
+        _column_quarantine_apply_real_block(rid_int)
+        _LXV_FASE_ZV_LAST_INFO = {"allow_real": False, "fase": "CUARENTENA", "motivo": "columna_cuarentenada_no_usable_para_real"}
+        return False
     if origen_txt in automatic_origins and (not rid_ok):
         _lxv_5v1x_event_cooldown(
             key=f"fasezv_block:{origen_txt}:rid_faltante",
@@ -9865,6 +10386,9 @@ def _normalizar_ack_demo_cerrado_para_alineacion(bot, ack, now_ts=None):
             ack_round = 0
         if ack_round <= 0:
             return None, "round_invalid"
+        if es_ronda_cuarentenada(ack_round):
+            _column_quarantine_note_late_ack(bot, ack_round, ack.get("resultado"))
+            return None, "ack_old_quarantined_ignored"
         status = str(ack.get("status", "")).strip().lower()
         if status != "closed":
             return None, f"status_no_closed_{status or 'empty'}"
@@ -11237,6 +11761,25 @@ def _sync_round_tick_maestro():
                 msg=f"SYNC BLOQUEADO: faltan bots no relacionados a REAL | no libero | motivo={why_exempt_no}",
                 cooldown_s=float(globals().get("SYNC_REAL_HOLD_DIAG_COOLDOWN_S", 15.0) or 15.0),
             )
+    quarantine_info = detectar_candidato_cuarentena_columna(
+        round_id,
+        released_round,
+        diag_align=globals().get("LAST_ROUND_ALIGNMENT_DIAG", {}),
+        closed_acks=closed,
+        reasons=sync_debug_missing,
+    )
+    if bool(quarantine_info.get("eligible", False)):
+        if liberar_ronda_por_cuarentena_demo_only(round_id, int(round_id) + 1, quarantine_info):
+            return
+    elif closed_count == max(0, expected_count - 1):
+        q_reason = str(quarantine_info.get("reason", "hold") or "hold")
+        if q_reason == "missing_without_fence_evidence":
+            print_rate_limited(
+                f"RELEASE_HOLD_FENCE:{round_id}:{q_reason}",
+                f"🧷 RELEASE_HOLD_FENCE | ronda={round_id} | cerrados={closed_count}/{expected_count} | motivo=missing_without_fence_evidence | no se libera",
+                ttl=20.0,
+            )
+
     incomplete_round = bool(closed_count < expected_count)
     has_expired_closed = bool(expired_count > 0)
     too_old_round = bool(max_lag_s is not None and float(max_lag_s) > float(ROUND_LIVE_INVEST_WINDOW_S))
@@ -11302,23 +11845,29 @@ def _sync_round_tick_maestro():
             )
             return
         if can_req_recover:
-            payload2 = dict(st) if isinstance(st, dict) else {}
-            payload2["released_round"] = int(round_id) + 1
-            payload2["status"] = "released_recovery_demo_timeout"
-            payload2["reason"] = "demo_wait_timeout_recovery_no_real"
-            payload2["ts"] = time.time()
-            payload2["last_recovery_requests"] = list(req_bots)
-            _sync_round_write_state_monotonic(payload2, reason="demo_wait_timeout_recovery_no_real")
-            agregar_evento(f"🟨 RELEASE_RECOVERY_DEMO_TIMEOUT: ronda #{round_id} → #{round_id + 1} bots={','.join(req_bots) or '--'} motivo=demo_wait_timeout_recovery_no_real real=NO pending=NO")
+            quarantine_req = detectar_candidato_cuarentena_columna(
+                round_id, released_round, diag_align=diag_recovery, closed_acks=closed, reasons=sync_debug_missing
+            )
+            if bool(quarantine_req.get("eligible", False)) and liberar_ronda_por_cuarentena_demo_only(round_id, int(round_id) + 1, quarantine_req):
+                return
+            print_rate_limited(
+                f"RELEASE_HOLD_FENCE:{round_id}:recovery_request_no_quarantine",
+                f"🧷 RELEASE_HOLD_FENCE | ronda={round_id} | recovery_request=SI | motivo={quarantine_req.get('reason', 'no_quarantine')} | no se libera sin cuarentena",
+                ttl=20.0,
+            )
             return
         if not can_recover:
             return
-        release_state = "RECOVERY_RONDA_INCOMPLETA"
-        agregar_evento(
-            f"🛟 {release_state}: ROUND RECOVERY #{round_id} → #{round_id + 1} | descartada incompleta {closed_count}/{expected_count} | "
-            f"faltan={missing_txt} | motivo=recovery_incomplete_timeout"
+        quarantine_timeout = detectar_candidato_cuarentena_columna(
+            round_id, released_round, diag_align=diag_recovery, closed_acks=closed, reasons=sync_debug_missing
         )
-        _sync_round_release_next_round(round_id, "recovery_incomplete_timeout")
+        if bool(quarantine_timeout.get("eligible", False)) and liberar_ronda_por_cuarentena_demo_only(round_id, int(round_id) + 1, quarantine_timeout):
+            return
+        print_rate_limited(
+            f"RELEASE_HOLD_FENCE:{round_id}:recovery_incomplete_timeout",
+            f"🧷 RELEASE_HOLD_FENCE | ronda={round_id} | cerrados={closed_count}/{expected_count} | faltan={missing_txt} | motivo={quarantine_timeout.get('reason', 'no_quarantine')} | no se libera",
+            ttl=20.0,
+        )
         return
     diag_final_align = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
     align_ok_final = bool(isinstance(diag_final_align, dict) and diag_final_align.get("ok") and int(diag_final_align.get("canonical_round") or -1) == int(round_id))
@@ -11403,6 +11952,18 @@ def _sync_round_tick_maestro():
     real_emitido = False
     real_hold_bot = None
     motivo_no_real = ""
+    if es_ronda_cuarentenada(round_id):
+        _column_quarantine_apply_real_block(round_id)
+        completed = False
+        payload["completed"] = False
+        payload["status"] = "hold_quarantined_round"
+        payload["reason"] = "NO_INVERTIR_COLUMNA_CUARENTENA"
+        payload["data_quality"] = "quarantine"
+        payload["quarantine"] = True
+        payload["usable_for_training"] = False
+        payload["usable_for_real"] = False
+        payload["usable_for_lxv"] = False
+        motivo_no_real = "columna_cuarentenada_no_usable_para_real"
 
     if completed:
         next_round = round_id + 1
