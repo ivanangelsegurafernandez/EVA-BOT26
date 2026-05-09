@@ -85,6 +85,25 @@ def _print_once(key: str, ttl: float = 25.0) -> bool:
     except Exception:
         return True
 
+_RATE_LIMIT_PRINT_TS = {}
+
+def print_rate_limited(key, msg, ttl=10.0):
+    """Imprime/agrega un evento con TTL por clave; nunca debe romper el flujo."""
+    try:
+        k = str(key or "rate_limited")
+        now = float(time.time())
+        last = float(_RATE_LIMIT_PRINT_TS.get(k, 0.0) or 0.0)
+        if (now - last) < float(ttl or 0.0):
+            return False
+        _RATE_LIMIT_PRINT_TS[k] = now
+        try:
+            agregar_evento(str(msg))
+        except Exception:
+            print(str(msg))
+        return True
+    except Exception:
+        return False
+
 def _load_optional_module(name: str):
     try:
         if str(name) == "pygame":
@@ -1806,6 +1825,19 @@ ULTIMA_OPERACION_REAL_AUDIT = {
     "ronda": None,
     "contract_id": None,
     "ts": 0.0,
+}
+
+REAL_EN_CURSO_AUDIT = {
+    "activo": False,
+    "bot": None,
+    "ciclo": None,
+    "monto": None,
+    "fuente": None,
+    "ronda": None,
+    "contract_id": None,
+    "saldo_inicio": None,
+    "ts_inicio": 0.0,
+    "estado": "NONE",
 }
 
 _DEMO_HOLD_REAL_LAST_TS = {}
@@ -5758,9 +5790,11 @@ def _sync_round_log_global_real_hold(active: bool, owner=None, context="", round
         if active:
             due = (not was_active) or (owner_txt != str(state.get("owner") or "--")) or ((now_ts - float(state.get("last_ts", 0.0) or 0.0)) >= cooldown_s)
             if due:
-                agregar_evento(
+                print_rate_limited(
+                    f"global_real_hold:{owner_txt}:{rid_txt}:{ctx_txt}",
                     f"⏸️ GLOBAL_REAL_HOLD_PRE_NEW_TRADE: owner_real={owner_txt} | ronda={rid_txt} | "
-                    f"released_round={rel_txt} | contexto={ctx_txt} | DEMO_GLOBAL_EN_HOLD=SI"
+                    f"released_round={rel_txt} | contexto={ctx_txt} | DEMO_GLOBAL_EN_HOLD=SI",
+                    ttl=10.0,
                 )
                 state["last_ts"] = now_ts
             state["active"] = True
@@ -7026,6 +7060,7 @@ def _aplicar_bloqueo_real_activo_a_locks(locks: dict, resultado: str = "", falta
             locks = {}
         real_activo, motivo = hay_real_activo_global()
         if real_activo:
+            locks["REAL_CLOSE_LIBRE"] = False
             locks["TOKEN_REAL_LIBRE"] = False
             locks["ORDEN_REAL_OK"] = False
             resultado = "REAL_ACTIVO / ESPERANDO CIERRE"
@@ -7335,6 +7370,7 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
         _real_lock_set("ORDEN_REAL_OK", order_status if order_status in (True, False, None) else None, "")
         real_activo, motivo_real_activo = hay_real_activo_global()
         if real_activo:
+            _real_lock_set("REAL_CLOSE_LIBRE", False, f"real_activo:{motivo_real_activo}")
             _real_lock_set("TOKEN_REAL_LIBRE", False, f"real_activo:{motivo_real_activo}")
             _real_lock_set("ORDEN_REAL_OK", False, f"real_activo:{motivo_real_activo}")
             _lxv_5v1x_event_cooldown(
@@ -11821,6 +11857,13 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
         estado_bots[bot]["real_activado_en"] = now
         estado_bots[bot]["modo_real_anunciado"] = True
         estado_bots[bot]["fuente"] = str(origen or "orden_real").upper()
+        try:
+            registrar_real_en_curso_audit(
+                bot=bot, ciclo=ciclo_obj, fuente=estado_bots[bot].get("fuente") or str(origen or "orden_real").upper(),
+                ronda=None, contract_id=estado_bots.get(bot, {}).get("id_contrato"), saldo_inicio=obtener_valor_saldo()
+            )
+        except Exception:
+            pass
         if str(globals().get("_REAL_ROUTE_SOURCE", "")).upper() == "MANUAL" or str(origen).lower() == "manual":
             _set_real_manual_alert(bot, ciclo_obj, "MANUAL")
 
@@ -11946,6 +11989,13 @@ def escribir_orden_real(bot: str, ciclo: int, round_id=None) -> bool:
     if ok:
         try:
             _marcar_real_close_pending(bot, int(ciclo), source=str(globals().get("_REAL_ROUTE_SOURCE", "LEGACY") or "LEGACY"), round_id=round_id)
+        except Exception:
+            pass
+        try:
+            registrar_real_en_curso_audit(
+                bot=bot, ciclo=int(ciclo), fuente="ORDEN_REAL",
+                ronda=round_id, contract_id=estado_bots.get(bot, {}).get("id_contrato"), saldo_inicio=obtener_valor_saldo()
+            )
         except Exception:
             pass
         _marti_audit_log_orden(ciclo, bot=bot, origen="escribir_orden_real")
@@ -18152,6 +18202,147 @@ def _resolver_ronda_audit(contexto=None):
         return "UNKNOWN"
 
 
+def _normalizar_ciclo_audit(ciclo):
+    try:
+        if ciclo in (None, ""):
+            return None
+        if isinstance(ciclo, (int, float)) or str(ciclo).strip().isdigit():
+            return f"C{int(float(ciclo))}"
+        txt = str(ciclo).strip()
+        return txt or None
+    except Exception:
+        return None
+
+
+def _resolver_real_activo_en_curso_audit(contexto=None):
+    """Resuelve owner REAL activo sin usar la última operación cerrada como falso positivo."""
+    try:
+        ctx = contexto if isinstance(contexto, dict) else {}
+        owner_ctx = ctx.get("owner_real") or ctx.get("owner")
+        if owner_ctx:
+            return True, str(owner_ctx), "contexto"
+    except Exception:
+        pass
+    try:
+        pending_on, pending_bot, _pending = _hay_real_close_pending_activo()
+        if pending_on:
+            return True, str(pending_bot or "UNKNOWN"), "REAL_CLOSE_PENDING"
+    except Exception:
+        pass
+    try:
+        owner = globals().get("REAL_OWNER_LOCK")
+        if owner:
+            return True, str(owner), "REAL_OWNER_LOCK"
+    except Exception:
+        pass
+    try:
+        token_owner = leer_token_actual()
+        token_txt = str(token_owner or "").strip()
+        if token_txt and token_txt.lower() not in ("none", "real:none", "demo", "false", "0", "null"):
+            if token_txt.upper().startswith("REAL:"):
+                token_txt = token_txt.split(":", 1)[1].strip() or "UNKNOWN"
+            return True, token_txt, "TOKEN_REAL"
+    except Exception:
+        pass
+    try:
+        for b in BOT_NAMES:
+            st = estado_bots.get(b, {}) if isinstance(estado_bots, dict) else {}
+            if str(st.get("token", "")).upper().startswith("REAL") or bool(st.get("trigger_real", False)):
+                return True, str(b), "ESTADO_BOT_REAL"
+    except Exception:
+        pass
+    return False, None, "NO_REAL"
+
+
+def registrar_real_en_curso_audit(bot=None, ciclo=None, monto=None, fuente=None, ronda=None, contract_id=None, saldo_inicio=None):
+    """Memoria visual del REAL abierto; no escribe órdenes, tokens, rondas ni martingala."""
+    try:
+        mem = globals().setdefault("REAL_EN_CURSO_AUDIT", {})
+        now_ts = float(time.time())
+        bot_txt = str(bot).strip() if bot not in (None, "") else (mem.get("bot") or None)
+        ciclo_txt = _normalizar_ciclo_audit(ciclo) or mem.get("ciclo")
+        same_turn = bool(mem.get("activo") and bot_txt and mem.get("bot") == bot_txt and (not ciclo_txt or mem.get("ciclo") == ciclo_txt))
+        if (not same_turn) or float(mem.get("ts_inicio", 0.0) or 0.0) <= 0.0:
+            mem["ts_inicio"] = now_ts
+        mem["activo"] = True
+        mem["estado"] = "EN_CURSO"
+        if bot_txt:
+            mem["bot"] = bot_txt
+        if ciclo_txt:
+            mem["ciclo"] = ciclo_txt
+        if monto is not None:
+            mem["monto"] = _audit_float_or_none(monto)
+        if fuente:
+            mem["fuente"] = str(fuente)
+        elif not mem.get("fuente"):
+            mem["fuente"] = "UNKNOWN"
+        if ronda not in (None, ""):
+            mem["ronda"] = ronda
+        if contract_id not in (None, ""):
+            mem["contract_id"] = contract_id
+        saldo = _audit_float_or_none(saldo_inicio)
+        if saldo is None and mem.get("saldo_inicio") is None:
+            try:
+                saldo = _audit_float_or_none(obtener_valor_saldo())
+            except Exception:
+                saldo = None
+        if saldo is not None and mem.get("saldo_inicio") is None:
+            mem["saldo_inicio"] = saldo
+    except Exception:
+        return
+
+
+def registrar_cierre_real_audit(bot=None, ciclo=None, resultado=None, ganancia_perdida=None, monto=None, ronda=None, contract_id=None, saldo_despues=None, contexto=None):
+    """Registra un cierre REAL confiable en auditoría; nunca mezcla cierres DEMO."""
+    try:
+        ctx = contexto if isinstance(contexto, dict) else {}
+        mem = globals().setdefault("REAL_EN_CURSO_AUDIT", {})
+        bot_txt = str(bot or mem.get("bot") or ctx.get("bot") or "UNKNOWN")
+        ciclo_txt = _normalizar_ciclo_audit(ciclo or mem.get("ciclo") or ctx.get("ciclo")) or "UNKNOWN"
+        res_txt = str(resultado or ctx.get("resultado") or "UNKNOWN")
+        saldo_inicio = _audit_float_or_none(mem.get("saldo_inicio"))
+        if saldo_inicio is None:
+            saldo_inicio = _audit_float_or_none(ctx.get("saldo_antes"))
+        despues = _audit_float_or_none(saldo_despues)
+        gp = _audit_float_or_none(ganancia_perdida)
+        registrar_ultima_operacion_real_audit(
+            bot=bot_txt, ciclo=ciclo_txt, monto=monto if monto is not None else mem.get("monto"),
+            resultado=res_txt, ganancia_perdida=gp, saldo_antes=saldo_inicio,
+            saldo_despues=despues, ronda=ronda if ronda not in (None, "") else mem.get("ronda"),
+            contract_id=contract_id if contract_id not in (None, "") else mem.get("contract_id"),
+        )
+        mem["activo"] = False
+        mem["estado"] = "CERRADO"
+        mem["ts_cierre"] = float(time.time())
+        if bot_txt != "UNKNOWN":
+            mem["bot"] = bot_txt
+        if ciclo_txt != "UNKNOWN":
+            mem["ciclo"] = ciclo_txt
+        if despues is not None:
+            mem["saldo_despues"] = despues
+        if gp is not None:
+            mem["ganancia_perdida"] = gp
+        if resultado:
+            mem["resultado"] = res_txt
+        if saldo_inicio is not None and despues is not None:
+            saldo_txt = f"{saldo_inicio:.2f}→{despues:.2f}"
+        elif saldo_inicio is None and despues is None:
+            saldo_txt = "UNKNOWN→UNKNOWN"
+        elif saldo_inicio is None:
+            saldo_txt = f"UNKNOWN→{despues:.2f}"
+        else:
+            saldo_txt = f"{saldo_inicio:.2f}→UNKNOWN"
+        gp_txt = f"{gp:+.2f}" if gp is not None else "UNKNOWN"
+        rid = ronda if ronda not in (None, "") else mem.get("ronda") or "UNKNOWN"
+        print_rate_limited(
+            f"real_cerrado_audit:{bot_txt}:{ciclo_txt}:{rid}:{contract_id or mem.get('contract_id') or ''}",
+            f"🧾 REAL_CERRADO_AUDIT | bot={bot_txt} | {ciclo_txt} | resultado={res_txt} | gp={gp_txt} | saldo {saldo_txt} | ronda={rid}",
+            ttl=2.0,
+        )
+    except Exception:
+        return
+
+
 def auditar_cambio_saldo_real(saldo_actual, contexto=None):
     """Auditor informativo: detecta variaciones del saldo REAL global sin cambiar operación."""
     try:
@@ -18165,11 +18356,20 @@ def auditar_cambio_saldo_real(saldo_actual, contexto=None):
             audit.update({"last_balance": float(actual), "last_ts": now_ts, "last_delta": 0.0})
             return
         delta = float(actual - previo)
+        ctx = contexto if isinstance(contexto, dict) else {}
         if abs(delta) < 0.01:
             audit["last_balance"] = float(actual)
             audit["last_ts"] = now_ts
+            if str(ctx.get("reason") or ctx.get("motivo") or "") == "real_close":
+                try:
+                    print_rate_limited(
+                        f"saldo_real_pendiente_refresh:{ctx.get('bot') or ctx.get('owner') or 'UNKNOWN'}:{ctx.get('ronda') or ''}",
+                        "🧾 AUDIT_SALDO_REAL | saldo pendiente de refresco",
+                        ttl=10.0,
+                    )
+                except Exception:
+                    pass
             return
-        ctx = contexto if isinstance(contexto, dict) else {}
         ultima = globals().get("ULTIMA_OPERACION_REAL_AUDIT", {}) if isinstance(globals().get("ULTIMA_OPERACION_REAL_AUDIT", {}), dict) else {}
         owner = _resolver_owner_real_audit(ctx)
         ciclo = ctx.get("ciclo") or ctx.get("cycle") or ultima.get("ciclo") or globals().get("ciclo_martingala_global") or "UNKNOWN"
@@ -18267,19 +18467,10 @@ def auditar_demo_en_hold_por_real(bot=None, owner_real=None, ronda=None, motivo=
     """Mensaje rate-limit para explicar que DEMO quedó en hold por REAL global activo."""
     try:
         b = str(bot or "UNKNOWN")
-        now_ts = float(time.time())
-        state = globals().setdefault("_DEMO_HOLD_REAL_LAST_TS", {})
-        last = float(state.get(b, 0.0) or 0.0)
-        if (now_ts - last) < 10.0:
-            return
-        state[b] = now_ts
         owner = str(owner_real or _resolver_owner_real_audit({}) or "UNKNOWN")
         rid = ronda if ronda not in (None, "") else _resolver_ronda_audit({})
-        msg = f"🧊 DEMO_EN_HOLD_POR_REAL | bot={b} | owner_real={owner} | ronda={rid or 'UNKNOWN'} | correcto=SI | motivo={motivo or 'real_activo'}"
-        try:
-            agregar_evento(msg)
-        except Exception:
-            print(msg)
+        msg = f"🧊 DEMO GLOBAL HOLD | owner={owner} | motivo=REAL activo | bots demo esperando | bot={b} | release_actual={rid or 'UNKNOWN'}"
+        print_rate_limited(f"demo_blocked_real:{b}:{owner}", msg, ttl=10.0)
     except Exception:
         return
 
@@ -18288,11 +18479,28 @@ def render_auditor_real_panel(valor_saldo=None):
     try:
         audit = globals().get("REAL_BALANCE_AUDIT", {}) if isinstance(globals().get("REAL_BALANCE_AUDIT", {}), dict) else {}
         ultima = globals().get("ULTIMA_OPERACION_REAL_AUDIT", {}) if isinstance(globals().get("ULTIMA_OPERACION_REAL_AUDIT", {}), dict) else {}
+        en_curso = globals().setdefault("REAL_EN_CURSO_AUDIT", {})
         saldo = _audit_float_or_none(valor_saldo)
         if saldo is None:
             saldo = _audit_float_or_none(audit.get("last_balance"))
         saldo_txt = "--" if saldo is None else f"{saldo:.2f}"
-        owner = audit.get("last_owner") or _resolver_owner_real_audit({}) or "NONE"
+        activo_real, owner_activo, fuente_activa = _resolver_real_activo_en_curso_audit({})
+        if activo_real and not bool(en_curso.get("activo", False)):
+            try:
+                st_owner = estado_bots.get(owner_activo, {}) if owner_activo in BOT_NAMES else {}
+                registrar_real_en_curso_audit(
+                    bot=owner_activo or "UNKNOWN",
+                    ciclo=st_owner.get("ciclo_actual") or st_owner.get("ciclo_forzado") or en_curso.get("ciclo"),
+                    monto=st_owner.get("monto") or st_owner.get("stake"),
+                    fuente=st_owner.get("fuente") or fuente_activa or "UNKNOWN",
+                    ronda=_resolver_ronda_audit({"bot": owner_activo}) if owner_activo else None,
+                    contract_id=st_owner.get("id_contrato"),
+                    saldo_inicio=saldo,
+                )
+                en_curso = globals().setdefault("REAL_EN_CURSO_AUDIT", {})
+            except Exception:
+                pass
+        owner = audit.get("last_owner") or owner_activo or _resolver_owner_real_audit({}) or "NONE"
         if owner == "UNKNOWN":
             owner = "UNKNOWN"
         delta = _audit_float_or_none(audit.get("last_delta"))
@@ -18303,9 +18511,25 @@ def render_auditor_real_panel(valor_saldo=None):
             age = max(0.0, time.time() - ts)
             viejo = f" | último cambio hace {int(age // 60)} min" if age > 300.0 else ""
             var_txt = f"Saldo cuenta: {saldo_txt} | Δ último: {delta:+.2f} | Owner: {owner}{viejo}"
-        if ultima.get("bot"):
+
+        extra_lines = []
+        if activo_real or bool(en_curso.get("activo", False)):
+            bot_txt = en_curso.get("bot") or owner_activo or "UNKNOWN"
+            ciclo_txt = en_curso.get("ciclo") or "UNKNOWN"
+            fuente_txt = en_curso.get("fuente") or fuente_activa or "UNKNOWN"
+            ts_ini = float(en_curso.get("ts_inicio", 0.0) or 0.0)
+            activo_s = int(max(0.0, time.time() - ts_ini)) if ts_ini > 0 else 0
+            saldo_ini = _audit_float_or_none(en_curso.get("saldo_inicio"))
+            saldo_ini_txt = "UNKNOWN" if saldo_ini is None else f"{saldo_ini:.2f}"
+            ultima_txt = f"REAL EN CURSO: {bot_txt} | {ciclo_txt} | fuente={fuente_txt} | activo={activo_s}s"
+            extra_lines.append(f"Saldo inicial REAL: {saldo_ini_txt}")
+            extra_lines.append("Resultado: esperando cierre")
+        elif ultima.get("bot"):
             antes = _audit_float_or_none(ultima.get("saldo_antes")); despues = _audit_float_or_none(ultima.get("saldo_despues"))
-            saldo_op = f"saldo {antes:.2f}→{despues:.2f}" if (antes is not None and despues is not None) else "saldo --"
+            if antes is not None and despues is not None:
+                saldo_op = f"saldo {antes:.2f}→{despues:.2f}"
+            else:
+                saldo_op = "saldo pendiente de refresco"
             gp = _audit_float_or_none(ultima.get("ganancia_perdida"))
             gp_txt = f" {gp:+.2f}" if gp is not None else ""
             ultima_txt = f"Última REAL: {ultima.get('bot')} | {ultima.get('ciclo') or 'UNKNOWN'} | {ultima.get('resultado') or 'UNKNOWN'}{gp_txt} | {saldo_op} | ronda={ultima.get('ronda') or 'UNKNOWN'}"
@@ -18314,16 +18538,18 @@ def render_auditor_real_panel(valor_saldo=None):
         else:
             ultima_txt = "Última REAL: pendiente / sin evento confiable"
         w = int(globals().get("HUD_BOX_WIDTH", 92) or 92)
-        return [
+        lines = [
             Fore.CYAN + hud_border_top(w),
             Fore.CYAN + hud_box_line(hud_pad("🧾 AUDITOR REAL", w), w),
             Fore.CYAN + hud_box_line(hud_pad(var_txt, w), w),
             Fore.CYAN + hud_box_line(hud_pad(ultima_txt, w), w),
-            Fore.CYAN + hud_border_bottom(w),
         ]
+        for extra in extra_lines:
+            lines.append(Fore.CYAN + hud_box_line(hud_pad(extra, w), w))
+        lines.append(Fore.CYAN + hud_border_bottom(w))
+        return lines
     except Exception:
         return ["🧾 AUDITOR REAL | saldo=-- | Última REAL: pendiente / sin evento confiable"]
-
 
 def _marti_audit_log_orden(ciclo: int, bot: str | None = None, origen: str = ""):
     """
@@ -28478,15 +28704,16 @@ async def main():
                         saldo_despues = obtener_valor_saldo()
                         try:
                             gp_audit = ((float(saldo_despues) - float(saldo_antes)) if isinstance(saldo_antes, (int, float)) and isinstance(saldo_despues, (int, float)) else (float(payout_total or 0.0) - float(monto or 0.0) if res == "GANANCIA" else -float(monto or 0.0)))
-                            registrar_ultima_operacion_real_audit(
+                            registrar_cierre_real_audit(
                                 bot=bot, ciclo=ciclo, monto=monto, resultado=res, ganancia_perdida=gp_audit,
-                                saldo_antes=saldo_antes, saldo_despues=saldo_despues, ronda=pending.get("round_id"),
+                                saldo_despues=saldo_despues, ronda=pending.get("round_id"),
                                 contract_id=estado_bots.get(bot, {}).get("id_contrato"),
+                                contexto={"saldo_antes": saldo_antes, "reason": "real_close"},
                             )
                             auditar_cambio_saldo_real(saldo_despues, {
-                                "owner": bot, "ciclo": f"C{int(ciclo or 0)}", "resultado": res,
+                                "owner": bot, "bot": bot, "ciclo": f"C{int(ciclo or 0)}", "resultado": res,
                                 "ronda": pending.get("round_id"), "contract_id": estado_bots.get(bot, {}).get("id_contrato"),
-                                "reason": "resultado_real",
+                                "reason": "real_close",
                             })
                         except Exception:
                             pass
@@ -28524,6 +28751,18 @@ async def main():
                             t_real = estado_bots[bot].get("real_activado_en", 0.0)
                             # Si lleva demasiado sin actualizarse desde que entró a REAL:
                             # NO salir a DEMO aquí: la salida solo ocurre con cierre GANANCIA/PÉRDIDA.
+                            if t_real > 0:
+                                try:
+                                    activo_s_soft = float(ahora - float(t_real))
+                                    ttl_soft = max(float(globals().get("REAL_ORDER_TTL_S", 0.0) or 0.0), float(globals().get("REAL_CLOSE_MAX_AGE_S", 0.0) or 0.0))
+                                    if ttl_soft > 0 and activo_s_soft > ttl_soft:
+                                        print_rate_limited(
+                                            f"real_stuck_soft:{bot}",
+                                            f"⚠️ REAL_STUCK_SOFT_AUDIT | owner={bot} | activo={int(activo_s_soft)}s | token=REAL:{bot} | acción=solo_auditar_no_liberar",
+                                            ttl=30.0,
+                                        )
+                                except Exception:
+                                    pass
                             if t_real > 0 and (ahora - max(t_last, t_real) > REAL_TIMEOUT_S):
                                 first_warn = float(estado_bots[bot].get("real_timeout_first_warn", 0.0) or 0.0)
                                 if first_warn <= 0.0:
@@ -28585,17 +28824,18 @@ async def main():
                                     saldo_despues = obtener_valor_saldo()
                                     try:
                                         gp_audit = ((float(saldo_despues) - float(saldo_antes)) if isinstance(saldo_antes, (int, float)) and isinstance(saldo_despues, (int, float)) else (float(payout_total or 0.0) - float(monto or 0.0) if res == "GANANCIA" else -float(monto or 0.0)))
-                                        registrar_ultima_operacion_real_audit(
+                                        registrar_cierre_real_audit(
                                             bot=bot, ciclo=ciclo, monto=monto, resultado=res, ganancia_perdida=gp_audit,
-                                            saldo_antes=saldo_antes, saldo_despues=saldo_despues,
+                                            saldo_despues=saldo_despues,
                                             ronda=_resolver_ronda_audit({"bot": bot}),
                                             contract_id=estado_bots.get(bot, {}).get("id_contrato"),
+                                            contexto={"saldo_antes": saldo_antes, "reason": "real_close"},
                                         )
                                         auditar_cambio_saldo_real(saldo_despues, {
-                                            "owner": bot, "ciclo": f"C{int(ciclo or 0)}", "resultado": res,
+                                            "owner": bot, "bot": bot, "ciclo": f"C{int(ciclo or 0)}", "resultado": res,
                                             "ronda": _resolver_ronda_audit({"bot": bot}),
                                             "contract_id": estado_bots.get(bot, {}).get("id_contrato"),
-                                            "reason": "resultado_real",
+                                            "reason": "real_close",
                                         })
                                     except Exception:
                                         pass
