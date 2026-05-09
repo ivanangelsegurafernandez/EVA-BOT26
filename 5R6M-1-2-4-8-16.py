@@ -3942,7 +3942,7 @@ def _ack_live_snapshot():
 
     state = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
     round_id_actual = int(state.get("round_id", state.get("released_round", 1)) or 1)
-    released_round = int(state.get("released_round", round_id_actual) or round_id_actual)
+    released_round = _sync_round_released_or_fallback(state.get("released_round"), round_id_actual)
     closed_bots_state = state.get("closed_bots", {})
     bots_missing_state = state.get("bots_missing", [])
     status_state = state.get("status", "")
@@ -4351,7 +4351,9 @@ def _sync_round_is_released(summary=None, state=None, round_id=None) -> bool:
         rid = int(round_id if round_id is not None else ss.get("round_id", ss.get("obj_round", st.get("round_id", 0))) or 0)
         if rid <= 0:
             return False
-        rel = int(ss.get("released_round", st.get("released_round", rid)) or rid)
+        rel = normalizar_released_round_id(ss.get("released_round", st.get("released_round")), fallback=None)
+        if rel is None:
+            return False
         return int(rel) >= (int(rid) + 1)
     except Exception:
         return False
@@ -4369,7 +4371,7 @@ def _dq_visual_lxv(summary, state=None):
             rid = 0
 
         try:
-            released_round = int(ss.get("released_round", st.get("released_round", rid)) or rid)
+            released_round = _sync_round_released_or_fallback(ss.get("released_round", st.get("released_round")), rid)
         except Exception:
             released_round = rid
 
@@ -4490,7 +4492,7 @@ def _lxv_green_opportunity_sync_diag(summary, rows_pack=None):
 def _ack_live_build_rows(obj_round_override=None, closed_override=None):
     state = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
     obj_round = int(obj_round_override if obj_round_override is not None else state.get("round_id", state.get("released_round", 1)) or 1)
-    released_round = int(state.get("released_round", obj_round) or obj_round)
+    released_round = _sync_round_released_or_fallback(state.get("released_round"), obj_round)
     rows = []
     now = time.time()
 
@@ -4640,7 +4642,7 @@ def _ack_live_calc_summary(rows_pack):
     rows = list((rows_pack or {}).get("rows", []) or [])
     st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
     obj_round = int((rows_pack or {}).get("obj_round", 1) or 1)
-    released_round = int((rows_pack or {}).get("released_round", obj_round) or obj_round)
+    released_round = _sync_round_released_or_fallback((rows_pack or {}).get("released_round"), obj_round)
 
     valid_current = [
         r for r in rows
@@ -4783,7 +4785,7 @@ def _sync_round_manual_status() -> dict:
         summary = _ack_live_calc_summary(rows_pack)
 
         obj_round = int(summary.get("obj_round", st.get("round_id", 1)) or 1)
-        released_round = int(summary.get("released_round", st.get("released_round", obj_round)) or obj_round)
+        released_round = _sync_round_released_or_fallback(summary.get("released_round", st.get("released_round")), obj_round)
         closed_count = int(summary.get("closed_count", 0) or 0)
         expected_count = int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
         faltan_count = int(summary.get("faltan_count", max(0, expected_count - closed_count)) or 0)
@@ -5092,7 +5094,7 @@ def _ack_live_format_lines(snapshot):
     rows = rows_pack.get("rows", [])
 
     obj_round = int(summary.get("obj_round", 1) or 1)
-    released_round = int(summary.get("released_round", obj_round) or obj_round)
+    released_round = _sync_round_released_or_fallback(summary.get("released_round"), obj_round)
     closed_count = int(summary.get("closed_count", 0) or 0)
     expected_count = int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
     faltan_count = int(summary.get("faltan_count", 0) or 0)
@@ -5582,9 +5584,12 @@ def render_cuadro_martingala_visible():
         ciclo_act = int(snap.get("ciclo_actual", prox) or prox)
         ciclo_act = max(1, min(max_c, ciclo_act))
         owner = reconciliar_token_real_visual("render_cuadro_martingala_visible") or (REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else "")
-        real_on = owner in BOT_NAMES
-        bot_real = owner if real_on else "ninguno"
-        estado_txt = "REAL ACTIVO" if real_on else "DEMO | ESPERANDO SEÑAL"
+        real_hold_on, real_hold_owner, _real_hold_reason = _sync_round_real_hold_owner("hud_martingala")
+        if real_hold_on and str(real_hold_owner or "").strip():
+            owner = str(real_hold_owner).strip()
+        real_on = bool((owner in BOT_NAMES) or real_hold_on)
+        bot_real = owner if real_on and str(owner or "").strip() else "--"
+        estado_txt = "REAL ACTIVO | DEMO GLOBAL EN HOLD" if real_on else "DEMO | ESPERANDO SEÑAL"
         is_final_loss = bool(str(snap.get("estado", "")).upper() == "FIN_C5")
         highlight_cycle = prox if not real_on else ciclo_act
 
@@ -5642,6 +5647,105 @@ def _sync_round_write_json_atomic(path: str, payload: dict) -> bool:
         return False
 
 _SYNC_MONOTONIC_GUARD_LAST_TS = {}
+_SYNC_GLOBAL_REAL_HOLD_STATE = {"active": False, "owner": None, "context": "", "last_ts": 0.0}
+
+
+def normalizar_released_round_id(raw, fallback=None):
+    if isinstance(raw, bool):
+        return fallback
+    try:
+        val = int(raw)
+    except Exception:
+        return fallback
+    if val <= 10:
+        return fallback
+    return val
+
+
+def _sync_round_released_or_fallback(raw, fallback=1):
+    val = normalizar_released_round_id(raw, fallback=None)
+    if val is not None:
+        return int(val)
+    try:
+        fb = int(fallback)
+    except Exception:
+        fb = 1
+    return max(1, fb)
+
+
+def _sync_round_real_hold_owner(context=""):
+    try:
+        pending_on, pending_bot, _pending_payload = _hay_real_close_pending_activo()
+        if pending_on and str(pending_bot or "").strip():
+            return True, str(pending_bot).strip(), "real_close_pending"
+    except Exception:
+        pass
+    try:
+        real_on, real_bot, motivo = _sync_real_turn_activo()
+        if real_on:
+            owner = str(real_bot or "").strip()
+            if owner in BOT_NAMES:
+                return True, owner, str(motivo or "real_turn_activo")
+            return True, owner or "--", str(motivo or "real_turn_activo")
+    except Exception:
+        pass
+    try:
+        owner = str(globals().get("REAL_OWNER_LOCK") or "").strip()
+        if owner in BOT_NAMES:
+            return True, owner, "real_owner_lock"
+    except Exception:
+        pass
+    try:
+        token_raw = str(leer_token_actual() or "").strip()
+        if _token_real_ocupado(token_raw):
+            owner = token_raw.split(":", 1)[1].strip() if ":" in token_raw else token_raw
+            return True, owner or "--", "token_real_ocupado"
+        if token_raw in BOT_NAMES:
+            return True, token_raw, "token_owner_bot"
+    except Exception:
+        pass
+    try:
+        order_on, order_bot = _sync_real_order_viva_any()
+        if order_on:
+            owner = str(order_bot or "").strip()
+            return True, owner or "--", "orden_real_viva"
+    except Exception:
+        pass
+    return False, None, str(context or "no_real")
+
+
+def _sync_round_log_global_real_hold(active: bool, owner=None, context="", round_id=None, released_round=None) -> None:
+    try:
+        state = globals().setdefault("_SYNC_GLOBAL_REAL_HOLD_STATE", {"active": False, "owner": None, "context": "", "last_ts": 0.0})
+        now_ts = float(time.time())
+        was_active = bool(state.get("active", False))
+        owner_txt = str(owner or "--").strip() or "--"
+        ctx_txt = str(context or "sync_round").strip() or "sync_round"
+        rid_txt = "--" if round_id is None else str(round_id)
+        rel_txt = "--" if released_round is None else str(released_round)
+        cooldown_s = float(globals().get("GLOBAL_REAL_HOLD_LOG_COOLDOWN_S", 15.0) or 15.0)
+        if active:
+            due = (not was_active) or (owner_txt != str(state.get("owner") or "--")) or ((now_ts - float(state.get("last_ts", 0.0) or 0.0)) >= cooldown_s)
+            if due:
+                agregar_evento(
+                    f"⏸️ GLOBAL_REAL_HOLD_PRE_NEW_TRADE: owner_real={owner_txt} | ronda={rid_txt} | "
+                    f"released_round={rel_txt} | contexto={ctx_txt} | DEMO_GLOBAL_EN_HOLD=SI"
+                )
+                state["last_ts"] = now_ts
+            state["active"] = True
+            state["owner"] = owner_txt
+            state["context"] = ctx_txt
+            return
+        if was_active:
+            prev_owner = str(state.get("owner") or owner_txt or "--").strip() or "--"
+            agregar_evento(f"✅ GLOBAL_REAL_CLEAR: {prev_owner} reanuda DEMO | contexto={ctx_txt}")
+        state["active"] = False
+        state["owner"] = None
+        state["context"] = ctx_txt
+        state["last_ts"] = 0.0
+    except Exception:
+        pass
+
 
 def _sync_round_int_or_none(value):
     try:
@@ -5752,21 +5856,46 @@ def _sync_round_write_state_monotonic(payload, reason="") -> bool:
     """Escritura central de sync_round/state.json: released_round nunca retrocede."""
     try:
         p = dict(payload or {})
-        if bool(p.pop("reset_sync_state", False)):
+        reset_requested = bool(p.pop("reset_sync_state", False))
+        if reset_requested:
+            real_hold_on, real_hold_owner, real_hold_reason = _sync_round_real_hold_owner("reset_sync_state")
+            if real_hold_on:
+                current_hold = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+                if not isinstance(current_hold, dict):
+                    current_hold = {}
+                rid_hold = _sync_round_int_or_none(current_hold.get("round_id")) or _sync_round_int_or_none(p.get("round_id")) or 1
+                rel_hold = normalizar_released_round_id(current_hold.get("released_round"), fallback=rid_hold) or rid_hold
+                current_hold.update({
+                    "round_id": int(rid_hold),
+                    "released_round": int(rel_hold),
+                    "status": "HOLD_REAL_ACTIVO",
+                    "reason": f"reset_sync_state bloqueado por REAL activo ({real_hold_reason})",
+                    "real_owner": real_hold_owner,
+                    "owner_real": real_hold_owner,
+                    "bot_real": real_hold_owner,
+                    "sync_sigue": False,
+                    "release_congelado": True,
+                    "ts": time.time(),
+                })
+                _sync_round_log_global_real_hold(True, real_hold_owner, f"reset_sync_state:{real_hold_reason}", rid_hold, rel_hold)
+                current_hold = _sync_round_enrich_real_global_state(current_hold, reason=reason)
+                return _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, current_hold)
             return _sync_round_write_json_atomic(SYNC_ROUND_STATE_PATH, p)
 
         current = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
         if not isinstance(current, dict):
             current = {}
-        old_released = _sync_round_int_or_none(current.get("released_round"))
         old_round_id = _sync_round_int_or_none(current.get("round_id"))
+        old_released = normalizar_released_round_id(current.get("released_round"), fallback=old_round_id)
         new_released_raw = p.get("released_round")
         new_round_raw = p.get("round_id")
-        new_released = _sync_round_int_or_none(new_released_raw)
         new_round_id = _sync_round_int_or_none(new_round_raw)
+        new_released = normalizar_released_round_id(new_released_raw, fallback=old_released)
 
         if new_released is None:
-            new_released = old_released if old_released is not None else 1
+            new_released = old_released if old_released is not None else (new_round_id if new_round_id is not None else 1)
+            p["released_round"] = int(new_released)
+        elif normalizar_released_round_id(new_released_raw, fallback=None) is None:
             p["released_round"] = int(new_released)
         if new_round_id is None:
             new_round_id = _sync_round_int_or_none(p.get("round_id"))
@@ -5780,6 +5909,23 @@ def _sync_round_write_state_monotonic(payload, reason="") -> bool:
             pending_on, pending_bot, _pending_data = _hay_real_close_pending_activo()
         except Exception:
             pending_on, pending_bot = False, None
+        real_hold_on, real_hold_owner, real_hold_reason = _sync_round_real_hold_owner("write_state_monotonic")
+        if real_hold_on and not hold_reason:
+            advances_release = bool(old_released is not None and new_released is not None and int(new_released) > int(old_released))
+            advances_round = bool(old_round_id is not None and new_round_id is not None and int(new_round_id) > int(old_round_id))
+            if advances_release or advances_round:
+                p["released_round"] = int(old_released or new_released or 1)
+                p["round_id"] = int(old_round_id or old_released or new_round_id or 1)
+                p["status"] = "HOLD_REAL_ACTIVO"
+                p["reason"] = f"SYNC congelado: REAL activo ({real_hold_reason})"
+                p["sync_sigue"] = False
+                p["release_congelado"] = True
+                p["real_owner"] = real_hold_owner
+                p["owner_real"] = real_hold_owner
+                p["bot_real"] = real_hold_owner
+                _sync_round_log_global_real_hold(True, real_hold_owner, f"write_state_monotonic:{real_hold_reason}", p.get("round_id"), p.get("released_round"))
+                new_released = normalizar_released_round_id(p.get("released_round"), fallback=old_released)
+                new_round_id = _sync_round_int_or_none(p.get("round_id"))
         if pending_on and not hold_reason:
             advances_release = bool(old_released is not None and new_released is not None and int(new_released) > int(old_released))
             advances_round = bool(old_round_id is not None and new_round_id is not None and int(new_round_id) > int(old_round_id))
@@ -5796,12 +5942,12 @@ def _sync_round_write_state_monotonic(payload, reason="") -> bool:
                     msg="SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI" if not _real_close_incident_active() else "🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro",
                     cooldown_s=10.0,
                 )
-                new_released = _sync_round_int_or_none(p.get("released_round"))
+                new_released = normalizar_released_round_id(p.get("released_round"), fallback=old_released)
                 new_round_id = _sync_round_int_or_none(p.get("round_id"))
 
-        corrupt_default = bool(old_released is not None and old_released > 10 and new_released in (0, 1))
-        rollback = bool(old_released is not None and new_released < old_released)
-        if corrupt_default or rollback:
+        corrupt_default = bool(old_released is not None and old_released > 10 and normalizar_released_round_id(new_released_raw, fallback=None) is None and new_released_raw in (0, 1, True, False, "0", "1"))
+        rollback = bool((not real_hold_on) and old_released is not None and new_released is not None and int(new_released) > 10 and int(new_released) < int(old_released))
+        if (not real_hold_on) and (corrupt_default or rollback):
             _sync_round_monotonic_guard_log(new_released, old_released, reason)
             p["released_round"] = int(old_released)
             p["round_id"] = int(max(old_round_id or 0, old_released, new_round_id or 0))
@@ -5850,7 +5996,7 @@ def _sync_round_apply_visual_heartbeat(bot: str) -> None:
         ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
         gstate = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
         round_id = int(gstate.get("round_id", 1) or 1)
-        released = int(gstate.get("released_round", 1) or 1)
+        released = _sync_round_released_or_fallback(gstate.get("released_round"), round_id)
         wait_flag = bool(ack.get("sync_wait", False))
         wait_round = int(ack.get("round_id", 0) or 0)
         waiting_release = int(ack.get("waiting_release_round", wait_round + 1) or (wait_round + 1))
@@ -8960,7 +9106,7 @@ def _sync_round_apply_post_real_rejoin(payload: dict, released_round: int | None
     if not isinstance(pr, dict) or not pr:
         return p
     try:
-        released = int(released_round if released_round is not None else p.get("released_round", 0) or 0)
+        released = normalizar_released_round_id(released_round if released_round is not None else p.get("released_round"), fallback=0) or 0
         target = int(pr.get("target_release", 0) or 0)
     except Exception:
         return p
@@ -8987,7 +9133,7 @@ def _sync_round_ensure_post_real_rejoin(bot, real_round=None, target_release=Non
     if b not in BOT_NAMES:
         return False
     try:
-        released = int(st.get("released_round", st.get("round_id", 1)) or 1)
+        released = _sync_round_released_or_fallback(st.get("released_round"), st.get("round_id", 1))
     except Exception:
         released = 1
     rr = real_round
@@ -9923,7 +10069,7 @@ def _sync_round_try_recovery_release_global() -> bool:
             return _hold("state_corrupto")
         try:
             round_id = max(1, int(st.get("round_id", st.get("released_round", 0)) or 0))
-            released_round = max(1, int(st.get("released_round", round_id) or round_id))
+            released_round = _sync_round_released_or_fallback(st.get("released_round"), round_id)
         except Exception:
             return _hold("state_corrupto")
         if int(released_round) > int(round_id):
@@ -10071,7 +10217,7 @@ def _sync_round_try_recovery_release_global() -> bool:
 
         st_check = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
         try:
-            released_check = int(st_check.get("released_round", released_round) or released_round)
+            released_check = _sync_round_released_or_fallback(st_check.get("released_round"), released_round)
         except Exception:
             return _hold("state_corrupto", released_round)
         if released_check != int(released_round):
@@ -10138,6 +10284,7 @@ def _sync_round_hard_hold_real_pending(round_id, released_round, pending_bot, pe
     pdata = pending_data if isinstance(pending_data, dict) else {}
     ciclo = pdata.get("ciclo", "?")
     incident_on = _real_close_incident_active()
+    _sync_round_log_global_real_hold(True, owner, "real_close_pending", rid, rel)
     globals()["SYNC_STATUS_LINE"] = (
         f"🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro"
         if incident_on else
@@ -10185,7 +10332,7 @@ def _sync_round_tick_maestro():
     except Exception:
         round_id = 1
     try:
-        released_round = max(1, int(st.get("released_round", round_id) or round_id))
+        released_round = _sync_round_released_or_fallback(st.get("released_round"), round_id)
     except Exception:
         released_round = round_id
 
@@ -10193,6 +10340,19 @@ def _sync_round_tick_maestro():
     if bool(pending_on_early):
         _sync_round_hard_hold_real_pending(round_id, released_round, pending_bot_early, pending_data_early, st)
         return
+
+    real_hold_on_early, real_hold_owner_early, real_hold_reason_early = _sync_round_real_hold_owner("tick_maestro_pre_rejoin")
+    if real_hold_on_early:
+        globals()["SYNC_STATUS_LINE"] = f"SYNC: HOLD_REAL_ACTIVO | owner={real_hold_owner_early or '--'} | ronda={round_id} | release={released_round} | DEMO_GLOBAL_EN_HOLD=SI"
+        _sync_round_log_global_real_hold(True, real_hold_owner_early, real_hold_reason_early, round_id, released_round)
+        try:
+            _real_lock_set("REAL_CLOSE_LIBRE", False, f"real_owner={real_hold_owner_early}")
+            _real_lock_set("ORDEN_REAL_OK", False, f"real_owner={real_hold_owner_early}")
+            _real_lock_set("TOKEN_REAL_LIBRE", False, f"real_owner={real_hold_owner_early}")
+        except Exception:
+            pass
+        return
+    _sync_round_log_global_real_hold(False, context="tick_maestro_pre_rejoin_clear", round_id=round_id, released_round=released_round)
 
     try:
         st2 = _sync_round_apply_post_real_rejoin(st, released_round=released_round)
@@ -10344,7 +10504,7 @@ def _sync_round_tick_maestro():
         elif reason_bot == "ok_demo_token_real_stale":
             rp = REAL_CLOSE_PENDING.get(bot)
             if isinstance(rp, dict) and rp.get("active"):
-                released_round = int(rp.get("round_id", 0) or 0)
+                released_round = normalizar_released_round_id(rp.get("round_id"), fallback=0) or 0
                 if int(round_id) <= released_round:
                     _lxv_5v1x_event_cooldown(
                         key=f"ack_demo_old_post_real:{bot}:{round_id}:{released_round}",
@@ -11232,7 +11392,7 @@ def _sync_round_release_all_after_real_close(bot_real, real_round=None, reason="
         return False
 
     try:
-        released_from = max(1, int(st.get("released_round", st.get("round_id", real_round or 1)) or 1))
+        released_from = _sync_round_released_or_fallback(st.get("released_round"), st.get("round_id", real_round or 1))
     except Exception:
         released_from = 1
     try:
@@ -23837,7 +23997,7 @@ def mostrar_panel():
     try:
         release_state = globals().get("REAL_LOCKS_PANEL", None)
         if isinstance(release_state, dict):
-            release_id = int(release_state.get("round_id", 0) or 0)
+            release_id = normalizar_released_round_id(release_state.get("round_id"), fallback=None)
     except Exception:
         release_id = None
     if not isinstance(release_id, int) or release_id <= 0:
