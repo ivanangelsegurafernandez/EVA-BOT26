@@ -1260,8 +1260,9 @@ def leer_orden_real(bot: str):
                 or data.get("ciclo_orden")
                 or data.get("ciclo_forzado")
                 or data.get("marti_ciclo")
-                or 1
             )
+            if raw_ciclo in (None, "", 0, "0"):
+                return None, None, 0, None
             cyc = int(raw_ciclo)
             ts = float(data.get("created_ts") or data.get("ts") or 0.0)
             ttl = float(data.get("ttl_s") or data.get("ttl") or 45.0)
@@ -1337,6 +1338,13 @@ INCIDENT_LOCK_LOG_COOLDOWN_S = 20
 INCIDENT_LOCK_MAX_AGE_S = 180
 INCIDENT_LOCK_RECOVERY_ATTEMPTS = 5
 INCIDENT_LOCK_RECOVERY_WAIT_S = 8
+INCIDENT_LOCK_HISTORY_LOOKBACK_S = 300
+INCIDENT_LOCK_HISTORY_MIN_DELAY_S = 5
+INCIDENT_LOCK_HISTORY_MAX_CHECKS = 5
+INCIDENT_LOCK_HISTORY_LOG_COOLDOWN_S = 20
+REAL_ORDER_READ_RETRIES = 5
+REAL_ORDER_READ_WAIT_S = 1.5
+REAL_SIN_ORDEN_LOG_COOLDOWN_S = 20
 CONTRATOS_RESUELTOS_INCIDENT_LOCK = set()
 
 
@@ -1359,7 +1367,7 @@ def _set_pending_contract_resolution(round_id: int, contract_id=None, reason: st
         "contract_id": contract_id,
         "attempts": 0,
         "last_recovery_ts": 0.0,
-        "history_todo": "TODO: integrar historial/transacciones Deriv para resolver compras sin contract_id confirmado.",
+        "history_recovery": "historial_deriv_seguro_habilitado",
         "context": dict(incident_context),
     }
     estado_bot["pending_contract_incident"] = incidente
@@ -1406,12 +1414,190 @@ def _pending_incident_from_state() -> dict:
             "contract_id": estado_bot.get("pending_contract_id"),
             "attempts": 0,
             "last_recovery_ts": 0.0,
-            "history_todo": "TODO: integrar historial/transacciones Deriv para resolver compras sin contract_id confirmado.",
+            "history_recovery": "historial_deriv_seguro_habilitado",
             "context": {},
         }
         estado_bot["pending_contract_incident"] = incidente
     return incidente
 
+
+
+def _incident_float(v, default=None):
+    try:
+        if v in (None, ""):
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _incident_int(v, default=None):
+    try:
+        if v in (None, ""):
+            return default
+        return int(float(v))
+    except Exception:
+        return default
+
+
+def _incident_text_blob(item: dict) -> str:
+    try:
+        parts = []
+        for k in ("symbol", "underlying", "display_name", "shortcode", "longcode", "description", "contract_type", "transaction_type"):
+            val = item.get(k) if isinstance(item, dict) else None
+            if val not in (None, ""):
+                parts.append(str(val))
+        return " ".join(parts).upper()
+    except Exception:
+        return ""
+
+
+def _contrato_item_compatible_con_incidente(item: dict, incidente: dict) -> bool:
+    if not isinstance(item, dict):
+        return False
+    ts_inc = float(incidente.get("ts", time.time()) or time.time())
+    lookback = float(INCIDENT_LOCK_HISTORY_LOOKBACK_S)
+    t_item = _incident_float(item.get("purchase_time") or item.get("date_start") or item.get("transaction_time") or item.get("time") or item.get("timestamp"), None)
+    if t_item is not None and not ((ts_inc - lookback) <= t_item <= (time.time() + 30.0)):
+        return False
+
+    blob = _incident_text_blob(item)
+    activo = str(incidente.get("activo") or incidente.get("symbol") or "").strip().upper()
+    if activo and blob and activo not in blob:
+        symbol_item = str(item.get("symbol") or item.get("underlying") or "").strip().upper()
+        if symbol_item and symbol_item != activo:
+            return False
+
+    direccion = str(incidente.get("direccion") or incidente.get("direction") or "").strip().upper()
+    if direccion in ("CALL", "PUT") and blob and direccion not in blob:
+        ctype = str(item.get("contract_type") or "").upper()
+        if ctype and direccion not in ctype:
+            return False
+
+    monto_inc = _incident_float(incidente.get("monto"), None)
+    monto_item = _incident_float(item.get("buy_price") or item.get("amount") or item.get("debit") or item.get("stake"), None)
+    if monto_inc is not None and monto_item is not None:
+        if abs(abs(monto_item) - abs(monto_inc)) > max(0.05, abs(monto_inc) * 0.25):
+            return False
+    return True
+
+
+async def _consultar_contract_id_incidente(ws, contract_id: int) -> tuple[bool, dict]:
+    try:
+        data_pc = await api_call(
+            ws,
+            {"proposal_open_contract": 1, "contract_id": int(contract_id)},
+            expect_msg_type="proposal_open_contract",
+            timeout=4.0,
+        )
+        poc = data_pc.get("proposal_open_contract", {}) if isinstance(data_pc, dict) else {}
+        if not poc:
+            return True, {"status": "open", "contract_id": int(contract_id), "reason": "proposal_sin_detalle"}
+        if not bool(poc.get("is_sold", False)):
+            return True, {"status": "open", "contract_id": int(contract_id), "proposal_open_contract": poc}
+        profit_val = _incident_float(poc.get("profit"), None)
+        if profit_val is None:
+            return True, {"status": "closed", "contract_id": int(contract_id), "resultado": "INDEFINIDO", "reason": "cerrado_sin_profit", "proposal_open_contract": poc}
+        resultado = "GANANCIA" if profit_val > 0 else "PÉRDIDA" if profit_val < 0 else "INDEFINIDO"
+        return True, {"status": "closed", "contract_id": int(contract_id), "resultado": resultado, "profit": profit_val, "proposal_open_contract": poc}
+    except Exception as e:
+        return True, {"status": "open", "contract_id": int(contract_id), "reason": f"proposal_open_contract_{type(e).__name__}"}
+
+
+async def buscar_contrato_reciente_deriv_seguro(ws, incidente: dict) -> tuple[bool, dict]:
+    """
+    Busca evidencia de un contrato reciente cuando una compra quedó incierta y no hay contract_id.
+    Nunca compra. Nunca registra resultado por sí sola.
+    """
+    if ws is None:
+        return False, {"reason": "ws_no_disponible"}
+    try:
+        ciclo = incidente.get("ciclo", estado_bot.get("ciclo_actual", "?"))
+        checks = int(incidente.get("history_checks", 0) or 0)
+        if checks >= int(INCIDENT_LOCK_HISTORY_MAX_CHECKS):
+            return False, {"reason": "historial_no_concluyente"}
+        last = float(incidente.get("last_history_check_ts", 0.0) or 0.0)
+        now = time.time()
+        if (now - last) < float(INCIDENT_LOCK_HISTORY_MIN_DELAY_S):
+            return False, {"reason": "cooldown_historial"}
+        incidente["last_history_check_ts"] = now
+        incidente["history_checks"] = checks + 1
+        if _print_once(f"incident-history-{NOMBRE_BOT}-{ciclo}", ttl=float(INCIDENT_LOCK_HISTORY_LOG_COOLDOWN_S)):
+            print(Fore.CYAN + Style.BRIGHT + f"🔎 INCIDENT_LOCK_BUSCANDO_HISTORIAL | {NOMBRE_BOT} | C{ciclo} | intento={checks + 1} | contract_id=None")
+
+        # A) Portfolio: contratos abiertos recientes.
+        try:
+            data_pf = await api_call(ws, {"portfolio": 1}, expect_msg_type="portfolio", timeout=4.0)
+            contracts = []
+            pf = data_pf.get("portfolio", {}) if isinstance(data_pf, dict) else {}
+            if isinstance(pf, dict):
+                contracts = pf.get("contracts") or []
+            if isinstance(contracts, list):
+                for item in contracts:
+                    if not _contrato_item_compatible_con_incidente(item, incidente):
+                        continue
+                    cid = _incident_int(item.get("contract_id") or item.get("id"), None)
+                    if cid is None:
+                        continue
+                    found, info = await _consultar_contract_id_incidente(ws, cid)
+                    info.update({"source": "portfolio"})
+                    if _print_once(f"incident-ghost-{NOMBRE_BOT}-{cid}", ttl=float(INCIDENT_LOCK_HISTORY_LOG_COOLDOWN_S)):
+                        print(Fore.GREEN + Style.BRIGHT + f"✅ INCIDENT_LOCK_CONTRATO_FANTASMA_ENCONTRADO | {NOMBRE_BOT} | contract_id={cid} | status={info.get('status')}")
+                    return found, info
+        except Exception:
+            pass
+
+        # C) Profit table / statement recientes.
+        queries = [
+            ({"profit_table": 1, "limit": 25, "description": 1}, "profit_table"),
+            ({"statement": 1, "limit": 25, "description": 1}, "statement"),
+        ]
+        for payload, key in queries:
+            try:
+                data_hist = await api_call(ws, payload, expect_msg_type=key, timeout=5.0)
+                root = data_hist.get(key, {}) if isinstance(data_hist, dict) else {}
+                txs = []
+                if isinstance(root, dict):
+                    txs = root.get("transactions") or root.get("contracts") or []
+                if not isinstance(txs, list):
+                    continue
+                for item in txs:
+                    if not _contrato_item_compatible_con_incidente(item, incidente):
+                        continue
+                    cid = _incident_int(item.get("contract_id") or item.get("id"), None)
+                    if cid is None:
+                        continue
+                    found, info = await _consultar_contract_id_incidente(ws, cid)
+                    info.update({"source": key})
+                    if _print_once(f"incident-ghost-{NOMBRE_BOT}-{cid}", ttl=float(INCIDENT_LOCK_HISTORY_LOG_COOLDOWN_S)):
+                        print(Fore.GREEN + Style.BRIGHT + f"✅ INCIDENT_LOCK_CONTRATO_FANTASMA_ENCONTRADO | {NOMBRE_BOT} | contract_id={cid} | status={info.get('status')}")
+                    return found, info
+            except Exception:
+                continue
+        return False, {"reason": "historial_no_concluyente"}
+    except Exception as e:
+        return False, {"reason": f"historial_error_{type(e).__name__}"}
+
+
+async def leer_orden_real_con_reintentos(bot: str):
+    for intento in range(int(REAL_ORDER_READ_RETRIES)):
+        cyc, ts, quiet, src = leer_orden_real(bot)
+        try:
+            cyc_i = int(cyc) if cyc is not None else None
+        except Exception:
+            cyc_i = None
+        if cyc_i is not None and 1 <= cyc_i <= MAX_CICLOS:
+            return cyc_i, ts, quiet, src
+        if intento < int(REAL_ORDER_READ_RETRIES) - 1:
+            await asyncio.sleep(float(REAL_ORDER_READ_WAIT_S))
+    token_txt = "?"
+    try:
+        token_txt = str(leer_token_actual() or "?").strip()
+    except Exception:
+        token_txt = "?"
+    if _print_once(f"real-sin-orden-{bot}", ttl=float(REAL_SIN_ORDEN_LOG_COOLDOWN_S)):
+        print(Fore.RED + Style.BRIGHT + f"🚫 REAL SIN ORDEN MAESTRO VÁLIDA | {bot} | no se opera para no romper Martingala | token={token_txt}")
+    return None, None, 0, None
 
 def _log_incident_lock_diagnostico(incidente: dict, accion: str = "esperando"):
     ciclo = incidente.get("ciclo", estado_bot.get("ciclo_actual", "?"))
@@ -1461,10 +1647,10 @@ async def resolver_contrato_incierto_seguro(ws, incidente: dict) -> tuple[bool, 
             cid_int = None
         if cid_int is not None and (cid_int in CONTRATOS_RESUELTOS_INCIDENT_LOCK or cid_int in _contratos_procesados):
             CONTRATOS_RESUELTOS_INCIDENT_LOCK.add(cid_int)
-            if _print_once(f"incident-dup-{cid_int}", ttl=float(INCIDENT_LOCK_LOG_COOLDOWN_S)):
-                print(Fore.CYAN + Style.BRIGHT + f"♻️ contrato ya resuelto, incidente limpiado sin duplicar. contract_id={cid_int}")
-            _clear_pending_contract_resolution(reason="incident_contract_already_resolved", resultado_final="GANANCIA")
-            return True, {"accion": "duplicado_limpiado", "contract_id": cid_int}
+            if _print_once(f"incident-dup-log-{cid_int}", ttl=float(INCIDENT_LOCK_LOG_COOLDOWN_S)):
+                print(Fore.CYAN + Style.BRIGHT + f"♻️ INCIDENT_LOCK_CONTRATO_YA_RESUELTO | {NOMBRE_BOT} | contract_id={cid_int} | sin duplicar registro")
+            _clear_pending_contract_resolution(reason="contract_already_resolved_no_duplicate", resultado_final="YA_RESUELTO")
+            return True, {"accion": "duplicado_limpiado", "contract_id": cid_int, "resultado_final": "YA_RESUELTO", "final_reason": "contract_already_resolved_no_duplicate"}
 
         if ws is None or cid_int is None:
             return False, {"accion": "esperando", "reason": "sin_ws_o_contract_id_invalido"}
@@ -1513,15 +1699,52 @@ async def resolver_contrato_incierto_seguro(ws, incidente: dict) -> tuple[bool, 
         print(Fore.GREEN + Style.BRIGHT + f"✅ INCIDENT_LOCK_RESUELTO | {NOMBRE_BOT} | contract_id={cid_int} | resultado={resultado} | C{incidente.get('ciclo', '?')}")
         return True, {"accion": "resuelto", "contract_id": cid_int, "resultado": resultado}
 
-    # Sin contract_id: no se inventa historial complejo. DEMO puede liberarse tras intentos seguros; REAL requiere revisión.
+    # Sin contract_id: buscar evidencia en Deriv antes de liberar DEMO; REAL no se libera sin evidencia.
     if now - float(incidente.get("last_recovery_ts", 0.0) or 0.0) >= float(INCIDENT_LOCK_RECOVERY_WAIT_S):
         incidente["last_recovery_ts"] = now
         incidente["attempts"] = int(incidente.get("attempts", 0) or 0) + 1
+        found, info_hist = await buscar_contrato_reciente_deriv_seguro(ws, incidente)
+        if found:
+            cid_hist = _incident_int(info_hist.get("contract_id"), None)
+            if cid_hist is not None:
+                incidente["contract_id"] = cid_hist
+                estado_bot["pending_contract_id"] = cid_hist
+            if str(info_hist.get("status") or "").lower() == "open":
+                return False, {"accion": "esperando", "reason": "contrato_fantasma_abierto", **info_hist}
+            if str(info_hist.get("status") or "").lower() == "closed":
+                if cid_hist is None:
+                    return False, {"accion": "manual", "reason": "contrato_fantasma_sin_id", **info_hist}
+                if cid_hist in CONTRATOS_RESUELTOS_INCIDENT_LOCK or cid_hist in _contratos_procesados:
+                    CONTRATOS_RESUELTOS_INCIDENT_LOCK.add(cid_hist)
+                    if _print_once(f"incident-dup-log-{cid_hist}", ttl=float(INCIDENT_LOCK_LOG_COOLDOWN_S)):
+                        print(Fore.CYAN + Style.BRIGHT + f"♻️ INCIDENT_LOCK_CONTRATO_YA_RESUELTO | {NOMBRE_BOT} | contract_id={cid_hist} | sin duplicar registro")
+                    _clear_pending_contract_resolution(reason="contract_already_resolved_no_duplicate", resultado_final="YA_RESUELTO")
+                    return True, {"accion": "duplicado_limpiado", "contract_id": cid_hist, "resultado_final": "YA_RESUELTO"}
+                resultado_hist = str(info_hist.get("resultado") or "").upper()
+                if resultado_hist not in ("GANANCIA", "PÉRDIDA", "PERDIDA"):
+                    return False, {"accion": "manual", "reason": "historial_sin_resultado_contable", **info_hist}
+                ctx = incidente.get("context", {}) if isinstance(incidente.get("context"), dict) else {}
+                required = ("activo", "direccion", "monto", "ciclo", "token_usado")
+                if not all(ctx.get(k) is not None for k in required):
+                    return False, {"accion": "manual", "reason": "contexto_insuficiente_para_registrar", **info_hist}
+                await finalizar_contrato_bg(
+                    cid_hist, 0, ctx.get("activo"), ctx.get("direccion"), ctx.get("monto"),
+                    ctx.get("rsi9"), ctx.get("rsi14"), ctx.get("sma5"), ctx.get("sma20"),
+                    ctx.get("cruce"), ctx.get("breakout"), ctx.get("rsi_reversion"),
+                    ctx.get("ciclo"), ctx.get("payout"), ctx.get("condiciones"), ctx.get("token_usado"),
+                    epoch_pretrade=ctx.get("epoch_pretrade"), trade_uid=ctx.get("trade_uid"), close_snapshot=ctx.get("close_snapshot"),
+                )
+                if cid_hist not in _contratos_procesados:
+                    return False, {"accion": "manual", "reason": "registro_final_no_confirmado", **info_hist}
+                CONTRATOS_RESUELTOS_INCIDENT_LOCK.add(cid_hist)
+                _clear_pending_contract_resolution(reason="incident_lock_resuelto", resultado_final=resultado_hist)
+                print(Fore.GREEN + Style.BRIGHT + f"✅ INCIDENT_LOCK_RESUELTO | {NOMBRE_BOT} | contract_id={cid_hist} | resultado={resultado_hist} | C{incidente.get('ciclo', '?')}")
+                return True, {"accion": "resuelto", "contract_id": cid_hist, "resultado": resultado_hist}
 
     if modo == "REAL":
         if int(incidente.get("attempts", 0) or 0) >= INCIDENT_LOCK_RECOVERY_ATTEMPTS and edad >= float(INCIDENT_LOCK_MAX_AGE_S):
             if _print_once(f"real-incident-manual-{NOMBRE_BOT}-{incidente.get('ciclo')}", ttl=float(INCIDENT_LOCK_LOG_COOLDOWN_S)):
-                print(Fore.RED + Style.BRIGHT + "🚨 REAL_INCIDENT_LOCK_REQUIERE_REVISION | no se libera sin evidencia")
+                print(Fore.RED + Style.BRIGHT + f"🚨 REAL_INCIDENT_LOCK_REQUIERE_REVISION | {NOMBRE_BOT} | no se libera sin evidencia")
         return False, {"accion": "manual", "reason": "real_sin_contract_id_no_liberado"}
 
     if int(incidente.get("attempts", 0) or 0) >= int(INCIDENT_LOCK_RECOVERY_ATTEMPTS):
@@ -1530,10 +1753,10 @@ async def resolver_contrato_incierto_seguro(ws, incidente: dict) -> tuple[bool, 
         estado_bot["pending_contract_action"] = "LIBERAR_SIN_CONTRATO"
         estado_bot["ciclo_forzado"] = ciclo
         _clear_pending_contract_resolution(reason="COMPRA_NO_CONFIRMADA", resultado_final="COMPRA_NO_CONFIRMADA")
-        print(Fore.YELLOW + Style.BRIGHT + f"🧯 INCIDENT_LOCK_LIBERADO_SIN_CONTRATO | {NOMBRE_BOT} | C{ciclo} | compra no confirmada | mismo_ciclo=SI")
+        print(Fore.YELLOW + Style.BRIGHT + f"🧯 INCIDENT_LOCK_LIBERADO_SIN_CONTRATO | {NOMBRE_BOT} | C{ciclo} | DEMO | mismo_ciclo=SI")
         return True, {"accion": "liberado_sin_contrato", "estado": "COMPRA_NO_CONFIRMADA"}
 
-    return False, {"accion": "consultando", "reason": "sin_contract_id_historial_no_implementado"}
+    return False, {"accion": "consultando", "reason": "historial_no_concluyente"}
 
 
 async def _pending_contract_fence_tick(ws):
@@ -2639,7 +2862,7 @@ async def check_token_and_reconnect(ws, current_token):
                         pass
                     primer_ingreso_real = True
                     real_activado_en_bot = time.time()  # BLOQUE 5 and 2: Set activation time
-                    cyc, _, quiet, src = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
+                    cyc, _, quiet, src = await leer_orden_real_con_reintentos(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
                     estado_bot["real_first_cycle_reset_pending"] = True
                     ciclo_maestro = None
                     try:
@@ -2658,15 +2881,15 @@ async def check_token_and_reconnect(ws, current_token):
                     if ciclo_forzado_prev is not None and not (1 <= ciclo_forzado_prev <= MAX_CICLOS):
                         ciclo_forzado_prev = None
 
-                    ciclo_real_entrada = ciclo_maestro or ciclo_forzado_prev or 1
-                    estado_bot["ciclo_forzado"] = ciclo_real_entrada
-                    estado_bot["ciclo_actual"] = ciclo_real_entrada
-                    if ciclo_maestro is not None:
-                        print(Fore.YELLOW + f"Entrada REAL detectada -> respetando orden maestro C{ciclo_maestro}")
-                    elif ciclo_forzado_prev is not None:
-                        print(Fore.YELLOW + f"Entrada REAL detectada sin orden válida -> usando ciclo_forzado C{ciclo_forzado_prev}")
+                    if ciclo_maestro is None:
+                        estado_bot["real_sin_orden_maestro"] = True
+                        estado_bot["ciclo_forzado"] = None
                     else:
-                        print(Fore.YELLOW + "Entrada REAL detectada sin orden válida -> fallback C1")
+                        estado_bot["real_sin_orden_maestro"] = False
+                        ciclo_real_entrada = ciclo_maestro
+                        estado_bot["ciclo_forzado"] = ciclo_real_entrada
+                        estado_bot["ciclo_actual"] = ciclo_real_entrada
+                        print(Fore.YELLOW + f"Entrada REAL detectada -> respetando orden maestro C{ciclo_maestro}")
 
                     # Silenciar ruido guiado por maestro (BLOQUE 3)
                     if quiet or (str(src).upper() == "MANUAL"):
@@ -2678,7 +2901,7 @@ async def check_token_and_reconnect(ws, current_token):
                     if not (MODO_SILENCIOSO and estado_bot.get("modo_manual")) and not estado_bot.get("barra_activa", False):
                         if _print_once("rea-REAL", ttl=180):
                             print(Fore.YELLOW + "Reafirmación de REAL (sin reset de martingala)")
-                    cyc, _, quiet, src = leer_orden_real(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
+                    cyc, _, quiet, src = await leer_orden_real_con_reintentos(NOMBRE_BOT)  # BLOQUE 7: Relee fresh
                     ciclo_maestro = None
                     try:
                         if cyc is not None:
@@ -2696,9 +2919,13 @@ async def check_token_and_reconnect(ws, current_token):
                     if ciclo_forzado_prev is not None and not (1 <= ciclo_forzado_prev <= MAX_CICLOS):
                         ciclo_forzado_prev = None
 
-                    ciclo_objetivo = ciclo_maestro or ciclo_forzado_prev or 1
-                    estado_bot["ciclo_forzado"] = ciclo_objetivo
-                    if ciclo_maestro is not None:
+                    if ciclo_maestro is None:
+                        estado_bot["real_sin_orden_maestro"] = True
+                        estado_bot["ciclo_forzado"] = None
+                    else:
+                        estado_bot["real_sin_orden_maestro"] = False
+                        ciclo_objetivo = ciclo_maestro
+                        estado_bot["ciclo_forzado"] = ciclo_objetivo
                         print(Fore.YELLOW + f"Reafirmación REAL -> respetando orden maestro C{ciclo_maestro}")
 
                     if quiet or (str(src).upper() == "MANUAL"):
@@ -2735,7 +2962,7 @@ async def check_token_and_reconnect(ws, current_token):
 
                 primer_ingreso_real = True
                 estado_bot["real_first_cycle_reset_pending"] = True
-                cyc, _, _quiet, _src = leer_orden_real(NOMBRE_BOT)
+                cyc, _, _quiet, _src = await leer_orden_real_con_reintentos(NOMBRE_BOT)
                 ciclo_maestro = None
                 try:
                     if cyc is not None:
@@ -2753,15 +2980,15 @@ async def check_token_and_reconnect(ws, current_token):
                 if ciclo_forzado_prev is not None and not (1 <= ciclo_forzado_prev <= MAX_CICLOS):
                     ciclo_forzado_prev = None
 
-                ciclo_real_entrada = ciclo_maestro or ciclo_forzado_prev or 1
-                estado_bot["ciclo_forzado"] = ciclo_real_entrada
-                estado_bot["ciclo_actual"] = ciclo_real_entrada
-                if ciclo_maestro is not None:
-                    print(Fore.YELLOW + f"Entrada REAL detectada -> respetando orden maestro C{ciclo_maestro}")
-                elif ciclo_forzado_prev is not None:
-                    print(Fore.YELLOW + f"Entrada REAL detectada sin orden válida -> usando ciclo_forzado C{ciclo_forzado_prev}")
+                if ciclo_maestro is None:
+                    estado_bot["real_sin_orden_maestro"] = True
+                    estado_bot["ciclo_forzado"] = None
                 else:
-                    print(Fore.YELLOW + "Entrada REAL detectada sin orden válida -> fallback C1")
+                    estado_bot["real_sin_orden_maestro"] = False
+                    ciclo_real_entrada = ciclo_maestro
+                    estado_bot["ciclo_forzado"] = ciclo_real_entrada
+                    estado_bot["ciclo_actual"] = ciclo_real_entrada
+                    print(Fore.YELLOW + f"Entrada REAL detectada -> respetando orden maestro C{ciclo_maestro}")
                 try:
                     real_activado_en_bot = time.time()
                 except Exception:
@@ -3523,7 +3750,7 @@ async def ejecutar_panel():
             martingala = MARTINGALA_REAL if modo_real else MARTINGALA_DEMO
 
             sep_ciclo()
-            ciclo_orden, _ts, _quiet, _src = leer_orden_real(NOMBRE_BOT)
+            ciclo_orden, _ts, _quiet, _src = await leer_orden_real_con_reintentos(NOMBRE_BOT) if modo_real else leer_orden_real(NOMBRE_BOT)
             ciclo_forzado = estado_bot.get("ciclo_forzado")
             ciclo_maestro = None
             try:
@@ -3543,7 +3770,12 @@ async def ejecutar_panel():
                 ciclo_forzado = max(1, min(ciclo_forzado, MAX_CICLOS))
                 print(Fore.YELLOW + f"⚠️ ciclo>MAX_CICLOS detectado, normalizado a C{ciclo_forzado} (retenido=C{ciclo_prev})")
 
-            ciclo = ciclo_maestro or ciclo_forzado or 1
+            if modo_real and ciclo_maestro is None:
+                estado_bot["real_sin_orden_maestro"] = True
+                await asyncio.sleep(0.5)
+                continue
+            estado_bot["real_sin_orden_maestro"] = False
+            ciclo = ciclo_maestro if ciclo_maestro is not None else (ciclo_forzado if ciclo_forzado is not None else 1)
             if modo_real:
                 now_guard = time.time()
                 last_guard = float(estado_bot.get("real_cycle_guard_last_ts", 0.0) or 0.0)
@@ -3561,10 +3793,8 @@ async def ejecutar_panel():
             if modo_real and estado_bot.get("real_first_cycle_reset_pending"):
                 if ciclo_maestro is not None:
                     print(Fore.YELLOW + f"Primer ciclo REAL confirmado por maestro en C{ciclo_maestro}")
-                elif ciclo_forzado is not None:
-                    print(Fore.YELLOW + f"Primer ciclo REAL sin orden válida -> usando ciclo_forzado C{ciclo_forzado}")
                 else:
-                    print(Fore.YELLOW + "Primer ciclo REAL sin orden válida -> fallback C1")
+                    print(Fore.RED + Style.BRIGHT + f"🚫 REAL SIN ORDEN MAESTRO VÁLIDA | {NOMBRE_BOT} | no se opera para no romper Martingala | token=REAL:{NOMBRE_BOT}")
                 estado_bot["real_first_cycle_reset_pending"] = False
 
             estado_bot["ciclo_forzado"] = None
