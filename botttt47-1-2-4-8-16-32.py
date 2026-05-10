@@ -1037,7 +1037,7 @@ async def _sync_round_wait_release(round_id: int) -> int:
                     )
                     last_global_hold_print_ts = now_ts
                 try:
-                    _sync_round_write_release_heartbeat(rid, next_round)
+                    _sync_round_write_wait_heartbeat(rid, next_round)
                 except Exception:
                     pass
                 last_progress_ts = now_ts
@@ -1054,6 +1054,13 @@ async def _sync_round_wait_release(round_id: int) -> int:
                     any_real_owner=any_real_owner,
                     any_real_reason=any_real_reason,
                 )
+                try:
+                    _sync_round_write_wait_heartbeat(rid, next_round)
+                    if (now_ts - float(globals().get("_SYNC_WAIT_HEARTBEAT_RECOVERY_LOG_TS", 0.0) or 0.0)) >= 15.0:
+                        globals()["_SYNC_WAIT_HEARTBEAT_RECOVERY_LOG_TS"] = now_ts
+                        print(Fore.CYAN + f"🫀 SYNC_WAIT_HEARTBEAT_RECOVERY | bot={NOMBRE_BOT} | ronda={rid} | espera={next_round}")
+                except Exception:
+                    pass
                 if (now_ts - last_global_hold_print_ts) >= 10.0:
                     print(
                         Fore.YELLOW + Style.BRIGHT +
