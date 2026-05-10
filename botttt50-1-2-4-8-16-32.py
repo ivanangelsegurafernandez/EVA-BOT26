@@ -1338,13 +1338,24 @@ def _set_pending_contract_resolution(round_id: int, contract_id=None, reason: st
         print(Fore.YELLOW + Style.BRIGHT + f"🧱 Fence contrato incierto activado.{cid_txt} reason={reason_txt}")
 
 
-def _clear_pending_contract_resolution(reason: str = ""):
+def _clear_pending_contract_resolution(reason: str = "", resultado_final: str | None = None):
+    res_norm = str(resultado_final or "").strip().upper()
+    if reason in ("reconciled_sold", "timeout") and res_norm not in ("GANANCIA", "PÉRDIDA", "PERDIDA"):
+        estado_bot["pending_contract_resolution"] = True
+        estado_bot["pending_contract_state"] = "VENDIDO_SIN_RESULTADO_CONTABLE" if reason == "reconciled_sold" else "INCIDENT_LOCK"
+        estado_bot["pending_contract_action"] = "ESPERAR"
+        if _print_once(f"pending-contract-hold-{reason}", ttl=6.0):
+            print(Fore.YELLOW + Style.BRIGHT + "🧱 REAL INCIERTO: contrato vendido/reconciliado pero sin resultado contable. Esperando cierre final. No se permite nueva compra.")
+        return False
     if estado_bot.get("pending_contract_resolution") and _print_once("pending-contract-clear", ttl=6.0):
         print(Fore.GREEN + f"✅ Fence contrato incierto liberado ({reason or 'resolved'}).")
     estado_bot["pending_contract_resolution"] = False
     estado_bot["pending_contract_id"] = None
     estado_bot["pending_since_ts"] = 0.0
     estado_bot["pending_round_id"] = None
+    estado_bot["pending_contract_state"] = "RESUELTO"
+    estado_bot["pending_contract_action"] = "LIBERAR"
+    return True
 
 
 async def _pending_contract_fence_tick(ws):
@@ -1355,18 +1366,38 @@ async def _pending_contract_fence_tick(ws):
     since = float(estado_bot.get("pending_since_ts", 0.0) or 0.0)
     elapsed = max(0.0, time.time() - since)
 
-    if isinstance(pending_id, int) and ws is not None:
+    pending_id_int = None
+    try:
+        pending_id_int = int(pending_id) if pending_id not in (None, "", 0, "0") else None
+    except Exception:
+        pending_id_int = None
+
+    if pending_id_int is not None and ws is not None:
         try:
             data_pc = await api_call(
                 ws,
-                {"proposal_open_contract": 1, "contract_id": int(pending_id)},
+                {"proposal_open_contract": 1, "contract_id": int(pending_id_int)},
                 expect_msg_type="proposal_open_contract",
                 timeout=4.0,
             )
             poc = data_pc.get("proposal_open_contract", {}) if isinstance(data_pc, dict) else {}
             if bool(poc.get("is_sold", False)):
-                _clear_pending_contract_resolution(reason="reconciled_sold")
-                return True
+                profit_raw = poc.get("profit", None)
+                try:
+                    profit_val = float(profit_raw)
+                    resultado_final = "GANANCIA" if profit_val >= 0 else "PÉRDIDA"
+                except Exception:
+                    resultado_final = None
+                if resultado_final in ("GANANCIA", "PÉRDIDA"):
+                    if _clear_pending_contract_resolution(reason="reconciled_sold", resultado_final=resultado_final):
+                        return True
+                estado_bot["pending_contract_resolution"] = True
+                estado_bot["pending_contract_state"] = "VENDIDO_SIN_RESULTADO_CONTABLE"
+                estado_bot["pending_contract_action"] = "ESPERAR"
+                if _print_once("pending-contract-sold-no-accounting", ttl=6.0):
+                    print(Fore.YELLOW + Style.BRIGHT + "🧱 REAL INCIERTO: contrato vendido/reconciliado pero sin resultado contable. Esperando cierre final. No se permite nueva compra.")
+                await asyncio.sleep(1.0)
+                return False
         except Exception:
             pass
 
@@ -1381,9 +1412,11 @@ async def _pending_contract_fence_tick(ws):
         await asyncio.sleep(1.0)
         return False
 
-    print(Fore.RED + Style.BRIGHT + "⚠️ Fence contrato incierto agotó timeout. Reinicio controlado sin duplicar compra.")
-    _clear_pending_contract_resolution(reason="timeout")
-    reinicio_forzado.set()
+    estado_bot["pending_contract_resolution"] = True
+    estado_bot["pending_contract_state"] = "INCIDENT_LOCK"
+    estado_bot["pending_contract_action"] = "ESPERAR"
+    if _print_once("pending-contract-incident-lock", ttl=10.0):
+        print(Fore.RED + Style.BRIGHT + "🚨 INCIDENT_LOCK: contrato incierto sin resultado final. No se permite nueva compra automática.")
     return False
 # <<< PATCH
 
@@ -3128,7 +3161,7 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
             print(msg2)
 
         try:
-            _clear_pending_contract_resolution(reason="bg_resolved")
+            _clear_pending_contract_resolution(reason="bg_resolved", resultado_final=resultado)
             print(Fore.GREEN + Style.BRIGHT + "✅ Fence contrato incierto liberado (bg_resolved)." + Style.RESET_ALL)
         except Exception:
             pass
@@ -3770,7 +3803,7 @@ async def ejecutar_panel():
                     continue
 
                 # Resultado definido
-                _clear_pending_contract_resolution(reason="resultado_definido")
+                _clear_pending_contract_resolution(reason="resultado_definido", resultado_final=resultado)
                 indefinidos_consecutivos = 0
                 estado_bot["intentos_saldo"] = 0
                 estado_bot["ciclo_en_progreso"] = False
