@@ -11545,7 +11545,7 @@ def _sync_round_try_recovery_release_global() -> bool:
     pegado en N, hay bots DEMO esperando esa liberación y no existe ningún
     candado duro de REAL activo. No compra, no emite REAL y no toca tokens.
     """
-    hold_cd = float(globals().get("SYNC_RECOVERY_GLOBAL_HOLD_COOLDOWN_S", 15.0) or 15.0)
+    hold_cd = float(globals().get("SYNC_RECOVERY_GLOBAL_HOLD_COOLDOWN_S", 20.0) or 20.0)
     recovery_hold_context = {}
 
     def _hold(motivo: str, released_value: int | str = "?") -> bool:
@@ -11563,10 +11563,14 @@ def _sync_round_try_recovery_release_global() -> bool:
             motivo_txt = "orden_real_viva"
         elif "token_real" in motivo_l:
             motivo_txt = "token_real_active"
+        elif "contract_pending_ack" in motivo_l or "contrato_pendiente_ack" in motivo_l:
+            motivo_txt = "contract_pending_ack"
         elif "pending_contract" in motivo_l or "contract_pending" in motivo_l or "contrato_pendiente" in motivo_l:
             motivo_txt = "pending_contract_resolution"
         elif "released_ya" in motivo_l or "already_released" in motivo_l:
             motivo_txt = "released_ya_avanzado"
+        elif "target_no_es" in motivo_l or "target_round" in motivo_l:
+            motivo_txt = "target_no_es_N_mas_1"
         elif "espera_minima" in motivo_l or "round_not_stale" in motivo_l:
             motivo_txt = "espera_minima_no_cumplida"
         elif "write_failed" in motivo_l:
@@ -11589,8 +11593,8 @@ def _sync_round_try_recovery_release_global() -> bool:
             target_ctx = ctx.get("target_round", "?")
             print_rate_limited(
                 f"DEMO_RECOVERY_HOLD:{released_value}:{target_ctx}:{motivo_txt}",
-                f"🧷 DEMO_RECOVERY_HOLD | release={released_value} | target={target_ctx} | req_bots={len(req_ctx)} | wait_bots={len(wait_ctx)} | motivo={motivo_txt}",
-                ttl=hold_cd,
+                f"🧷 DEMO_RECOVERY_HOLD | release={released_value} | target={target_ctx} | req={req_ctx} | wait={wait_ctx} | motivo={motivo_txt}",
+                ttl=20.0,
             )
         except Exception:
             pass
@@ -11651,13 +11655,18 @@ def _sync_round_try_recovery_release_global() -> bool:
                 st_bot = estado_bots.get(bot, {}) if isinstance(estado_bots.get(bot, {}), dict) else {}
                 if bool(st_bot.get("pending_contract_resolution", False)):
                     return f"pending_contract_resolution:{bot}:estado"
+                ciclo_modo = str(st_bot.get("ciclo_en_progreso_modo") or st_bot.get("modo_ciclo") or st_bot.get("modo") or "").upper()
+                if bool(st_bot.get("ciclo_en_progreso", False)) and "REAL" in ciclo_modo:
+                    return f"real_turn_active:{bot}:ciclo_en_progreso_REAL"
                 for key in ("pending_contract_resolution", "pending_contract", "contract_pending", "contrato_pendiente"):
                     if bool(st_dict.get(key, False)):
                         return f"{key}:state"
                 if bool(st_bot.get("pending_contract_resolution", False) or st_bot.get("pending_contract", False) or st_bot.get("contract_pending", False) or st_bot.get("contrato_pendiente", False)):
                     return f"pending_contract_resolution:{bot}:estado"
-                if isinstance(ack, dict) and bool(ack.get("pending_contract_resolution", False) or ack.get("pending_contract", False) or ack.get("contract_pending", False) or ack.get("contrato_pendiente", False)):
+                if isinstance(ack, dict) and bool(ack.get("pending_contract_resolution", False)):
                     return f"pending_contract_resolution:{bot}:ack"
+                if isinstance(ack, dict) and bool(ack.get("pending_contract", False) or ack.get("contract_pending", False) or ack.get("contrato_pendiente", False)):
+                    return f"contract_pending_ack:{bot}"
         except Exception:
             return "pending_contract_resolution_check_error"
         return ""
@@ -11668,8 +11677,12 @@ def _sync_round_try_recovery_release_global() -> bool:
         if not isinstance(st, dict) or not st:
             return _hold("state_corrupto")
         try:
-            round_id = normalizar_released_round_id(st.get("round_id"), fallback=None)
-            released_round = normalizar_released_round_id(st.get("released_round"), fallback=None)
+            raw_round_id = st.get("round_id")
+            raw_released_round = st.get("released_round")
+            if isinstance(raw_round_id, bool) or isinstance(raw_released_round, bool):
+                return _hold("state_corrupto")
+            round_id = normalizar_released_round_id(raw_round_id, fallback=None)
+            released_round = normalizar_released_round_id(raw_released_round, fallback=None)
             if round_id is None or released_round is None:
                 return _hold("state_corrupto")
         except Exception:
@@ -11681,9 +11694,14 @@ def _sync_round_try_recovery_release_global() -> bool:
 
         target_round = int(released_round) + 1
         recovery_hold_context.update({"target_round": int(target_round), "req_bots": [], "wait_bots": []})
+        if isinstance(target_round, bool) or target_round <= int(released_round) or target_round != (int(released_round) + 1) or target_round <= 10:
+            return _hold("target_no_es_N_mas_1", released_round)
         status_now = str(st.get("status", "") or "").strip().lower()
-        owner_state = str(st.get("real_owner") or st.get("owner_real") or st.get("bot_real") or st.get("real_pending_bot") or "").strip()
-        if owner_state in BOT_NAMES:
+        owner_raw = st.get("real_owner") or st.get("owner_real") or st.get("bot_real") or st.get("real_pending_bot")
+        owner_state = str(owner_raw or "").strip()
+        if bool(st.get("real_global", False)):
+            return _hold("real_turn_active", released_round)
+        if owner_state and owner_state not in ("--", "None", "NONE", "null", "NULL"):
             return _hold("real_turn_active", released_round)
         if status_now in ("holding_real_result", "holding_real_turn") or bool(st.get("holding_real_result", False) or st.get("holding_real_turn", False)):
             return _hold("real_turn_active", released_round)
@@ -11760,8 +11778,15 @@ def _sync_round_try_recovery_release_global() -> bool:
         for bot in BOT_NAMES:
             ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
             st_bot = estado_bots.get(bot, {}) if isinstance(estado_bots.get(bot, {}), dict) else {}
-            if bool(st_bot.get("pending_contract_resolution", False) or st_bot.get("pending_contract", False) or st_bot.get("contract_pending", False) or st_bot.get("contrato_pendiente", False) or (isinstance(ack, dict) and (ack.get("pending_contract_resolution", False) or ack.get("pending_contract", False) or ack.get("contract_pending", False) or ack.get("contrato_pendiente", False)))):
+            if bool(st_bot.get("pending_contract_resolution", False) or st_bot.get("pending_contract", False) or st_bot.get("contract_pending", False) or st_bot.get("contrato_pendiente", False)):
                 return _hold("pending_contract_resolution", released_round)
+            ciclo_modo = str(st_bot.get("ciclo_en_progreso_modo") or st_bot.get("modo_ciclo") or st_bot.get("modo") or "").upper()
+            if bool(st_bot.get("ciclo_en_progreso", False)) and "REAL" in ciclo_modo:
+                return _hold("real_turn_active", released_round)
+            if isinstance(ack, dict) and bool(ack.get("pending_contract_resolution", False)):
+                return _hold("pending_contract_resolution", released_round)
+            if isinstance(ack, dict) and bool(ack.get("pending_contract", False) or ack.get("contract_pending", False) or ack.get("contrato_pendiente", False)):
+                return _hold("contract_pending_ack", released_round)
             if not isinstance(ack, dict):
                 continue
             try:
@@ -11879,7 +11904,7 @@ def _sync_round_try_recovery_release_global() -> bool:
                 cooldown_s=1.0,
             )
             agregar_evento(f"🧯 DEMO_CLEAN_RELEASE_FROM_RECOVERY_REQUEST | {released_round}→{target_round} | bots={list(req_bots)} | real=NO")
-            globals()["SYNC_STATUS_LINE"] = f"DEMO_CLEAN_RELEASE_FROM_RECOVERY_REQUEST: {released_round}→{target_round}"
+            globals()["SYNC_STATUS_LINE"] = f"SYNC: DEMO_CLEAN_RELEASE_FROM_RECOVERY_REQUEST | {released_round}→{target_round}"
             return True
         return _hold("write_failed", released_round)
     except Exception:
@@ -31244,46 +31269,6 @@ if __name__ == "__main__":
             time.sleep(5)
 
 # === FIN BLOQUE 13 ===
-# === BLOQUE 99 — RESUMEN FINAL DE LO QUE SE LOGRA ===
-#
-# - Bot maestro 5R6M-1-2-4-8-16 con:
-#   * Martingala 1-2-4-8-16 intacta.
-#   * Tokens DEMO/REAL y handshake maestro→bots intactos.
-#   * CSV enriquecidos, dataset_incremental.csv, IA XGBoost, reentrenos intactos.
-#   * HUD visual con Prob IA, % éxito, saldo, meta, eventos
-#   * Audio para GANANCIA/PÉRDIDA, racha, meta, IA 53%, etc.
-# - Organización por bloques numerados:
-#   ver índice de bloques al inicio del archivo.
-#
-# Esta organización no cambia la lógica original, solo la hace más mantenible.
-# === FIN BLOQUE 99 ===
-        if len(src_rows) <= 0:
-            src_rows = list(LXV_FASE_COLUMNS_CACHE)
-            cache_has_target = True if target_rid is None else any(int((x or {}).get("round_id", 0) or 0) == target_rid for x in src_rows)
-            if (not src_rows) or ((target_rid is not None) and (not cache_has_target)):
-                src_rows = _lxv_5v1x_load_recent_matrix_rows(max_rows=40)
-                matrix_has_target = True if target_rid is None else any(_mrv_5v1x_to_int((x or {}).get("round_id", 0), 0) == target_rid for x in src_rows)
-                if target_rid is not None and not matrix_has_target:
-                    try:
-                        rows_pack = _ack_live_build_rows()
-                        fb = _ack_live_calc_summary(rows_pack)
-                        rid_fb = _mrv_5v1x_to_int((fb or {}).get("obj_round", 0), 0)
-                        if rid_fb == target_rid:
-                            src_rows.append({
-                                "round_id": rid_fb,
-                                "n_verdes": int((fb or {}).get("verdes_count", 0) or 0),
-                                "n_rojos": int((fb or {}).get("rojas_count", 0) or 0),
-                                "round_complete": bool((fb or {}).get("complete", False)),
-                                "data_quality": str((fb or {}).get("data_quality", "") or ""),
-                                "source": "ack_live_summary",
-                            })
-                    except Exception:
-                        pass
-    _lxv_5v1x_event_cooldown(
-        key=f"5v1x_green_ok:{rid}",
-        msg=f"✅ LXV VERDE OK: rid={rid} patron=5V1X prev_full_green_streak={int((info_exh or {}).get('prev_full_green_streak',0))}",
-        cooldown_s=8.0,
-    )
 
 def _selftest_real_activo_prepatron_lxv():
     tests = [
@@ -31698,3 +31683,16 @@ def _selftest_dq_released_hud():
 
 if os.environ.get("RUN_DQ_RELEASED_HUD_SELFTEST") == "1":
     _selftest_dq_released_hud()
+# === BLOQUE 99 — RESUMEN FINAL DE LO QUE SE LOGRA ===
+#
+# - Bot maestro 5R6M-1-2-4-8-16 con:
+#   * Martingala 1-2-4-8-16 intacta.
+#   * Tokens DEMO/REAL y handshake maestro→bots intactos.
+#   * CSV enriquecidos, dataset_incremental.csv, IA XGBoost, reentrenos intactos.
+#   * HUD visual con Prob IA, % éxito, saldo, meta, eventos
+#   * Audio para GANANCIA/PÉRDIDA, racha, meta, IA 53%, etc.
+# - Organización por bloques numerados:
+#   ver índice de bloques al inicio del archivo.
+#
+# Esta organización no cambia la lógica original, solo la hace más mantenible.
+# === FIN BLOQUE 99 ===
