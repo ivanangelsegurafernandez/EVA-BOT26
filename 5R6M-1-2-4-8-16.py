@@ -1737,6 +1737,11 @@ def _activar_real_close_incident_lock(bot, pending, reason="REAL_CLOSE_PENDING_T
             REAL_CLOSE_PENDING[bot]["active"] = True
         ciclo_txt = pending.get("ciclo") if isinstance(pending, dict) else "?"
         round_txt = pending.get("round_id") if isinstance(pending, dict) else None
+        _audit_real_close_pending_action(
+            bot=bot, pending=pending, resultado="INDEFINIDO",
+            contract_id=estado_bots.get(bot, {}).get("id_contrato") if bot in BOT_NAMES else None,
+            reason=str(reason or "REAL_CLOSE_PENDING_TTL_EXPIRED"), accion="INCIDENT_LOCK",
+        )
         _lxv_5v1x_event_cooldown(
             key=f"incident_lock_real_close_expired:{bot}:{ciclo_txt}:{round_txt}",
             msg=f"🚨 INCIDENT_LOCK_REAL_CLOSE_EXPIRED: {bot} C{ciclo_txt} | ronda={round_txt} | requiere revisión",
@@ -1788,6 +1793,83 @@ def _real_close_sig(bot, res, monto, ciclo, payout_total, baseline=None):
         round(float(payout_total or 0.0), 4),
         int(baseline or REAL_ENTRY_BASELINE.get(bot, 0) or 0),
     )
+
+def _real_hold_ciclo_text(bot=None, pending=None, ciclo=None):
+    try:
+        if isinstance(pending, dict) and pending.get("ciclo") is not None:
+            return f"C{int(pending.get('ciclo'))}"
+    except Exception:
+        pass
+    try:
+        if ciclo is not None:
+            return f"C{int(ciclo)}"
+    except Exception:
+        pass
+    try:
+        if bot in BOT_NAMES:
+            return f"C{int(estado_bots.get(bot, {}).get('ciclo_actual', 1) or 1)}"
+    except Exception:
+        pass
+    return "C?"
+
+def _audit_real_close_pending_action(bot=None, pending=None, resultado=None, contract_id=None, reason="", accion="HOLD", ciclo_ordenado=None):
+    try:
+        pending = pending if isinstance(pending, dict) else {}
+        bot_txt = str(bot or pending.get("bot") or "UNKNOWN")
+        ciclo_pending = pending.get("ciclo")
+        if ciclo_pending is None and bot_txt in BOT_NAMES:
+            ciclo_pending = estado_bots.get(bot_txt, {}).get("ciclo_actual")
+        ciclo_ord = ciclo_ordenado if ciclo_ordenado is not None else pending.get("ciclo_orden", pending.get("ciclo"))
+        res_norm = normalizar_resultado(resultado)
+        cid = contract_id if contract_id is not None else estado_bots.get(bot_txt, {}).get("id_contrato") if bot_txt in BOT_NAMES else None
+        msg = (
+            "🧾 REAL_CLOSE_AUDIT | "
+            f"bot={bot_txt} | ciclo_pending=C{ciclo_pending if ciclo_pending is not None else '?'} | "
+            f"ciclo_ordenado=C{ciclo_ord if ciclo_ord is not None else '?'} | "
+            f"resultado_norm={res_norm} | contract_id={cid or '--'} | "
+            f"reason={reason or '--'} | accion={accion}"
+        )
+        _lxv_5v1x_event_cooldown(
+            key=f"real_close_audit:{bot_txt}:{ciclo_pending}:{res_norm}:{cid}:{accion}:{reason}",
+            msg=msg,
+            cooldown_s=12.0,
+        )
+    except Exception:
+        pass
+
+def _real_hold_event(bot=None, pending=None, resultado=None, contract_id=None, reason="contrato_incierto"):
+    try:
+        pending = pending if isinstance(pending, dict) else {}
+        bot_txt = str(bot or pending.get("bot") or "UNKNOWN")
+        ciclo_txt = _real_hold_ciclo_text(bot_txt if bot_txt in BOT_NAMES else None, pending=pending)
+        res_norm = normalizar_resultado(resultado)
+        if bot_txt in BOT_NAMES:
+            try:
+                estado_bots[bot_txt]["real_estado_cierre"] = "VENDIDO_SIN_RESULTADO_CONTABLE" if str(reason) == "reconciled_sold_sin_resultado" else "CONTRATO_INCIERTO_SIN_RESULTADO_CONTABLE"
+                estado_bots[bot_txt]["real_close_accion"] = "ESPERAR"
+                estado_bots[bot_txt]["real_resultado_pendiente_norm"] = res_norm
+            except Exception:
+                pass
+        _audit_real_close_pending_action(
+            bot=bot_txt, pending=pending, resultado=res_norm, contract_id=contract_id,
+            reason=reason, accion="HOLD",
+        )
+        _lxv_5v1x_event_cooldown(
+            key=f"real_hold:{bot_txt}:{ciclo_txt}:{res_norm}:{reason}",
+            msg=(
+                f"🧱 REAL HOLD | bot={bot_txt} | {ciclo_txt} | contrato incierto | "
+                "esperando GANANCIA/PÉRDIDA | nueva compra bloqueada"
+            ),
+            cooldown_s=10.0,
+        )
+        if str(reason) == "reconciled_sold_sin_resultado":
+            _lxv_5v1x_event_cooldown(
+                key=f"real_reconciled_no_accounting:{bot_txt}:{ciclo_txt}",
+                msg="🧱 REAL INCIERTO: contrato vendido/reconciliado pero sin resultado contable. Esperando cierre final. No se permite nueva compra.",
+                cooldown_s=10.0,
+            )
+    except Exception:
+        pass
 CTT_CLOSE_EVENTS = deque(maxlen=6000)
 CTT_CLOSE_SEEN = set()
 CTT_STATE = {
@@ -12949,6 +13031,15 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
         if bot not in BOT_NAMES:
             return False
 
+        hay_pending, pending_bot, pending = _hay_real_close_pending_activo()
+        if hay_pending or real_indefinido_bloquea_nueva_compra(bot):
+            _real_hold_event(bot=pending_bot or bot, pending=pending if isinstance(pending, dict) else REAL_CLOSE_PENDING.get(bot), resultado=(pending or {}).get("resultado") if isinstance(pending, dict) else "INDEFINIDO", reason="activar_real_bloqueado_por_cierre_pendiente")
+            agregar_evento(
+                f"🧱 REAL bloqueado: cierre pendiente sin resultado final; no se activa REAL para {bot}. "
+                f"pendiente={pending_bot or bot} C{pending.get('ciclo') if isinstance(pending, dict) else '?'}"
+            )
+            return False
+
         now = time.time()
 
         # 🔒 No permitir reemplazar owner REAL activo por otro bot.
@@ -13135,6 +13226,15 @@ def escribir_orden_real(bot: str, ciclo: int, round_id=None) -> bool:
         _emitir_marca_purificacion_real()
         return False
 
+    hay_pending, pending_bot, pending = _hay_real_close_pending_activo()
+    if hay_pending or real_indefinido_bloquea_nueva_compra(bot):
+        _real_hold_event(bot=pending_bot or bot, pending=pending if isinstance(pending, dict) else REAL_CLOSE_PENDING.get(bot), resultado=(pending or {}).get("resultado") if isinstance(pending, dict) else "INDEFINIDO", reason="orden_real_bloqueada_por_cierre_pendiente")
+        agregar_evento(
+            f"🧱 REAL bloqueado: cierre pendiente sin resultado final; no se escribe orden REAL para {bot}. "
+            f"pendiente={pending_bot or bot} C{pending.get('ciclo') if isinstance(pending, dict) else '?'}"
+        )
+        return False
+
     # 🔒 No crear orden si ya hay otro owner REAL activo.
     try:
         owner_lock = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
@@ -13273,8 +13373,9 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
     pending_on, pending_bot, pending = _hay_real_close_pending_activo()
     if pending_on:
         reason_pending = "INCIDENT_LOCK_REAL_CLOSE" if _real_close_incident_active() else "CIERRE_REAL_PENDIENTE"
+        _real_hold_event(bot=pending_bot or bot, pending=pending, resultado=(pending or {}).get("resultado") if isinstance(pending, dict) else "INDEFINIDO", reason="emitir_real_bloqueado_por_cierre_pendiente")
         agregar_evento(
-            f"⏸️ REAL bloqueado por {reason_pending}: no se emite {src} para {bot}; "
+            f"🧱 REAL bloqueado: cierre pendiente sin resultado final ({reason_pending}); no se emite {src} para {bot}; "
             f"pendiente={pending_bot} C{pending.get('ciclo') if isinstance(pending, dict) else '?'}"
         )
         return False
@@ -13815,6 +13916,29 @@ def normalizar_resultado(texto):
     if "GAN" in t or "WIN" in t:
         return "GANANCIA"
     return "INDEFINIDO"
+
+def resultado_real_contable(res):
+    return normalizar_resultado(res) in ("GANANCIA", "PÉRDIDA")
+
+def real_indefinido_bloquea_nueva_compra(bot):
+    try:
+        if bot in BOT_NAMES:
+            p = REAL_CLOSE_PENDING.get(bot)
+            if isinstance(p, dict) and p.get("active"):
+                _real_hold_event(bot=bot, pending=p, resultado=p.get("resultado", "INDEFINIDO"), reason="real_close_pending_active")
+                return True
+            if _real_close_incident_active() and str(REAL_CLOSE_INCIDENT_LOCK.get("bot") or "") in ("", str(bot)):
+                _audit_real_close_pending_action(bot=bot, pending=REAL_CLOSE_INCIDENT_LOCK, resultado="INDEFINIDO", reason=REAL_CLOSE_INCIDENT_LOCK.get("reason"), accion="INCIDENT_LOCK")
+                return True
+            st = estado_bots.get(bot, {}) if isinstance(estado_bots, dict) else {}
+            estado = str(st.get("real_estado_cierre") or st.get("estado_contrato") or "").upper()
+            res_norm = normalizar_resultado(st.get("real_resultado_pendiente_norm") or st.get("resultado") or st.get("resultado_real"))
+            if estado in ("CONTRATO_INCIERTO_SIN_RESULTADO_CONTABLE", "VENDIDO_SIN_RESULTADO_CONTABLE", "INDEFINIDO", "ERROR_WS", "CERRADO_SIN_RESULTADO") and not resultado_real_contable(res_norm):
+                _real_hold_event(bot=bot, pending=REAL_CLOSE_PENDING.get(bot), resultado=res_norm, reason="last_state_uncertain")
+                return True
+        return False
+    except Exception:
+        return False
 def normalizar_trade_status(ts):
     """
     Normaliza trade_status a canónico del Maestro:
@@ -29864,11 +29988,17 @@ async def main():
                                 cooldown_s=15.0,
                             )
                             continue
-                        if res not in ("GANANCIA", "PÉRDIDA"):
-                            _lxv_5v1x_event_cooldown(
-                                key=f"real_close_invalid_result_pending:{bot}:{int(ciclo or 0)}",
-                                msg="🚨 REAL sin cierre válido: HOLD activo, no se cierra ciclo ni se libera sync",
-                                cooldown_s=15.0,
+                        if not resultado_real_contable(res):
+                            try:
+                                pending["resultado"] = normalizar_resultado(res)
+                                pending["last_hold_reason"] = "resultado_no_contable"
+                                pending["active"] = True
+                            except Exception:
+                                pass
+                            _real_hold_event(
+                                bot=bot, pending=pending, resultado=res,
+                                contract_id=estado_bots.get(bot, {}).get("id_contrato"),
+                                reason="resultado_no_contable",
                             )
                             continue
                         saldo_antes = obtener_valor_saldo()
@@ -29906,6 +30036,7 @@ async def main():
                             "detector": f"REAL_CLOSE_PENDING_{modo_detector}",
                         })
                         if res == "GANANCIA":
+                            _audit_real_close_pending_action(bot=bot, pending=pending, resultado=res, contract_id=estado_bots.get(bot, {}).get("id_contrato"), reason=f"pending_{modo_detector}", accion="LIBERAR_WIN")
                             agregar_evento(f"✅ REAL C{int(ciclo)} GANANCIA registrada por pending ({modo_detector}): {bot} -> C1")
                             cerrar_por_fin_de_ciclo(bot, "Ganancia REAL cerrada por pending; vuelve a DEMO")
                             _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
@@ -29916,6 +30047,7 @@ async def main():
                             activo_real = None
                             break
                         if res == "PÉRDIDA":
+                            _audit_real_close_pending_action(bot=bot, pending=pending, resultado=res, contract_id=estado_bots.get(bot, {}).get("id_contrato"), reason=f"pending_{modo_detector}", accion="LIBERAR_LOSS")
                             prox = int(ciclo_martingala_siguiente() or 1)
                             agregar_evento(f"❌ REAL C{int(ciclo)} PÉRDIDA registrada por pending ({modo_detector}): {bot} -> próxima C{prox}")
                             cerrar_por_fin_de_ciclo(bot, f"Pérdida REAL C{int(ciclo)} cerrada por pending")
@@ -29989,6 +30121,29 @@ async def main():
                                     )
                                     continue
 
+                                if not resultado_real_contable(res):
+                                    pending_direct = REAL_CLOSE_PENDING.get(bot)
+                                    if not isinstance(pending_direct, dict):
+                                        pending_direct = {
+                                            "active": True,
+                                            "bot": bot,
+                                            "ciclo": int(ciclo or estado_bots.get(bot, {}).get("ciclo_actual", 1) or 1),
+                                            "baseline": int(REAL_ENTRY_BASELINE.get(bot, 0) or 0),
+                                            "ts": float(time.time()),
+                                            "source": str(estado_bots.get(bot, {}).get("fuente") or "DIRECT"),
+                                            "round_id": _resolver_ronda_audit({"bot": bot}),
+                                        }
+                                        REAL_CLOSE_PENDING[bot] = pending_direct
+                                    pending_direct["resultado"] = normalizar_resultado(res)
+                                    pending_direct["last_hold_reason"] = "direct_resultado_no_contable"
+                                    pending_direct["active"] = True
+                                    _real_hold_event(
+                                        bot=bot, pending=pending_direct, resultado=res,
+                                        contract_id=estado_bots.get(bot, {}).get("id_contrato"),
+                                        reason="direct_resultado_no_contable",
+                                    )
+                                    continue
+
                                 if res in ("GANANCIA", "PÉRDIDA"):
                                     saldo_antes = obtener_valor_saldo()
                                     globals()["REAL_BALANCE_AUDIT_CONTEXT"] = {
@@ -30033,6 +30188,7 @@ async def main():
                                     except Exception:
                                         pass
                                     if res == "GANANCIA":
+                                        _audit_real_close_pending_action(bot=bot, pending=REAL_CLOSE_PENDING.get(bot), resultado=res, contract_id=estado_bots.get(bot, {}).get("id_contrato"), reason="direct_real_close", accion="LIBERAR_WIN")
                                         prox = int(ciclo_martingala_siguiente() or 1)
                                         agregar_evento(f"✅ REAL WIN: {bot} C{int(ciclo or 0)} -> DEMO | próximo ciclo C{prox}")
                                         cerrar_por_fin_de_ciclo(bot, "Ganancia REAL cerrada; vuelve a DEMO")
@@ -30044,6 +30200,7 @@ async def main():
                                         activo_real = None
                                         break
                                     if res == "PÉRDIDA":
+                                        _audit_real_close_pending_action(bot=bot, pending=REAL_CLOSE_PENDING.get(bot), resultado=res, contract_id=estado_bots.get(bot, {}).get("id_contrato"), reason="direct_real_close", accion="LIBERAR_LOSS")
                                         prox = int(ciclo_martingala_siguiente() or 1)
                                         if int(ciclo or 0) >= int(MAX_CICLOS):
                                             agregar_evento(f"❌ REAL LOSS FINAL: {bot} C{int(ciclo or 0)} -> DEMO | reinicio próximo ciclo C{prox}")
@@ -30062,8 +30219,9 @@ async def main():
                         set_etapa("TICK_03")
                         pending_on, pending_bot, pending = _hay_real_close_pending_activo()
                         if pending_on:
+                            _real_hold_event(bot=pending_bot, pending=pending, resultado=(pending or {}).get("resultado") if isinstance(pending, dict) else "INDEFINIDO", reason="tick_bloqueo_nueva_compra")
                             agregar_evento(
-                                f"⏸️ REAL pendiente: no se evalúa nueva entrada REAL hasta cerrar {pending_bot} C{pending.get('ciclo')}"
+                                f"🧱 REAL bloqueado: cierre pendiente sin resultado final; no se evalúa nueva entrada REAL hasta cerrar {pending_bot} C{pending.get('ciclo') if isinstance(pending, dict) else '?'}"
                             )
                             set_etapa("TICK_02")
                             continue
