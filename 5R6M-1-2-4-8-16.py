@@ -688,6 +688,29 @@ MRV_ZONA_V2_SLOPE_TEMPRANO = 0.02
 MRV_ZONA_V2_SLOPE_MADURO_MIN = -0.06
 MRV_ZONA_V2_SLOPE_TARDIO = -0.08
 MRV_ZONA_V2_FULL_GREEN_PREV_BLOCK = 3
+
+# === ZONA LXV EXTRA: REBOTE POST-ROJO / SERRUCHO SATURADO ===
+LXV_REBOTE_POST_ROJO_ENABLE = True
+LXV_REBOTE_POST_ROJO_CAN_UNLOCK = True
+LXV_REBOTE_POST_ROJO_LOOKBACK = 4
+LXV_REBOTE_POST_ROJO_MIN_GREEN_ACTUAL = 4
+LXV_REBOTE_POST_ROJO_RED_MIN = 4
+LXV_REBOTE_POST_ROJO_MIN_RED_COLS = 1
+LXV_REBOTE_POST_ROJO_MIN_IMPULSE = 0.18
+LXV_REBOTE_POST_ROJO_PROM_PREV_MAX = 0.50
+LXV_REBOTE_POST_ROJO_4V2X_REQUIRE_STRICT = True
+LXV_REBOTE_POST_ROJO_LOG_COOLDOWN_S = 20.0
+
+LXV_VERDE_SERRUCHO_SATURADO_ENABLE = True
+LXV_VERDE_SERRUCHO_LOOKBACK = 6
+LXV_VERDE_SERRUCHO_MIN_FULL_GREEN_PREV = 2
+LXV_VERDE_SERRUCHO_RED_DROP_MIN_ROJOS = 4
+LXV_VERDE_SERRUCHO_CURRENT_MAX_GREEN = 4
+LXV_VERDE_SERRUCHO_BLOCK_4V2X = True
+LXV_VERDE_SERRUCHO_BLOCK_5V1X = False
+LXV_VERDE_SERRUCHO_LOG_COOLDOWN_S = 20.0
+_LXV_REBOTE_POST_ROJO_LAST_LOG_TS = 0.0
+_LXV_VERDE_SERRUCHO_LAST_LOG_TS = 0.0
 _MRV_ZONA_V2_LAST_STATE = None
 _MRV_ZONA_V2_LAST_LOG_TS = 0.0
 ZONA_REGIONAL_DOMINANTE_ENABLE = True
@@ -8723,6 +8746,106 @@ def _lxv_zona_dynamic_metrics(norm_rows, expected=6):
 
 
 
+def _lxv_extra_zona_emit_event(zona_extra, data):
+    try:
+        fn_evt = globals().get("agregar_evento", None)
+        if not callable(fn_evt):
+            return
+        now = time.time()
+        global _LXV_REBOTE_POST_ROJO_LAST_LOG_TS, _LXV_VERDE_SERRUCHO_LAST_LOG_TS
+        if zona_extra == "REBOTE_POST_ROJO":
+            cooldown = float(globals().get("LXV_REBOTE_POST_ROJO_LOG_COOLDOWN_S", 20.0) or 20.0)
+            if now - float(globals().get("_LXV_REBOTE_POST_ROJO_LAST_LOG_TS", 0.0) or 0.0) < cooldown:
+                return
+            _LXV_REBOTE_POST_ROJO_LAST_LOG_TS = now
+            fn_evt(f"🟢 REBOTE_POST_ROJO: desbloqueo controlado | patrón={data.get('patron_actual','--')} | impulse={float(data.get('impulse',0.0) or 0.0):.2f} | prom_prev={float(data.get('prom_prev',0.0) or 0.0):.2f}")
+        elif zona_extra == "VERDE_SERRUCHO_SATURADO":
+            cooldown = float(globals().get("LXV_VERDE_SERRUCHO_LOG_COOLDOWN_S", 20.0) or 20.0)
+            if now - float(globals().get("_LXV_VERDE_SERRUCHO_LAST_LOG_TS", 0.0) or 0.0) < cooldown:
+                return
+            _LXV_VERDE_SERRUCHO_LAST_LOG_TS = now
+            red_drop_txt = "sí" if bool(data.get("red_drop_prev", False)) else "no"
+            fn_evt(f"🟠 VERDE_SERRUCHO_SATURADO: bloqueado | full_prev={int(data.get('full_green_prev',0) or 0)} | red_drop={red_drop_txt} | patrón={data.get('patron_actual','--')}")
+    except Exception:
+        return
+
+
+def _lxv_extra_zona_rebote_serrucho(rows_validas, idx_actual=None, patron_actual=None):
+    base = {
+        "zona_extra": None,
+        "allow_extra": False,
+        "block_extra": False,
+        "motivo_extra": "sin_data_extra",
+    }
+    try:
+        rows = [dict(x) for x in list(rows_validas or []) if isinstance(x, dict)]
+        if not rows:
+            return dict(base)
+        idx = int(idx_actual) if idx_actual is not None else (len(rows) - 1)
+        if idx < 0 or idx >= len(rows):
+            return dict(base)
+        curr = rows[idx]
+        verdes_actual = _mrv_5v1x_to_int(curr.get("n_verdes", curr.get("verdes", -1)), -1)
+        rojos_actual = _mrv_5v1x_to_int(curr.get("n_rojos", curr.get("rojos", -1)), -1)
+        dq = str(curr.get("data_quality", curr.get("quality", "")) or "").strip().lower()
+        complete = bool(curr.get("round_complete", curr.get("complete", False)))
+        if (not complete) or dq != "ok" or verdes_actual < 0 or rojos_actual < 0 or (verdes_actual + rojos_actual) != 6:
+            out = dict(base)
+            out["motivo_extra"] = "candado_columna_o_data"
+            return out
+        patron = str(patron_actual or curr.get("patron", curr.get("pattern", "")) or "").strip().upper()
+        if not patron:
+            if verdes_actual == 5 and rojos_actual == 1:
+                patron = "5V1X"
+            elif verdes_actual == 4 and rojos_actual == 2:
+                patron = "4V2X"
+        lookback_rebote = max(1, int(globals().get("LXV_REBOTE_POST_ROJO_LOOKBACK", 4) or 4))
+        lookback_serrucho = max(1, int(globals().get("LXV_VERDE_SERRUCHO_LOOKBACK", 6) or 6))
+        prev_rebote = rows[max(0, idx - lookback_rebote):idx]
+        prev_serrucho = rows[max(0, idx - lookback_serrucho):idx]
+        if not prev_rebote:
+            return dict(base)
+        g_actual = float(verdes_actual) / 6.0
+        r_actual = float(rojos_actual) / 6.0
+        prom_prev = sum(max(0.0, min(1.0, float(_mrv_5v1x_to_int(x.get("n_verdes", 0), 0)) / 6.0)) for x in prev_rebote) / max(1, len(prev_rebote))
+        red_cols = sum(1 for x in prev_rebote if _mrv_5v1x_to_int(x.get("n_rojos", 0), 0) >= int(globals().get("LXV_REBOTE_POST_ROJO_RED_MIN", 4) or 4))
+        full_green_prev = sum(1 for x in prev_serrucho if _mrv_5v1x_to_int(x.get("n_verdes", 0), 0) >= 5)
+        red_drop_prev = any(_mrv_5v1x_to_int(x.get("n_rojos", 0), 0) >= int(globals().get("LXV_VERDE_SERRUCHO_RED_DROP_MIN_ROJOS", 4) or 4) for x in prev_serrucho)
+        impulse = float(g_actual - prom_prev)
+        metrics = {"patron_actual": patron or "--", "g_actual": g_actual, "r_actual": r_actual, "prom_prev": prom_prev, "red_cols": red_cols, "full_green_prev": full_green_prev, "red_drop_prev": red_drop_prev, "impulse": impulse}
+        if bool(globals().get("LXV_VERDE_SERRUCHO_SATURADO_ENABLE", True)):
+            patron_block = (patron == "4V2X" and bool(globals().get("LXV_VERDE_SERRUCHO_BLOCK_4V2X", True))) or (patron == "5V1X" and bool(globals().get("LXV_VERDE_SERRUCHO_BLOCK_5V1X", False)))
+            if patron_block and verdes_actual <= int(globals().get("LXV_VERDE_SERRUCHO_CURRENT_MAX_GREEN", 4) or 4) and full_green_prev >= int(globals().get("LXV_VERDE_SERRUCHO_MIN_FULL_GREEN_PREV", 2) or 2) and red_drop_prev:
+                out = dict(base)
+                out.update(metrics)
+                out.update({"zona_extra": "VERDE_SERRUCHO_SATURADO", "allow_extra": False, "block_extra": True, "motivo_extra": "serrucho_saturado_fullgreen_red_drop"})
+                _lxv_extra_zona_emit_event("VERDE_SERRUCHO_SATURADO", out)
+                return out
+        if bool(globals().get("LXV_REBOTE_POST_ROJO_ENABLE", True)) and bool(globals().get("LXV_REBOTE_POST_ROJO_CAN_UNLOCK", True)):
+            base_ok = (
+                patron in {"5V1X", "4V2X"}
+                and verdes_actual >= int(globals().get("LXV_REBOTE_POST_ROJO_MIN_GREEN_ACTUAL", 4) or 4)
+                and red_cols >= int(globals().get("LXV_REBOTE_POST_ROJO_MIN_RED_COLS", 1) or 1)
+                and prom_prev <= float(globals().get("LXV_REBOTE_POST_ROJO_PROM_PREV_MAX", 0.50) or 0.50)
+                and impulse >= float(globals().get("LXV_REBOTE_POST_ROJO_MIN_IMPULSE", 0.18) or 0.18)
+            )
+            if base_ok and patron == "4V2X" and bool(globals().get("LXV_REBOTE_POST_ROJO_4V2X_REQUIRE_STRICT", True)):
+                base_ok = impulse >= (float(globals().get("LXV_REBOTE_POST_ROJO_MIN_IMPULSE", 0.18) or 0.18) + 0.05) and full_green_prev < int(globals().get("LXV_VERDE_SERRUCHO_MIN_FULL_GREEN_PREV", 2) or 2)
+            if base_ok:
+                out = dict(base)
+                out.update(metrics)
+                out.update({"zona_extra": "REBOTE_POST_ROJO", "allow_extra": True, "block_extra": False, "motivo_extra": "rebote_post_rojo_impulse_ok"})
+                _lxv_extra_zona_emit_event("REBOTE_POST_ROJO", out)
+                return out
+        out = dict(base)
+        out.update(metrics)
+        out["motivo_extra"] = "sin_match_extra"
+        return out
+    except Exception:
+        out = dict(base)
+        out["motivo_extra"] = "extra_fail_closed"
+        return out
+
 def detectar_zona_mrv_v2(cols_norm, expected=6, prom3=None, prom8=None, prom20=None):
     base = {"zona_mrv_v2":"NEUTRO_MIXTO","decision_mrv_v2":"NO_INVERTIR","allow_real_mrv_v2":False,"motivo_mrv_v2":"sin_dominio_claro","g_actual":0.0,"r_actual":0.0,"green_cols_3":0,"green_cols_5":0,"green_cols_8":0,"red_cols_3":0,"red_cols_5":0,"full_green_prev_streak_mrv2":0,"green_pressure":0.0,"red_pressure":0.0,"slope_3_8":0.0,"slope_8_20":0.0,"noise_ratio":0.0,"mrv2_ok":False}
     try:
@@ -9033,20 +9156,67 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
         d820 = float(metrics.get("delta_8_20", 0.0))
         prev_streak = int(metrics.get("prev_full_green_streak", 0) or 0)
         out=dict(base); out.update({"g0":g0,"g1":g1,"g2":g2,"verdes0":v0,"rojos0":r0,"verdes1":v1,"rojos1":r1,"verdes2":v2,"rojos2":r2,"streak_verde":streak,"prev_full_green_streak":prev_streak,"round_id":rid0,"source":source_resumen,"sources":source_resumen,"cols_usadas":len(norm),"dq0":str(c0.get("data_quality","")),"dq1":str(c1.get("data_quality","")),"dq2":str(c2.get("data_quality","")),"g_actual":g,"prom3":p3,"prom8":p8,"prom20":p20,"delta_3_8":d38,"delta_8_20":d820,"zona_model":"PROM3_PROM8_PROM20"})
+        def _finalizar_zona_lxv_extra(out_base):
+            out2 = dict(out_base)
+            try:
+                zona_original = str(out2.get("zona", "UNKNOWN") or "UNKNOWN").strip().upper()
+                extra = _lxv_extra_zona_rebote_serrucho(norm, len(norm) - 1, None)
+                if isinstance(extra, dict):
+                    out2["zona_extra_info"] = dict(extra)
+                    if bool(extra.get("block_extra", False)):
+                        motivo_original = str(out2.get("motivo", "") or "")
+                        out2.update({
+                            "zona": "VERDE_SERRUCHO_SATURADO",
+                            "fase": "VERDE_SERRUCHO_SATURADO",
+                            "zona_base": "VERDE_TARDIO",
+                            "decision": ZONA_NO_INVERTIR,
+                            "allow_real": False,
+                            "color_key": "ORANGE",
+                            "emoji": "🟠",
+                            "motivo": f"{motivo_original}|extra:serrucho_saturado" if motivo_original else "extra:serrucho_saturado",
+                            "bloqueo_lxv_extra": True,
+                        })
+                    elif extra.get("zona_extra") == "REBOTE_POST_ROJO" and bool(extra.get("allow_extra", False)) and zona_original in {"ROJO_MADURO", "ROJA_TEMPRANO", "NEUTRO"}:
+                        motivo_original = str(out2.get("motivo", "") or "")
+                        out2.update({
+                            "zona": "REBOTE_POST_ROJO",
+                            "fase": "REBOTE_POST_ROJO",
+                            "zona_base": "VERDE_TEMPRANO",
+                            "decision": ZONA_SI_INVERTIR,
+                            "allow_real": True,
+                            "color_key": "GREEN_BRIGHT",
+                            "emoji": "🟢",
+                            "motivo": "rebote_post_rojo_impulse_ok",
+                            "motivo_original_extra": f"{motivo_original}|extra:rebote_post_rojo" if motivo_original else "extra:rebote_post_rojo",
+                            "desbloqueo_lxv_extra": True,
+                        })
+                    for k in ("patron_actual", "impulse", "prom_prev", "red_cols", "full_green_prev", "red_drop_prev", "motivo_extra"):
+                        if k in extra:
+                            out2[f"extra_{k}"] = extra.get(k)
+            except Exception:
+                pass
+            out2 = combinar_zona_lxv_con_mrv2(out2)
+            if str(out2.get("zona", "")).upper() == "REBOTE_POST_ROJO" and bool(out2.get("allow_real", False)):
+                out2["zona_base"] = "VERDE_TEMPRANO"
+            if str(out2.get("zona", "")).upper() == "VERDE_SERRUCHO_SATURADO":
+                out2["zona_base"] = "VERDE_TARDIO"
+                out2["decision"] = ZONA_NO_INVERTIR
+                out2["allow_real"] = False
+            return out2
         if (r0 >= 4 and r1 >= 4) or (p3 <= 0.40 and p8 <= 0.50):
-            out.update({"zona":"ROJO_MADURO","fase":"ROJO_MADURO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"rojo_maduro_promedios"}); out = combinar_zona_lxv_con_mrv2(out); return out
+            out.update({"zona":"ROJO_MADURO","fase":"ROJO_MADURO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"rojo_maduro_promedios"}); return _finalizar_zona_lxv_extra(out)
         if r0 >= 4 or (p3 < p8 - float(globals().get("LXV_ZONA_DROP_TARDIO", 0.08)) and g <= 0.50):
-            out.update({"zona":"ROJA_TEMPRANO","fase":"ROJA_TEMPRANO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_ORANGE","emoji":"🟥","motivo":"caida_hacia_rojo"}); out = combinar_zona_lxv_con_mrv2(out); return out
+            out.update({"zona":"ROJA_TEMPRANO","fase":"ROJA_TEMPRANO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_ORANGE","emoji":"🟥","motivo":"caida_hacia_rojo"}); return _finalizar_zona_lxv_extra(out)
         if (prev_streak >= int(globals().get("LXV_ZONA_FULL_GREEN_PREV_BLOCK", 3) or 3) and g <= (5/6)) or (p8 >= float(globals().get("LXV_ZONA_PROM8_SATURADO", 0.92)) and p3 < p8 - float(globals().get("LXV_ZONA_DROP_SATURADO", 0.04)) and g <= (5/6)):
-            out.update({"zona":"VERDE_SATURADO_TARDIO","fase":"VERDE_SATURADO_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"prev_full_green_streak" if prev_streak >= int(globals().get("LXV_ZONA_FULL_GREEN_PREV_BLOCK", 3) or 3) else "saturacion_con_caida"}); out = combinar_zona_lxv_con_mrv2(out); return out
+            out.update({"zona":"VERDE_SATURADO_TARDIO","fase":"VERDE_SATURADO_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"prev_full_green_streak" if prev_streak >= int(globals().get("LXV_ZONA_FULL_GREEN_PREV_BLOCK", 3) or 3) else "saturacion_con_caida"}); return _finalizar_zona_lxv_extra(out)
         if p8 >= float(globals().get("LXV_ZONA_PROM8_TARDIO_MIN", 0.70)) and p3 < p8 - float(globals().get("LXV_ZONA_DROP_TARDIO", 0.08)) and g <= (4/6):
-            out.update({"zona":"VERDE_TARDIO","fase":"VERDE_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"ORANGE","emoji":"🟧","motivo":"verde_perdiendo_fuerza"}); out = combinar_zona_lxv_con_mrv2(out); return out
+            out.update({"zona":"VERDE_TARDIO","fase":"VERDE_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"ORANGE","emoji":"🟧","motivo":"verde_perdiendo_fuerza"}); return _finalizar_zona_lxv_extra(out)
         if g >= (4/6) and p8 >= 0.45 and p8 < 0.68 and p3 >= p8 + float(globals().get("LXV_ZONA_DELTA_TEMPRANO", 0.02)):
-            out.update({"zona":"VERDE_TEMPRANO","fase":"VERDE_TEMPRANO","decision":ZONA_SI_INVERTIR,"allow_real":True,"color_key":"GREEN_BRIGHT","emoji":"🟩","motivo":"verde_naciendo_promedios"}); out = combinar_zona_lxv_con_mrv2(out); return out
+            out.update({"zona":"VERDE_TEMPRANO","fase":"VERDE_TEMPRANO","decision":ZONA_SI_INVERTIR,"allow_real":True,"color_key":"GREEN_BRIGHT","emoji":"🟩","motivo":"verde_naciendo_promedios"}); return _finalizar_zona_lxv_extra(out)
         if g >= (4/6) and p8 >= float(globals().get("LXV_ZONA_PROM8_MIN_ALLOW", 0.50)) and p8 <= float(globals().get("LXV_ZONA_PROM8_MAX_ALLOW", 0.92)) and p3 >= p8 - float(globals().get("LXV_ZONA_DELTA_OK", 0.05)):
-            out.update({"zona":"VERDE_MADURO","fase":"VERDE_MADURO","decision":ZONA_SI_INVERTIR,"allow_real":True,"color_key":"GREEN_YELLOW","emoji":"🟨","motivo":"verde_estable_promedios"}); out = combinar_zona_lxv_con_mrv2(out); return out
+            out.update({"zona":"VERDE_MADURO","fase":"VERDE_MADURO","decision":ZONA_SI_INVERTIR,"allow_real":True,"color_key":"GREEN_YELLOW","emoji":"🟨","motivo":"verde_estable_promedios"}); return _finalizar_zona_lxv_extra(out)
         out.update({"zona":"NEUTRO","fase":"NEUTRO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"GRAY","emoji":"⬜","motivo":"sin_predominio_dinamico"})
-        return out
+        return _finalizar_zona_lxv_extra(out)
     except Exception:
         out=dict(base); out.update({"zona":"ERROR","fase":"ERROR","decision":ZONA_NO_INVERTIR,"allow_real":False,"motivo":"zona_error_fail_closed","ok":False})
         return out
@@ -9159,6 +9329,7 @@ def normalizar_zona_lxv_oficial(info):
     zonas_validas = {
         "VERDE_TEMPRANO", "VERDE_MADURO", "VERDE_TARDIO", "VERDE_SATURADO_TARDIO",
         "ROJA_TEMPRANO", "ROJO_MADURO", "NEUTRO", "INSUFICIENTE", "ERROR", "UNKNOWN",
+        "REBOTE_POST_ROJO", "VERDE_SERRUCHO_SATURADO",
     }
     try:
         raw = dict(info) if isinstance(info, dict) else {}
@@ -9170,13 +9341,21 @@ def normalizar_zona_lxv_oficial(info):
         raw_decision = str(raw.get("decision", "") or "").strip().upper()
         dq_raw = str(raw.get("dq0", raw.get("data_quality", "")) or "").strip().lower()
         motivo_l = motivo_raw.lower()
+        motivo_bloqueante = any(tok in motivo_l for tok in ("bloq", "block", "tardio", "saturacion", "roja", "error", "expired", "incompleta", "missing", "partial"))
         bloqueo_duro = (
             bool(raw.get("bloqueo_mrv_v2", False))
             or raw_decision == "NO_INVERTIR"
             or (raw_has_allow and raw_allow is False)
             or dq_raw in ("missing", "partial", "closed_expired", "expired", "incomplete", "error")
-            or any(tok in motivo_l for tok in ("bloq", "block", "tardio", "saturacion", "roja", "error", "expired", "incompleta", "missing", "partial"))
+            or motivo_bloqueante
         )
+        if zona_raw == "REBOTE_POST_ROJO":
+            bloqueo_duro = (
+                bool(raw.get("bloqueo_mrv_v2", False))
+                or raw_decision == "NO_INVERTIR"
+                or (raw_has_allow and raw_allow is False)
+                or dq_raw in ("missing", "partial", "closed_expired", "expired", "incomplete", "error")
+            )
         zona_base = zona_raw if zona_raw in zonas_validas else "UNKNOWN"
         if zona_raw == "VERDE_TEMPRANO_CONFIRMADO":
             zona_base = "VERDE_TEMPRANO"
@@ -9184,15 +9363,28 @@ def normalizar_zona_lxv_oficial(info):
             zona_base = "VERDE_MADURO"
         elif zona_raw == "VERDE_MADURO_CON_RUIDO":
             zona_base = "VERDE_MADURO" if raw_allow else "UNKNOWN"
+        elif zona_raw == "REBOTE_POST_ROJO":
+            zona_base = "VERDE_TEMPRANO" if raw_allow else "UNKNOWN"
+        elif zona_raw == "VERDE_SERRUCHO_SATURADO":
+            zona_base = "VERDE_TARDIO"
         elif zona_raw in {"VERDE_TARDIO", "VERDE_SATURADO_TARDIO", "ROJA_TEMPRANO"}:
             zona_base = zona_raw if zona_raw in zonas_validas else "UNKNOWN"
         zonas_ok = set(globals().get("LXV_ZONAS_INVERTIBLES", {"VERDE_TEMPRANO", "VERDE_MADURO"}))
         allow_final = bool(zona_base in zonas_ok and not bloqueo_duro)
-        if zona_raw in {"VERDE_TARDIO", "VERDE_SATURADO_TARDIO", "ROJA_TEMPRANO"}:
+        if zona_raw in {"VERDE_TARDIO", "VERDE_SATURADO_TARDIO", "ROJA_TEMPRANO", "VERDE_SERRUCHO_SATURADO"}:
             allow_final = False
+        if zona_raw == "REBOTE_POST_ROJO":
+            allow_final = bool(raw_allow and raw_decision != "NO_INVERTIR" and zona_base == "VERDE_TEMPRANO" and not bloqueo_duro)
+            if motivo_bloqueante:
+                raw.setdefault("motivo_original_extra", motivo_raw)
+                motivo_raw = "rebote_post_rojo_impulse_ok"
         if zona_raw == "VERDE_MADURO_CON_RUIDO":
             allow_final = bool(raw_allow and (zona_base in zonas_ok) and not bloqueo_duro)
         decision = str(raw.get("decision", "") or "").strip().upper()
+        if zona_raw == "REBOTE_POST_ROJO" and allow_final:
+            decision = ZONA_SI_INVERTIR
+        elif zona_raw == "VERDE_SERRUCHO_SATURADO":
+            decision = ZONA_NO_INVERTIR
         if not decision:
             decision = ZONA_SI_INVERTIR if allow_final else ZONA_NO_INVERTIR
         if zona_base == "UNKNOWN" and not motivo_raw:
@@ -9373,6 +9565,26 @@ def _selftest_zona_lxv_minimo():
                 ok = ok and bool(inv_ok) is False
             print(f"[SELFTEST_ZONA_LXV] {name}: {'OK' if ok else 'FAIL'} zona={info.get('zona')} decision={info.get('decision')} inv={inv_ok} reason={inv_reason} dq0={info.get('dq0','')}")
             all_ok = all_ok and ok
+        extra_cases = [
+            ("I_REBOTE_POST_ROJO_5V1X", [1,2,5], "REBOTE_POST_ROJO", ZONA_SI_INVERTIR, True),
+            ("J_REBOTE_POST_ROJO_4V2X_ESTRICTO_OK", [1,2,4], "REBOTE_POST_ROJO", ZONA_SI_INVERTIR, True),
+            ("K_SERRUCHO_SATURADO_4V2X", [6,6,1,4], "VERDE_SERRUCHO_SATURADO", ZONA_NO_INVERTIR, False),
+        ]
+        for name, verdes_seq, zona_exp, decision_exp, allow_exp in extra_cases:
+            rows_case = [{"round_id":i+1,"n_verdes":v,"n_rojos":6-v,"round_complete":True,"data_quality":"ok"} for i,v in enumerate(verdes_seq)]
+            info = clasificar_zona_operativa_lxv(rows=rows_case)
+            ok = str(info.get("zona")) == zona_exp and str(info.get("decision")) == decision_exp and bool(info.get("allow_real")) == bool(allow_exp)
+            print(f"[SELFTEST_ZONA_LXV] {name}: {'OK' if ok else 'FAIL'} zona={info.get('zona')} decision={info.get('decision')} allow={info.get('allow_real')} motivo={info.get('motivo')}")
+            all_ok = all_ok and ok
+        rows_bad = [
+            {"round_id":1,"n_verdes":1,"n_rojos":5,"round_complete":True,"data_quality":"ok"},
+            {"round_id":2,"n_verdes":2,"n_rojos":4,"round_complete":True,"data_quality":"ok"},
+            {"round_id":3,"n_verdes":5,"n_rojos":1,"round_complete":False,"data_quality":"missing"},
+        ]
+        info_bad = clasificar_zona_operativa_lxv(rows=rows_bad)
+        ok_bad = str(info_bad.get("decision")) == ZONA_NO_INVERTIR and bool(info_bad.get("allow_real")) is False and str(info_bad.get("zona")) != "REBOTE_POST_ROJO"
+        print(f"[SELFTEST_ZONA_LXV] L_DATA_QUALITY_MALA_NO_DESBLOQUEA: {'OK' if ok_bad else 'FAIL'} zona={info_bad.get('zona')} decision={info_bad.get('decision')} allow={info_bad.get('allow_real')}")
+        all_ok = all_ok and ok_bad
         return bool(all_ok)
     except Exception as e:
         print(f"[SELFTEST_ZONA_LXV] ERROR: {e}")
