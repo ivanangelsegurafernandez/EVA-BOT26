@@ -11614,6 +11614,33 @@ def _sync_round_try_recovery_release_global() -> bool:
             pass
         return ""
 
+    def _recovery_pending_contract_keys_active(payload: dict | None) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        for key in (
+            "pending_contract_resolution",
+            "contract_pending",
+            "contrato_pendiente",
+            "incident_lock_active",
+            "fence_active",
+            "compra_bloqueada",
+            "ciclo_en_progreso_real",
+            "real_contract_open",
+        ):
+            try:
+                if bool(payload.get(key, False)):
+                    return True
+            except Exception:
+                pass
+        try:
+            if bool(payload.get("ciclo_en_progreso", False)):
+                modo_val = str(payload.get("ciclo_en_progreso_modo") or payload.get("modo_ciclo") or payload.get("modo") or "").upper()
+                if "REAL" in modo_val:
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _recovery_real_or_contract_pending_reason(st_payload=None, token_value="") -> str:
         try:
             pending_on, pending_bot, _pending_payload = _hay_real_close_pending_activo()
@@ -11648,24 +11675,14 @@ def _sync_round_try_recovery_release_global() -> bool:
             return "orden_real_check_error"
         try:
             st_dict = st_payload if isinstance(st_payload, dict) else {}
-            if bool(st_dict.get("pending_contract_resolution", False)):
+            if _recovery_pending_contract_keys_active(st_dict):
                 return "pending_contract_resolution:state"
             for bot in BOT_NAMES:
                 ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
                 st_bot = estado_bots.get(bot, {}) if isinstance(estado_bots.get(bot, {}), dict) else {}
-                if bool(st_bot.get("pending_contract_resolution", False)):
+                if _recovery_pending_contract_keys_active(st_bot):
                     return f"pending_contract_resolution:{bot}:estado"
-                ciclo_modo = str(st_bot.get("ciclo_en_progreso_modo") or st_bot.get("modo_ciclo") or st_bot.get("modo") or "").upper()
-                if bool(st_bot.get("ciclo_en_progreso", False)) and "REAL" in ciclo_modo:
-                    return f"real_turn_active:{bot}:ciclo_en_progreso_REAL"
-                for key in ("pending_contract_resolution", "pending_contract", "contract_pending", "contrato_pendiente"):
-                    if bool(st_dict.get(key, False)):
-                        return f"{key}:state"
-                if bool(st_bot.get("pending_contract_resolution", False) or st_bot.get("pending_contract", False) or st_bot.get("contract_pending", False) or st_bot.get("contrato_pendiente", False)):
-                    return f"pending_contract_resolution:{bot}:estado"
-                if isinstance(ack, dict) and bool(ack.get("pending_contract_resolution", False)):
-                    return f"pending_contract_resolution:{bot}:ack"
-                if isinstance(ack, dict) and bool(ack.get("pending_contract", False) or ack.get("contract_pending", False) or ack.get("contrato_pendiente", False)):
+                if _recovery_pending_contract_keys_active(ack):
                     return f"contract_pending_ack:{bot}"
         except Exception:
             return "pending_contract_resolution_check_error"
@@ -11687,12 +11704,13 @@ def _sync_round_try_recovery_release_global() -> bool:
                 return _hold("state_corrupto")
         except Exception:
             return _hold("state_corrupto")
+        round_ahead_clean = (int(round_id) == int(released_round) + 1)
         if int(released_round) > int(round_id):
             return _hold("released_ya_avanzado", released_round)
-        if int(released_round) != int(round_id):
+        if int(released_round) != int(round_id) and not round_ahead_clean:
             return _hold("state_corrupto", released_round)
 
-        target_round = int(released_round) + 1
+        target_round = int(round_id) if round_ahead_clean else int(released_round) + 1
         recovery_hold_context.update({"target_round": int(target_round), "req_bots": [], "wait_bots": []})
         if isinstance(target_round, bool) or target_round <= int(released_round) or target_round != (int(released_round) + 1) or target_round <= 10:
             return _hold("target_no_es_N_mas_1", released_round)
@@ -11778,14 +11796,19 @@ def _sync_round_try_recovery_release_global() -> bool:
         for bot in BOT_NAMES:
             ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
             st_bot = estado_bots.get(bot, {}) if isinstance(estado_bots.get(bot, {}), dict) else {}
-            if bool(st_bot.get("pending_contract_resolution", False) or st_bot.get("pending_contract", False) or st_bot.get("contract_pending", False) or st_bot.get("contrato_pendiente", False)):
-                return _hold("pending_contract_resolution", released_round)
-            ciclo_modo = str(st_bot.get("ciclo_en_progreso_modo") or st_bot.get("modo_ciclo") or st_bot.get("modo") or "").upper()
-            if bool(st_bot.get("ciclo_en_progreso", False)) and "REAL" in ciclo_modo:
-                return _hold("real_turn_active", released_round)
-            if isinstance(ack, dict) and bool(ack.get("pending_contract_resolution", False)):
-                return _hold("pending_contract_resolution", released_round)
-            if isinstance(ack, dict) and bool(ack.get("pending_contract", False) or ack.get("contract_pending", False) or ack.get("contrato_pendiente", False)):
+            if _recovery_pending_contract_keys_active(st_bot):
+                print_rate_limited(
+                    f"DEMO_RECOVERY_HOLD:contract_pending_ack:{bot}",
+                    f"🧷 DEMO_RECOVERY_HOLD | motivo=contract_pending_ack | bots={[bot]}",
+                    ttl=20.0,
+                )
+                return _hold("contract_pending_ack", released_round)
+            if _recovery_pending_contract_keys_active(ack):
+                print_rate_limited(
+                    f"DEMO_RECOVERY_HOLD:contract_pending_ack:{bot}",
+                    f"🧷 DEMO_RECOVERY_HOLD | motivo=contract_pending_ack | bots={[bot]}",
+                    ttl=20.0,
+                )
                 return _hold("contract_pending_ack", released_round)
             if not isinstance(ack, dict):
                 continue
@@ -11856,14 +11879,21 @@ def _sync_round_try_recovery_release_global() -> bool:
             return _hold("state_corrupto", released_round)
         if released_check is None or round_check is None:
             return _hold("state_corrupto", released_round)
-        if released_check != int(released_round) or round_check != int(round_id):
+        round_ahead_fix = (
+            int(released_check) == int(released_round)
+            and int(round_check) == int(target_round)
+            and int(target_round) == int(released_round) + 1
+        )
+        if int(released_check) >= int(target_round):
+            return _hold("released_ya_avanzado", released_round)
+        if released_check != int(released_round) or (round_check != int(round_id) and not round_ahead_fix):
             return _hold("released_ya_avanzado", released_round)
         hard_block_reason = _recovery_real_or_contract_pending_reason(st_check, token_raw)
         if hard_block_reason:
             recovery_hold_context["hard_block_reason"] = hard_block_reason
             return _hold(hard_block_reason, released_round)
 
-        recovery_reason = "DEMO_CLEAN_RELEASE_FROM_RECOVERY_REQUEST"
+        recovery_reason = "DEMO_CLEAN_RELEASE_FROM_RECOVERY_REQUEST_ROUND_AHEAD" if round_ahead_fix else "DEMO_CLEAN_RELEASE_FROM_RECOVERY_REQUEST"
         payload = dict(st_check)
         payload.update({
             "round_id": target_round,
@@ -11898,13 +11928,21 @@ def _sync_round_try_recovery_release_global() -> bool:
         payload = _sync_round_apply_post_real_rejoin(payload, released_round=payload.get("released_round"))
         ok = _sync_round_write_state_monotonic(payload, reason=recovery_reason)
         if ok:
-            _lxv_5v1x_event_cooldown(
-                f"sync_recovery_global_force_demo_clean:{released_round}:released",
-                f"🧯 DEMO_CLEAN_RELEASE_FROM_RECOVERY_REQUEST | {released_round}→{target_round} | bots={list(req_bots)} | real=NO",
-                cooldown_s=1.0,
-            )
-            agregar_evento(f"🧯 DEMO_CLEAN_RELEASE_FROM_RECOVERY_REQUEST | {released_round}→{target_round} | bots={list(req_bots)} | real=NO")
-            globals()["SYNC_STATUS_LINE"] = f"SYNC: DEMO_CLEAN_RELEASE_FROM_RECOVERY_REQUEST | {released_round}→{target_round}"
+            if round_ahead_fix:
+                _lxv_5v1x_event_cooldown(
+                    f"sync_recovery_global_round_ahead_fix:{released_round}:{target_round}",
+                    f"🧯 DEMO_CLEAN_RELEASE_ROUND_AHEAD_FIX | release={released_round} -> target={target_round} | round_id={round_id} | real=NO",
+                    cooldown_s=1.0,
+                )
+                agregar_evento(f"🧯 DEMO_CLEAN_RELEASE_ROUND_AHEAD_FIX | release={released_round} -> target={target_round} | round_id={round_id} | real=NO")
+            else:
+                _lxv_5v1x_event_cooldown(
+                    f"sync_recovery_global_force_demo_clean:{released_round}:released",
+                    f"🧯 DEMO_CLEAN_RELEASE_FROM_RECOVERY_REQUEST | {released_round}→{target_round} | bots={list(req_bots)} | real=NO",
+                    cooldown_s=1.0,
+                )
+                agregar_evento(f"🧯 DEMO_CLEAN_RELEASE_FROM_RECOVERY_REQUEST | {released_round}→{target_round} | bots={list(req_bots)} | real=NO")
+            globals()["SYNC_STATUS_LINE"] = f"SYNC: {recovery_reason} | {released_round}→{target_round}"
             return True
         return _hold("write_failed", released_round)
     except Exception:
