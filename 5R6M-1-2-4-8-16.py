@@ -1769,6 +1769,280 @@ def _limpiar_real_close_incident_lock_after_valid_close(bot, sig=None):
     except Exception:
         pass
 
+
+def _real_close_pending_csv_get(row, aliases):
+    try:
+        if not isinstance(row, dict):
+            return None
+        norm = {str(k or "").strip().lower(): k for k in row.keys()}
+        for alias in aliases:
+            key = norm.get(str(alias or "").strip().lower())
+            if key is not None:
+                return row.get(key)
+    except Exception:
+        pass
+    return None
+
+
+def _real_close_pending_parse_ts(value):
+    try:
+        if value in (None, ""):
+            return None
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            ts = float(value)
+            return ts if ts > 0 else None
+        txt = str(value).strip()
+        if not txt:
+            return None
+        try:
+            ts = float(txt)
+            return ts if ts > 0 else None
+        except Exception:
+            pass
+        txt_iso = txt.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(txt_iso).timestamp()
+        except Exception:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"):
+            try:
+                return datetime.strptime(txt, fmt).timestamp()
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def _real_close_pending_parse_num(value):
+    try:
+        if value in (None, ""):
+            return None
+        txt = str(value).strip().replace("$", "").replace(",", ".")
+        if not txt:
+            return None
+        nums = re.findall(r"-?\d+(?:\.\d+)?", txt)
+        if not nums:
+            return None
+        val = float(nums[0])
+        return val if math.isfinite(val) else None
+    except Exception:
+        return None
+
+
+def _real_close_pending_norm_resultado(value):
+    try:
+        txt = str(value or "").strip()
+        if not txt:
+            return None
+        up = txt.upper()
+        up_ascii = normalize("NFKD", up).encode("ascii", "ignore").decode("ascii")
+        if up in ("✓", "✅") or up_ascii in ("GANANCIA", "WIN"):
+            return "GANANCIA"
+        if up in ("✗", "❌", "×") or up_ascii in ("PERDIDA", "LOSS"):
+            return "PÉRDIDA"
+        return None
+    except Exception:
+        return None
+
+
+def _real_close_pending_diag_line(owner, pdata, age, ttl, recovered=False, reason=""):
+    try:
+        bot = str(owner or "--").strip() or "--"
+        pdata = pdata if isinstance(pdata, dict) else {}
+        ciclo = pdata.get("ciclo", "?")
+        reason_txt = str(reason or "").strip() or "--"
+        if recovered:
+            estado = "RECOVERED"
+        elif _real_close_incident_active() or "incident" in reason_txt.lower():
+            estado = "INCIDENT"
+        elif "no_csv" in reason_txt.lower() or "sin_evidencia" in reason_txt.lower():
+            estado = "NO_CSV_EVIDENCE"
+        else:
+            estado = "WAIT"
+        line = f"REAL_CLOSE_PENDING_DIAG bot={bot} C{ciclo} age={int(age or 0)}s ttl={int(ttl or 0)}s estado={estado} reason={reason_txt}"
+        line = line[:140]
+        _lxv_5v1x_event_cooldown(
+            key=f"real_close_pending_diag:{bot}:{ciclo}:{estado}:{reason_txt[:32]}",
+            msg=line,
+            cooldown_s=25.0,
+        )
+        return line
+    except Exception:
+        return "REAL_CLOSE_PENDING_DIAG error"[:140]
+
+
+def _real_close_pending_recover_from_csv(pending_bot, pending_data, reason="ttl_recovery"):
+    """
+    Intenta recuperar un REAL_CLOSE_PENDING atascado leyendo el CSV enriquecido del bot.
+    Solo libera si encuentra evidencia fuerte de cierre REAL posterior al pending.
+    No toca Martingala, IA, zonas ni patrones.
+    Retorna:
+        (True, info_dict) si recuperó cierre válido.
+        (False, info_dict) si no hay evidencia suficiente.
+    """
+    info = {"bot": pending_bot, "reason": str(reason or "ttl_recovery")}
+    try:
+        bot = str(pending_bot or "").strip()
+        if bot not in BOT_NAMES:
+            info["motivo"] = "bot_invalido"
+            return False, info
+        if not isinstance(pending_data, dict):
+            info["motivo"] = "pending_data_no_dict"
+            return False, info
+
+        for other, pdata_other in REAL_CLOSE_PENDING.items():
+            if other != bot and isinstance(pdata_other, dict) and pdata_other.get("active"):
+                info["motivo"] = f"pending_otro_bot:{other}"
+                return False, info
+
+        owner_lock = str(globals().get("REAL_OWNER_LOCK") or "").strip()
+        if owner_lock in BOT_NAMES and owner_lock != bot:
+            info["motivo"] = f"real_owner_lock_otro:{owner_lock}"
+            return False, info
+
+        try:
+            token_raw = str(_read_token_file_raw() or "").strip()
+        except Exception:
+            token_raw = ""
+        token_owner = ""
+        if token_raw.upper().startswith("REAL:"):
+            token_owner = token_raw.split(":", 1)[1].strip()
+        if token_owner in BOT_NAMES and token_owner != bot:
+            info["motivo"] = f"token_real_otro:{token_owner}"
+            return False, info
+
+        order_on, order_bot = _sync_real_order_viva_any()
+        if order_on:
+            if token_owner == bot:
+                info["motivo"] = f"token_y_orden_real_viva:{order_bot or bot}"
+            else:
+                info["motivo"] = f"orden_real_viva:{order_bot or 'unknown'}"
+            return False, info
+
+        real_on, real_bot, real_why = _sync_real_turn_activo()
+        if real_on:
+            stale_self_token_only = bool(
+                real_bot == bot
+                and token_owner == bot
+                and owner_lock not in BOT_NAMES
+                and not order_on
+                and bool(pending_data.get("incident", False) or _real_close_incident_active())
+            )
+            if not stale_self_token_only:
+                info["motivo"] = f"real_activo:{real_bot or real_why}"
+                return False, info
+            info["real_turn_match"] = "stale_self_token_only"
+
+        csv_path = f"registro_enriquecido_{bot}.csv"
+        info["csv"] = csv_path
+        if not os.path.exists(csv_path):
+            info["motivo"] = "csv_no_existe"
+            return False, info
+
+        with open(csv_path, "r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                info["motivo"] = "csv_sin_header"
+                return False, info
+            tail = deque(maxlen=150)
+            total = 0
+            for row in reader:
+                total += 1
+                tail.append((total, row))
+
+        if not tail:
+            info["motivo"] = "csv_sin_filas"
+            return False, info
+
+        pending_ts = None
+        for key in ("ts", "created_at", "start_ts", "timestamp", "fecha", "datetime"):
+            pending_ts = _real_close_pending_parse_ts(pending_data.get(key))
+            if pending_ts:
+                break
+        pending_ciclo = _real_close_pending_parse_num(pending_data.get("ciclo"))
+        pending_monto = _real_close_pending_parse_num(pending_data.get("monto", pending_data.get("stake", pending_data.get("inversion", pending_data.get("inversión")))))
+        pending_contract = str(pending_data.get("contract_id") or pending_data.get("contrato") or pending_data.get("id_contrato") or "").strip()
+        monto_tol = float(globals().get("MONTO_TOL", 0.05) or 0.05)
+
+        aliases_res = ("resultado", "Resultado", "result", "estado")
+        aliases_token = ("token", "modo", "cuenta", "tipo_cuenta")
+        aliases_ciclo = ("ciclo", "ciclo_martingala", "martingala")
+        aliases_monto = ("monto", "stake", "inversion", "inversión")
+        aliases_ts = ("timestamp", "fecha", "hora", "datetime", "ts")
+        aliases_contract = ("contract_id", "contrato", "id_contrato")
+
+        best_fail = "sin_resultado_valido"
+        for row_index, row in reversed(list(tail)):
+            resultado = _real_close_pending_norm_resultado(_real_close_pending_csv_get(row, aliases_res))
+            if resultado not in ("GANANCIA", "PÉRDIDA"):
+                continue
+
+            contract = str(_real_close_pending_csv_get(row, aliases_contract) or "").strip()
+            if pending_contract and contract and contract != pending_contract:
+                best_fail = "contract_id_no_coincide"
+                continue
+
+            row_ts = _real_close_pending_parse_ts(_real_close_pending_csv_get(row, aliases_ts))
+            timestamp_match = "ok"
+            if pending_ts:
+                if not row_ts or row_ts < (pending_ts - 1.0):
+                    best_fail = "fila_antigua"
+                    continue
+            else:
+                if row_index < max(1, total - 20):
+                    best_fail = "sin_timestamp_fila_no_reciente"
+                    continue
+                timestamp_match = "no_disponible_fallback_reciente"
+
+            token_val = _real_close_pending_csv_get(row, aliases_token)
+            token_diag = "columna_no_disponible"
+            if token_val not in (None, ""):
+                token_txt = str(token_val).strip().upper()
+                token_diag = token_txt
+                if "DEMO" in token_txt or ("REAL" not in token_txt and bot.upper() not in token_txt):
+                    best_fail = "fila_no_real"
+                    continue
+
+            ciclo_val = _real_close_pending_parse_num(_real_close_pending_csv_get(row, aliases_ciclo))
+            ciclo_diag = "columna_no_disponible" if ciclo_val is None else int(ciclo_val)
+            if pending_ciclo is not None and ciclo_val is not None and int(ciclo_val) != int(pending_ciclo):
+                best_fail = "ciclo_no_compatible"
+                continue
+
+            monto_val = _real_close_pending_parse_num(_real_close_pending_csv_get(row, aliases_monto))
+            monto_diag = "columna_no_disponible" if monto_val is None else monto_val
+            if pending_monto is not None and monto_val is not None and abs(float(monto_val) - float(pending_monto)) > monto_tol:
+                best_fail = "monto_fuera_tolerancia"
+                continue
+
+            if pending_contract and not contract:
+                best_fail = "contract_id_csv_no_disponible"
+                continue
+
+            info.update({
+                "bot": bot,
+                "resultado": resultado,
+                "ciclo": int(ciclo_val) if ciclo_val is not None else (int(pending_ciclo) if pending_ciclo is not None else None),
+                "monto": monto_val,
+                "csv": csv_path,
+                "row_index": int(row_index),
+                "contract_id": contract or None,
+                "reason": str(reason or "ttl_recovery"),
+                "timestamp_match": timestamp_match,
+                "token_match": token_diag,
+                "ciclo_match": ciclo_diag,
+                "monto_match": monto_diag,
+            })
+            return True, info
+
+        info["motivo"] = best_fail
+        return False, info
+    except Exception as e:
+        info["motivo"] = f"error:{type(e).__name__}"
+        info["error"] = str(e)
+        return False, info
+
 def _hay_real_close_pending_activo():
     try:
         now = time.time()
@@ -6638,7 +6912,7 @@ def _sync_round_write_state_monotonic(payload, reason="") -> bool:
                 _lxv_5v1x_event_cooldown(
                     key=f"sync_write_freeze_real_pending:{pending_bot}",
                     msg="SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI" if not _real_close_incident_active() else "🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro",
-                    cooldown_s=10.0,
+                    cooldown_s=25.0 if _real_close_incident_active() else 10.0,
                 )
                 new_released = normalizar_released_round_id(p.get("released_round"), fallback=old_released)
                 new_round_id = _sync_round_int_or_none(p.get("round_id"))
@@ -10271,7 +10545,7 @@ def _sync_round_release_now(round_id, payload, reason="release_now", real_emitid
         _lxv_5v1x_event_cooldown(
             key=f"release_now_frozen:{pending_bot}",
             msg="🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro" if _real_close_incident_active() else "SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI",
-            cooldown_s=10.0,
+            cooldown_s=25.0 if _real_close_incident_active() else 10.0,
         )
         return False
     try:
@@ -11599,8 +11873,104 @@ def _sync_round_hard_hold_real_pending(round_id, released_round, pending_bot, pe
             if incident_on else
             f"SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI | owner={owner} C{ciclo} | ronda={rid} | release={rel}"
         ),
-        cooldown_s=8.0,
+        cooldown_s=25.0 if incident_on else 8.0,
     )
+    try:
+        ttl = float(globals().get("REAL_CLOSE_PENDING_TTL_S", globals().get("REAL_CLOSE_PENDING_MAX_AGE_S", 240)) or 240)
+    except Exception:
+        ttl = 240.0
+    pending_ts = None
+    for _ts_key in ("ts", "created_at", "start_ts"):
+        try:
+            pending_ts = float(pdata.get(_ts_key, 0) or 0)
+            if pending_ts > 0:
+                break
+        except Exception:
+            pending_ts = None
+    age = max(0.0, time.time() - float(pending_ts or time.time()))
+    status_now = str((st or {}).get("status", "") if isinstance(st, dict) else "").upper()
+    recovery_due = bool(incident_on or age > (ttl + 10.0) or status_now == "INCIDENT_LOCK_REAL_CLOSE")
+    if recovery_due and owner in BOT_NAMES:
+        ok_recovery, recovery_info = _real_close_pending_recover_from_csv(owner, pdata, reason="incident_lock_ttl_expired")
+        if ok_recovery:
+            try:
+                _sync_real_cleanup_locks_after_close(owner, reason="REAL_CLOSE_RECOVERED_FROM_CSV")
+            except Exception:
+                pass
+            try:
+                if owner in BOT_NAMES:
+                    REAL_CLOSE_PENDING[owner] = None
+            except Exception:
+                pass
+            try:
+                _limpiar_real_close_incident_lock_after_valid_close(owner, sig="REAL_CLOSE_RECOVERED_FROM_CSV")
+            except Exception:
+                pass
+            try:
+                limpiar_orden_real(owner, reason="REAL_CLOSE_RECOVERED_FROM_CSV")
+            except Exception:
+                pass
+            try:
+                write_token_atomic(TOKEN_FILE, "REAL:none")
+            except Exception:
+                pass
+            now_ts = float(time.time())
+            try:
+                payload_recovered = dict(st) if isinstance(st, dict) else {}
+                payload_recovered.update({
+                    "round_id": rid,
+                    "released_round": rel,
+                    "real_close_pending": False,
+                    "real_pending_bot": None,
+                    "real_close_pending_owner": None,
+                    "real_global": False,
+                    "real_owner": None,
+                    "owner_real": None,
+                    "bot_real": None,
+                    "real_status": "closed_recovered_from_csv",
+                    "token_status": "REAL:none",
+                    "last_real_closed_ts": now_ts,
+                    "last_real_owner": owner,
+                    "last_real_close_recovery": recovery_info,
+                    "sync_sigue": True,
+                    "release_congelado": False,
+                    "reason": "REAL_CLOSE_RECOVERED_FROM_CSV",
+                    "status": "closed_recovered_from_csv",
+                    "ts": now_ts,
+                })
+                _sync_round_write_state_monotonic(payload_recovered, reason="REAL_CLOSE_RECOVERED_FROM_CSV")
+            except Exception:
+                pass
+            try:
+                real_round = recovery_info.get("real_round") or recovery_info.get("round_id") or pdata.get("round_id") or rid
+                released_ok = _sync_round_release_all_after_real_close(owner, real_round=real_round, reason="REAL_CLOSE_RECOVERED_FROM_CSV")
+                if not released_ok:
+                    released_ok = _sync_round_release_all_after_real_close(owner, real_round=real_round, reason="REAL_CLOSE_RECOVERED_FROM_CSV")
+            except Exception:
+                released_ok = False
+            try:
+                ciclo_txt = recovery_info.get("ciclo") if isinstance(recovery_info, dict) else ciclo
+                agregar_evento(f"🧯 REAL_CLOSE_RECOVERED_FROM_CSV | bot={owner} | resultado={recovery_info.get('resultado')} | C{ciclo_txt} | release desbloqueado")
+                globals()["SYNC_STATUS_LINE"] = f"SYNC: REAL_CLOSE_RECOVERED_FROM_CSV | bot={owner} | resultado={recovery_info.get('resultado')} | sync_sigue=SI"
+                _real_close_pending_diag_line(owner, pdata, age, ttl, recovered=True, reason="REAL_CLOSE_RECOVERED_FROM_CSV")
+            except Exception:
+                pass
+            return True
+        else:
+            try:
+                _real_close_pending_diag_line(owner, pdata, age, ttl, recovered=False, reason=str((recovery_info or {}).get("motivo") or "sin_evidencia_csv"))
+                _lxv_5v1x_event_cooldown(
+                    key=f"incident_lock_real_close_no_csv:{owner}",
+                    msg=f"🚨 INCIDENT_LOCK_REAL_CLOSE: sin evidencia CSV válida todavía | bot={owner} | age={int(age)}s | no se libera por seguridad",
+                    cooldown_s=25.0,
+                )
+            except Exception:
+                pass
+    elif owner in BOT_NAMES:
+        try:
+            _real_close_pending_diag_line(owner, pdata, age, ttl, recovered=False, reason="wait_ttl")
+        except Exception:
+            pass
     try:
         payload = dict(st) if isinstance(st, dict) else {}
         payload["round_id"] = rid
@@ -12760,7 +13130,7 @@ def _sync_round_release_all_after_real_close(bot_real, real_round=None, reason="
         _lxv_5v1x_event_cooldown(
             key=f"release_all_frozen:{pending_bot}",
             msg="🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro" if _real_close_incident_active() else "SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI",
-            cooldown_s=10.0,
+            cooldown_s=25.0 if _real_close_incident_active() else 10.0,
         )
         return False
     if globals().get("REAL_OWNER_LOCK") in BOT_NAMES:
@@ -12860,7 +13230,7 @@ def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") 
         _lxv_5v1x_event_cooldown(
             key=f"release_after_close_frozen:{pending_bot}",
             msg="🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro" if _real_close_incident_active() else "SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI",
-            cooldown_s=10.0,
+            cooldown_s=25.0 if _real_close_incident_active() else 10.0,
         )
         return
     _sync_real_cleanup_locks_after_close(bot, reason_txt)
