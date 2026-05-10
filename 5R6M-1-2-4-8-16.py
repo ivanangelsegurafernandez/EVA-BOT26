@@ -11273,6 +11273,7 @@ def _sync_round_try_recovery_release_global() -> bool:
     candado duro de REAL activo. No compra, no emite REAL y no toca tokens.
     """
     hold_cd = float(globals().get("SYNC_RECOVERY_GLOBAL_HOLD_COOLDOWN_S", 15.0) or 15.0)
+    recovery_hold_context = {}
 
     def _hold(motivo: str, released_value: int | str = "?") -> bool:
         motivo_txt = str(motivo or "state_corrupto").strip() or "state_corrupto"
@@ -11285,6 +11286,18 @@ def _sync_round_try_recovery_release_global() -> bool:
             f"RECOVERY_FORCE_DEMO_CLEAN HOLD | motivo={motivo_txt} | token={token_diag}",
             cooldown_s=hold_cd,
         )
+        try:
+            ctx = recovery_hold_context if isinstance(recovery_hold_context, dict) else {}
+            req_ctx = list(ctx.get("req_bots") or [])
+            wait_ctx = list(ctx.get("wait_bots") or [])
+            if req_ctx:
+                print_rate_limited(
+                    f"RECOVERY_HOLD:{released_value}:{ctx.get('target_round', '?')}:{motivo_txt}",
+                    f"🧷 RECOVERY_HOLD | release={released_value} | target={ctx.get('target_round', '?')} | req_bots={len(req_ctx)} | wait_bots={len(wait_ctx)} | motivo={motivo_txt}",
+                    ttl=15.0,
+                )
+        except Exception:
+            pass
         return False
 
     def _token_raw_actual() -> str:
@@ -11299,6 +11312,53 @@ def _sync_round_try_recovery_release_global() -> bool:
                     return str(f.read() or "").strip()
         except Exception:
             pass
+        return ""
+
+    def _recovery_real_or_contract_pending_reason(st_payload=None, token_value="") -> str:
+        try:
+            pending_on, pending_bot, _pending_payload = _hay_real_close_pending_activo()
+            if pending_on:
+                return f"real_close_pending:{pending_bot or '--'}"
+        except Exception:
+            return "real_close_pending_check_error"
+        try:
+            real_hold_on, real_hold_owner, real_hold_reason = _sync_round_real_hold_owner("recovery_global_force_demo_clean")
+            if real_hold_on:
+                return f"real_hold:{real_hold_owner or '--'}:{real_hold_reason or '--'}"
+        except Exception:
+            return "real_hold_check_error"
+        try:
+            real_on, real_bot, real_reason = _sync_real_turn_activo()
+            if real_on:
+                return f"real_turn_active:{real_bot or '--'}:{real_reason or '--'}"
+        except Exception:
+            return "real_turn_check_error"
+        try:
+            token_now = str(token_value or _token_raw_actual() or "").strip()
+            token_owner_now = str(leer_token_actual() or "").strip()
+            if _token_real_ocupado(token_now) or _token_real_ocupado(token_owner_now) or token_owner_now in BOT_NAMES:
+                return f"token_real_ocupado:{token_now or token_owner_now or '--'}"
+        except Exception:
+            return "token_real_check_error"
+        try:
+            order_on, order_bot = _sync_real_order_viva_any()
+            if order_on:
+                return f"orden_real_viva:{order_bot or '--'}"
+        except Exception:
+            return "orden_real_check_error"
+        try:
+            st_dict = st_payload if isinstance(st_payload, dict) else {}
+            if bool(st_dict.get("pending_contract_resolution", False)):
+                return "pending_contract_resolution:state"
+            for bot in BOT_NAMES:
+                ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
+                st_bot = estado_bots.get(bot, {}) if isinstance(estado_bots.get(bot, {}), dict) else {}
+                if bool(st_bot.get("pending_contract_resolution", False)):
+                    return f"pending_contract_resolution:{bot}:estado"
+                if isinstance(ack, dict) and bool(ack.get("pending_contract_resolution", False)):
+                    return f"pending_contract_resolution:{bot}:ack"
+        except Exception:
+            return "pending_contract_resolution_check_error"
         return ""
 
     try:
@@ -11317,36 +11377,21 @@ def _sync_round_try_recovery_release_global() -> bool:
         target_round = int(released_round) + 1
         status_now = str(st.get("status", "") or "").strip().lower()
         if status_now in ("holding_real_result", "holding_real_turn") or bool(st.get("holding_real_result", False) or st.get("holding_real_turn", False)):
-            return _hold("owner_real_detectado", released_round)
+            return _hold("recovery_hold_real_or_contract_pending:owner_real_detectado", released_round)
 
         pending_on, pending_bot, _pending = _hay_real_close_pending_activo()
         if pending_on:
-            return _hold("real_close_pending", released_round)
+            return _hold("recovery_hold_real_or_contract_pending:real_close_pending", released_round)
 
         owner_mem = globals().get("REAL_OWNER_LOCK")
         if owner_mem in BOT_NAMES:
-            return _hold("owner_real_detectado", released_round)
+            return _hold("recovery_hold_real_or_contract_pending:owner_real_detectado", released_round)
 
         token_raw = _token_raw_actual()
-        try:
-            token_owner = str(leer_token_actual() or "").strip()
-        except Exception:
-            token_owner = ""
-        if _token_real_ocupado(token_raw) or token_owner in BOT_NAMES or _token_real_ocupado(token_owner):
-            return _hold("token_real_detectado", released_round)
-
-        order_on, order_bot = _sync_real_order_viva_any()
-        if order_on:
-            return _hold("orden_real_viva", released_round)
-
-        real_on, real_bot, _motivo_real = _sync_real_turn_activo()
-        if real_on:
-            if real_bot in BOT_NAMES:
-                return _hold("owner_real_detectado", released_round)
-            return _hold("orden_real_viva", released_round)
-
-        if bool(st.get("pending_contract_resolution", False)):
-            return _hold("state_corrupto", released_round)
+        hard_block_reason = _recovery_real_or_contract_pending_reason(st, token_raw)
+        if hard_block_reason:
+            recovery_hold_context["hard_block_reason"] = hard_block_reason
+            return _hold(f"recovery_hold_real_or_contract_pending:{hard_block_reason}", released_round)
 
         # Blindaje post-REAL: si state.json fue sobrescrito a 1 pero los ACKs
         # muestran bots esperando N+1 con ACK en N, reconstruye desde ACKs.
@@ -11402,13 +11447,7 @@ def _sync_round_try_recovery_release_global() -> bool:
 
         diag_recovery_global = diagnosticar_alineacion_rounds(released_round=released_round, expected_bots=BOT_NAMES)
         globals()["LAST_ROUND_ALIGNMENT_DIAG"] = dict(diag_recovery_global) if isinstance(diag_recovery_global, dict) else globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
-        if isinstance(diag_recovery_global, dict) and bool(diag_recovery_global.get("mixed_rounds", False)):
-            print_rate_limited(
-                f"RELEASE_HOLD_MIXED_ROUNDS:global:{diag_recovery_global.get('best_round')}",
-                f"🧷 RELEASE_HOLD_MIXED_ROUNDS | best_round=#{diag_recovery_global.get('best_round')} {int(diag_recovery_global.get('closed', 0) or 0)}/{int(diag_recovery_global.get('expected', len(BOT_NAMES)) or len(BOT_NAMES))} | behind={len(diag_recovery_global.get('behind') or {})} | acción=esperar_rejoin",
-                ttl=20.0,
-            )
-            return _hold("mixed_rounds_esperar_rejoin", released_round)
+        mixed_rounds_recovery = bool(isinstance(diag_recovery_global, dict) and diag_recovery_global.get("mixed_rounds", False))
 
         wait_bots = []
         wait_since_candidates = []
@@ -11416,7 +11455,7 @@ def _sync_round_try_recovery_release_global() -> bool:
             ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
             st_bot = estado_bots.get(bot, {}) if isinstance(estado_bots.get(bot, {}), dict) else {}
             if bool(st_bot.get("pending_contract_resolution", False) or (isinstance(ack, dict) and ack.get("pending_contract_resolution", False))):
-                return _hold("state_corrupto", released_round)
+                return _hold("recovery_hold_real_or_contract_pending:pending_contract_resolution", released_round)
             if not isinstance(ack, dict):
                 continue
             try:
@@ -11451,10 +11490,16 @@ def _sync_round_try_recovery_release_global() -> bool:
                     ts_val = 0.0
                 if ts_val > 0:
                     wait_since_candidates.append(ts_val)
+        effective_wait_bots = sorted(set(wait_bots) | set(req_bots))
+        recovery_hold_context.update({
+            "target_round": int(target_round),
+            "req_bots": list(req_bots),
+            "wait_bots": list(effective_wait_bots),
+        })
         if not req_bots:
             return _hold("sin_recovery_request", released_round)
-        if not wait_bots:
-            return _hold("sin_bots_waiting", released_round)
+        if not effective_wait_bots:
+            return _hold("sin_bots_waiting_or_recovery", released_round)
 
         started_at = float(st.get("started_at", st.get("ts", 0.0)) or 0.0)
         wait_elapsed = max(0.0, now_ts - started_at) if started_at > 0 else 0.0
@@ -11463,6 +11508,12 @@ def _sync_round_try_recovery_release_global() -> bool:
         threshold_s = float(globals().get("SYNC_RECOVERY_GLOBAL_MIN_WAIT_S", 10.0) or 10.0)
         if wait_elapsed <= threshold_s:
             return _hold("espera_minima_no_cumplida", released_round)
+        if mixed_rounds_recovery:
+            print_rate_limited(
+                f"MIXED_ROUNDS_RECOVERY_OVERRIDE:{released_round}:{target_round}",
+                f"🧯 MIXED_ROUNDS_RECOVERY_OVERRIDE: released={released_round} -> target={target_round} | req_bots={list(req_bots)} | no_real=SI",
+                ttl=20.0,
+            )
 
         st_check = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
         try:
@@ -11471,13 +11522,12 @@ def _sync_round_try_recovery_release_global() -> bool:
             return _hold("state_corrupto", released_round)
         if released_check != int(released_round):
             return _hold("released_ya_avanzado", released_round)
+        hard_block_reason = _recovery_real_or_contract_pending_reason(st_check, token_raw)
+        if hard_block_reason:
+            recovery_hold_context["hard_block_reason"] = hard_block_reason
+            return _hold(f"recovery_hold_real_or_contract_pending:{hard_block_reason}", released_round)
 
-        after_real_context = bool(
-            isinstance(st_check.get("after_real_release"), dict)
-            or str(st_check.get("last_real_owner") or st_check.get("real_released_after_bot") or st_check.get("real_pending_bot") or "").strip() in BOT_NAMES
-            or str(token_raw or "").strip().upper() in ("REAL:NONE", "REAL:NULL", "REAL:--", "REAL:")
-        )
-        recovery_reason = "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_AFTER_REAL_CLOSE" if after_real_context else "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN"
+        recovery_reason = "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN"
         payload = dict(st_check)
         payload.update({
             "round_id": target_round,
@@ -11491,7 +11541,7 @@ def _sync_round_try_recovery_release_global() -> bool:
             "last_release_reason": recovery_reason,
             "recovery_release_ts": now_ts,
             "recovery_from_round": int(released_round),
-            "recovery_bots_waiting": list(wait_bots),
+            "recovery_bots_waiting": list(effective_wait_bots),
             "recovery_request_bots": list(req_bots),
             "started_at": now_ts,
             "ts": now_ts,
@@ -11503,14 +11553,11 @@ def _sync_round_try_recovery_release_global() -> bool:
         if ok:
             _lxv_5v1x_event_cooldown(
                 f"sync_recovery_global_force_demo_clean:{released_round}:released",
-                f"{recovery_reason}: {released_round}→{target_round} | bots_waiting={len(wait_bots)} | token={token_raw}",
+                f"🧯 RECOVERY_RELEASE_GLOBAL_OK | {released_round}→{target_round} | req_bots={list(req_bots)} | effective_wait={list(effective_wait_bots)} | real=NO",
                 cooldown_s=1.0,
             )
-            if recovery_reason.endswith("AFTER_REAL_CLOSE"):
-                agregar_evento(f"🔓 RECOVERY_FORCE_AFTER_REAL_CLOSE: {released_round} → {target_round} | bots_waiting={len(wait_bots)} | token={token_raw or 'DEMO'}")
-            else:
-                agregar_evento(f"🔓 RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN: {released_round} → {target_round} | bots_waiting={len(wait_bots)} | token={token_raw} | real=NO | owner=--")
-            globals()["SYNC_STATUS_LINE"] = f"{recovery_reason}: {released_round}→{target_round} | bots_waiting={len(wait_bots)} | token={token_raw}"
+            agregar_evento(f"🧯 RECOVERY_RELEASE_GLOBAL_OK | {released_round}→{target_round} | req_bots={list(req_bots)} | effective_wait={list(effective_wait_bots)} | real=NO")
+            globals()["SYNC_STATUS_LINE"] = f"{recovery_reason}: {released_round}→{target_round} | bots_waiting={len(effective_wait_bots)} | token={token_raw}"
             return True
         return _hold("state_corrupto", released_round)
     except Exception:
