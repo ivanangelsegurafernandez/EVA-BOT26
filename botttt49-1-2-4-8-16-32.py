@@ -1543,6 +1543,65 @@ def _pending_incident_from_state() -> dict:
 
 
 
+
+def _incident_lock_es_demo_original(incidente: dict) -> bool:
+    try:
+        modo = str((incidente or {}).get("modo") or "").upper()
+        token_usado = str((incidente or {}).get("token_usado") or "")
+        if modo == "DEMO":
+            return True
+        if token_usado and token_usado == str(TOKEN_DEMO):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _bot_tiene_real_actual_o_orden_valida() -> bool:
+    try:
+        token_txt = str(leer_token_actual() or "").strip()
+        if token_txt == f"REAL:{NOMBRE_BOT}":
+            return True
+    except Exception:
+        pass
+    try:
+        ciclo_maestro, ts_orden, quiet, src = leer_orden_real(NOMBRE_BOT)
+        if ciclo_maestro is not None:
+            edad = time.time() - float(ts_orden or 0)
+            if edad <= float(REAL_ORDER_TTL_S):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _maybe_liberar_incident_lock_demo_por_real(incidente: dict, edad: float | None = None) -> bool:
+    try:
+        if not _incident_lock_es_demo_original(incidente):
+            return False
+        if not _bot_tiene_real_actual_o_orden_valida():
+            return False
+        attempts = int((incidente or {}).get("attempts", 0) or 0)
+        if edad is None:
+            edad = max(0.0, time.time() - float((incidente or {}).get("ts", time.time()) or time.time()))
+        if attempts < int(INCIDENT_LOCK_RECOVERY_ATTEMPTS):
+            return False
+        if float(edad or 0.0) < float(INCIDENT_LOCK_MAX_AGE_S):
+            return False
+        cid = (incidente or {}).get("contract_id") or estado_bot.get("pending_contract_id")
+        estado_bot["pending_contract_state"] = "COMPRA_NO_CONFIRMADA"
+        estado_bot["pending_contract_action"] = "LIBERAR_FENCE_DEMO_POR_REAL"
+        _clear_pending_contract_resolution(reason="COMPRA_NO_CONFIRMADA", resultado_final="COMPRA_NO_CONFIRMADA")
+        print(
+            Fore.YELLOW + Style.BRIGHT +
+            f"🧯 INCIDENT_LOCK_DEMO_LIBERADO_TRAS_TOKEN_REAL | bot={NOMBRE_BOT} | "
+            f"contract_id={cid if cid not in (None, '') else 'None'} | edad={int(float(edad or 0.0))}s | "
+            f"intentos={attempts} | acción=libera_fence_demo_no_toca_martingala"
+        )
+        return True
+    except Exception:
+        return False
+
 def _incident_float(v, default=None):
     try:
         if v in (None, ""):
@@ -1760,6 +1819,9 @@ async def resolver_contrato_incierto_seguro(ws, incidente: dict) -> tuple[bool, 
     token_usado = incidente.get("token_usado")
     if not modo:
         modo = "REAL" if token_usado == TOKEN_REAL else "DEMO"
+
+    if _maybe_liberar_incident_lock_demo_por_real(incidente, edad=edad):
+        return True, {"accion": "demo_liberado_por_token_real", "estado": "COMPRA_NO_CONFIRMADA", "final_reason": "COMPRA_NO_CONFIRMADA"}
 
     if cid not in (None, "", 0, "0"):
         try:

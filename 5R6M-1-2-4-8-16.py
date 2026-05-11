@@ -11822,7 +11822,7 @@ def _sync_should_block_candidate_by_recovery(candidate: dict | None) -> bool:
         rid = int(c.get("round_id", 0) or 0)
         dq = str(c.get("data_quality", "") or "").strip().lower()
         reason = str(c.get("last_release_reason", "") or "").strip()
-        if dq == "recovery_quarantine" or reason == "DEMO_RECOVERY_FORCE_RELEASE" or c.get("real_allowed") is False:
+        if dq == "recovery_quarantine" or reason in ("DEMO_RECOVERY_FORCE_RELEASE", "DEMO_RECOVERY_ORPHAN_FORCE_RELEASE") or c.get("real_allowed") is False:
             _lxv_5v1x_event_cooldown(f"COLUMNA_RECOVERY_NO_REAL:{rid}", f"🧯 COLUMNA_RECOVERY_NO_REAL | ronda={rid} | motivo=recovery_quarantine", cooldown_s=20.0)
             return True
         if rid > 0 and es_ronda_cuarentenada(rid):
@@ -13654,6 +13654,176 @@ def _escribir_orden_real_raw(bot: str, ciclo: int):
             agregar_evento(f"⚠️ Falló escritura de orden para {bot}: {e}")
         except Exception:
             pass
+
+
+def _real_order_parse_ts_value(value):
+    try:
+        if value in (None, ""):
+            return 0.0
+        if isinstance(value, (int, float)):
+            v = float(value)
+            return v / 1000.0 if v > 100000000000 else v
+        txt = str(value).strip()
+        if not txt:
+            return 0.0
+        try:
+            v = float(txt)
+            return v / 1000.0 if v > 100000000000 else v
+        except Exception:
+            pass
+        txt = txt.replace("Z", "+00:00")
+        try:
+            return float(datetime.fromisoformat(txt).timestamp())
+        except Exception:
+            return 0.0
+    except Exception:
+        return 0.0
+
+
+def _csv_get_first(row: dict, aliases: tuple[str, ...]):
+    try:
+        lower = {str(k).strip().lower(): v for k, v in (row or {}).items()}
+        for alias in aliases:
+            key = str(alias).strip().lower()
+            if key in lower and lower.get(key) not in (None, ""):
+                return lower.get(key)
+    except Exception:
+        pass
+    return None
+
+
+def _bot_tiene_compra_real_confirmada_despues_de_orden(bot, ts_orden):
+    """
+    Retorna True SOLO si hay evidencia fuerte de compra REAL posterior a ts_orden:
+    - id_contrato REAL vivo/reciente en estado_bots[bot], o
+    - fila CSV posterior a ts_orden con modo REAL y contrato/id válido.
+    Si no hay evidencia clara, retorna False y nunca lanza excepción.
+    """
+    try:
+        b = str(bot or "").strip()
+        ts_ref = float(ts_orden or 0.0)
+        st = estado_bots.get(b, {}) if isinstance(estado_bots, dict) else {}
+        cid = st.get("id_contrato") or st.get("contract_id") or st.get("contrato") or st.get("last_real_contract_id")
+        token_txt = str(st.get("token") or "").upper()
+        fuente_txt = str(st.get("fuente") or st.get("modo") or "").upper()
+        real_ts = float(st.get("real_activado_en") or st.get("last_buy_ts") or st.get("buy_ts") or 0.0)
+        if cid not in (None, "", 0, "0") and (token_txt == "REAL" or "REAL" in fuente_txt) and (real_ts <= 0.0 or real_ts >= (ts_ref - 5.0)):
+            return True
+    except Exception:
+        pass
+
+    try:
+        csv_path = f"registro_enriquecido_{str(bot)}.csv"
+        if not os.path.exists(csv_path):
+            return False
+        with open(csv_path, "r", encoding="utf-8", errors="replace", newline="") as f:
+            rows = deque(csv.DictReader(f), maxlen=60)
+        for row in reversed(rows):
+            cid = _csv_get_first(row, ("contract_id", "id_contrato", "contrato", "contract", "buy_id"))
+            if cid in (None, "", 0, "0"):
+                continue
+            modo = str(_csv_get_first(row, ("modo", "token", "tipo_cuenta", "cuenta", "token_usado")) or "").upper()
+            if "REAL" not in modo:
+                continue
+            row_ts = _real_order_parse_ts_value(_csv_get_first(row, ("ts", "timestamp", "epoch", "fecha", "hora", "created_ts", "buy_ts")))
+            if row_ts > float(ts_orden or 0.0):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _real_close_pending_tiene_contract_id_confirmado(bot) -> bool:
+    try:
+        pending = REAL_CLOSE_PENDING.get(bot)
+        if isinstance(pending, dict):
+            cid = pending.get("contract_id") or pending.get("id_contrato") or pending.get("contrato")
+            if cid not in (None, "", 0, "0"):
+                return True
+        st = estado_bots.get(bot, {}) if isinstance(estado_bots, dict) else {}
+        cid_st = st.get("id_contrato") or st.get("contract_id") or st.get("contrato") or st.get("last_real_contract_id")
+        if cid_st not in (None, "", 0, "0") and str(st.get("token") or "").upper() == "REAL":
+            return True
+    except Exception:
+        return True
+    return False
+
+
+def _watchdog_liberar_orden_real_expirada_sin_compra(bot, now_ts=None) -> bool:
+    global REAL_OWNER_LOCK
+    try:
+        b = str(bot or "").strip()
+        if b not in BOT_NAMES:
+            return False
+        now = float(now_ts or time.time())
+        owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
+        if owner != b:
+            return False
+        orden = _sync_round_safe_read_json(path_orden(b)) or {}
+        ts_orden = float(orden.get("created_ts") or orden.get("ts") or 0.0) if isinstance(orden, dict) else 0.0
+        if ts_orden <= 0.0:
+            pending = REAL_CLOSE_PENDING.get(b)
+            if isinstance(pending, dict):
+                ts_orden = float(pending.get("ts") or 0.0)
+        if ts_orden <= 0.0:
+            return False
+        edad = now - ts_orden
+        if edad <= (float(REAL_ORDER_TTL_S) + 15.0):
+            return False
+        if _real_close_pending_tiene_contract_id_confirmado(b):
+            print_rate_limited(
+                f"real-order-expired-review-contract:{b}",
+                f"⚠️ REAL_ORDER_EXPIRED_REVIEW_REQUIRED | bot={b} | edad={int(edad)}s | motivo=contract_id_confirmado",
+                ttl=30.0,
+            )
+            return False
+        if _bot_tiene_compra_real_confirmada_despues_de_orden(b, ts_orden):
+            print_rate_limited(
+                f"real-order-expired-review-buy:{b}",
+                f"⚠️ REAL_ORDER_EXPIRED_REVIEW_REQUIRED | bot={b} | edad={int(edad)}s | motivo=compra_real_confirmada",
+                ttl=30.0,
+            )
+            return False
+
+        limpiar_orden_real(b, reason="REAL_ORDER_EXPIRED_NO_BUY")
+        try:
+            pending = REAL_CLOSE_PENDING.get(b)
+            if isinstance(pending, dict) and str(pending.get("bot") or b) == b:
+                REAL_CLOSE_PENDING[b] = None
+        except Exception:
+            pass
+        try:
+            if _real_close_incident_active() and str(REAL_CLOSE_INCIDENT_LOCK.get("bot") or "") == b and not _real_close_pending_tiene_contract_id_confirmado(b):
+                REAL_CLOSE_INCIDENT_LOCK.update({"active": False, "bot": None, "ciclo": None, "round_id": None, "ts": 0.0, "reason": "REAL_ORDER_EXPIRED_NO_BUY"})
+        except Exception:
+            pass
+        try:
+            write_token_atomic(TOKEN_FILE, "REAL:none")
+        except Exception:
+            pass
+        REAL_OWNER_LOCK = None
+        try:
+            estado_bots[b]["token"] = "DEMO"
+            estado_bots[b]["trigger_real"] = False
+            estado_bots[b]["modo_real_anunciado"] = False
+            estado_bots[b]["fuente"] = None
+            estado_bots[b]["real_activado_en"] = 0.0
+            estado_bots[b]["real_timeout_first_warn"] = 0.0
+            _set_ui_token_holder(None)
+        except Exception:
+            pass
+        agregar_evento(f"🧯 REAL_ORDER_EXPIRED_NO_BUY_RELEASED | bot={b} | edad={int(edad)}s | acción=token_demo_sin_avanzar_martingala")
+        return True
+    except Exception as e:
+        try:
+            print_rate_limited(
+                f"real-order-expired-review-error:{bot}",
+                f"⚠️ REAL_ORDER_EXPIRED_REVIEW_REQUIRED | bot={bot} | motivo={type(e).__name__}",
+                ttl=30.0,
+            )
+        except Exception:
+            pass
+        return False
 
 def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> bool:
 
@@ -30705,6 +30875,9 @@ async def main():
                         if estado_bots[bot]["token"] == "REAL":
                             t_last = last_update_time.get(bot, 0)
                             t_real = estado_bots[bot].get("real_activado_en", 0.0)
+                            if _watchdog_liberar_orden_real_expirada_sin_compra(bot, now_ts=ahora):
+                                activo_real = None
+                                break
                             # Si lleva demasiado sin actualizarse desde que entró a REAL:
                             # NO salir a DEMO aquí: la salida solo ocurre con cierre GANANCIA/PÉRDIDA.
                             if t_real > 0:
