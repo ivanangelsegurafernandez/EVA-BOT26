@@ -32,7 +32,7 @@
 # === FIN BLOQUE 0 ===
 
 # === BLOQUE 1 — IMPORTS Y ENTORNO BÁSICO ===
-import os, csv, time, random, asyncio, json, re
+import os, csv, time, random, asyncio, json, re, glob
 from collections import deque
 from pathlib import Path
 from unicodedata import normalize
@@ -3519,6 +3519,7 @@ LXV_SYNC_MIN_CLOSED_FOR_EVAL = 4
 RECOVERY_RELEASE_TTL_S = 120.0
 RECOVERY_RELEASE_MIN_BOTS = 3
 RECOVERY_RELEASE_STRONG_BOTS = 5
+ORPHAN_RECOVERY_TTL_S = 180.0
 RECOVERY_REQUEST_MAX_AGE_S = 300.0
 DEMO_PENDING_TTL_S = 180.0
 ROUND_BEHIND_REJOIN_WARN_S = 90.0
@@ -11875,6 +11876,91 @@ def _sync_try_release_from_recovery_requests():
         min_bots = int(globals().get("RECOVERY_RELEASE_MIN_BOTS", 3) or 3)
         strong_bots = int(globals().get("RECOVERY_RELEASE_STRONG_BOTS", 5) or 5)
         ttl_s = float(globals().get("RECOVERY_RELEASE_TTL_S", 120.0) or 120.0)
+        orphan_ttl_s = float(globals().get("ORPHAN_RECOVERY_TTL_S", 180.0) or 180.0)
+        if waiting and len(waiting) < min_bots and ttl_wait >= orphan_ttl_s:
+            blocked_check, motivo_check, owner_check = _sync_hay_bloqueo_real_duro()
+            if blocked_check:
+                print_rate_limited(
+                    f"ORPHAN_RECOVERY_BLOQUEADO_REAL:{target}:{motivo_check}:{owner_check}",
+                    f"⛔ ORPHAN_RECOVERY_BLOQUEADO_REAL | target={target} | motivo={motivo_check} | owner={owner_check}",
+                    ttl=10.0,
+                )
+                return False
+            pending_check, pending_reason_check, pending_bot_check = _sync_demo_pending_fresco_bloquea_recovery()
+            if pending_check:
+                print_rate_limited(
+                    f"ORPHAN_RECOVERY_BLOQUEADO_PENDING:{target}:{pending_bot_check}:{pending_reason_check}",
+                    f"⛔ ORPHAN_RECOVERY_BLOQUEADO_PENDING | target={target} | motivo={pending_reason_check} | bot={pending_bot_check}",
+                    ttl=10.0,
+                )
+                return False
+            st_check = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+            released_check = normalizar_released_round_id((st_check if isinstance(st_check, dict) else {}).get("released_round"), fallback=None)
+            if released_check is None or int(released_check) != old:
+                return False
+            payload = dict(st_check)
+            rq_rounds = list(payload.get("recovery_quarantine_rounds") or []) if isinstance(payload.get("recovery_quarantine_rounds"), list) else []
+            if old not in rq_rounds:
+                rq_rounds.append(old)
+            payload.update({
+                "round_id": int(target),
+                "released_round": int(target),
+                "expected_bots": list(BOT_NAMES),
+                "expected_bots_effective": list(BOT_NAMES),
+                "closed_bots": {},
+                "completed": False,
+                "status": "released_demo_recovery_quarantine",
+                "reason": "DEMO_RECOVERY_ORPHAN_FORCE_RELEASE",
+                "last_release_reason": "DEMO_RECOVERY_ORPHAN_FORCE_RELEASE",
+                "data_quality": "recovery_quarantine",
+                "real_allowed": False,
+                "lxv_pattern_allowed": False,
+                "source": "orphan_recovery_request_no_real",
+                "recovery_release_ts": now_ts,
+                "recovery_from_round": int(old),
+                "recovery_target_round": int(target),
+                "recovery_quarantine_round": int(old),
+                "recovery_quarantine_rounds": rq_rounds[-20:],
+                "quarantined_round": int(old),
+                "recovery_wait_bots": sorted(waiting),
+                "recovery_bots_waiting": sorted(waiting),
+                "recovery_request_bots": sorted(waiting),
+                "orphan_recovery_ttl_s": float(orphan_ttl_s),
+                "started_at": now_ts,
+                "ts": now_ts,
+                "real_global": False,
+                "real_owner": None,
+                "owner_real": None,
+                "bot_real": None,
+                "real_pending_bot": None,
+                "real_close_pending": False,
+                "real_status": "none",
+                "token_status": "DEMO",
+                "release_congelado": False,
+                "sync_sigue": True,
+            })
+            qstate = _column_quarantine_default_state()
+            qstate.update({
+                "active": True,
+                "round_id": int(old),
+                "reason": "DEMO_RECOVERY_ORPHAN_FORCE_RELEASE",
+                "since_ts": now_ts,
+                "released_to": int(target),
+                "closed_count": 0,
+                "expected": len(BOT_NAMES),
+                "source": "orphan_recovery_request_no_real",
+                "data_quality": "recovery_quarantine",
+                "real_allowed": False,
+                "lxv_pattern_allowed": False,
+            })
+            globals()["ROUND_QUARANTINE_STATE"] = qstate
+            _column_quarantine_persist_state(qstate)
+            ok = _sync_round_write_state_monotonic(payload, reason="DEMO_RECOVERY_ORPHAN_FORCE_RELEASE")
+            if ok:
+                agregar_evento(f"🧯 DEMO_RECOVERY_ORPHAN_FORCE_RELEASE | released_round {old}→{target} | bots_waiting={sorted(waiting)} | real=NO | owner=--")
+                agregar_evento(f"✅ RELEASE_OK_AFTER_ORPHAN_RECOVERY | ronda={target} | data_quality=recovery_quarantine | real_allowed=NO")
+                globals()["SYNC_STATUS_LINE"] = f"SYNC: DEMO_RECOVERY_ORPHAN_FORCE_RELEASE | {old}→{target} | bots={len(waiting)}"
+                return True
         if len(waiting) < min_bots:
             return False
         if ttl_wait < ttl_s:
