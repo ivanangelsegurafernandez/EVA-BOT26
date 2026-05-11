@@ -21033,6 +21033,265 @@ def _y_to_bin(v) -> int | None:
     except Exception:
         return None
 
+
+def _real_close_sig_ya_procesada(bot, res, monto, ciclo, payout_total, baseline=None):
+    sig = _real_close_sig(bot, res, monto, ciclo, payout_total, baseline=baseline)
+    for prev in (LAST_REAL_CLOSE_SIG.get(bot), REAL_CLOSE_PROCESSED_SIG.get(bot)):
+        if sig == prev:
+            return True
+        try:
+            # Idempotencia adicional: una limpieza puede poner baseline=0; aun así el
+            # mismo bot/resultado/monto/ciclo/payout no debe contabilizarse dos veces.
+            if isinstance(prev, tuple) and tuple(prev[:5]) == tuple(sig[:5]):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _extraer_ciclo_int_seguro(valor):
+    try:
+        if valor in (None, ""):
+            return None
+        txt = str(valor).strip().upper()
+        if txt.startswith("C"):
+            txt = txt[1:].strip()
+        return int(float(txt))
+    except Exception:
+        return None
+
+
+def _ciclo_real_reciente_para_cierre_tardio(bot):
+    """Ciclo esperado para un cierre REAL tardío sin depender del token actual."""
+    try:
+        p = REAL_CLOSE_PENDING.get(bot)
+        if isinstance(p, dict) and p.get("ciclo") not in (None, ""):
+            c = _extraer_ciclo_int_seguro(p.get("ciclo"))
+            if c:
+                return c
+    except Exception:
+        pass
+    try:
+        c = _extraer_ciclo_int_seguro(estado_bots.get(bot, {}).get("ciclo_actual"))
+        if c:
+            return c
+    except Exception:
+        pass
+    try:
+        mem = globals().get("REAL_EN_CURSO_AUDIT", {})
+        if isinstance(mem, dict) and str(mem.get("bot") or "") == str(bot):
+            c = _extraer_ciclo_int_seguro(mem.get("ciclo"))
+            if c:
+                return c
+    except Exception:
+        pass
+    try:
+        st = globals().get("LAST_REAL_OWNER_STATE", {})
+        if isinstance(st, dict) and str(st.get("owner_bot") or "") == str(bot):
+            c = _extraer_ciclo_int_seguro(st.get("ciclo"))
+            if c:
+                return c
+    except Exception:
+        pass
+    try:
+        ultima = globals().get("ULTIMA_OPERACION_REAL_AUDIT", {})
+        if isinstance(ultima, dict) and str(ultima.get("bot") or "") == str(bot):
+            c = _extraer_ciclo_int_seguro(ultima.get("ciclo"))
+            if c:
+                return c
+    except Exception:
+        pass
+    return None
+
+
+def _hay_contexto_real_reciente_para_cierre_tardio(bot):
+    """Señales conservadoras de que el bot acaba de operar REAL aunque ya no tenga token REAL."""
+    try:
+        if int(REAL_ENTRY_BASELINE.get(bot, 0) or 0) > 0:
+            return True, "baseline"
+    except Exception:
+        pass
+    try:
+        p = REAL_CLOSE_PENDING.get(bot)
+        if isinstance(p, dict) and p.get("active"):
+            return True, "pending"
+    except Exception:
+        pass
+    try:
+        if globals().get("REAL_OWNER_LOCK") == bot:
+            return True, "owner_lock"
+    except Exception:
+        pass
+    try:
+        fuente = str(estado_bots.get(bot, {}).get("fuente") or "").upper()
+        if any(tag in fuente for tag in ("ORDEN_REAL", "LXV", "MANUAL")):
+            return True, "fuente_real"
+    except Exception:
+        pass
+    try:
+        mem = globals().get("REAL_EN_CURSO_AUDIT", {})
+        if isinstance(mem, dict) and str(mem.get("bot") or "") == str(bot):
+            return True, "auditor_en_curso"
+    except Exception:
+        pass
+    try:
+        st = globals().get("LAST_REAL_OWNER_STATE", {})
+        if isinstance(st, dict) and str(st.get("owner_bot") or "") == str(bot):
+            return True, "last_owner_state"
+    except Exception:
+        pass
+    return False, "sin_contexto"
+
+
+def _blindar_marti_post_cierre_real_tardio(res, ciclo):
+    """Asegura la regla oficial C1..C4 pérdida => próximo C+1; C5/win => C1."""
+    global marti_ciclos_perdidos, marti_paso
+    try:
+        ciclo_int = int(ciclo or 0)
+    except Exception:
+        ciclo_int = 0
+    res_norm = normalizar_resultado(res)
+    if res_norm == "PÉRDIDA" and 1 <= ciclo_int < int(MAX_CICLOS):
+        esperado = ciclo_int + 1
+        actual = int(ciclo_martingala_siguiente() or 1)
+        if actual != esperado:
+            marti_ciclos_perdidos = ciclo_int
+            marti_paso = ciclo_int
+            agregar_evento(f"🛠️ MARTI_FIX_APLICADO | pérdida C{ciclo_int} -> próxima C{esperado}")
+        # Blindaje final: una pérdida C1..C4 nunca puede quedar en C1.
+        if int(ciclo_martingala_siguiente() or 1) == 1:
+            marti_ciclos_perdidos = ciclo_int
+            marti_paso = ciclo_int
+            agregar_evento(f"🛠️ MARTI_FIX_APLICADO | pérdida C{ciclo_int} -> próxima C{esperado}")
+    elif res_norm in ("GANANCIA", "PÉRDIDA"):
+        # registrar_resultado_real ya reinicia GANANCIA y pérdida en C5 a C1; este bloque solo normaliza
+        # un cierre tardío si alguna limpieza externa alteró los contadores después del commit.
+        if res_norm == "GANANCIA" or ciclo_int >= int(MAX_CICLOS):
+            marti_ciclos_perdidos = 0
+            marti_paso = 0
+
+
+def procesar_cierre_real_tardio_si_existe(bot) -> bool:
+    """
+    Commit tardío/idempotente de cierres REAL ya escritos en CSV cuando el bot liberó
+    token/owner antes de que TICK_02 pasara por el bloque token == REAL.
+    """
+    if bot not in BOT_NAMES:
+        return False
+    ok_ctx, ctx_reason = _hay_contexto_real_reciente_para_cierre_tardio(bot)
+    if not ok_ctx:
+        return False
+
+    baseline = int(REAL_ENTRY_BASELINE.get(bot, 0) or 0)
+    pending = REAL_CLOSE_PENDING.get(bot)
+    pending_activo = isinstance(pending, dict) and bool(pending.get("active"))
+    expected_ciclo = estado_bots.get(bot, {}).get("ciclo_actual", None)
+    cierre_info = detectar_cierre_martingala(
+        bot,
+        min_fila=baseline,
+        require_closed=True,
+        require_real_token=True,
+        expected_ciclo=expected_ciclo,
+    )
+
+    ciclo_contexto = _ciclo_real_reciente_para_cierre_tardio(bot)
+    if not cierre_info and ciclo_contexto is not None and expected_ciclo is not None:
+        try:
+            if int(ciclo_contexto) != int(expected_ciclo):
+                cierre_info = detectar_cierre_martingala(
+                    bot,
+                    min_fila=baseline,
+                    require_closed=True,
+                    require_real_token=True,
+                    expected_ciclo=ciclo_contexto,
+                )
+        except Exception:
+            pass
+
+    if not cierre_info and (pending_activo or baseline > 0):
+        expected_fallback = ciclo_contexto if ciclo_contexto is not None else expected_ciclo
+        cierre_info = detectar_cierre_martingala(
+            bot,
+            min_fila=baseline,
+            require_closed=True,
+            require_real_token=False,
+            expected_ciclo=expected_fallback,
+        )
+        if cierre_info:
+            try:
+                _res_fb, _monto_fb, ciclo_fb, _payout_fb = cierre_info
+                if baseline <= 0 or expected_fallback is None or int(ciclo_fb or 0) != int(expected_fallback):
+                    cierre_info = None
+            except Exception:
+                cierre_info = None
+
+    if not cierre_info or not isinstance(cierre_info, tuple) or len(cierre_info) < 4:
+        return False
+
+    res, monto, ciclo, payout_total = cierre_info
+    res = normalizar_resultado(res)
+    if res not in ("GANANCIA", "PÉRDIDA"):
+        return False
+    try:
+        ciclo_int = int(ciclo or 0)
+    except Exception:
+        return False
+    if ciclo_contexto is not None and ciclo_int != int(ciclo_contexto):
+        return False
+
+    sig = _real_close_sig(bot, res, monto, ciclo_int, payout_total, baseline=baseline)
+    if _real_close_sig_ya_procesada(bot, res, monto, ciclo_int, payout_total, baseline=baseline):
+        _lxv_5v1x_event_cooldown(
+            key=f"real_close_duplicate_late:{bot}:{ciclo_int}",
+            msg=f"⚠️ Cierre REAL tardío duplicado detectado; no se reprocesa: {bot} C{ciclo_int}",
+            cooldown_s=15.0,
+        )
+        return False
+
+    registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo_int)
+    _blindar_marti_post_cierre_real_tardio(res, ciclo_int)
+    sig = _real_close_sig(bot, res, monto, ciclo_int, payout_total, baseline=baseline)
+    LAST_REAL_CLOSE_SIG[bot] = sig
+    REAL_CLOSE_PROCESSED_SIG[bot] = sig
+    prox = int(ciclo_martingala_siguiente() or 1)
+    agregar_evento(f"🧾 REAL_CLOSE_LATE_COMMIT | {bot} | C{ciclo_int} | {res} | próxima=C{prox}")
+
+    try:
+        _registrar_real_close_trace({
+            "bot": bot,
+            "resultado": res,
+            "ciclo": ciclo_int,
+            "monto": float(monto or 0.0),
+            "payout_total": float(payout_total or 0.0),
+            "pending_baseline": baseline,
+            "source_real": estado_bots.get(bot, {}).get("fuente") or ctx_reason,
+            "round_id": _resolver_ronda_audit({"bot": bot}),
+            "detector": "REAL_CLOSE_LATE",
+        })
+    except Exception:
+        pass
+
+    try:
+        _audit_real_close_pending_action(
+            bot=bot, pending=REAL_CLOSE_PENDING.get(bot), resultado=res,
+            contract_id=estado_bots.get(bot, {}).get("id_contrato"),
+            reason="late_real_close", accion="LIBERAR_WIN" if res == "GANANCIA" else "LIBERAR_LOSS",
+        )
+    except Exception:
+        pass
+    try:
+        _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
+    except Exception:
+        pass
+
+    # Limpiezas/liberación solo después del commit martingala y de marcar la firma como procesada.
+    REAL_CLOSE_PENDING[bot] = None
+    try:
+        cerrar_por_fin_de_ciclo(bot, f"Cierre REAL tardío {res} C{ciclo_int}; vuelve a DEMO; próximo ciclo C{prox}")
+    except Exception as e:
+        agregar_evento(f"⚠️ REAL_CLOSE_LATE_RELEASE_FAIL | {bot} | C{ciclo_int} | {type(e).__name__}")
+    return True
+
 def _buscar_cierre_real_pendiente(bot):
     pending = REAL_CLOSE_PENDING.get(bot)
     if not isinstance(pending, dict) or not pending.get("active"):
@@ -30804,6 +31063,12 @@ async def main():
                     set_etapa("TICK_02")
                     # Watchdog para REAL pegado
                     ahora = time.time()
+                    # Commit tardío antes de limpiezas/reconciliaciones fuertes y antes del
+                    # bloque histórico que depende de estado_bots[bot]["token"] == "REAL".
+                    for bot in BOT_NAMES:
+                        if procesar_cierre_real_tardio_si_existe(bot):
+                            activo_real = None
+                            break
                     for bot in BOT_NAMES:
                         pack = _buscar_cierre_real_pendiente(bot)
                         if not pack:
