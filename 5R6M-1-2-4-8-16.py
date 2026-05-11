@@ -13445,7 +13445,7 @@ def _sync_round_release_all_after_real_close(bot_real, real_round=None, reason="
     return ok
 
 
-def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") -> None:
+def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") -> bool:
     reason_txt = str(reason or "real_closed").strip() or "real_closed"
     st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
     real_round = None
@@ -13458,11 +13458,13 @@ def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") 
             msg="🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro" if _real_close_incident_active() else "SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI",
             cooldown_s=25.0 if _real_close_incident_active() else 10.0,
         )
-        return
+        return False
     _sync_real_cleanup_locks_after_close(bot, reason_txt)
     _sync_round_ensure_post_real_rejoin(bot, real_round=real_round, reason=reason_txt)
     if not _sync_round_release_all_after_real_close(bot, real_round=real_round, reason=reason_txt):
         agregar_evento(f"⚠️ REAL_CLOSED_RELEASE_ALL pendiente: bot_real={bot} reason={reason_txt} | candado REAL aún activo")
+        return False
+    return True
 
 # === PATCH: REAL INMEDIATO EN HUD AL EMITIR ORDEN (sin esperar compra) ===
 # Objetivo:
@@ -21248,13 +21250,24 @@ def procesar_cierre_real_tardio_si_existe(bot) -> bool:
         )
         return False
 
-    registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo_int)
-    _blindar_marti_post_cierre_real_tardio(res, ciclo_int)
-    sig = _real_close_sig(bot, res, monto, ciclo_int, payout_total, baseline=baseline)
-    LAST_REAL_CLOSE_SIG[bot] = sig
-    REAL_CLOSE_PROCESSED_SIG[bot] = sig
+    late_commit_done = isinstance(pending, dict) and pending.get("late_commit_sig") == sig
+    if not late_commit_done:
+        registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo_int)
+        _blindar_marti_post_cierre_real_tardio(res, ciclo_int)
+        sig = _real_close_sig(bot, res, monto, ciclo_int, payout_total, baseline=baseline)
     prox = int(ciclo_martingala_siguiente() or 1)
     agregar_evento(f"🧾 REAL_CLOSE_LATE_COMMIT | {bot} | C{ciclo_int} | {res} | próxima=C{prox}")
+
+    if isinstance(pending, dict):
+        pending = dict(pending)
+        pending.update({
+            "active": True,
+            "late_commit_sig": sig,
+            "late_commit_resultado": res,
+            "late_commit_ciclo": ciclo_int,
+            "late_commit_pending_retry": True,
+        })
+        REAL_CLOSE_PENDING[bot] = pending
 
     try:
         _registrar_real_close_trace({
@@ -21284,12 +21297,88 @@ def procesar_cierre_real_tardio_si_existe(bot) -> bool:
     except Exception:
         pass
 
-    # Limpiezas/liberación solo después del commit martingala y de marcar la firma como procesada.
-    REAL_CLOSE_PENDING[bot] = None
+    release_reason = "real_late_close_win" if res == "GANANCIA" else "real_late_close_loss"
+    pending_snapshot = dict(pending) if isinstance(pending, dict) else None
+    pending_restore_needed = False
+    if isinstance(pending_snapshot, dict) and bool(pending_snapshot.get("active")):
+        try:
+            pending_release = dict(pending_snapshot)
+            pending_release["active"] = False
+            pending_release["late_release_in_progress"] = True
+            REAL_CLOSE_PENDING[bot] = pending_release
+            pending_restore_needed = True
+        except Exception:
+            pending_restore_needed = False
+    sync_release_ok = False
+    try:
+        sync_release_ok = bool(_sync_round_release_after_real_close(bot, reason=release_reason))
+    except Exception as e:
+        agregar_evento(f"⚠️ REAL_CLOSE_LATE_SYNC_RELEASE_FAIL | {bot} | C{ciclo_int} | {res} | {type(e).__name__}")
+        sync_release_ok = False
+    finally:
+        if pending_restore_needed and isinstance(pending_snapshot, dict):
+            REAL_CLOSE_PENDING[bot] = pending_snapshot
+    if not sync_release_ok:
+        retry_pending = dict(pending_snapshot or {})
+        retry_pending.update({
+            "active": True,
+            "bot": bot,
+            "ciclo": ciclo_int,
+            "baseline": baseline,
+            "ts": time.time(),
+            "late_commit_sig": sig,
+            "late_commit_resultado": res,
+            "late_commit_ciclo": ciclo_int,
+            "late_commit_pending_retry": True,
+        })
+        REAL_CLOSE_PENDING[bot] = retry_pending
+        agregar_evento(f"⚠️ REAL_CLOSE_LATE_SYNC_RELEASE_FAIL | {bot} | C{ciclo_int} | {res}")
+        return True
+    agregar_evento(f"🔓 REAL_CLOSE_LATE_SYNC_RELEASE | {bot} | C{ciclo_int} | {res} | reason={release_reason}")
+
     try:
         cerrar_por_fin_de_ciclo(bot, f"Cierre REAL tardío {res} C{ciclo_int}; vuelve a DEMO; próximo ciclo C{prox}")
     except Exception as e:
         agregar_evento(f"⚠️ REAL_CLOSE_LATE_RELEASE_FAIL | {bot} | C{ciclo_int} | {type(e).__name__}")
+
+    try:
+        token_raw = leer_token_archivo_raw()
+    except Exception as e:
+        retry_pending = dict(pending_snapshot or {})
+        retry_pending.update({
+            "active": True,
+            "bot": bot,
+            "ciclo": ciclo_int,
+            "baseline": baseline,
+            "ts": time.time(),
+            "late_commit_sig": sig,
+            "late_commit_resultado": res,
+            "late_commit_ciclo": ciclo_int,
+            "late_commit_pending_retry": True,
+        })
+        REAL_CLOSE_PENDING[bot] = retry_pending
+        agregar_evento(f"⚠️ REAL_CLOSE_LATE_TOKEN_NO_LIBERADO | {bot} | C{ciclo_int} | {res} | {type(e).__name__}")
+        return True
+    if token_raw == bot:
+        retry_pending = dict(pending_snapshot or {})
+        retry_pending.update({
+            "active": True,
+            "bot": bot,
+            "ciclo": ciclo_int,
+            "baseline": baseline,
+            "ts": time.time(),
+            "late_commit_sig": sig,
+            "late_commit_resultado": res,
+            "late_commit_ciclo": ciclo_int,
+            "late_commit_pending_retry": True,
+        })
+        REAL_CLOSE_PENDING[bot] = retry_pending
+        agregar_evento(f"⚠️ REAL_CLOSE_LATE_TOKEN_NO_LIBERADO | {bot} | C{ciclo_int} | {res}")
+        return True
+
+    LAST_REAL_CLOSE_SIG[bot] = sig
+    REAL_CLOSE_PROCESSED_SIG[bot] = sig
+    REAL_CLOSE_PENDING[bot] = None
     return True
 
 def _buscar_cierre_real_pendiente(bot):
