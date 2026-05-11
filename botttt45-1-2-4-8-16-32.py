@@ -627,6 +627,34 @@ def _sync_round_emit_close_ack(round_id: int, resultado: str, contract_id=None, 
         print(Fore.YELLOW + f"🧷 LXV_SYNC_COLUMN ACK cierre | {NOMBRE_BOT} | ronda #{rid} | {res}")
     return ok
 
+_SYNC_RECOVERY_SINCE_RESET_LOG_TS = {}
+
+def _sync_recovery_since_ts_seguro(prev, rid, next_round, released, now_ts, bot=None):
+    try:
+        if not isinstance(prev, dict):
+            return float(now_ts)
+        same_round = int(prev.get("round_id", -1)) == int(rid)
+        same_next = int(prev.get("next_round", -1)) == int(next_round)
+        same_released = int(prev.get("released", -1)) == int(released)
+        if same_round and same_next and same_released:
+            old_ts = float(prev.get("recovery_since_ts", now_ts) or now_ts)
+            if old_ts > 0:
+                return old_ts
+        try:
+            if "recovery_since_ts" in prev:
+                log_key = f"{bot or NOMBRE_BOT}:{int(rid)}:{int(next_round)}:{int(released)}"
+                now_log = float(time.time())
+                last_log = float(_SYNC_RECOVERY_SINCE_RESET_LOG_TS.get(log_key, 0.0) or 0.0)
+                if (now_log - last_log) >= 20.0:
+                    _SYNC_RECOVERY_SINCE_RESET_LOG_TS[log_key] = now_log
+                    print(Fore.YELLOW + f"🧯 RECOVERY_SINCE_RESET | bot={bot or NOMBRE_BOT} | ronda={int(rid)} | espera={int(next_round)} | released={int(released)}")
+        except Exception:
+            pass
+        return float(now_ts)
+    except Exception:
+        return float(now_ts)
+
+
 def _sync_round_write_wait_heartbeat(round_id: int, next_round: int):
     path = _sync_round_ack_path()
     prev = _sync_round_safe_read_json(path) or {}
@@ -642,7 +670,7 @@ def _sync_round_write_wait_heartbeat(round_id: int, next_round: int):
     payload["next_round"] = int(next_round)
     payload["released"] = int(next_round) - 1
     payload["reason"] = "demo_wait_timeout_no_release"
-    payload["recovery_since_ts"] = float(payload.get("recovery_since_ts", now_ts) or now_ts)
+    payload["recovery_since_ts"] = _sync_recovery_since_ts_seguro(prev, round_id, next_round, int(next_round) - 1, now_ts, NOMBRE_BOT)
     payload["mode"] = "DEMO"
     payload["real_global"] = False
     payload["owner"] = None
@@ -671,7 +699,7 @@ def _sync_round_write_recovery_request(bot, round_id, next_round, released, reas
         path = os.path.join(req_dir, f"{str(bot or NOMBRE_BOT)}.json")
         now_ts = time.time()
         prev = _sync_round_safe_read_json(path) or {}
-        recovery_since = float((prev if isinstance(prev, dict) else {}).get("recovery_since_ts", now_ts) or now_ts)
+        recovery_since = _sync_recovery_since_ts_seguro(prev, round_id, next_round, released, now_ts, str(bot or NOMBRE_BOT))
         payload = {
             "bot": str(bot or NOMBRE_BOT),
             "round_id": int(round_id),

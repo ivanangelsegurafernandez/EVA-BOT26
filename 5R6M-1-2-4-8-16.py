@@ -1536,6 +1536,7 @@ LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # firma del último cier
 REAL_CLOSE_PROCESSED_SIG = {bot: None for bot in BOT_NAMES}
 REAL_CLOSE_PENDING = {bot: None for bot in BOT_NAMES}
 REAL_CLOSE_PENDING_TTL_S = 240
+REAL_OWNER_STALE_TTL_S = 180.0
 REAL_CLOSE_INCIDENT_LOCK = {
     "active": False,
     "bot": None,
@@ -11573,15 +11574,38 @@ def _sync_payload_has_pending_contract(payload: dict | None) -> bool:
 
 def _sync_hay_bloqueo_real_duro():
     """Devuelve (bloqueado, motivo, owner) solo para candados duros de REAL."""
+    def _owner_check(owner="--", real_evidence=False, stale=False, bloquea=False):
+        owner_txt = str(owner or "--").strip() or "--"
+        evidence_txt = "SI" if bool(real_evidence) else "NO"
+        stale_txt = "SI" if bool(stale) else "NO"
+        bloquea_txt = "SI" if bool(bloquea) else "NO"
+        print_rate_limited(
+            f"RECOVERY_OWNER_CHECK:{owner_txt}:{evidence_txt}:{stale_txt}:{bloquea_txt}",
+            f"🧾 RECOVERY_OWNER_CHECK | owner={owner_txt} | real_evidence={evidence_txt} | stale={stale_txt} | bloquea={bloquea_txt}",
+            ttl=20.0,
+        )
+
     def _blocked(motivo, owner="--"):
         owner_txt = str(owner or "--").strip() or "--"
         motivo_txt = str(motivo or "real_block").strip() or "real_block"
+        _owner_check(owner_txt, real_evidence=True, stale=False, bloquea=True)
         print_rate_limited(
             f"RECOVERY_RELEASE_BLOQUEADO_REAL:{motivo_txt}:{owner_txt}",
             f"⛔ RECOVERY_RELEASE_BLOQUEADO_REAL | motivo={motivo_txt} | owner={owner_txt}",
             ttl=10.0,
         )
         return True, motivo_txt, owner_txt
+
+    def _owner_state_age_s(st: dict):
+        now_ts = float(time.time())
+        for key in ("real_owner_ts", "owner_ts", "updated_ts", "ts", "last_seen_ts"):
+            try:
+                ts = float((st if isinstance(st, dict) else {}).get(key, 0.0) or 0.0)
+                if ts > 0:
+                    return max(0.0, now_ts - ts)
+            except Exception:
+                pass
+        return None
 
     try:
         pending_on, pending_bot, _pending_payload = _hay_real_close_pending_activo()
@@ -11630,18 +11654,46 @@ def _sync_hay_bloqueo_real_duro():
         st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
         if isinstance(st, dict):
             owner = str(st.get("real_owner") or st.get("owner_real") or st.get("bot_real") or st.get("real_pending_bot") or "").strip()
-            if bool(st.get("real_global", False)):
-                return _blocked("real_global_activo", owner or "--")
-            if owner and owner not in ("--", "None", "NONE", "null", "NULL"):
-                return _blocked("owner_real_activo", owner)
+            owner_valido = bool(owner and owner not in ("--", "None", "NONE", "null", "NULL"))
             token_status = str(st.get("token_status") or st.get("sync_round_token_status") or "").strip()
             if _token_real_ocupado(token_status) or token_status.upper().startswith("REAL"):
                 owner2 = token_status.split(":", 1)[1].strip() if ":" in token_status else owner
                 return _blocked("sync_round_token_status_real", owner2 or "--")
-            if str(st.get("status", "") or "").strip().lower() in ("holding_real_result", "holding_real_turn"):
-                return _blocked("turno_real_activo", owner or "--")
-            if bool(st.get("real_lock", False) or st.get("lock_real", False) or st.get("holding_real_result", False) or st.get("holding_real_turn", False)):
-                return _blocked("lock_real_explicito", owner or "--")
+            if bool(st.get("real_global", False)):
+                return _blocked("real_global_activo", owner or "--")
+            status_txt = str(st.get("status", "") or "").strip().lower()
+            state_real_activo = bool(
+                status_txt in ("holding_real_result", "holding_real_turn", "waiting_real_close", "closing", "real_close_pending")
+                or st.get("holding_real_result", False)
+                or st.get("holding_real_turn", False)
+                or st.get("waiting_real_close", False)
+                or st.get("closing", False)
+                or st.get("real_close_pending", False)
+                or st.get("real_lock", False)
+                or st.get("lock_real", False)
+            )
+            if state_real_activo:
+                return _blocked("estado_real_activo", owner or "--")
+            if owner_valido:
+                age_s = _owner_state_age_s(st)
+                ttl_owner = float(globals().get("REAL_OWNER_STALE_TTL_S", 180.0) or 180.0)
+                if age_s is not None and age_s <= ttl_owner:
+                    return _blocked("owner_real_fresco", owner)
+                _owner_check(owner, real_evidence=False, stale=True, bloquea=False)
+                if age_s is None:
+                    print_rate_limited(
+                        f"OWNER_REAL_STALE_IGNORADO_RECOVERY:{owner}:sin_ts",
+                        f"🧯 OWNER_REAL_STALE_IGNORADO_RECOVERY | owner={owner} | motivo=sin_evidencia_real_fresca",
+                        ttl=20.0,
+                    )
+                else:
+                    print_rate_limited(
+                        f"OWNER_REAL_STALE_IGNORADO_RECOVERY:{owner}:{int(age_s)}",
+                        f"🧯 OWNER_REAL_STALE_IGNORADO_RECOVERY | owner={owner} | edad={int(age_s)}s",
+                        ttl=20.0,
+                    )
+            else:
+                _owner_check("--", real_evidence=False, stale=False, bloquea=False)
     except Exception:
         return _blocked("state_real_check_error", "--")
     try:
