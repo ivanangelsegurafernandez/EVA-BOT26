@@ -13797,10 +13797,26 @@ def _watchdog_liberar_orden_real_expirada_sin_compra(bot, now_ts=None) -> bool:
                 REAL_CLOSE_INCIDENT_LOCK.update({"active": False, "bot": None, "ciclo": None, "round_id": None, "ts": 0.0, "reason": "REAL_ORDER_EXPIRED_NO_BUY"})
         except Exception:
             pass
+        liberado = False
         try:
-            write_token_atomic(TOKEN_FILE, "REAL:none")
+            with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
+                if got:
+                    liberado = bool(write_token_atomic(TOKEN_FILE, "REAL:none"))
+                    if not liberado:
+                        agregar_evento("⚠️ REAL_ORDER_EXPIRED_NO_BUY: token REAL no liberado por fallo de escritura.")
+                else:
+                    agregar_evento("⚠️ REAL_ORDER_EXPIRED_NO_BUY: real.lock ocupado; no se libera token.")
         except Exception:
-            pass
+            liberado = False
+
+        if not liberado:
+            print_rate_limited(
+                f"real-order-expired-release-lock-failed:{b}",
+                f"⚠️ REAL_ORDER_EXPIRED_REVIEW_REQUIRED | bot={b} | motivo=real_lock_no_liberado",
+                ttl=30.0,
+            )
+            return False
+
         REAL_OWNER_LOCK = None
         try:
             estado_bots[b]["token"] = "DEMO"
@@ -30871,6 +30887,19 @@ async def main():
                             REAL_CLOSE_PROCESSED_SIG[bot] = sig
                             activo_real = None
                             break
+                    try:
+                        owner_archivo = leer_token_archivo_raw()
+                    except Exception:
+                        owner_archivo = None
+
+                    if owner_archivo in BOT_NAMES:
+                        try:
+                            if _watchdog_liberar_orden_real_expirada_sin_compra(owner_archivo, now_ts=ahora):
+                                activo_real = None
+                                break
+                        except Exception:
+                            pass
+
                     for bot in BOT_NAMES:
                         if estado_bots[bot]["token"] == "REAL":
                             t_last = last_update_time.get(bot, 0)
