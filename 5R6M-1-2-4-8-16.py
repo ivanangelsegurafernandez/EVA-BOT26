@@ -13786,18 +13786,6 @@ def _watchdog_liberar_orden_real_expirada_sin_compra(bot, now_ts=None) -> bool:
             )
             return False
 
-        limpiar_orden_real(b, reason="REAL_ORDER_EXPIRED_NO_BUY")
-        try:
-            pending = REAL_CLOSE_PENDING.get(b)
-            if isinstance(pending, dict) and str(pending.get("bot") or b) == b:
-                REAL_CLOSE_PENDING[b] = None
-        except Exception:
-            pass
-        try:
-            if _real_close_incident_active() and str(REAL_CLOSE_INCIDENT_LOCK.get("bot") or "") == b and not _real_close_pending_tiene_contract_id_confirmado(b):
-                REAL_CLOSE_INCIDENT_LOCK.update({"active": False, "bot": None, "ciclo": None, "round_id": None, "ts": 0.0, "reason": "REAL_ORDER_EXPIRED_NO_BUY"})
-        except Exception:
-            pass
         liberado = False
         try:
             with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
@@ -13818,6 +13806,18 @@ def _watchdog_liberar_orden_real_expirada_sin_compra(bot, now_ts=None) -> bool:
             )
             return False
 
+        limpiar_orden_real(b, reason="REAL_ORDER_EXPIRED_NO_BUY")
+        try:
+            pending = REAL_CLOSE_PENDING.get(b)
+            if isinstance(pending, dict) and str(pending.get("bot") or b) == b:
+                REAL_CLOSE_PENDING[b] = None
+        except Exception:
+            pass
+        try:
+            if _real_close_incident_active() and str(REAL_CLOSE_INCIDENT_LOCK.get("bot") or "") == b and not _real_close_pending_tiene_contract_id_confirmado(b):
+                REAL_CLOSE_INCIDENT_LOCK.update({"active": False, "bot": None, "ciclo": None, "round_id": None, "ts": 0.0, "reason": "REAL_ORDER_EXPIRED_NO_BUY"})
+        except Exception:
+            pass
         REAL_OWNER_LOCK = None
         try:
             estado_bots[b]["token"] = "DEMO"
