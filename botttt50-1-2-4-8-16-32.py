@@ -216,6 +216,7 @@ estado_bot = {
     "pending_contract_id": None,
     "pending_since_ts": 0.0,
     "pending_round_id": None,
+    "pending_sync_round_id_original": 0,
 }  # Added modo_manual and barra_activa
 racha_actual_bot = 0  # racha del bot: >0 = racha de GANANCIAS, <0 = racha de PÉRDIDAS
 
@@ -626,6 +627,75 @@ def _sync_round_emit_close_ack(round_id: int, resultado: str, contract_id=None, 
     if ok:
         print(Fore.YELLOW + f"🧷 LXV_SYNC_COLUMN ACK cierre | {NOMBRE_BOT} | ronda #{rid} | {res}")
     return ok
+
+def _emitir_ack_sync_incident_demo_resuelto(resultado, contract_id=None, asset=None, ciclo=None, token_usado=None, source="INCIDENT_LOCK_RESOLVED"):
+    """
+    Emite ACK SYNC cuando un INCIDENT_LOCK DEMO se resolvió en background.
+    Solo informa al sistema SYNC.
+    No cambia Martingala.
+    No escribe CSV.
+    No suma saldo.
+    No consulta saldo.
+    No emite si es REAL.
+    No emite si no hay ronda original.
+    No emite si resultado no es GANANCIA/PÉRDIDA.
+    Nunca lanza excepción.
+    """
+    try:
+        res = str(resultado or "").strip().upper()
+        if res == "PERDIDA":
+            res = "PÉRDIDA"
+
+        if res not in ("GANANCIA", "PÉRDIDA"):
+            return False
+
+        try:
+            token_usado_str = str(token_usado or "").strip()
+            es_real_por_contexto = token_usado_str == str(TOKEN_REAL)
+            if es_real_por_contexto:
+                print(f"ℹ️ INCIDENT_LOCK_SYNC_ACK_OMITIDO_REAL | bot={NOMBRE_BOT} | contract_id={contract_id}")
+                return False
+        except Exception:
+            pass
+
+        round_id = 0
+        try:
+            round_id = int(estado_bot.get("pending_sync_round_id_original", 0) or 0)
+        except Exception:
+            round_id = 0
+
+        if round_id <= 0:
+            print(f"⚠️ INCIDENT_LOCK_SYNC_ACK_OMITIDO_SIN_RONDA | bot={NOMBRE_BOT} | contract_id={contract_id} | resultado={res}")
+            return False
+
+        ack_key = f"{round_id}:{contract_id}:{res}"
+        emitted = estado_bot.setdefault("_incident_sync_ack_emitidos", set())
+        if ack_key in emitted:
+            print(f"ℹ️ INCIDENT_LOCK_SYNC_ACK_YA_EXISTE | bot={NOMBRE_BOT} | ronda={round_id} | contract_id={contract_id}")
+            return False
+
+        ok = _sync_round_emit_close_ack(
+            round_id,
+            res,
+            contract_id=contract_id,
+            asset=asset,
+            ciclo=ciclo,
+            modo_real_contrato=False,
+        )
+        if not ok:
+            return False
+
+        emitted.add(ack_key)
+
+        print(f"🧷 INCIDENT_LOCK_SYNC_ACK_EMITIDO | bot={NOMBRE_BOT} | ronda={round_id} | resultado={res} | contract_id={contract_id}")
+        return True
+
+    except Exception as e:
+        try:
+            print(f"⚠️ INCIDENT_LOCK_SYNC_ACK_ERROR | bot={NOMBRE_BOT} | contract_id={contract_id} | error={e}")
+        except Exception:
+            pass
+        return False
 
 _SYNC_RECOVERY_SINCE_RESET_LOG_TS = {}
 
@@ -1399,6 +1469,7 @@ def _set_pending_contract_resolution(round_id: int, contract_id=None, reason: st
     estado_bot["pending_contract_id"] = contract_id
     estado_bot["pending_since_ts"] = float(time.time())
     estado_bot["pending_round_id"] = int(round_id or estado_bot.get("sync_round_id", 1) or 1)
+    estado_bot["pending_sync_round_id_original"] = int(round_id or estado_bot.get("sync_round_id", 0) or 0)
     ciclo_ctx = incident_context.get("ciclo", estado_bot.get("ciclo_actual", "?"))
     incidente = {
         "bot": NOMBRE_BOT,
@@ -1411,6 +1482,7 @@ def _set_pending_contract_resolution(round_id: int, contract_id=None, reason: st
         "ts": float(time.time()),
         "reason": reason or "unknown",
         "contract_id": contract_id,
+        "sync_round_id_original": estado_bot["pending_sync_round_id_original"],
         "attempts": 0,
         "last_recovery_ts": 0.0,
         "history_recovery": "historial_deriv_seguro_habilitado",
@@ -1741,6 +1813,14 @@ async def resolver_contrato_incierto_seguro(ws, incidente: dict) -> tuple[bool, 
         if cid_int not in _contratos_procesados:
             return False, {"accion": "manual", "reason": "registro_final_no_confirmado", "contract_id": cid_int, "resultado": resultado}
         CONTRATOS_RESUELTOS_INCIDENT_LOCK.add(cid_int)
+        _emitir_ack_sync_incident_demo_resuelto(
+            resultado,
+            contract_id=cid_int,
+            asset=incidente.get("activo") or incidente.get("asset") or ctx.get("activo"),
+            ciclo=incidente.get("ciclo") or ctx.get("ciclo") or estado_bot.get("ciclo_actual"),
+            token_usado=incidente.get("token_usado") or ctx.get("token_usado"),
+            source="INCIDENT_LOCK_RESOLVED",
+        )
         _clear_pending_contract_resolution(reason="incident_lock_resuelto", resultado_final=resultado)
         print(Fore.GREEN + Style.BRIGHT + f"✅ INCIDENT_LOCK_RESUELTO | {NOMBRE_BOT} | contract_id={cid_int} | resultado={resultado} | C{incidente.get('ciclo', '?')}")
         return True, {"accion": "resuelto", "contract_id": cid_int, "resultado": resultado}
@@ -1783,6 +1863,14 @@ async def resolver_contrato_incierto_seguro(ws, incidente: dict) -> tuple[bool, 
                 if cid_hist not in _contratos_procesados:
                     return False, {"accion": "manual", "reason": "registro_final_no_confirmado", **info_hist}
                 CONTRATOS_RESUELTOS_INCIDENT_LOCK.add(cid_hist)
+                _emitir_ack_sync_incident_demo_resuelto(
+                    resultado_hist,
+                    contract_id=cid_hist,
+                    asset=incidente.get("activo") or incidente.get("asset") or ctx.get("activo"),
+                    ciclo=incidente.get("ciclo") or ctx.get("ciclo") or estado_bot.get("ciclo_actual"),
+                    token_usado=incidente.get("token_usado") or ctx.get("token_usado"),
+                    source="INCIDENT_LOCK_RESOLVED",
+                )
                 _clear_pending_contract_resolution(reason="incident_lock_resuelto", resultado_final=resultado_hist)
                 print(Fore.GREEN + Style.BRIGHT + f"✅ INCIDENT_LOCK_RESUELTO | {NOMBRE_BOT} | contract_id={cid_hist} | resultado={resultado_hist} | C{incidente.get('ciclo', '?')}")
                 return True, {"accion": "resuelto", "contract_id": cid_hist, "resultado": resultado_hist}
