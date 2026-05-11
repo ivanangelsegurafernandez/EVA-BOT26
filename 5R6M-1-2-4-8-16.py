@@ -13756,8 +13756,9 @@ def _watchdog_liberar_orden_real_expirada_sin_compra(bot, now_ts=None) -> bool:
         if b not in BOT_NAMES:
             return False
         now = float(now_ts or time.time())
-        owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
-        if owner != b:
+        owner_mem = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+        owner_file = leer_token_archivo_raw()
+        if b != owner_mem and b != owner_file:
             return False
         orden = _sync_round_safe_read_json(path_orden(b)) or {}
         ts_orden = float(orden.get("created_ts") or orden.get("ts") or 0.0) if isinstance(orden, dict) else 0.0
