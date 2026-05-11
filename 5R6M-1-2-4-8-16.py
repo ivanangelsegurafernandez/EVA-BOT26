@@ -31154,11 +31154,15 @@ async def main():
                     ahora = time.time()
                     # Commit tardío antes de limpiezas/reconciliaciones fuertes y antes del
                     # bloque histórico que depende de estado_bots[bot]["token"] == "REAL".
+                    bots_late_handled = set()
                     for bot in BOT_NAMES:
                         if procesar_cierre_real_tardio_si_existe(bot):
+                            bots_late_handled.add(bot)
                             activo_real = None
                             break
                     for bot in BOT_NAMES:
+                        if bot in bots_late_handled:
+                            continue
                         pack = _buscar_cierre_real_pendiente(bot)
                         if not pack:
                             continue
@@ -31185,6 +31189,62 @@ async def main():
                                 reason="resultado_no_contable",
                             )
                             continue
+                        if isinstance(pending, dict) and pending.get("late_commit_sig") == sig:
+                            agregar_evento(
+                                f"🔁 REAL_CLOSE_PENDING_RETRY_POST_LATE_COMMIT | {bot} | C{int(ciclo or 0)} | {normalizar_resultado(res)}"
+                            )
+                            pending_snapshot = dict(pending)
+                            sync_release_ok = False
+                            try:
+                                pending_release = dict(pending_snapshot)
+                                pending_release["active"] = False
+                                pending_release["late_release_in_progress"] = True
+                                REAL_CLOSE_PENDING[bot] = pending_release
+                                sync_release_ok = bool(_sync_round_release_after_real_close(bot, reason="post_late_commit_retry"))
+                            except Exception as e:
+                                agregar_evento(
+                                    f"⚠️ REAL_CLOSE_PENDING_RETRY_POST_LATE_COMMIT_SYNC_FAIL | {bot} | C{int(ciclo or 0)} | {type(e).__name__}"
+                                )
+                                sync_release_ok = False
+                            if not sync_release_ok:
+                                retry_pending = dict(pending_snapshot)
+                                retry_pending["active"] = True
+                                retry_pending["late_commit_pending_retry"] = True
+                                retry_pending["ts"] = time.time()
+                                REAL_CLOSE_PENDING[bot] = retry_pending
+                                continue
+                            try:
+                                cerrar_por_fin_de_ciclo(
+                                    bot,
+                                    f"Retry post late commit {normalizar_resultado(res)} C{int(ciclo or 0)}; vuelve a DEMO",
+                                )
+                            except Exception as e:
+                                agregar_evento(
+                                    f"⚠️ REAL_CLOSE_PENDING_RETRY_POST_LATE_COMMIT_TOKEN_FAIL | {bot} | C{int(ciclo or 0)} | {type(e).__name__}"
+                                )
+                            try:
+                                token_raw = leer_token_archivo_raw()
+                            except Exception:
+                                token_raw = bot
+                            if token_raw == bot:
+                                retry_pending = dict(pending_snapshot)
+                                retry_pending["active"] = True
+                                retry_pending["late_commit_pending_retry"] = True
+                                retry_pending["ts"] = time.time()
+                                REAL_CLOSE_PENDING[bot] = retry_pending
+                                agregar_evento(
+                                    f"⚠️ REAL_CLOSE_PENDING_RETRY_POST_LATE_COMMIT_TOKEN_PENDIENTE | {bot} | C{int(ciclo or 0)} | {normalizar_resultado(res)}"
+                                )
+                                continue
+                            try:
+                                _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
+                            except Exception:
+                                pass
+                            REAL_CLOSE_PENDING[bot] = None
+                            LAST_REAL_CLOSE_SIG[bot] = sig
+                            REAL_CLOSE_PROCESSED_SIG[bot] = sig
+                            activo_real = None
+                            break
                         saldo_antes = obtener_valor_saldo()
                         globals()["REAL_BALANCE_AUDIT_CONTEXT"] = {
                             "owner": bot, "ciclo": f"C{int(ciclo or 0)}", "resultado": res,
