@@ -634,9 +634,18 @@ def _sync_round_write_wait_heartbeat(round_id: int, next_round: int):
     payload["bot"] = NOMBRE_BOT
     payload["round_id"] = int(round_id)
     payload["status"] = "closed"
+    now_ts = time.time()
     payload["sync_wait"] = True
     payload["waiting_release_round"] = int(next_round)
-    payload["last_seen_ts"] = time.time()
+    payload["last_seen_ts"] = now_ts
+    payload["recovery_request"] = True
+    payload["next_round"] = int(next_round)
+    payload["released"] = int(next_round) - 1
+    payload["reason"] = "demo_wait_timeout_no_release"
+    payload["recovery_since_ts"] = float(payload.get("recovery_since_ts", now_ts) or now_ts)
+    payload["mode"] = "DEMO"
+    payload["real_global"] = False
+    payload["owner"] = None
     _sync_round_write_json_atomic(path, payload)
 
 
@@ -660,13 +669,22 @@ def _sync_round_write_recovery_request(bot, round_id, next_round, released, reas
         req_dir = os.path.join(SYNC_ROUND_DIR, "recovery_requests")
         os.makedirs(req_dir, exist_ok=True)
         path = os.path.join(req_dir, f"{str(bot or NOMBRE_BOT)}.json")
+        now_ts = time.time()
+        prev = _sync_round_safe_read_json(path) or {}
+        recovery_since = float((prev if isinstance(prev, dict) else {}).get("recovery_since_ts", now_ts) or now_ts)
         payload = {
             "bot": str(bot or NOMBRE_BOT),
             "round_id": int(round_id),
             "next_round": int(next_round),
             "released": int(released),
-            "reason": str(reason or ""),
-            "ts": time.time(),
+            "recovery_request": True,
+            "reason": str(reason or "demo_wait_timeout_no_release"),
+            "last_seen_ts": now_ts,
+            "recovery_since_ts": recovery_since,
+            "ts": now_ts,
+            "mode": "DEMO",
+            "real_global": bool(any_real_active),
+            "owner": str(any_real_owner or "") or None,
             "any_real_active": bool(any_real_active),
             "any_real_owner": str(any_real_owner or ""),
             "any_real_reason": str(any_real_reason or ""),
@@ -1061,7 +1079,7 @@ async def _sync_round_wait_release(round_id: int) -> int:
                         print(Fore.CYAN + f"🫀 SYNC_WAIT_HEARTBEAT_RECOVERY | bot={NOMBRE_BOT} | ronda={rid} | espera={next_round}")
                 except Exception:
                     pass
-                if (now_ts - last_global_hold_print_ts) >= 10.0:
+                if (now_ts - last_global_hold_print_ts) >= 20.0:
                     print(
                         Fore.YELLOW + Style.BRIGHT +
                         f"⏳ SYNC DEMO HOLD RECOVERY:\n"
