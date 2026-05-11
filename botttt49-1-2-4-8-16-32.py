@@ -651,15 +651,9 @@ def _emitir_ack_sync_incident_demo_resuelto(resultado, contract_id=None, asset=N
             return False
 
         try:
-            if token_usado is not None and str(token_usado) == str(TOKEN_REAL):
-                print(f"ℹ️ INCIDENT_LOCK_SYNC_ACK_OMITIDO_REAL | bot={NOMBRE_BOT} | contract_id={contract_id}")
-                return False
-        except Exception:
-            pass
-
-        try:
-            current_token_tmp = leer_token_desde_archivo()
-            if str(current_token_tmp) == str(TOKEN_REAL):
+            token_usado_str = str(token_usado or "").strip()
+            es_real_por_contexto = token_usado_str == str(TOKEN_REAL)
+            if es_real_por_contexto:
                 print(f"ℹ️ INCIDENT_LOCK_SYNC_ACK_OMITIDO_REAL | bot={NOMBRE_BOT} | contract_id={contract_id}")
                 return False
         except Exception:
@@ -1477,7 +1471,7 @@ def _set_pending_contract_resolution(round_id: int, contract_id=None, reason: st
     estado_bot["pending_contract_id"] = contract_id
     estado_bot["pending_since_ts"] = float(time.time())
     estado_bot["pending_round_id"] = int(round_id or estado_bot.get("sync_round_id", 1) or 1)
-    estado_bot["pending_sync_round_id_original"] = int(estado_bot.get("sync_round_id", 0) or 0)
+    estado_bot["pending_sync_round_id_original"] = int(round_id or estado_bot.get("sync_round_id", 0) or 0)
     ciclo_ctx = incident_context.get("ciclo", estado_bot.get("ciclo_actual", "?"))
     incidente = {
         "bot": NOMBRE_BOT,
@@ -3914,10 +3908,19 @@ async def ejecutar_panel():
                 print(Fore.YELLOW + f"⚠️ ciclo>MAX_CICLOS detectado, normalizado a C{ciclo_forzado} (retenido=C{ciclo_prev})")
 
             if modo_real and ciclo_maestro is None:
+                now_real_sin_orden = time.time()
+                if not bool(estado_bot.get("real_sin_orden_maestro", False)):
+                    estado_bot["real_sin_orden_maestro_since_ts"] = now_real_sin_orden
                 estado_bot["real_sin_orden_maestro"] = True
+                since_real_sin_orden = float(estado_bot.get("real_sin_orden_maestro_since_ts", now_real_sin_orden) or now_real_sin_orden)
+                last_real_sin_orden_log = float(estado_bot.get("real_sin_orden_maestro_last_log_ts", 0.0) or 0.0)
+                if (now_real_sin_orden - since_real_sin_orden) >= 30.0 and (now_real_sin_orden - last_real_sin_orden_log) >= 30.0:
+                    estado_bot["real_sin_orden_maestro_last_log_ts"] = now_real_sin_orden
+                    print(Fore.RED + f"🚫 REAL_SIN_ORDEN_MAESTRO_STUCK | {NOMBRE_BOT} | token=REAL:{NOMBRE_BOT} | acción=esperando_maestro_no_compra")
                 await asyncio.sleep(0.5)
                 continue
             estado_bot["real_sin_orden_maestro"] = False
+            estado_bot["real_sin_orden_maestro_since_ts"] = 0.0
             ciclo = ciclo_maestro if ciclo_maestro is not None else (ciclo_forzado if ciclo_forzado is not None else 1)
             if modo_real:
                 now_guard = time.time()

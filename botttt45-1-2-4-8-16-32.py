@@ -3817,10 +3817,19 @@ async def ejecutar_panel():
                 print(Fore.YELLOW + f"⚠️ ciclo>MAX_CICLOS detectado, normalizado a C{ciclo_forzado} (retenido=C{ciclo_prev})")
 
             if modo_real and ciclo_maestro is None:
+                now_real_sin_orden = time.time()
+                if not bool(estado_bot.get("real_sin_orden_maestro", False)):
+                    estado_bot["real_sin_orden_maestro_since_ts"] = now_real_sin_orden
                 estado_bot["real_sin_orden_maestro"] = True
+                since_real_sin_orden = float(estado_bot.get("real_sin_orden_maestro_since_ts", now_real_sin_orden) or now_real_sin_orden)
+                last_real_sin_orden_log = float(estado_bot.get("real_sin_orden_maestro_last_log_ts", 0.0) or 0.0)
+                if (now_real_sin_orden - since_real_sin_orden) >= 30.0 and (now_real_sin_orden - last_real_sin_orden_log) >= 30.0:
+                    estado_bot["real_sin_orden_maestro_last_log_ts"] = now_real_sin_orden
+                    print(Fore.RED + f"🚫 REAL_SIN_ORDEN_MAESTRO_STUCK | {NOMBRE_BOT} | token=REAL:{NOMBRE_BOT} | acción=esperando_maestro_no_compra")
                 await asyncio.sleep(0.5)
                 continue
             estado_bot["real_sin_orden_maestro"] = False
+            estado_bot["real_sin_orden_maestro_since_ts"] = 0.0
             ciclo = ciclo_maestro if ciclo_maestro is not None else (ciclo_forzado if ciclo_forzado is not None else 1)
             if modo_real:
                 now_guard = time.time()
