@@ -11127,14 +11127,37 @@ def _sync_round_neutral_incident_stale_open_request(round_id, released_round, re
     try:
         rid = int(round_id or 0)
         rel = int(released_round or 0)
-        if rid <= 0 or rel != rid or not isinstance(requests, dict):
+        if rid <= 0 or rel > rid or not isinstance(requests, dict):
             out["reason"] = "round_mismatch"
+            return out
+        try:
+            real_on, real_bot, _motivo_real = _sync_real_turn_activo()
+        except Exception:
+            real_on, real_bot = True, "UNKNOWN"
+        try:
+            pending_on, pending_bot, _pending = _hay_real_close_pending_activo()
+        except Exception:
+            pending_on, pending_bot = True, "UNKNOWN"
+        try:
+            order_on, order_bot = _sync_real_order_viva_any()
+        except Exception:
+            order_on, order_bot = True, "UNKNOWN"
+        if bool(real_on) or bool(pending_on) or bool(order_on):
+            out.update({
+                "reason": "real_guard_active",
+                "real_bot": real_bot,
+                "pending_bot": pending_bot,
+                "order_bot": order_bot,
+            })
             return out
         target = rid + 1
         for bot, req in requests.items():
             if bot not in BOT_NAMES or not isinstance(req, dict):
                 continue
             if str(req.get("reason") or "").strip() != "incident_lock_demo_stale_open":
+                continue
+            if str(req.get("source") or "").strip() != "INCIDENT_LOCK_STALE_OPEN_DEMO":
+                out["reason"] = "incident_request_bad_source"
                 continue
             if int(req.get("round_id", 0) or 0) != rid or int(req.get("next_round", 0) or 0) != target:
                 continue
@@ -11146,7 +11169,7 @@ def _sync_round_neutral_incident_stale_open_request(round_id, released_round, re
                 "bot": bot,
                 "contract_id": req.get("contract_id"),
                 "reason": "incident_lock_demo_stale_open",
-                "source": req.get("source", "INCIDENT_LOCK_STALE_OPEN_DEMO"),
+                "source": "INCIDENT_LOCK_STALE_OPEN_DEMO",
             })
             return out
         return out
@@ -12053,6 +12076,11 @@ def _sync_round_tick_maestro():
                     "expected": int(expected_count),
                     "contract_id": incident_req.get("contract_id"),
                     "source": "INCIDENT_LOCK_STALE_OPEN_DEMO",
+                    "neutral": True,
+                    "no_trade_result": True,
+                    "usable_for_real": False,
+                    "usable_for_lxv": False,
+                    "usable_for_training": False,
                 }
                 if liberar_ronda_por_cuarentena_demo_only(round_id, int(round_id) + 1, qi_incident):
                     agregar_evento(

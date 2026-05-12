@@ -672,9 +672,7 @@ def _sync_round_write_recovery_request(bot, round_id, next_round, released, reas
             "any_real_reason": str(any_real_reason or ""),
         }
         if isinstance(extra_fields, dict) and extra_fields:
-            for k, v in extra_fields.items():
-                if k and k not in payload:
-                    payload[str(k)] = v
+            payload.update(extra_fields)
         return _sync_round_write_json_atomic(path, payload)
     except Exception:
         return False
@@ -1350,7 +1348,7 @@ def _set_pending_contract_resolution(round_id: int, contract_id=None, reason: st
         print(Fore.YELLOW + Style.BRIGHT + f"🧱 Fence contrato incierto activado.{cid_txt} reason={reason_txt}")
 
 
-def _clear_pending_contract_resolution(reason: str = ""):
+def _clear_pending_contract_resolution(reason: str = "", resultado_final=None):
     if estado_bot.get("pending_contract_resolution") and _print_once("pending-contract-clear", ttl=6.0):
         print(Fore.GREEN + f"✅ Fence contrato incierto liberado ({reason or 'resolved'}).")
     estado_bot["pending_contract_resolution"] = False
@@ -1415,9 +1413,14 @@ async def _pending_contract_fence_tick(ws):
     pending_id = estado_bot.get("pending_contract_id")
     since = float(estado_bot.get("pending_since_ts", 0.0) or 0.0)
     elapsed = max(0.0, time.time() - since)
-    attempts = min(int(INCIDENT_LOCK_RECOVERY_ATTEMPTS), int(estado_bot.get("pending_attempts", 0) or 0) + 1)
+    attempts = int(estado_bot.get("pending_attempts", 0) or 0) + 1
     estado_bot["pending_attempts"] = attempts
-    pending_round = int(estado_bot.get("pending_round_id") or estado_bot.get("sync_round_id", 0) or 0)
+    pending_round = int(
+        estado_bot.get("pending_sync_round_id_original")
+        or estado_bot.get("pending_round_id")
+        or estado_bot.get("sync_round_id", 0)
+        or 0
+    )
 
     if isinstance(pending_id, int) and ws is not None:
         try:
@@ -1436,40 +1439,65 @@ async def _pending_contract_fence_tick(ws):
             modo_is_real = bool(str(estado_bot.get("tipo_cuenta", "") or estado_bot.get("modo", "")).strip().upper() == "REAL")
             profit_final = poc.get("profit")
             has_final_profit = profit_final not in (None, "") and bool(poc.get("is_sold", False))
-            any_real_active, _owner_real, _real_reason = (False, "", "")
+            resultado_txt = str(poc.get("status") or poc.get("result") or poc.get("resultado") or "").strip().upper()
+            has_trade_result = resultado_txt in ("GANANCIA", "PÉRDIDA", "PERDIDA", "WIN", "LOSS")
+            any_real_active, _owner_real, _real_reason = (True, "", "real_owner_check_failed")
             try:
                 any_real_active, _owner_real, _real_reason = _sync_any_real_owner_active()
             except Exception:
                 any_real_active = True
+            real_close_pending_live = False
+            try:
+                real_close_pending_raw = globals().get("REAL_CLOSE_PENDING", False)
+                real_close_pending_live = any(bool(v) for v in real_close_pending_raw.values()) if isinstance(real_close_pending_raw, dict) else bool(real_close_pending_raw)
+            except Exception:
+                real_close_pending_live = True
+            real_order_live = False
+            try:
+                real_order_live = bool(callable(globals().get("_manual_real_order_targets_this_bot")) and _manual_real_order_targets_this_bot())
+            except Exception:
+                real_order_live = True
             if (
-                pending_round > 0
+                isinstance(pending_id, int)
+                and int(pending_id or 0) > 0
+                and pending_round > 0
                 and not modo_is_real
                 and not token_is_real
                 and not any_real_active
+                and not real_close_pending_live
+                and not real_order_live
                 and not has_final_profit
+                and not has_trade_result
                 and not bool(poc.get("is_sold", False))
                 and elapsed >= float(INCIDENT_LOCK_MAX_AGE_S)
                 and attempts >= int(INCIDENT_LOCK_RECOVERY_ATTEMPTS)
             ):
                 rid = pending_round
                 cid = int(pending_id)
-                ciclo_actual = estado_bot.get("pending_ciclo") or estado_bot.get("ciclo_actual")
+                ciclo_actual = estado_bot.get("pending_ciclo") or estado_bot.get("ciclo_actual") or 1
                 asset = estado_bot.get("pending_asset")
                 direction = estado_bot.get("pending_direction")
                 estado_bot["pending_contract_state"] = "COMPRA_NO_CONFIRMADA_STALE_OPEN_DEMO"
                 estado_bot["pending_contract_action"] = "LIBERAR_STALE_OPEN_DEMO"
                 estado_bot["ciclo_forzado"] = ciclo_actual
-                print(
-                    Fore.YELLOW + Style.BRIGHT +
-                    f"🧯 INCIDENT_LOCK_STALE_OPEN_DEMO_LIBERADO | bot={NOMBRE_BOT} | ronda=#{rid} | C{ciclo_actual} | "
-                    f"contract_id={cid} | edad={elapsed:.0f}s | attempts={attempts}/{INCIDENT_LOCK_RECOVERY_ATTEMPTS} | "
-                    f"acción=recovery_request_neutral | mismo_ciclo=SI"
-                )
+                log_key = f"incident-stale-open-liberado:{rid}:{cid}"
+                if _print_once(log_key, ttl=60.0):
+                    print(
+                        Fore.YELLOW + Style.BRIGHT +
+                        f"🧯 INCIDENT_LOCK_STALE_OPEN_DEMO_LIBERADO | bot={NOMBRE_BOT} | ronda=#{rid} | C{ciclo_actual} | "
+                        f"contract_id={cid} | edad={elapsed:.0f}s | attempts={attempts}/{INCIDENT_LOCK_RECOVERY_ATTEMPTS} | "
+                        f"acción=recovery_request_neutral | mismo_ciclo=SI"
+                    )
                 _emitir_sync_recovery_incident_demo_neutral(rid, cid, ciclo_actual, asset, direction, attempts, elapsed)
-                _clear_pending_contract_resolution(reason="COMPRA_NO_CONFIRMADA_STALE_OPEN_DEMO")
+                _clear_pending_contract_resolution(
+                    reason="COMPRA_NO_CONFIRMADA_STALE_OPEN_DEMO",
+                    resultado_final="COMPRA_NO_CONFIRMADA_STALE_OPEN_DEMO",
+                )
+                estado_bot["ciclo_forzado"] = ciclo_actual
                 estado_bot["ciclo_en_progreso"] = False
                 estado_bot["token_msg_mostrado"] = False
-                estado_bot["sync_round_id"] = await _sync_round_wait_release(rid)
+                if callable(globals().get("_sync_round_wait_release")):
+                    estado_bot["sync_round_id"] = await _sync_round_wait_release(rid)
                 return False
         except Exception:
             pass
