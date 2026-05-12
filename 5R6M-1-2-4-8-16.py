@@ -11159,6 +11159,7 @@ def _sync_round_neutral_incident_stale_open_request(round_id, released_round, re
             incident_neutral_sources = {
                 "incident_lock_demo_stale_open": "INCIDENT_LOCK_STALE_OPEN_DEMO",
                 "incident_lock_demo_sin_evidencia": "INCIDENT_LOCK_SIN_EVIDENCIA_DEMO",
+                "incident_lock_demo_closed_sin_profit": "INCIDENT_LOCK_CLOSED_SIN_PROFIT_DEMO",
             }
             if req_reason not in incident_neutral_sources:
                 continue
@@ -11369,6 +11370,7 @@ def _sync_round_try_recovery_release_global() -> bool:
                     (
                         (req_reason_txt == "incident_lock_demo_stale_open" and req_source_txt == "INCIDENT_LOCK_STALE_OPEN_DEMO")
                         or (req_reason_txt == "incident_lock_demo_sin_evidencia" and req_source_txt == "INCIDENT_LOCK_SIN_EVIDENCIA_DEMO")
+                        or (req_reason_txt == "incident_lock_demo_closed_sin_profit" and req_source_txt == "INCIDENT_LOCK_CLOSED_SIN_PROFIT_DEMO")
                     )
                     and bool(req.get("neutral", False))
                     and bool(req.get("no_trade_result", False))
@@ -11408,7 +11410,18 @@ def _sync_round_try_recovery_release_global() -> bool:
             or str(token_raw or "").strip().upper() in ("REAL:NONE", "REAL:NULL", "REAL:--", "REAL:")
         )
         if incident_req_bots and not after_real_context:
-            recovery_reason = "RECOVERY_RELEASE_INCIDENT_LOCK_STALE_OPEN_DEMO"
+            incident_req_lookup = reqs or {}
+            incident_reason_txt = ""
+            try:
+                incident_reason_txt = str((incident_req_lookup.get(incident_req_bots[0]) or {}).get("reason") or "").strip()
+            except Exception:
+                incident_reason_txt = ""
+            recovery_reason_by_req = {
+                "incident_lock_demo_stale_open": "RECOVERY_RELEASE_INCIDENT_LOCK_STALE_OPEN_DEMO",
+                "incident_lock_demo_sin_evidencia": "RECOVERY_RELEASE_INCIDENT_LOCK_SIN_EVIDENCIA_DEMO",
+                "incident_lock_demo_closed_sin_profit": "RECOVERY_RELEASE_INCIDENT_LOCK_CLOSED_SIN_PROFIT_DEMO",
+            }
+            recovery_reason = recovery_reason_by_req.get(incident_reason_txt, "RECOVERY_RELEASE_INCIDENT_LOCK_STALE_OPEN_DEMO")
         else:
             recovery_reason = "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_AFTER_REAL_CLOSE" if after_real_context else "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN"
         payload = dict(st_check)
@@ -11439,9 +11452,9 @@ def _sync_round_try_recovery_release_global() -> bool:
                 f"{recovery_reason}: {released_round}→{target_round} | bots_waiting={len(wait_bots)} | token={token_raw}",
                 cooldown_s=1.0,
             )
-            if recovery_reason == "RECOVERY_RELEASE_INCIDENT_LOCK_STALE_OPEN_DEMO":
+            if recovery_reason.startswith("RECOVERY_RELEASE_INCIDENT_LOCK_"):
                 bot_txt = incident_req_bots[0] if incident_req_bots else "--"
-                agregar_evento(f"🧯 RECOVERY_RELEASE_INCIDENT_LOCK_STALE_OPEN_DEMO | bot={bot_txt} | ronda=#{released_round} | release=#{target_round} | neutral=SI")
+                agregar_evento(f"🧯 {recovery_reason} | bot={bot_txt} | ronda=#{released_round} | release=#{target_round} | neutral=SI")
             elif recovery_reason.endswith("AFTER_REAL_CLOSE"):
                 agregar_evento(f"🔓 RECOVERY_FORCE_AFTER_REAL_CLOSE: {released_round} → {target_round} | bots_waiting={len(wait_bots)} | token={token_raw or 'DEMO'}")
             else:
@@ -12095,7 +12108,7 @@ def _sync_round_tick_maestro():
                 }
                 if liberar_ronda_por_cuarentena_demo_only(round_id, int(round_id) + 1, qi_incident):
                     agregar_evento(
-                        f"🧯 RECOVERY_RELEASE_INCIDENT_LOCK_STALE_OPEN_DEMO | bot={incident_req.get('bot')} | "
+                        f"🧯 {('RECOVERY_RELEASE_INCIDENT_LOCK_CLOSED_SIN_PROFIT_DEMO' if incident_req.get('reason') == 'incident_lock_demo_closed_sin_profit' else ('RECOVERY_RELEASE_INCIDENT_LOCK_SIN_EVIDENCIA_DEMO' if incident_req.get('reason') == 'incident_lock_demo_sin_evidencia' else 'RECOVERY_RELEASE_INCIDENT_LOCK_STALE_OPEN_DEMO'))} | bot={incident_req.get('bot')} | "
                         f"ronda=#{round_id} | release=#{int(round_id) + 1} | neutral=SI"
                     )
                     return
