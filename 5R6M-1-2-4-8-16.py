@@ -440,6 +440,13 @@ LXV_ZONA_PROM8_MAX_ALLOW = 0.92
 LXV_ZONA_PROM8_SATURADO = 0.92
 LXV_ZONA_PROM8_TARDIO_MIN = 0.70
 LXV_ZONA_FULL_GREEN_PREV_BLOCK = 3
+LXV_REBOTE_VERDE_TEMPRANO_ENABLE = True
+LXV_REBOTE_VERDE_TEMPRANO_LOG_COOLDOWN_S = 20.0
+LXV_REBOTE_VERDE_TEMPRANO_PROM8_MAX = 0.55
+LXV_REBOTE_VERDE_TEMPRANO_DELTA_MIN = 0.03
+LXV_REBOTE_VERDE_TEMPRANO_RED_PREV_MIN = 4
+LXV_REBOTE_VERDE_TEMPRANO_PREV_LOOKBACK = 3
+LXV_REBOTE_VERDE_TEMPRANO_FULL_GREEN_MAX = 1
 LXV_ZONAS_BLOQUEANTES = {
     "ROJA_TEMPRANO",
     "ROJO_MADURO",
@@ -7459,6 +7466,33 @@ def _lxv_load_recent_columns_for_gate(round_id, lookback=12):
             dedup[rrid] = rr
     return [dedup[k] for k in sorted(dedup.keys())]
 
+def calcular_prev_full_green_streak_por_historial(columnas, idx_actual, expected=6):
+    try:
+        rows = list(columnas or [])
+        idx = int(idx_actual)
+        expected = int(expected or 6)
+        if expected <= 0:
+            expected = 6
+        if idx > len(rows):
+            idx = len(rows)
+        if idx <= 0:
+            return 0
+        streak = 0
+        for pos in range(idx - 1, -1, -1):
+            row = rows[pos]
+            if not isinstance(row, dict):
+                break
+            v, r = _lxv_row_counts(row)
+            complete_ok = _lxv_row_round_complete(row) or bool(row.get("round_complete", False))
+            quality_ok = _lxv_row_quality_ok(row) or _lxv_zona_quality_ok(str(row.get("data_quality", row.get("quality", "")) or ""))
+            if v == expected and r == 0 and complete_ok and quality_ok:
+                streak += 1
+                continue
+            break
+        return int(streak)
+    except Exception:
+        return 0
+
 def _lxv_prev_full_green_streak(round_id, lookback=12):
     try:
         rid = int(round_id or 0)
@@ -7468,18 +7502,9 @@ def _lxv_prev_full_green_streak(round_id, lookback=12):
         return 0
     try:
         rows = _lxv_load_recent_columns_for_gate(rid, lookback=lookback)
-        by_rid = {_lxv_row_round_id(r): r for r in rows if _lxv_row_round_id(r) > 0}
-        streak = 0
-        expected = rid - 1
-        while expected > 0:
-            row = by_rid.get(expected)
-            if not isinstance(row, dict):
-                break
-            if not _lxv_is_full_green_row(row):
-                break
-            streak += 1
-            expected -= 1
-        return int(streak)
+        rows = [r for r in list(rows or []) if isinstance(r, dict) and _lxv_row_round_id(r) > 0 and _lxv_row_round_id(r) < rid]
+        rows = sorted(rows, key=lambda r: _lxv_row_round_id(r))
+        return int(calcular_prev_full_green_streak_por_historial(rows, len(rows), expected=6))
     except Exception:
         return 0
 
@@ -9073,26 +9098,11 @@ def _lxv_count_prev_full_green_from_norm(norm_rows, rid_obj, expected=6):
     try:
         rid_obj = int(rid_obj or 0)
         expected = int(expected or 6)
-        rows = list(norm_rows or [])
-        by_rid = {}
-        for rr in rows:
-            rid = int((rr or {}).get("round_id", 0) or 0)
-            if rid > 0:
-                by_rid[rid] = rr
-        streak = 0
-        rid = rid_obj - 1
-        while rid > 0:
-            rr = by_rid.get(rid)
-            if not isinstance(rr, dict):
-                break
-            v = int(rr.get("n_verdes", -1))
-            r = int(rr.get("n_rojos", -1))
-            if v == expected and r == 0:
-                streak += 1
-                rid -= 1
-                continue
-            break
-        return int(streak)
+        rows = [x for x in list(norm_rows or []) if isinstance(x, dict)]
+        if not rows:
+            return 0
+        idx = next((i for i, rr in enumerate(rows) if int((rr or {}).get("round_id", 0) or 0) == rid_obj), len(rows) - 1)
+        return int(calcular_prev_full_green_streak_por_historial(rows, idx, expected))
     except Exception:
         return 0
 
@@ -9122,14 +9132,158 @@ def _lxv_zona_dynamic_metrics(norm_rows, expected=6):
 
 
 
+def _lxv_symbol_for_bot_from_row(row, bot):
+    try:
+        b = str(bot or "").strip()
+        if not b or not isinstance(row, dict):
+            return ""
+        sym = str(row.get(b, "") or "").strip()
+        if sym in ("✓", "X"):
+            return sym
+        return _mrv_5v1x_row_symbol(row, b)
+    except Exception:
+        return ""
+
+def _lxv_pick_bot_objetivo_rebote(row):
+    try:
+        rr = row if isinstance(row, dict) else {}
+        for k in ("bot_x_fuerte", "bot_x1", "bot_x2"):
+            b = str(rr.get(k, "") or "").strip()
+            if b in globals().get("BOT_NAMES", []):
+                return b
+        for b in list(globals().get("BOT_NAMES", []) or []):
+            if _lxv_symbol_for_bot_from_row(rr, b) == "X":
+                return b
+    except Exception:
+        pass
+    return ""
+
+def validar_bot_objetivo_para_rebote(bot, historial_columnas, idx_actual):
+    out = {"ok": False, "motivo": "datos_insuficientes", "x_ult4": 0, "apariciones": 0, "patron_fresco": False}
+    try:
+        b = str(bot or "").strip()
+        rows = [x for x in list(historial_columnas or []) if isinstance(x, dict)]
+        idx = int(idx_actual)
+        if not b or b not in globals().get("BOT_NAMES", []):
+            out["motivo"] = "bot_objetivo_invalido"
+            return out
+        if idx < 0 or idx >= len(rows):
+            out["motivo"] = "idx_actual_invalido"
+            return out
+        sym_actual = _lxv_symbol_for_bot_from_row(rows[idx], b)
+        if sym_actual != "X":
+            out.update({"motivo": "bot_no_es_x_candidato", "simbolo_actual": sym_actual})
+            return out
+        prev = []
+        for rr in reversed(rows[:idx]):
+            sym = _lxv_symbol_for_bot_from_row(rr, b)
+            if sym in ("✓", "X"):
+                prev.append(sym)
+            if len(prev) >= 4:
+                break
+        prev = list(reversed(prev))
+        if len(prev) < 4:
+            out.update({"motivo": "datos_insuficientes_bot", "apariciones": len(prev), "simbolo_actual": sym_actual})
+            return out
+        x_ult4 = sum(1 for x in prev if x == "X")
+        patron_fresco = bool(prev and prev[-1] == "✓")
+        out.update({"x_ult4": int(x_ult4), "apariciones": len(prev), "patron_fresco": bool(patron_fresco), "simbolo_actual": sym_actual})
+        if x_ult4 >= 3 and not patron_fresco:
+            out["motivo"] = "bot_objetivo_debil"
+            return out
+        out.update({"ok": True, "motivo": "bot_objetivo_ok"})
+        return out
+    except Exception:
+        out["motivo"] = "validacion_bot_error"
+        return out
+
+def detectar_rebote_verde_temprano_controlado(rows_validas, idx_actual=None, metrics=None, patron_actual=None):
+    base = {"zona_extra": None, "allow_extra": False, "block_extra": False, "motivo_extra": "sin_match_rebote_verde_temprano", "decision_extra": ZONA_NO_INVERTIR}
+    try:
+        if not bool(globals().get("LXV_REBOTE_VERDE_TEMPRANO_ENABLE", True)):
+            out = dict(base); out["motivo_extra"] = "rebote_verde_temprano_disabled"; return out
+        rows = [dict(x) for x in list(rows_validas or []) if isinstance(x, dict)]
+        if not rows:
+            return dict(base)
+        idx = int(idx_actual) if idx_actual is not None else (len(rows) - 1)
+        if idx < 0 or idx >= len(rows):
+            out = dict(base); out["motivo_extra"] = "idx_actual_invalido"; return out
+        curr = rows[idx]
+        expected = int(len(globals().get("BOT_NAMES", []) or [])) or 6
+        v = _mrv_5v1x_to_int(curr.get("n_verdes", -1), -1)
+        r = _mrv_5v1x_to_int(curr.get("n_rojos", -1), -1)
+        dq = str(curr.get("data_quality", curr.get("quality", "")) or "").strip().lower()
+        complete = bool(curr.get("round_complete", curr.get("complete", False)))
+        patron = str(patron_actual or curr.get("patron_lxv", curr.get("patron", curr.get("pattern", ""))) or "").strip().upper()
+        if not patron:
+            patron = "5V1X" if (v == 5 and r == 1) else ("4V2X" if (v == 4 and r == 2) else "OTHER")
+        m = dict(metrics or {})
+        prom3 = float(m.get("prom3", 0.0) or 0.0)
+        prom8 = float(m.get("prom8", 0.0) or 0.0)
+        delta = float(m.get("delta_3_8", prom3 - prom8) or 0.0)
+        prev_full = int(m.get("prev_full_green_streak", calcular_prev_full_green_streak_por_historial(rows, idx, expected)) or 0)
+        prev_n = max(1, int(globals().get("LXV_REBOTE_VERDE_TEMPRANO_PREV_LOOKBACK", 3) or 3))
+        prev = rows[max(0, idx - prev_n):idx]
+        red_min = int(globals().get("LXV_REBOTE_VERDE_TEMPRANO_RED_PREV_MIN", 4) or 4)
+        presion_roja = any(_mrv_5v1x_to_int(x.get("n_rojos", -1), -1) >= red_min for x in prev)
+        bot_obj = _lxv_pick_bot_objetivo_rebote(curr)
+        bot_val = validar_bot_objetivo_para_rebote(bot_obj, rows, idx)
+        out = dict(base)
+        out.update({"zona_extra": "REBOTE_VERDE_TEMPRANO", "patron_actual": patron, "verdes_actual": v, "rojos_actual": r, "prom3": prom3, "prom8": prom8, "delta_3_8": delta, "presion_roja_previa": bool(presion_roja), "prev_full_green_streak": prev_full, "bot_objetivo": bot_obj or "--", "bot_rebote_info": dict(bot_val)})
+        if (not complete) or (not _lxv_zona_quality_ok(dq)) or v < 0 or r < 0 or (v + r) != expected:
+            out.update({"motivo_extra": "datos_incompletos", "block_extra": True})
+        elif patron not in {"5V1X", "4V2X"}:
+            out.update({"motivo_extra": "patron_no_valido", "block_extra": True})
+        elif v < 4:
+            out.update({"motivo_extra": "verde_actual_insuficiente", "block_extra": True})
+        elif prev_full >= int(globals().get("LXV_REBOTE_VERDE_TEMPRANO_FULL_GREEN_MAX", 1) or 1) + 1:
+            out.update({"motivo_extra": "saturacion_verde_previa", "block_extra": True})
+        elif not presion_roja:
+            out.update({"motivo_extra": "presion_roja_insuficiente", "block_extra": True})
+        elif prom8 > float(globals().get("LXV_REBOTE_VERDE_TEMPRANO_PROM8_MAX", 0.55) or 0.55):
+            out.update({"motivo_extra": "prom8_fuera_rango", "block_extra": True})
+        elif delta < float(globals().get("LXV_REBOTE_VERDE_TEMPRANO_DELTA_MIN", 0.03) or 0.03):
+            out.update({"motivo_extra": "delta_insuficiente", "block_extra": True})
+        elif not bool(bot_val.get("ok", False)):
+            out.update({"motivo_extra": str(bot_val.get("motivo", "bot_objetivo_debil") or "bot_objetivo_debil"), "block_extra": True})
+        else:
+            out.update({"allow_extra": True, "block_extra": False, "motivo_extra": "rebote_controlado_ok", "decision_extra": ZONA_SI_INVERTIR, "marca_rebote": "REBOTE_CONTROLADO"})
+        if patron in {"5V1X", "4V2X"} and v >= 4:
+            _lxv_extra_zona_emit_event("REBOTE_VERDE_TEMPRANO", out)
+        return out
+    except Exception:
+        out = dict(base)
+        out["motivo_extra"] = "rebote_verde_temprano_error_fail_closed"
+        return out
+
 def _lxv_extra_zona_emit_event(zona_extra, data):
     try:
         fn_evt = globals().get("agregar_evento", None)
         if not callable(fn_evt):
             return
         now = time.time()
-        global _LXV_REBOTE_POST_ROJO_LAST_LOG_TS, _LXV_VERDE_SERRUCHO_LAST_LOG_TS
-        if zona_extra == "REBOTE_POST_ROJO":
+        global _LXV_REBOTE_POST_ROJO_LAST_LOG_TS, _LXV_VERDE_SERRUCHO_LAST_LOG_TS, _LXV_REBOTE_VERDE_TEMPRANO_LAST_LOG_TS
+        if zona_extra == "REBOTE_VERDE_TEMPRANO":
+            cooldown = float(globals().get("LXV_REBOTE_VERDE_TEMPRANO_LOG_COOLDOWN_S", 20.0) or 20.0)
+            key = f"{data.get('patron_actual','--')}:{data.get('bot_objetivo','--')}:{data.get('motivo_extra','--')}"
+            last = globals().get("_LXV_REBOTE_VERDE_TEMPRANO_LAST_LOG_TS", {})
+            if not isinstance(last, dict):
+                last = {}
+            if now - float(last.get(key, 0.0) or 0.0) < cooldown:
+                return
+            last[key] = now
+            _LXV_REBOTE_VERDE_TEMPRANO_LAST_LOG_TS = last
+            decision_txt = "SI_INVERTIR" if bool(data.get("allow_extra", False)) else "NO_INVERTIR"
+            presion_txt = "SI" if bool(data.get("presion_roja_previa", False)) else "NO"
+            fn_evt(("🟢 REBOTE_VERDE_TEMPRANO DETECTADO\n"
+                    f"patrón={data.get('patron_actual','--')} | verdes={int(data.get('verdes_actual',0) or 0)}/6\n"
+                    f"prom3={float(data.get('prom3',0.0) or 0.0):.3f} prom8={float(data.get('prom8',0.0) or 0.0):.3f} delta={float(data.get('delta_3_8',0.0) or 0.0):.3f}\n"
+                    f"presión_roja_previa={presion_txt}\n"
+                    f"prev_full_green_streak={int(data.get('prev_full_green_streak',0) or 0)}\n"
+                    f"bot_objetivo={data.get('bot_objetivo','--')}\n"
+                    f"decisión={decision_txt}\n"
+                    f"motivo={data.get('motivo_extra','--')}"))
+        elif zona_extra == "REBOTE_POST_ROJO":
             cooldown = float(globals().get("LXV_REBOTE_POST_ROJO_LOG_COOLDOWN_S", 20.0) or 20.0)
             if now - float(globals().get("_LXV_REBOTE_POST_ROJO_LAST_LOG_TS", 0.0) or 0.0) < cooldown:
                 return
@@ -9426,7 +9580,11 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
             dq = str(rr.get("data_quality", rr.get("quality", "")) or "").strip().lower()
             if rid <= 0 or (not complete) or (not _lxv_zona_quality_ok(dq)) or v < 0 or r < 0 or (v + r) != expected:
                 continue
-            norm.append({"round_id":rid,"n_verdes":v,"n_rojos":r,"round_complete":True,"data_quality":dq,"source":rr.get("_zona_source", "unknown")})
+            row_norm = {"round_id":rid,"n_verdes":v,"n_rojos":r,"round_complete":True,"data_quality":dq,"source":rr.get("_zona_source", "unknown"),"patron_lxv":str(rr.get("patron_lxv", rr.get("patron", "")) or ""),"bot_x1":str(rr.get("bot_x1", "") or ""),"bot_x2":str(rr.get("bot_x2", "") or ""),"bot_x_fuerte":str(rr.get("bot_x_fuerte", "") or "")}
+            for _b in list(globals().get("BOT_NAMES", []) or []):
+                if _b in rr:
+                    row_norm[_b] = rr.get(_b)
+            norm.append(row_norm)
         if target_rid is not None and not any(int(x.get("round_id", 0) or 0) == target_rid for x in norm):
             try:
                 ack = dict(globals().get("LXV_SYNC_LAST_ACK_CANDIDATE") or {})
@@ -9537,6 +9695,29 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
             try:
                 zona_original = str(out2.get("zona", "UNKNOWN") or "UNKNOWN").strip().upper()
                 extra = _lxv_extra_zona_rebote_serrucho(norm, len(norm) - 1, None)
+                rebote_temprano = detectar_rebote_verde_temprano_controlado(norm, len(norm) - 1, metrics, None)
+                if isinstance(rebote_temprano, dict) and rebote_temprano.get("zona_extra") == "REBOTE_VERDE_TEMPRANO":
+                    out2["rebote_verde_temprano_info"] = dict(rebote_temprano)
+                    zona_original_rvt = str(out2.get("zona", "UNKNOWN") or "UNKNOWN").strip().upper()
+                    if bool(rebote_temprano.get("allow_extra", False)) and zona_original_rvt in {"ROJO_MADURO", "ROJA_TEMPRANO", "NEUTRO"}:
+                        motivo_original = str(out2.get("motivo", "") or "")
+                        out2.update({
+                            "zona": "REBOTE_VERDE_TEMPRANO",
+                            "fase": "REBOTE_VERDE_TEMPRANO",
+                            "zona_base": "VERDE_TEMPRANO",
+                            "subzona": "REBOTE_VERDE_TEMPRANO",
+                            "decision": ZONA_SI_INVERTIR,
+                            "allow_real": True,
+                            "color_key": "GREEN_BRIGHT",
+                            "emoji": "🟢",
+                            "motivo": "rebote_controlado_ok",
+                            "motivo_original_extra": f"{motivo_original}|extra:rebote_verde_temprano" if motivo_original else "extra:rebote_verde_temprano",
+                            "desbloqueo_lxv_extra": True,
+                            "marca_rebote": "REBOTE_CONTROLADO",
+                            "bot_objetivo_rebote": rebote_temprano.get("bot_objetivo", "--"),
+                        })
+                    elif str(out2.get("zona", "")).upper() == "REBOTE_VERDE_TEMPRANO":
+                        out2.update({"decision": ZONA_NO_INVERTIR, "allow_real": False})
                 if isinstance(extra, dict):
                     out2["zona_extra_info"] = dict(extra)
                     if bool(extra.get("block_extra", False)):
@@ -9572,6 +9753,9 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
             except Exception:
                 pass
             out2 = combinar_zona_lxv_con_mrv2(out2)
+            if str(out2.get("zona", "")).upper() == "REBOTE_VERDE_TEMPRANO" and bool(out2.get("allow_real", False)):
+                out2["zona_base"] = "VERDE_TEMPRANO"
+                out2["marca_rebote"] = "REBOTE_CONTROLADO"
             if str(out2.get("zona", "")).upper() == "REBOTE_POST_ROJO" and bool(out2.get("allow_real", False)):
                 out2["zona_base"] = "VERDE_TEMPRANO"
             if str(out2.get("zona", "")).upper() == "VERDE_SERRUCHO_SATURADO":
@@ -9600,32 +9784,11 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
 def _lxv_prev_full_green_streak_from_norm_rows(norm_rows, round_id):
     try:
         rid_obj = int(round_id or 0)
-        if rid_obj <= 1:
+        rows = [x for x in list(norm_rows or []) if isinstance(x, dict)]
+        if rid_obj <= 1 or not rows:
             return 0
-        rows = list(norm_rows or [])
-        if not rows:
-            return 0
-        by_rid = {}
-        for rr in rows:
-            if not isinstance(rr, dict):
-                continue
-            rid = _mrv_5v1x_to_int(rr.get("round_id", 0), 0)
-            if rid > 0:
-                by_rid[rid] = rr
-        streak = 0
-        esperado = rid_obj - 1
-        while esperado > 0:
-            col = by_rid.get(esperado)
-            if not isinstance(col, dict):
-                break
-            v = _mrv_5v1x_to_int(col.get("n_verdes", -1), -1)
-            r = _mrv_5v1x_to_int(col.get("n_rojos", -1), -1)
-            if v == 6 and r == 0:
-                streak += 1
-                esperado -= 1
-                continue
-            break
-        return int(streak)
+        idx = next((i for i, rr in enumerate(rows) if _mrv_5v1x_to_int(rr.get("round_id", 0), 0) == rid_obj), len(rows) - 1)
+        return int(calcular_prev_full_green_streak_por_historial(rows, idx, expected=6))
     except Exception:
         return 0
 
@@ -9705,7 +9868,7 @@ def normalizar_zona_lxv_oficial(info):
     zonas_validas = {
         "VERDE_TEMPRANO", "VERDE_MADURO", "VERDE_TARDIO", "VERDE_SATURADO_TARDIO",
         "ROJA_TEMPRANO", "ROJO_MADURO", "NEUTRO", "INSUFICIENTE", "ERROR", "UNKNOWN",
-        "REBOTE_POST_ROJO", "VERDE_SERRUCHO_SATURADO",
+        "REBOTE_POST_ROJO", "REBOTE_VERDE_TEMPRANO", "VERDE_SERRUCHO_SATURADO",
     }
     try:
         raw = dict(info) if isinstance(info, dict) else {}
@@ -9725,7 +9888,7 @@ def normalizar_zona_lxv_oficial(info):
             or dq_raw in ("missing", "partial", "closed_expired", "expired", "incomplete", "error")
             or motivo_bloqueante
         )
-        if zona_raw == "REBOTE_POST_ROJO":
+        if zona_raw in {"REBOTE_POST_ROJO", "REBOTE_VERDE_TEMPRANO"}:
             bloqueo_duro = (
                 bool(raw.get("bloqueo_mrv_v2", False))
                 or raw_decision == "NO_INVERTIR"
@@ -9739,7 +9902,7 @@ def normalizar_zona_lxv_oficial(info):
             zona_base = "VERDE_MADURO"
         elif zona_raw == "VERDE_MADURO_CON_RUIDO":
             zona_base = "VERDE_MADURO" if raw_allow else "UNKNOWN"
-        elif zona_raw == "REBOTE_POST_ROJO":
+        elif zona_raw in {"REBOTE_POST_ROJO", "REBOTE_VERDE_TEMPRANO"}:
             zona_base = "VERDE_TEMPRANO" if raw_allow else "UNKNOWN"
         elif zona_raw == "VERDE_SERRUCHO_SATURADO":
             zona_base = "VERDE_TARDIO"
@@ -9754,10 +9917,15 @@ def normalizar_zona_lxv_oficial(info):
             if motivo_bloqueante:
                 raw.setdefault("motivo_original_extra", motivo_raw)
                 motivo_raw = "rebote_post_rojo_impulse_ok"
+        if zona_raw == "REBOTE_VERDE_TEMPRANO":
+            allow_final = bool(raw_allow and raw_decision != "NO_INVERTIR" and zona_base == "VERDE_TEMPRANO" and not bloqueo_duro and str(raw.get("marca_rebote", "")).upper() == "REBOTE_CONTROLADO")
+            if motivo_bloqueante and allow_final:
+                raw.setdefault("motivo_original_extra", motivo_raw)
+                motivo_raw = "rebote_controlado_ok"
         if zona_raw == "VERDE_MADURO_CON_RUIDO":
             allow_final = bool(raw_allow and (zona_base in zonas_ok) and not bloqueo_duro)
         decision = str(raw.get("decision", "") or "").strip().upper()
-        if zona_raw == "REBOTE_POST_ROJO" and allow_final:
+        if zona_raw in {"REBOTE_POST_ROJO", "REBOTE_VERDE_TEMPRANO"} and allow_final:
             decision = ZONA_SI_INVERTIR
         elif zona_raw == "VERDE_SERRUCHO_SATURADO":
             decision = ZONA_NO_INVERTIR
