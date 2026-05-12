@@ -32,7 +32,7 @@
 # === FIN BLOQUE 0 ===
 
 # === BLOQUE 1 — IMPORTS Y ENTORNO BÁSICO ===
-import os, csv, time, random, asyncio, json, re, glob
+import os, csv, time, random, asyncio, json, re
 from collections import deque
 from pathlib import Path
 from unicodedata import normalize
@@ -384,7 +384,7 @@ IA_METRIC_THRESHOLD = AUTO_REAL_THR_MIN
 # Modo clásico: activación REAL con umbral operativo vigente (hoy 65%, con techo dinámico base 70%).
 # Mantiene lock de un solo bot en REAL y ciclo martingala global en HUD.
 REAL_CLASSIC_GATE = True
-MODO_PURIFICACION_REAL = False  # Modo normal operativo: no bloquea REAL; True solo para diagnóstico/purificación explícita.
+MODO_PURIFICACION_REAL = True  # Llave maestra: bypassea toda promoción/activación REAL sin apagar IA/HUD.
 LXV_SYNC_REAL_ROUTE_ENABLE = True
 LXV_SYNC_REAL_SOURCE = "LXV_SYNC"
 LXV_5V1X_ENABLE = True
@@ -440,13 +440,6 @@ LXV_ZONA_PROM8_MAX_ALLOW = 0.92
 LXV_ZONA_PROM8_SATURADO = 0.92
 LXV_ZONA_PROM8_TARDIO_MIN = 0.70
 LXV_ZONA_FULL_GREEN_PREV_BLOCK = 3
-LXV_REBOTE_VERDE_TEMPRANO_ENABLE = True
-LXV_REBOTE_VERDE_TEMPRANO_LOG_COOLDOWN_S = 20.0
-LXV_REBOTE_VERDE_TEMPRANO_PROM8_MAX = 0.55
-LXV_REBOTE_VERDE_TEMPRANO_DELTA_MIN = 0.03
-LXV_REBOTE_VERDE_TEMPRANO_RED_PREV_MIN = 4
-LXV_REBOTE_VERDE_TEMPRANO_PREV_LOOKBACK = 3
-LXV_REBOTE_VERDE_TEMPRANO_FULL_GREEN_MAX = 1
 LXV_ZONAS_BLOQUEANTES = {
     "ROJA_TEMPRANO",
     "ROJO_MADURO",
@@ -695,29 +688,6 @@ MRV_ZONA_V2_SLOPE_TEMPRANO = 0.02
 MRV_ZONA_V2_SLOPE_MADURO_MIN = -0.06
 MRV_ZONA_V2_SLOPE_TARDIO = -0.08
 MRV_ZONA_V2_FULL_GREEN_PREV_BLOCK = 3
-
-# === ZONA LXV EXTRA: REBOTE POST-ROJO / SERRUCHO SATURADO ===
-LXV_REBOTE_POST_ROJO_ENABLE = True
-LXV_REBOTE_POST_ROJO_CAN_UNLOCK = True
-LXV_REBOTE_POST_ROJO_LOOKBACK = 4
-LXV_REBOTE_POST_ROJO_MIN_GREEN_ACTUAL = 4
-LXV_REBOTE_POST_ROJO_RED_MIN = 4
-LXV_REBOTE_POST_ROJO_MIN_RED_COLS = 1
-LXV_REBOTE_POST_ROJO_MIN_IMPULSE = 0.18
-LXV_REBOTE_POST_ROJO_PROM_PREV_MAX = 0.50
-LXV_REBOTE_POST_ROJO_4V2X_REQUIRE_STRICT = True
-LXV_REBOTE_POST_ROJO_LOG_COOLDOWN_S = 20.0
-
-LXV_VERDE_SERRUCHO_SATURADO_ENABLE = True
-LXV_VERDE_SERRUCHO_LOOKBACK = 6
-LXV_VERDE_SERRUCHO_MIN_FULL_GREEN_PREV = 2
-LXV_VERDE_SERRUCHO_RED_DROP_MIN_ROJOS = 4
-LXV_VERDE_SERRUCHO_CURRENT_MAX_GREEN = 4
-LXV_VERDE_SERRUCHO_BLOCK_4V2X = True
-LXV_VERDE_SERRUCHO_BLOCK_5V1X = False
-LXV_VERDE_SERRUCHO_LOG_COOLDOWN_S = 20.0
-_LXV_REBOTE_POST_ROJO_LAST_LOG_TS = 0.0
-_LXV_VERDE_SERRUCHO_LAST_LOG_TS = 0.0
 _MRV_ZONA_V2_LAST_STATE = None
 _MRV_ZONA_V2_LAST_LOG_TS = 0.0
 ZONA_REGIONAL_DOMINANTE_ENABLE = True
@@ -889,34 +859,10 @@ def _pattern_v1_log_bot(bot: str, pattern_score: float, bonus_dual: float, penal
         pass
 
 
-def _purificacion_real_activa(source=None, bot=None, round_id=None, ciclo=None) -> bool:
+def _purificacion_real_activa() -> bool:
     """Llave maestra centralizada para apagar capa REAL sin romper flujo IA/HUD."""
     try:
         route_src = str(globals().get("_REAL_ROUTE_SOURCE", "") or "").strip().upper()
-        purif_on = bool(globals().get("MODO_PURIFICACION_REAL", False))
-        src_log = str(source or route_src or "UNKNOWN").strip() or "UNKNOWN"
-        bot_log = str(bot or globals().get("_REAL_ROUTE_BOT", "UNKNOWN") or "UNKNOWN").strip() or "UNKNOWN"
-        rid_log = str(round_id if round_id is not None else globals().get("_REAL_ROUTE_ROUND_ID", "UNKNOWN"))
-        ciclo_log = str(ciclo if ciclo is not None else globals().get("_REAL_ROUTE_CICLO", "UNKNOWN"))
-        if purif_on:
-            try:
-                _lxv_5v1x_event_cooldown(
-                    key=f"purif:on:{src_log}",
-                    msg="🧪 REAL OFF | PURIFICACION ACTIVA | MODO_PURIFICACION_REAL=True",
-                    cooldown_s=15.0,
-                )
-            except Exception:
-                pass
-            try:
-                _lxv_5v1x_event_cooldown(
-                    key=f"purif:block:{src_log}:{bot_log}:{rid_log}:{ciclo_log}",
-                    msg=f"🧪 REAL BLOQUEADO POR MODO_PURIFICACION_REAL=True | source={src_log} | bot={bot_log} | round_id={rid_log} | ciclo={ciclo_log}",
-                    cooldown_s=15.0,
-                )
-            except Exception:
-                pass
-            return True
-
         allow_sync = str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper()
         allow_5v1x = str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X")).upper()
         allow_4v2x = str(globals().get("LXV_4V2X_REAL_SOURCE", "LXV_4V2X")).upper()
@@ -939,7 +885,18 @@ def _purificacion_real_activa(source=None, bot=None, round_id=None, ciclo=None) 
                 )
             except Exception:
                 pass
-        return False
+            return False
+        purif_on = bool(globals().get("MODO_PURIFICACION_REAL", False))
+        if purif_on and route_src:
+            try:
+                _lxv_5v1x_event_cooldown(
+                    key=f"purif:block:{route_src}",
+                    msg=f"🧪 Purificación activa: source REAL bloqueada={route_src}",
+                    cooldown_s=15.0,
+                )
+            except Exception:
+                pass
+        return purif_on
     except Exception:
         return False
 
@@ -954,7 +911,7 @@ def _emitir_marca_purificacion_real() -> None:
         if (now - float(_LAST_PURIFICACION_REAL_EVENT_TS or 0.0)) < float(PURIFICACION_REAL_EVENT_COOLDOWN_S):
             return
         _LAST_PURIFICACION_REAL_EVENT_TS = now
-        agregar_evento("🧪 REAL OFF | PURIFICACION ACTIVA | MODO_PURIFICACION_REAL=True")
+        agregar_evento("🧪 MODO PURIFICACION REAL ACTIVO: promoción/orden REAL desactivada (bypass).")
     except Exception:
         pass
 
@@ -1554,10 +1511,8 @@ t_inicio_indef = {bot: None for bot in BOT_NAMES}
 last_update_time = {bot: time.time() for bot in BOT_NAMES}
 LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # firma del último cierre REAL completamente procesado
 REAL_CLOSE_PROCESSED_SIG = {bot: None for bot in BOT_NAMES}
-MARTI_REAL_TARDIO_COMMITS = {}
 REAL_CLOSE_PENDING = {bot: None for bot in BOT_NAMES}
 REAL_CLOSE_PENDING_TTL_S = 240
-REAL_OWNER_STALE_TTL_S = 180.0
 REAL_CLOSE_INCIDENT_LOCK = {
     "active": False,
     "bot": None,
@@ -1759,11 +1714,6 @@ def _activar_real_close_incident_lock(bot, pending, reason="REAL_CLOSE_PENDING_T
             REAL_CLOSE_PENDING[bot]["active"] = True
         ciclo_txt = pending.get("ciclo") if isinstance(pending, dict) else "?"
         round_txt = pending.get("round_id") if isinstance(pending, dict) else None
-        _audit_real_close_pending_action(
-            bot=bot, pending=pending, resultado="INDEFINIDO",
-            contract_id=estado_bots.get(bot, {}).get("id_contrato") if bot in BOT_NAMES else None,
-            reason=str(reason or "REAL_CLOSE_PENDING_TTL_EXPIRED"), accion="INCIDENT_LOCK",
-        )
         _lxv_5v1x_event_cooldown(
             key=f"incident_lock_real_close_expired:{bot}:{ciclo_txt}:{round_txt}",
             msg=f"🚨 INCIDENT_LOCK_REAL_CLOSE_EXPIRED: {bot} C{ciclo_txt} | ronda={round_txt} | requiere revisión",
@@ -1791,280 +1741,6 @@ def _limpiar_real_close_incident_lock_after_valid_close(bot, sig=None):
     except Exception:
         pass
 
-
-def _real_close_pending_csv_get(row, aliases):
-    try:
-        if not isinstance(row, dict):
-            return None
-        norm = {str(k or "").strip().lower(): k for k in row.keys()}
-        for alias in aliases:
-            key = norm.get(str(alias or "").strip().lower())
-            if key is not None:
-                return row.get(key)
-    except Exception:
-        pass
-    return None
-
-
-def _real_close_pending_parse_ts(value):
-    try:
-        if value in (None, ""):
-            return None
-        if isinstance(value, (int, float, np.integer, np.floating)):
-            ts = float(value)
-            return ts if ts > 0 else None
-        txt = str(value).strip()
-        if not txt:
-            return None
-        try:
-            ts = float(txt)
-            return ts if ts > 0 else None
-        except Exception:
-            pass
-        txt_iso = txt.replace("Z", "+00:00")
-        try:
-            return datetime.fromisoformat(txt_iso).timestamp()
-        except Exception:
-            pass
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"):
-            try:
-                return datetime.strptime(txt, fmt).timestamp()
-            except Exception:
-                continue
-    except Exception:
-        return None
-    return None
-
-
-def _real_close_pending_parse_num(value):
-    try:
-        if value in (None, ""):
-            return None
-        txt = str(value).strip().replace("$", "").replace(",", ".")
-        if not txt:
-            return None
-        nums = re.findall(r"-?\d+(?:\.\d+)?", txt)
-        if not nums:
-            return None
-        val = float(nums[0])
-        return val if math.isfinite(val) else None
-    except Exception:
-        return None
-
-
-def _real_close_pending_norm_resultado(value):
-    try:
-        txt = str(value or "").strip()
-        if not txt:
-            return None
-        up = txt.upper()
-        up_ascii = normalize("NFKD", up).encode("ascii", "ignore").decode("ascii")
-        if up in ("✓", "✅") or up_ascii in ("GANANCIA", "WIN"):
-            return "GANANCIA"
-        if up in ("✗", "❌", "×") or up_ascii in ("PERDIDA", "LOSS"):
-            return "PÉRDIDA"
-        return None
-    except Exception:
-        return None
-
-
-def _real_close_pending_diag_line(owner, pdata, age, ttl, recovered=False, reason=""):
-    try:
-        bot = str(owner or "--").strip() or "--"
-        pdata = pdata if isinstance(pdata, dict) else {}
-        ciclo = pdata.get("ciclo", "?")
-        reason_txt = str(reason or "").strip() or "--"
-        if recovered:
-            estado = "RECOVERED"
-        elif _real_close_incident_active() or "incident" in reason_txt.lower():
-            estado = "INCIDENT"
-        elif "no_csv" in reason_txt.lower() or "sin_evidencia" in reason_txt.lower():
-            estado = "NO_CSV_EVIDENCE"
-        else:
-            estado = "WAIT"
-        line = f"REAL_CLOSE_PENDING_DIAG bot={bot} C{ciclo} age={int(age or 0)}s ttl={int(ttl or 0)}s estado={estado} reason={reason_txt}"
-        line = line[:140]
-        _lxv_5v1x_event_cooldown(
-            key=f"real_close_pending_diag:{bot}:{ciclo}:{estado}:{reason_txt[:32]}",
-            msg=line,
-            cooldown_s=25.0,
-        )
-        return line
-    except Exception:
-        return "REAL_CLOSE_PENDING_DIAG error"[:140]
-
-
-def _real_close_pending_recover_from_csv(pending_bot, pending_data, reason="ttl_recovery"):
-    """
-    Intenta recuperar un REAL_CLOSE_PENDING atascado leyendo el CSV enriquecido del bot.
-    Solo libera si encuentra evidencia fuerte de cierre REAL posterior al pending.
-    No toca Martingala, IA, zonas ni patrones.
-    Retorna:
-        (True, info_dict) si recuperó cierre válido.
-        (False, info_dict) si no hay evidencia suficiente.
-    """
-    info = {"bot": pending_bot, "reason": str(reason or "ttl_recovery")}
-    try:
-        bot = str(pending_bot or "").strip()
-        if bot not in BOT_NAMES:
-            info["motivo"] = "bot_invalido"
-            return False, info
-        if not isinstance(pending_data, dict):
-            info["motivo"] = "pending_data_no_dict"
-            return False, info
-
-        for other, pdata_other in REAL_CLOSE_PENDING.items():
-            if other != bot and isinstance(pdata_other, dict) and pdata_other.get("active"):
-                info["motivo"] = f"pending_otro_bot:{other}"
-                return False, info
-
-        owner_lock = str(globals().get("REAL_OWNER_LOCK") or "").strip()
-        if owner_lock in BOT_NAMES and owner_lock != bot:
-            info["motivo"] = f"real_owner_lock_otro:{owner_lock}"
-            return False, info
-
-        try:
-            token_raw = str(_read_token_file_raw() or "").strip()
-        except Exception:
-            token_raw = ""
-        token_owner = ""
-        if token_raw.upper().startswith("REAL:"):
-            token_owner = token_raw.split(":", 1)[1].strip()
-        if token_owner in BOT_NAMES and token_owner != bot:
-            info["motivo"] = f"token_real_otro:{token_owner}"
-            return False, info
-
-        order_on, order_bot = _sync_real_order_viva_any()
-        if order_on:
-            if token_owner == bot:
-                info["motivo"] = f"token_y_orden_real_viva:{order_bot or bot}"
-            else:
-                info["motivo"] = f"orden_real_viva:{order_bot or 'unknown'}"
-            return False, info
-
-        real_on, real_bot, real_why = _sync_real_turn_activo()
-        if real_on:
-            stale_self_token_only = bool(
-                real_bot == bot
-                and token_owner == bot
-                and owner_lock not in BOT_NAMES
-                and not order_on
-                and bool(pending_data.get("incident", False) or _real_close_incident_active())
-            )
-            if not stale_self_token_only:
-                info["motivo"] = f"real_activo:{real_bot or real_why}"
-                return False, info
-            info["real_turn_match"] = "stale_self_token_only"
-
-        csv_path = f"registro_enriquecido_{bot}.csv"
-        info["csv"] = csv_path
-        if not os.path.exists(csv_path):
-            info["motivo"] = "csv_no_existe"
-            return False, info
-
-        with open(csv_path, "r", encoding="utf-8", errors="replace", newline="") as f:
-            reader = csv.DictReader(f)
-            if not reader.fieldnames:
-                info["motivo"] = "csv_sin_header"
-                return False, info
-            tail = deque(maxlen=150)
-            total = 0
-            for row in reader:
-                total += 1
-                tail.append((total, row))
-
-        if not tail:
-            info["motivo"] = "csv_sin_filas"
-            return False, info
-
-        pending_ts = None
-        for key in ("ts", "created_at", "start_ts", "timestamp", "fecha", "datetime"):
-            pending_ts = _real_close_pending_parse_ts(pending_data.get(key))
-            if pending_ts:
-                break
-        pending_ciclo = _real_close_pending_parse_num(pending_data.get("ciclo"))
-        pending_monto = _real_close_pending_parse_num(pending_data.get("monto", pending_data.get("stake", pending_data.get("inversion", pending_data.get("inversión")))))
-        pending_contract = str(pending_data.get("contract_id") or pending_data.get("contrato") or pending_data.get("id_contrato") or "").strip()
-        monto_tol = float(globals().get("MONTO_TOL", 0.05) or 0.05)
-
-        aliases_res = ("resultado", "Resultado", "result", "estado")
-        aliases_token = ("token", "modo", "cuenta", "tipo_cuenta")
-        aliases_ciclo = ("ciclo", "ciclo_martingala", "martingala")
-        aliases_monto = ("monto", "stake", "inversion", "inversión")
-        aliases_ts = ("timestamp", "fecha", "hora", "datetime", "ts")
-        aliases_contract = ("contract_id", "contrato", "id_contrato")
-
-        best_fail = "sin_resultado_valido"
-        for row_index, row in reversed(list(tail)):
-            resultado = _real_close_pending_norm_resultado(_real_close_pending_csv_get(row, aliases_res))
-            if resultado not in ("GANANCIA", "PÉRDIDA"):
-                continue
-
-            contract = str(_real_close_pending_csv_get(row, aliases_contract) or "").strip()
-            if pending_contract and contract and contract != pending_contract:
-                best_fail = "contract_id_no_coincide"
-                continue
-
-            row_ts = _real_close_pending_parse_ts(_real_close_pending_csv_get(row, aliases_ts))
-            timestamp_match = "ok"
-            if pending_ts:
-                if not row_ts or row_ts < (pending_ts - 1.0):
-                    best_fail = "fila_antigua"
-                    continue
-            else:
-                if row_index < max(1, total - 20):
-                    best_fail = "sin_timestamp_fila_no_reciente"
-                    continue
-                timestamp_match = "no_disponible_fallback_reciente"
-
-            token_val = _real_close_pending_csv_get(row, aliases_token)
-            token_diag = "columna_no_disponible"
-            if token_val not in (None, ""):
-                token_txt = str(token_val).strip().upper()
-                token_diag = token_txt
-                if "DEMO" in token_txt or ("REAL" not in token_txt and bot.upper() not in token_txt):
-                    best_fail = "fila_no_real"
-                    continue
-
-            ciclo_val = _real_close_pending_parse_num(_real_close_pending_csv_get(row, aliases_ciclo))
-            ciclo_diag = "columna_no_disponible" if ciclo_val is None else int(ciclo_val)
-            if pending_ciclo is not None and ciclo_val is not None and int(ciclo_val) != int(pending_ciclo):
-                best_fail = "ciclo_no_compatible"
-                continue
-
-            monto_val = _real_close_pending_parse_num(_real_close_pending_csv_get(row, aliases_monto))
-            monto_diag = "columna_no_disponible" if monto_val is None else monto_val
-            if pending_monto is not None and monto_val is not None and abs(float(monto_val) - float(pending_monto)) > monto_tol:
-                best_fail = "monto_fuera_tolerancia"
-                continue
-
-            if pending_contract and not contract:
-                best_fail = "contract_id_csv_no_disponible"
-                continue
-
-            info.update({
-                "bot": bot,
-                "resultado": resultado,
-                "ciclo": int(ciclo_val) if ciclo_val is not None else (int(pending_ciclo) if pending_ciclo is not None else None),
-                "monto": monto_val,
-                "csv": csv_path,
-                "row_index": int(row_index),
-                "contract_id": contract or None,
-                "reason": str(reason or "ttl_recovery"),
-                "timestamp_match": timestamp_match,
-                "token_match": token_diag,
-                "ciclo_match": ciclo_diag,
-                "monto_match": monto_diag,
-            })
-            return True, info
-
-        info["motivo"] = best_fail
-        return False, info
-    except Exception as e:
-        info["motivo"] = f"error:{type(e).__name__}"
-        info["error"] = str(e)
-        return False, info
-
 def _hay_real_close_pending_activo():
     try:
         now = time.time()
@@ -2089,83 +1765,6 @@ def _real_close_sig(bot, res, monto, ciclo, payout_total, baseline=None):
         round(float(payout_total or 0.0), 4),
         int(baseline or REAL_ENTRY_BASELINE.get(bot, 0) or 0),
     )
-
-def _real_hold_ciclo_text(bot=None, pending=None, ciclo=None):
-    try:
-        if isinstance(pending, dict) and pending.get("ciclo") is not None:
-            return f"C{int(pending.get('ciclo'))}"
-    except Exception:
-        pass
-    try:
-        if ciclo is not None:
-            return f"C{int(ciclo)}"
-    except Exception:
-        pass
-    try:
-        if bot in BOT_NAMES:
-            return f"C{int(estado_bots.get(bot, {}).get('ciclo_actual', 1) or 1)}"
-    except Exception:
-        pass
-    return "C?"
-
-def _audit_real_close_pending_action(bot=None, pending=None, resultado=None, contract_id=None, reason="", accion="HOLD", ciclo_ordenado=None):
-    try:
-        pending = pending if isinstance(pending, dict) else {}
-        bot_txt = str(bot or pending.get("bot") or "UNKNOWN")
-        ciclo_pending = pending.get("ciclo")
-        if ciclo_pending is None and bot_txt in BOT_NAMES:
-            ciclo_pending = estado_bots.get(bot_txt, {}).get("ciclo_actual")
-        ciclo_ord = ciclo_ordenado if ciclo_ordenado is not None else pending.get("ciclo_orden", pending.get("ciclo"))
-        res_norm = normalizar_resultado(resultado)
-        cid = contract_id if contract_id is not None else estado_bots.get(bot_txt, {}).get("id_contrato") if bot_txt in BOT_NAMES else None
-        msg = (
-            "🧾 REAL_CLOSE_AUDIT | "
-            f"bot={bot_txt} | ciclo_pending=C{ciclo_pending if ciclo_pending is not None else '?'} | "
-            f"ciclo_ordenado=C{ciclo_ord if ciclo_ord is not None else '?'} | "
-            f"resultado_norm={res_norm} | contract_id={cid or '--'} | "
-            f"reason={reason or '--'} | accion={accion}"
-        )
-        _lxv_5v1x_event_cooldown(
-            key=f"real_close_audit:{bot_txt}:{ciclo_pending}:{res_norm}:{cid}:{accion}:{reason}",
-            msg=msg,
-            cooldown_s=12.0,
-        )
-    except Exception:
-        pass
-
-def _real_hold_event(bot=None, pending=None, resultado=None, contract_id=None, reason="contrato_incierto"):
-    try:
-        pending = pending if isinstance(pending, dict) else {}
-        bot_txt = str(bot or pending.get("bot") or "UNKNOWN")
-        ciclo_txt = _real_hold_ciclo_text(bot_txt if bot_txt in BOT_NAMES else None, pending=pending)
-        res_norm = normalizar_resultado(resultado)
-        if bot_txt in BOT_NAMES:
-            try:
-                estado_bots[bot_txt]["real_estado_cierre"] = "VENDIDO_SIN_RESULTADO_CONTABLE" if str(reason) == "reconciled_sold_sin_resultado" else "CONTRATO_INCIERTO_SIN_RESULTADO_CONTABLE"
-                estado_bots[bot_txt]["real_close_accion"] = "ESPERAR"
-                estado_bots[bot_txt]["real_resultado_pendiente_norm"] = res_norm
-            except Exception:
-                pass
-        _audit_real_close_pending_action(
-            bot=bot_txt, pending=pending, resultado=res_norm, contract_id=contract_id,
-            reason=reason, accion="HOLD",
-        )
-        _lxv_5v1x_event_cooldown(
-            key=f"real_hold:{bot_txt}:{ciclo_txt}:{res_norm}:{reason}",
-            msg=(
-                f"🧱 REAL HOLD | bot={bot_txt} | {ciclo_txt} | contrato incierto | "
-                "esperando GANANCIA/PÉRDIDA | nueva compra bloqueada"
-            ),
-            cooldown_s=10.0,
-        )
-        if str(reason) == "reconciled_sold_sin_resultado":
-            _lxv_5v1x_event_cooldown(
-                key=f"real_reconciled_no_accounting:{bot_txt}:{ciclo_txt}",
-                msg="🧱 REAL INCIERTO: contrato vendido/reconciliado pero sin resultado contable. Esperando cierre final. No se permite nueva compra.",
-                cooldown_s=10.0,
-            )
-    except Exception:
-        pass
 CTT_CLOSE_EVENTS = deque(maxlen=6000)
 CTT_CLOSE_SEEN = set()
 CTT_STATE = {
@@ -3537,12 +3136,6 @@ LXV_SYNC_ROUND_MAX_WAIT_S = 90.0
 LXV_SYNC_BOT_STALE_S = 60.0
 LXV_SYNC_PENDING_MAX_WAIT_S = 90.0
 LXV_SYNC_MIN_CLOSED_FOR_EVAL = 4
-RECOVERY_RELEASE_TTL_S = 120.0
-RECOVERY_RELEASE_MIN_BOTS = 3
-RECOVERY_RELEASE_STRONG_BOTS = 5
-ORPHAN_RECOVERY_TTL_S = 180.0
-RECOVERY_REQUEST_MAX_AGE_S = 300.0
-DEMO_PENDING_TTL_S = 180.0
 ROUND_BEHIND_REJOIN_WARN_S = 90.0
 LAST_ROUND_ALIGNMENT_DIAG = {}
 SYNC_TURBO_WATCHER_ENABLE = True
@@ -6507,16 +6100,8 @@ def es_ronda_cuarentenada(round_id):
         if isinstance(st_mem, dict) and int(st_mem.get("round_id", 0) or 0) == rid:
             return True
         st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
-        if isinstance(st, dict):
-            if int(st.get("quarantined_round", 0) or 0) == rid:
-                return True
-            if int(st.get("recovery_quarantine_round", 0) or 0) == rid:
-                return True
-            if int(st.get("recovery_from_round", 0) or 0) == rid and str(st.get("last_release_reason", "") or "") == "DEMO_RECOVERY_FORCE_RELEASE":
-                return True
-            rq = st.get("recovery_quarantine_rounds")
-            if isinstance(rq, (list, tuple, set)) and rid in {int(x or 0) for x in rq}:
-                return True
+        if isinstance(st, dict) and int(st.get("quarantined_round", 0) or 0) == rid:
+            return True
         qf = _column_quarantine_load_state()
         if isinstance(qf, dict) and int(qf.get("round_id", 0) or 0) == rid:
             return True
@@ -6546,7 +6131,7 @@ def _column_quarantine_apply_real_block(round_id, motivo="columna_cuarentenada_n
             p["updated_ts"] = float(time.time())
         print_rate_limited(
             f"COLUMNA_EN_CUARENTENA_BLOCK:{round_id}",
-            f"🧯 COLUMNA_RECOVERY_NO_REAL | ronda={int(round_id)} | motivo=recovery_quarantine" if str(motivo) == "recovery_quarantine" else f"🧯 COLUMNA_EN_CUARENTENA | ronda={int(round_id)} | FINAL=NO_INVERTIR_COLUMNA_CUARENTENA | motivo={motivo}",
+            f"🧯 COLUMNA_EN_CUARENTENA | ronda={int(round_id)} | FINAL=NO_INVERTIR_COLUMNA_CUARENTENA | motivo={motivo}",
             ttl=float(globals().get("COLUMN_QUARANTINE_LOG_COOLDOWN_S", 20.0) or 20.0),
         )
         return True
@@ -6948,7 +6533,7 @@ def _sync_round_write_state_monotonic(payload, reason="") -> bool:
                 _lxv_5v1x_event_cooldown(
                     key=f"sync_write_freeze_real_pending:{pending_bot}",
                     msg="SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI" if not _real_close_incident_active() else "🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro",
-                    cooldown_s=25.0 if _real_close_incident_active() else 10.0,
+                    cooldown_s=10.0,
                 )
                 new_released = normalizar_released_round_id(p.get("released_round"), fallback=old_released)
                 new_round_id = _sync_round_int_or_none(p.get("round_id"))
@@ -7237,8 +6822,6 @@ def _lxv_5v1x_get_exported_rows(round_id: int) -> tuple[dict, dict]:
 
 def _lxv_5v1x_gate_ok(candidate: dict | None) -> tuple[bool, str]:
     c = candidate if isinstance(candidate, dict) else {}
-    if _sync_should_block_candidate_by_recovery(c):
-        return False, "recovery_quarantine"
     try:
         if es_ronda_cuarentenada(int(c.get("round_id", 0) or 0)):
             _column_quarantine_apply_real_block(int(c.get("round_id", 0) or 0))
@@ -7270,8 +6853,6 @@ def _lxv_5v1x_pick_real_bot(candidate: dict | None) -> str | None:
 
 def _lxv_4v2x_gate_ok(candidate: dict | None) -> tuple[bool, str]:
     c = candidate if isinstance(candidate, dict) else {}
-    if _sync_should_block_candidate_by_recovery(c):
-        return False, "recovery_quarantine"
     try:
         if es_ronda_cuarentenada(int(c.get("round_id", 0) or 0)):
             _column_quarantine_apply_real_block(int(c.get("round_id", 0) or 0))
@@ -7479,33 +7060,6 @@ def _lxv_load_recent_columns_for_gate(round_id, lookback=12):
             dedup[rrid] = rr
     return [dedup[k] for k in sorted(dedup.keys())]
 
-def calcular_prev_full_green_streak_por_historial(columnas, idx_actual, expected=6):
-    try:
-        rows = list(columnas or [])
-        idx = int(idx_actual)
-        expected = int(expected or 6)
-        if expected <= 0:
-            expected = 6
-        if idx > len(rows):
-            idx = len(rows)
-        if idx <= 0:
-            return 0
-        streak = 0
-        for pos in range(idx - 1, -1, -1):
-            row = rows[pos]
-            if not isinstance(row, dict):
-                break
-            v, r = _lxv_row_counts(row)
-            complete_ok = _lxv_row_round_complete(row) or bool(row.get("round_complete", False))
-            quality_ok = _lxv_row_quality_ok(row) or _lxv_zona_quality_ok(str(row.get("data_quality", row.get("quality", "")) or ""))
-            if v == expected and r == 0 and complete_ok and quality_ok:
-                streak += 1
-                continue
-            break
-        return int(streak)
-    except Exception:
-        return 0
-
 def _lxv_prev_full_green_streak(round_id, lookback=12):
     try:
         rid = int(round_id or 0)
@@ -7515,9 +7069,18 @@ def _lxv_prev_full_green_streak(round_id, lookback=12):
         return 0
     try:
         rows = _lxv_load_recent_columns_for_gate(rid, lookback=lookback)
-        rows = [r for r in list(rows or []) if isinstance(r, dict) and _lxv_row_round_id(r) > 0 and _lxv_row_round_id(r) < rid]
-        rows = sorted(rows, key=lambda r: _lxv_row_round_id(r))
-        return int(calcular_prev_full_green_streak_por_historial(rows, len(rows), expected=6))
+        by_rid = {_lxv_row_round_id(r): r for r in rows if _lxv_row_round_id(r) > 0}
+        streak = 0
+        expected = rid - 1
+        while expected > 0:
+            row = by_rid.get(expected)
+            if not isinstance(row, dict):
+                break
+            if not _lxv_is_full_green_row(row):
+                break
+            streak += 1
+            expected -= 1
+        return int(streak)
     except Exception:
         return 0
 
@@ -9111,11 +8674,26 @@ def _lxv_count_prev_full_green_from_norm(norm_rows, rid_obj, expected=6):
     try:
         rid_obj = int(rid_obj or 0)
         expected = int(expected or 6)
-        rows = [x for x in list(norm_rows or []) if isinstance(x, dict)]
-        if not rows:
-            return 0
-        idx = next((i for i, rr in enumerate(rows) if int((rr or {}).get("round_id", 0) or 0) == rid_obj), len(rows) - 1)
-        return int(calcular_prev_full_green_streak_por_historial(rows, idx, expected))
+        rows = list(norm_rows or [])
+        by_rid = {}
+        for rr in rows:
+            rid = int((rr or {}).get("round_id", 0) or 0)
+            if rid > 0:
+                by_rid[rid] = rr
+        streak = 0
+        rid = rid_obj - 1
+        while rid > 0:
+            rr = by_rid.get(rid)
+            if not isinstance(rr, dict):
+                break
+            v = int(rr.get("n_verdes", -1))
+            r = int(rr.get("n_rojos", -1))
+            if v == expected and r == 0:
+                streak += 1
+                rid -= 1
+                continue
+            break
+        return int(streak)
     except Exception:
         return 0
 
@@ -9144,335 +8722,6 @@ def _lxv_zona_dynamic_metrics(norm_rows, expected=6):
         return {}
 
 
-
-def _lxv_symbol_for_bot_from_row(row, bot):
-    try:
-        b = str(bot or "").strip()
-        if not b or not isinstance(row, dict):
-            return ""
-        sym = str(row.get(b, "") or "").strip()
-        if sym in ("✓", "X"):
-            return sym
-        return _mrv_5v1x_row_symbol(row, b)
-    except Exception:
-        return ""
-
-def _lxv_pick_bot_objetivo_rebote(row):
-    try:
-        rr = row if isinstance(row, dict) else {}
-        for k in ("bot_x_fuerte", "bot_x1", "bot_x2"):
-            b = str(rr.get(k, "") or "").strip()
-            if b in globals().get("BOT_NAMES", []):
-                return b
-        for b in list(globals().get("BOT_NAMES", []) or []):
-            if _lxv_symbol_for_bot_from_row(rr, b) == "X":
-                return b
-    except Exception:
-        pass
-    return ""
-
-def validar_bot_objetivo_para_rebote(bot, historial_columnas, idx_actual):
-    out = {"ok": False, "motivo": "datos_insuficientes", "x_ult4": 0, "apariciones": 0, "patron_fresco": False}
-    try:
-        b = str(bot or "").strip()
-        rows = [x for x in list(historial_columnas or []) if isinstance(x, dict)]
-        idx = int(idx_actual)
-        if not b or b not in globals().get("BOT_NAMES", []):
-            out["motivo"] = "bot_objetivo_invalido"
-            return out
-        if idx < 0 or idx >= len(rows):
-            out["motivo"] = "idx_actual_invalido"
-            return out
-        sym_actual = _lxv_symbol_for_bot_from_row(rows[idx], b)
-        if sym_actual != "X":
-            out.update({"motivo": "bot_no_es_x_candidato", "simbolo_actual": sym_actual})
-            return out
-        prev = []
-        for rr in reversed(rows[:idx]):
-            sym = _lxv_symbol_for_bot_from_row(rr, b)
-            if sym in ("✓", "X"):
-                prev.append(sym)
-            if len(prev) >= 4:
-                break
-        prev = list(reversed(prev))
-        if len(prev) < 4:
-            out.update({"motivo": "datos_insuficientes_bot", "apariciones": len(prev), "simbolo_actual": sym_actual})
-            return out
-        x_ult4 = sum(1 for x in prev if x == "X")
-        patron_fresco = bool(prev and prev[-1] == "✓")
-        out.update({"x_ult4": int(x_ult4), "apariciones": len(prev), "patron_fresco": bool(patron_fresco), "simbolo_actual": sym_actual})
-        if x_ult4 >= 3 and not patron_fresco:
-            out["motivo"] = "bot_objetivo_debil"
-            return out
-        out.update({"ok": True, "motivo": "bot_objetivo_ok"})
-        return out
-    except Exception:
-        out["motivo"] = "validacion_bot_error"
-        return out
-
-
-
-def calcular_full_green_streak_inmediato_previo(columnas, idx_actual):
-    try:
-        rows = [x for x in list(columnas or []) if isinstance(x, dict)]
-        idx = int(idx_actual)
-        if idx <= 0 or not rows:
-            return 0
-        if idx > len(rows):
-            idx = len(rows)
-        streak = 0
-        for pos in range(idx - 1, -1, -1):
-            row = rows[pos]
-            verdes = _mrv_5v1x_to_int(row.get("n_verdes", row.get("verdes", -1)), -1)
-            if verdes >= 5:
-                streak += 1
-                continue
-            break
-        return int(streak)
-    except Exception:
-        return 0
-
-def detectar_rebote_verde_temprano_controlado(rows_validas, idx_actual=None, metrics=None, patron_actual=None):
-    base = {"zona_extra": None, "allow_extra": False, "block_extra": False, "motivo_extra": "sin_match_rebote_verde_temprano", "decision_extra": ZONA_NO_INVERTIR}
-    try:
-        if not bool(globals().get("LXV_REBOTE_VERDE_TEMPRANO_ENABLE", True)):
-            out = dict(base); out["motivo_extra"] = "rebote_verde_temprano_disabled"; return out
-        rows = [dict(x) for x in list(rows_validas or []) if isinstance(x, dict)]
-        if not rows:
-            return dict(base)
-        idx = int(idx_actual) if idx_actual is not None else (len(rows) - 1)
-        if idx < 0 or idx >= len(rows):
-            out = dict(base); out["motivo_extra"] = "idx_actual_invalido"; return out
-        curr = rows[idx]
-        expected = int(len(globals().get("BOT_NAMES", []) or [])) or 6
-        v = _mrv_5v1x_to_int(curr.get("n_verdes", -1), -1)
-        r = _mrv_5v1x_to_int(curr.get("n_rojos", -1), -1)
-        dq = str(curr.get("data_quality", curr.get("quality", "")) or "").strip().lower()
-        complete = bool(curr.get("round_complete", curr.get("complete", False)))
-        patron = str(patron_actual or curr.get("patron_lxv", curr.get("patron", curr.get("pattern", ""))) or "").strip().upper()
-        if not patron:
-            patron = "5V1X" if (v == 5 and r == 1) else ("4V2X" if (v == 4 and r == 2) else "OTHER")
-        m = dict(metrics or {})
-        prom3 = float(m.get("prom3", 0.0) or 0.0)
-        prom8 = float(m.get("prom8", 0.0) or 0.0)
-        delta = float(m.get("delta_3_8", prom3 - prom8) or 0.0)
-        prev_full = int(m.get("prev_full_green_streak", calcular_prev_full_green_streak_por_historial(rows, idx, expected)) or 0)
-        prev_n = max(1, int(globals().get("LXV_REBOTE_VERDE_TEMPRANO_PREV_LOOKBACK", 3) or 3))
-        prev = rows[max(0, idx - prev_n):idx]
-        red_min = int(globals().get("LXV_REBOTE_VERDE_TEMPRANO_RED_PREV_MIN", 4) or 4)
-        presion_roja = any(_mrv_5v1x_to_int(x.get("n_rojos", -1), -1) >= red_min for x in prev)
-        bot_obj = _lxv_pick_bot_objetivo_rebote(curr)
-        bot_val = validar_bot_objetivo_para_rebote(bot_obj, rows, idx)
-        out = dict(base)
-        out.update({"zona_extra": "REBOTE_VERDE_TEMPRANO", "patron_actual": patron, "verdes_actual": v, "rojos_actual": r, "prom3": prom3, "prom8": prom8, "delta_3_8": delta, "presion_roja_previa": bool(presion_roja), "prev_full_green_streak": prev_full, "bot_objetivo": bot_obj or "--", "bot_rebote_info": dict(bot_val)})
-        if (not complete) or (not _lxv_zona_quality_ok(dq)) or v < 0 or r < 0 or (v + r) != expected:
-            out.update({"motivo_extra": "datos_incompletos", "block_extra": True})
-        elif patron not in {"5V1X", "4V2X"}:
-            out.update({"motivo_extra": "patron_no_valido", "block_extra": True})
-        elif v < 4:
-            out.update({"motivo_extra": "verde_actual_insuficiente", "block_extra": True})
-        elif prev_full >= int(globals().get("LXV_REBOTE_VERDE_TEMPRANO_FULL_GREEN_MAX", 1) or 1) + 1:
-            out.update({"motivo_extra": "saturacion_verde_previa", "block_extra": True})
-        elif not presion_roja:
-            out.update({"motivo_extra": "presion_roja_insuficiente", "block_extra": True})
-        elif prom8 > float(globals().get("LXV_REBOTE_VERDE_TEMPRANO_PROM8_MAX", 0.55) or 0.55):
-            out.update({"motivo_extra": "prom8_fuera_rango", "block_extra": True})
-        elif delta < float(globals().get("LXV_REBOTE_VERDE_TEMPRANO_DELTA_MIN", 0.03) or 0.03):
-            out.update({"motivo_extra": "delta_insuficiente", "block_extra": True})
-        elif not bool(bot_val.get("ok", False)):
-            out.update({"motivo_extra": str(bot_val.get("motivo", "bot_objetivo_debil") or "bot_objetivo_debil"), "block_extra": True})
-        else:
-            out.update({"allow_extra": True, "block_extra": False, "motivo_extra": "rebote_controlado_ok", "decision_extra": ZONA_SI_INVERTIR, "marca_rebote": "REBOTE_CONTROLADO"})
-        if patron in {"5V1X", "4V2X"} and v >= 4:
-            _lxv_extra_zona_emit_event("REBOTE_VERDE_TEMPRANO", out)
-        return out
-    except Exception:
-        out = dict(base)
-        out["motivo_extra"] = "rebote_verde_temprano_error_fail_closed"
-        return out
-
-def _lxv_extra_zona_emit_event(zona_extra, data):
-    try:
-        fn_evt = globals().get("agregar_evento", None)
-        if not callable(fn_evt):
-            return
-        now = time.time()
-        global _LXV_REBOTE_POST_ROJO_LAST_LOG_TS, _LXV_VERDE_SERRUCHO_LAST_LOG_TS, _LXV_REBOTE_VERDE_TEMPRANO_LAST_LOG_TS
-        if zona_extra == "REBOTE_VERDE_TEMPRANO":
-            cooldown = float(globals().get("LXV_REBOTE_VERDE_TEMPRANO_LOG_COOLDOWN_S", 20.0) or 20.0)
-            key = f"{data.get('patron_actual','--')}:{data.get('bot_objetivo','--')}:{data.get('motivo_extra','--')}"
-            last = globals().get("_LXV_REBOTE_VERDE_TEMPRANO_LAST_LOG_TS", {})
-            if not isinstance(last, dict):
-                last = {}
-            if now - float(last.get(key, 0.0) or 0.0) < cooldown:
-                return
-            last[key] = now
-            _LXV_REBOTE_VERDE_TEMPRANO_LAST_LOG_TS = last
-            decision_txt = "SI_INVERTIR" if bool(data.get("allow_extra", False)) else "NO_INVERTIR"
-            presion_txt = "SI" if bool(data.get("presion_roja_previa", False)) else "NO"
-            fn_evt(("🟢 REBOTE_VERDE_TEMPRANO DETECTADO\n"
-                    f"patrón={data.get('patron_actual','--')} | verdes={int(data.get('verdes_actual',0) or 0)}/6\n"
-                    f"prom3={float(data.get('prom3',0.0) or 0.0):.3f} prom8={float(data.get('prom8',0.0) or 0.0):.3f} delta={float(data.get('delta_3_8',0.0) or 0.0):.3f}\n"
-                    f"presión_roja_previa={presion_txt}\n"
-                    f"prev_full_green_streak={int(data.get('prev_full_green_streak',0) or 0)}\n"
-                    f"bot_objetivo={data.get('bot_objetivo','--')}\n"
-                    f"decisión={decision_txt}\n"
-                    f"motivo={data.get('motivo_extra','--')}"))
-        elif zona_extra == "REBOTE_POST_ROJO":
-            cooldown = float(globals().get("LXV_REBOTE_POST_ROJO_LOG_COOLDOWN_S", 20.0) or 20.0)
-            if now - float(globals().get("_LXV_REBOTE_POST_ROJO_LAST_LOG_TS", 0.0) or 0.0) < cooldown:
-                return
-            _LXV_REBOTE_POST_ROJO_LAST_LOG_TS = now
-            patron = str(data.get("patron_actual", "--") or "--").upper()
-            bot = str(data.get("bot_objetivo", "--") or "--")
-            motivo = str(data.get("motivo_extra", data.get("motivo", "--")) or "--")
-            if patron == "4V2X":
-                if bool(data.get("allow_extra", False)):
-                    fn_evt(f"🟢 REBOTE_POST_ROJO 4V2X VALIDADO | bot={bot} | motivo={motivo}")
-                else:
-                    fn_evt(f"🟡 REBOTE_POST_ROJO 4V2X BLOQUEADO | bot={bot} | motivo={motivo}")
-            else:
-                fn_evt(f"🟢 REBOTE_POST_ROJO: desbloqueo controlado | patrón={patron} | impulse={float(data.get('impulse',0.0) or 0.0):.2f} | prom_prev={float(data.get('prom_prev',0.0) or 0.0):.2f}")
-        elif zona_extra == "VERDE_SERRUCHO_SATURADO":
-            cooldown = float(globals().get("LXV_VERDE_SERRUCHO_LOG_COOLDOWN_S", 20.0) or 20.0)
-            if now - float(globals().get("_LXV_VERDE_SERRUCHO_LAST_LOG_TS", 0.0) or 0.0) < cooldown:
-                return
-            _LXV_VERDE_SERRUCHO_LAST_LOG_TS = now
-            ruptura_txt = "SI" if bool(data.get("ruptura_clara", data.get("red_drop_prev", False))) else "NO"
-            fn_evt(f"🔴 VERDE_SERRUCHO_SATURADO | streak_inmediato={int(data.get('streak_inmediato', data.get('full_green_prev',0)) or 0)} | ruptura={ruptura_txt} | patrón={data.get('patron_actual','--')} | decisión=NO_INVERTIR")
-        elif zona_extra == "SERRUCHO_NO_APLICA":
-            cooldown = float(globals().get("LXV_VERDE_SERRUCHO_LOG_COOLDOWN_S", 20.0) or 20.0)
-            if now - float(globals().get("_LXV_VERDE_SERRUCHO_LAST_LOG_TS", 0.0) or 0.0) < cooldown:
-                return
-            _LXV_VERDE_SERRUCHO_LAST_LOG_TS = now
-            fn_evt(f"🟢 SERRUCHO NO APLICA | streak_inmediato={int(data.get('streak_inmediato',0) or 0)} | motivo={data.get('motivo_extra','sin_saturacion_consecutiva')}")
-    except Exception:
-        return
-
-
-def _lxv_extra_zona_rebote_serrucho(rows_validas, idx_actual=None, patron_actual=None):
-    base = {
-        "zona_extra": None,
-        "allow_extra": False,
-        "block_extra": False,
-        "motivo_extra": "sin_data_extra",
-    }
-    try:
-        rows = [dict(x) for x in list(rows_validas or []) if isinstance(x, dict)]
-        if not rows:
-            return dict(base)
-        idx = int(idx_actual) if idx_actual is not None else (len(rows) - 1)
-        if idx < 0 or idx >= len(rows):
-            return dict(base)
-        curr = rows[idx]
-        verdes_actual = _mrv_5v1x_to_int(curr.get("n_verdes", curr.get("verdes", -1)), -1)
-        rojos_actual = _mrv_5v1x_to_int(curr.get("n_rojos", curr.get("rojos", -1)), -1)
-        dq = str(curr.get("data_quality", curr.get("quality", "")) or "").strip().lower()
-        complete = bool(curr.get("round_complete", curr.get("complete", False)))
-        if (not complete) or dq != "ok" or verdes_actual < 0 or rojos_actual < 0 or (verdes_actual + rojos_actual) != 6:
-            out = dict(base)
-            out["motivo_extra"] = "candado_columna_o_data"
-            return out
-        patron = str(patron_actual or curr.get("patron", curr.get("pattern", "")) or "").strip().upper()
-        if not patron:
-            if verdes_actual == 5 and rojos_actual == 1:
-                patron = "5V1X"
-            elif verdes_actual == 4 and rojos_actual == 2:
-                patron = "4V2X"
-        lookback_rebote = max(1, int(globals().get("LXV_REBOTE_POST_ROJO_LOOKBACK", 4) or 4))
-        lookback_serrucho = max(1, int(globals().get("LXV_VERDE_SERRUCHO_LOOKBACK", 6) or 6))
-        prev_rebote = rows[max(0, idx - lookback_rebote):idx]
-        prev_serrucho = rows[max(0, idx - lookback_serrucho):idx]
-        if not prev_rebote:
-            return dict(base)
-        g_actual = float(verdes_actual) / 6.0
-        r_actual = float(rojos_actual) / 6.0
-        prom_prev = sum(max(0.0, min(1.0, float(_mrv_5v1x_to_int(x.get("n_verdes", 0), 0)) / 6.0)) for x in prev_rebote) / max(1, len(prev_rebote))
-        red_cols = sum(1 for x in prev_rebote if _mrv_5v1x_to_int(x.get("n_rojos", 0), 0) >= int(globals().get("LXV_REBOTE_POST_ROJO_RED_MIN", 4) or 4))
-        full_green_prev = sum(1 for x in prev_serrucho if _mrv_5v1x_to_int(x.get("n_verdes", 0), 0) >= 5)
-        streak_inmediato = calcular_full_green_streak_inmediato_previo(rows, idx)
-        red_drop_min = int(globals().get("LXV_VERDE_SERRUCHO_RED_DROP_MIN_ROJOS", 4) or 4)
-        prev_1 = rows[idx - 1] if idx > 0 else {}
-        red_drop_prev = _mrv_5v1x_to_int(prev_1.get("n_rojos", 0), 0) >= red_drop_min
-        vals = [max(0.0, min(1.0, float(_mrv_5v1x_to_int(x.get("n_verdes", 0), 0)) / 6.0)) for x in rows[:idx + 1]]
-        prom3_actual = sum(vals[-3:]) / max(1, len(vals[-3:]))
-        prom8_actual = sum(vals[-8:]) / max(1, len(vals[-8:]))
-        delta_3_8_actual = float(prom3_actual - prom8_actual)
-        ruptura_clara = bool(
-            rojos_actual >= red_drop_min
-            or red_drop_prev
-            or delta_3_8_actual <= -float(globals().get("LXV_ZONA_DROP_TARDIO", 0.08) or 0.08)
-        )
-        impulse = float(g_actual - prom_prev)
-        metrics = {"patron_actual": patron or "--", "g_actual": g_actual, "r_actual": r_actual, "prom_prev": prom_prev, "red_cols": red_cols, "full_green_prev": full_green_prev, "streak_inmediato": streak_inmediato, "red_drop_prev": red_drop_prev, "ruptura_clara": ruptura_clara, "delta_3_8": delta_3_8_actual, "impulse": impulse}
-        if bool(globals().get("LXV_VERDE_SERRUCHO_SATURADO_ENABLE", True)):
-            patron_block = (patron == "4V2X" and bool(globals().get("LXV_VERDE_SERRUCHO_BLOCK_4V2X", True))) or (patron == "5V1X" and bool(globals().get("LXV_VERDE_SERRUCHO_BLOCK_5V1X", False)))
-            min_full_green = int(globals().get("LXV_VERDE_SERRUCHO_MIN_FULL_GREEN_PREV", 2) or 2)
-            current_riesgoso = verdes_actual <= int(globals().get("LXV_VERDE_SERRUCHO_CURRENT_MAX_GREEN", 4) or 4)
-            if patron_block and current_riesgoso and streak_inmediato >= min_full_green and ruptura_clara:
-                out = dict(base)
-                out.update(metrics)
-                out.update({"zona_extra": "VERDE_SERRUCHO_SATURADO", "allow_extra": False, "block_extra": True, "motivo_extra": "serrucho_saturado_streak_inmediato_ruptura"})
-                _lxv_extra_zona_emit_event("VERDE_SERRUCHO_SATURADO", out)
-                return out
-            if patron_block and full_green_prev >= min_full_green and streak_inmediato < min_full_green:
-                out_log = dict(base)
-                out_log.update(metrics)
-                out_log.update({"motivo_extra": "sin_saturacion_consecutiva"})
-                _lxv_extra_zona_emit_event("SERRUCHO_NO_APLICA", out_log)
-        if bool(globals().get("LXV_REBOTE_POST_ROJO_ENABLE", True)) and bool(globals().get("LXV_REBOTE_POST_ROJO_CAN_UNLOCK", True)):
-            base_ok = (
-                patron in {"5V1X", "4V2X"}
-                and verdes_actual >= int(globals().get("LXV_REBOTE_POST_ROJO_MIN_GREEN_ACTUAL", 4) or 4)
-                and red_cols >= int(globals().get("LXV_REBOTE_POST_ROJO_MIN_RED_COLS", 1) or 1)
-                and prom_prev <= float(globals().get("LXV_REBOTE_POST_ROJO_PROM_PREV_MAX", 0.50) or 0.50)
-                and impulse >= float(globals().get("LXV_REBOTE_POST_ROJO_MIN_IMPULSE", 0.18) or 0.18)
-            )
-            if base_ok and patron == "4V2X" and bool(globals().get("LXV_REBOTE_POST_ROJO_4V2X_REQUIRE_STRICT", True)):
-                bot_obj = _lxv_pick_bot_objetivo_rebote(curr)
-                bot_val = validar_bot_objetivo_para_rebote(bot_obj, rows, idx)
-                motivo_bot = str(bot_val.get("motivo", "datos_insuficientes") or "datos_insuficientes")
-                strict_ok = (
-                    bool(bot_val.get("ok", False))
-                    and bool(bot_val.get("patron_fresco", False))
-                    and int(bot_val.get("apariciones", 0) or 0) >= 4
-                    and int(bot_val.get("x_ult4", 0) or 0) < 3
-                    and "bot_objetivo_debil" not in motivo_bot
-                    and streak_inmediato < int(globals().get("LXV_VERDE_SERRUCHO_MIN_FULL_GREEN_PREV", 2) or 2)
-                )
-                out_strict = dict(base)
-                out_strict.update(metrics)
-                out_strict.update({"bot_objetivo": bot_obj or "--", "bot_rebote_info": dict(bot_val)})
-                if not strict_ok:
-                    motivo_strict = motivo_bot
-                    if not bot_obj:
-                        motivo_strict = "datos_insuficientes"
-                    elif not bool(bot_val.get("patron_fresco", False)):
-                        motivo_strict = "patron_no_fresco"
-                    elif int(bot_val.get("x_ult4", 0) or 0) >= 3 or "bot_objetivo_debil" in motivo_bot:
-                        motivo_strict = "bot_objetivo_debil"
-                    elif streak_inmediato >= int(globals().get("LXV_VERDE_SERRUCHO_MIN_FULL_GREEN_PREV", 2) or 2):
-                        motivo_strict = "saturacion_verde_previa"
-                    out_strict.update({"zona_extra": "REBOTE_POST_ROJO", "allow_extra": False, "block_extra": False, "motivo_extra": motivo_strict})
-                    _lxv_extra_zona_emit_event("REBOTE_POST_ROJO", out_strict)
-                    base_ok = False
-                else:
-                    metrics.update({"bot_objetivo": bot_obj or "--", "bot_rebote_info": dict(bot_val)})
-                    metrics["motivo_extra"] = "bot_objetivo_ok"
-            if base_ok:
-                out = dict(base)
-                out.update(metrics)
-                out.update({"zona_extra": "REBOTE_POST_ROJO", "allow_extra": True, "block_extra": False, "motivo_extra": str(metrics.get("motivo_extra", "rebote_post_rojo_impulse_ok") or "rebote_post_rojo_impulse_ok")})
-                _lxv_extra_zona_emit_event("REBOTE_POST_ROJO", out)
-                return out
-        out = dict(base)
-        out.update(metrics)
-        out["motivo_extra"] = "sin_match_extra"
-        return out
-    except Exception:
-        out = dict(base)
-        out["motivo_extra"] = "extra_fail_closed"
-        return out
 
 def detectar_zona_mrv_v2(cols_norm, expected=6, prom3=None, prom8=None, prom20=None):
     base = {"zona_mrv_v2":"NEUTRO_MIXTO","decision_mrv_v2":"NO_INVERTIR","allow_real_mrv_v2":False,"motivo_mrv_v2":"sin_dominio_claro","g_actual":0.0,"r_actual":0.0,"green_cols_3":0,"green_cols_5":0,"green_cols_8":0,"red_cols_3":0,"red_cols_5":0,"full_green_prev_streak_mrv2":0,"green_pressure":0.0,"red_pressure":0.0,"slope_3_8":0.0,"slope_8_20":0.0,"noise_ratio":0.0,"mrv2_ok":False}
@@ -9678,11 +8927,7 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
             dq = str(rr.get("data_quality", rr.get("quality", "")) or "").strip().lower()
             if rid <= 0 or (not complete) or (not _lxv_zona_quality_ok(dq)) or v < 0 or r < 0 or (v + r) != expected:
                 continue
-            row_norm = {"round_id":rid,"n_verdes":v,"n_rojos":r,"round_complete":True,"data_quality":dq,"source":rr.get("_zona_source", "unknown"),"patron_lxv":str(rr.get("patron_lxv", rr.get("patron", "")) or ""),"bot_x1":str(rr.get("bot_x1", "") or ""),"bot_x2":str(rr.get("bot_x2", "") or ""),"bot_x_fuerte":str(rr.get("bot_x_fuerte", "") or "")}
-            for _b in list(globals().get("BOT_NAMES", []) or []):
-                if _b in rr:
-                    row_norm[_b] = rr.get(_b)
-            norm.append(row_norm)
+            norm.append({"round_id":rid,"n_verdes":v,"n_rojos":r,"round_complete":True,"data_quality":dq,"source":rr.get("_zona_source", "unknown")})
         if target_rid is not None and not any(int(x.get("round_id", 0) or 0) == target_rid for x in norm):
             try:
                 ack = dict(globals().get("LXV_SYNC_LAST_ACK_CANDIDATE") or {})
@@ -9788,93 +9033,20 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
         d820 = float(metrics.get("delta_8_20", 0.0))
         prev_streak = int(metrics.get("prev_full_green_streak", 0) or 0)
         out=dict(base); out.update({"g0":g0,"g1":g1,"g2":g2,"verdes0":v0,"rojos0":r0,"verdes1":v1,"rojos1":r1,"verdes2":v2,"rojos2":r2,"streak_verde":streak,"prev_full_green_streak":prev_streak,"round_id":rid0,"source":source_resumen,"sources":source_resumen,"cols_usadas":len(norm),"dq0":str(c0.get("data_quality","")),"dq1":str(c1.get("data_quality","")),"dq2":str(c2.get("data_quality","")),"g_actual":g,"prom3":p3,"prom8":p8,"prom20":p20,"delta_3_8":d38,"delta_8_20":d820,"zona_model":"PROM3_PROM8_PROM20"})
-        def _finalizar_zona_lxv_extra(out_base):
-            out2 = dict(out_base)
-            try:
-                zona_original = str(out2.get("zona", "UNKNOWN") or "UNKNOWN").strip().upper()
-                extra = _lxv_extra_zona_rebote_serrucho(norm, len(norm) - 1, None)
-                rebote_temprano = detectar_rebote_verde_temprano_controlado(norm, len(norm) - 1, metrics, None)
-                if isinstance(rebote_temprano, dict) and rebote_temprano.get("zona_extra") == "REBOTE_VERDE_TEMPRANO":
-                    out2["rebote_verde_temprano_info"] = dict(rebote_temprano)
-                    zona_original_rvt = str(out2.get("zona", "UNKNOWN") or "UNKNOWN").strip().upper()
-                    if bool(rebote_temprano.get("allow_extra", False)) and zona_original_rvt in {"ROJO_MADURO", "ROJA_TEMPRANO", "NEUTRO"}:
-                        motivo_original = str(out2.get("motivo", "") or "")
-                        out2.update({
-                            "zona": "REBOTE_VERDE_TEMPRANO",
-                            "fase": "REBOTE_VERDE_TEMPRANO",
-                            "zona_base": "VERDE_TEMPRANO",
-                            "subzona": "REBOTE_VERDE_TEMPRANO",
-                            "decision": ZONA_SI_INVERTIR,
-                            "allow_real": True,
-                            "color_key": "GREEN_BRIGHT",
-                            "emoji": "🟢",
-                            "motivo": "rebote_controlado_ok",
-                            "motivo_original_extra": f"{motivo_original}|extra:rebote_verde_temprano" if motivo_original else "extra:rebote_verde_temprano",
-                            "desbloqueo_lxv_extra": True,
-                            "marca_rebote": "REBOTE_CONTROLADO",
-                            "bot_objetivo_rebote": rebote_temprano.get("bot_objetivo", "--"),
-                        })
-                    elif str(out2.get("zona", "")).upper() == "REBOTE_VERDE_TEMPRANO":
-                        out2.update({"decision": ZONA_NO_INVERTIR, "allow_real": False})
-                if isinstance(extra, dict):
-                    out2["zona_extra_info"] = dict(extra)
-                    if bool(extra.get("block_extra", False)):
-                        motivo_original = str(out2.get("motivo", "") or "")
-                        out2.update({
-                            "zona": "VERDE_SERRUCHO_SATURADO",
-                            "fase": "VERDE_SERRUCHO_SATURADO",
-                            "zona_base": "VERDE_TARDIO",
-                            "decision": ZONA_NO_INVERTIR,
-                            "allow_real": False,
-                            "color_key": "ORANGE",
-                            "emoji": "🟠",
-                            "motivo": f"{motivo_original}|extra:serrucho_saturado" if motivo_original else "extra:serrucho_saturado",
-                            "bloqueo_lxv_extra": True,
-                        })
-                    elif extra.get("zona_extra") == "REBOTE_POST_ROJO" and bool(extra.get("allow_extra", False)) and zona_original in {"ROJO_MADURO", "ROJA_TEMPRANO", "NEUTRO"}:
-                        motivo_original = str(out2.get("motivo", "") or "")
-                        out2.update({
-                            "zona": "REBOTE_POST_ROJO",
-                            "fase": "REBOTE_POST_ROJO",
-                            "zona_base": "VERDE_TEMPRANO",
-                            "decision": ZONA_SI_INVERTIR,
-                            "allow_real": True,
-                            "color_key": "GREEN_BRIGHT",
-                            "emoji": "🟢",
-                            "motivo": "rebote_post_rojo_impulse_ok",
-                            "motivo_original_extra": f"{motivo_original}|extra:rebote_post_rojo" if motivo_original else "extra:rebote_post_rojo",
-                            "desbloqueo_lxv_extra": True,
-                        })
-                    for k in ("patron_actual", "impulse", "prom_prev", "red_cols", "full_green_prev", "red_drop_prev", "motivo_extra"):
-                        if k in extra:
-                            out2[f"extra_{k}"] = extra.get(k)
-            except Exception:
-                pass
-            out2 = combinar_zona_lxv_con_mrv2(out2)
-            if str(out2.get("zona", "")).upper() == "REBOTE_VERDE_TEMPRANO" and bool(out2.get("allow_real", False)):
-                out2["zona_base"] = "VERDE_TEMPRANO"
-                out2["marca_rebote"] = "REBOTE_CONTROLADO"
-            if str(out2.get("zona", "")).upper() == "REBOTE_POST_ROJO" and bool(out2.get("allow_real", False)):
-                out2["zona_base"] = "VERDE_TEMPRANO"
-            if str(out2.get("zona", "")).upper() == "VERDE_SERRUCHO_SATURADO":
-                out2["zona_base"] = "VERDE_TARDIO"
-                out2["decision"] = ZONA_NO_INVERTIR
-                out2["allow_real"] = False
-            return out2
         if (r0 >= 4 and r1 >= 4) or (p3 <= 0.40 and p8 <= 0.50):
-            out.update({"zona":"ROJO_MADURO","fase":"ROJO_MADURO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"rojo_maduro_promedios"}); return _finalizar_zona_lxv_extra(out)
+            out.update({"zona":"ROJO_MADURO","fase":"ROJO_MADURO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"rojo_maduro_promedios"}); out = combinar_zona_lxv_con_mrv2(out); return out
         if r0 >= 4 or (p3 < p8 - float(globals().get("LXV_ZONA_DROP_TARDIO", 0.08)) and g <= 0.50):
-            out.update({"zona":"ROJA_TEMPRANO","fase":"ROJA_TEMPRANO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_ORANGE","emoji":"🟥","motivo":"caida_hacia_rojo"}); return _finalizar_zona_lxv_extra(out)
+            out.update({"zona":"ROJA_TEMPRANO","fase":"ROJA_TEMPRANO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_ORANGE","emoji":"🟥","motivo":"caida_hacia_rojo"}); out = combinar_zona_lxv_con_mrv2(out); return out
         if (prev_streak >= int(globals().get("LXV_ZONA_FULL_GREEN_PREV_BLOCK", 3) or 3) and g <= (5/6)) or (p8 >= float(globals().get("LXV_ZONA_PROM8_SATURADO", 0.92)) and p3 < p8 - float(globals().get("LXV_ZONA_DROP_SATURADO", 0.04)) and g <= (5/6)):
-            out.update({"zona":"VERDE_SATURADO_TARDIO","fase":"VERDE_SATURADO_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"prev_full_green_streak" if prev_streak >= int(globals().get("LXV_ZONA_FULL_GREEN_PREV_BLOCK", 3) or 3) else "saturacion_con_caida"}); return _finalizar_zona_lxv_extra(out)
+            out.update({"zona":"VERDE_SATURADO_TARDIO","fase":"VERDE_SATURADO_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"prev_full_green_streak" if prev_streak >= int(globals().get("LXV_ZONA_FULL_GREEN_PREV_BLOCK", 3) or 3) else "saturacion_con_caida"}); out = combinar_zona_lxv_con_mrv2(out); return out
         if p8 >= float(globals().get("LXV_ZONA_PROM8_TARDIO_MIN", 0.70)) and p3 < p8 - float(globals().get("LXV_ZONA_DROP_TARDIO", 0.08)) and g <= (4/6):
-            out.update({"zona":"VERDE_TARDIO","fase":"VERDE_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"ORANGE","emoji":"🟧","motivo":"verde_perdiendo_fuerza"}); return _finalizar_zona_lxv_extra(out)
+            out.update({"zona":"VERDE_TARDIO","fase":"VERDE_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"ORANGE","emoji":"🟧","motivo":"verde_perdiendo_fuerza"}); out = combinar_zona_lxv_con_mrv2(out); return out
         if g >= (4/6) and p8 >= 0.45 and p8 < 0.68 and p3 >= p8 + float(globals().get("LXV_ZONA_DELTA_TEMPRANO", 0.02)):
-            out.update({"zona":"VERDE_TEMPRANO","fase":"VERDE_TEMPRANO","decision":ZONA_SI_INVERTIR,"allow_real":True,"color_key":"GREEN_BRIGHT","emoji":"🟩","motivo":"verde_naciendo_promedios"}); return _finalizar_zona_lxv_extra(out)
+            out.update({"zona":"VERDE_TEMPRANO","fase":"VERDE_TEMPRANO","decision":ZONA_SI_INVERTIR,"allow_real":True,"color_key":"GREEN_BRIGHT","emoji":"🟩","motivo":"verde_naciendo_promedios"}); out = combinar_zona_lxv_con_mrv2(out); return out
         if g >= (4/6) and p8 >= float(globals().get("LXV_ZONA_PROM8_MIN_ALLOW", 0.50)) and p8 <= float(globals().get("LXV_ZONA_PROM8_MAX_ALLOW", 0.92)) and p3 >= p8 - float(globals().get("LXV_ZONA_DELTA_OK", 0.05)):
-            out.update({"zona":"VERDE_MADURO","fase":"VERDE_MADURO","decision":ZONA_SI_INVERTIR,"allow_real":True,"color_key":"GREEN_YELLOW","emoji":"🟨","motivo":"verde_estable_promedios"}); return _finalizar_zona_lxv_extra(out)
+            out.update({"zona":"VERDE_MADURO","fase":"VERDE_MADURO","decision":ZONA_SI_INVERTIR,"allow_real":True,"color_key":"GREEN_YELLOW","emoji":"🟨","motivo":"verde_estable_promedios"}); out = combinar_zona_lxv_con_mrv2(out); return out
         out.update({"zona":"NEUTRO","fase":"NEUTRO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"GRAY","emoji":"⬜","motivo":"sin_predominio_dinamico"})
-        return _finalizar_zona_lxv_extra(out)
+        return out
     except Exception:
         out=dict(base); out.update({"zona":"ERROR","fase":"ERROR","decision":ZONA_NO_INVERTIR,"allow_real":False,"motivo":"zona_error_fail_closed","ok":False})
         return out
@@ -9882,11 +9054,32 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
 def _lxv_prev_full_green_streak_from_norm_rows(norm_rows, round_id):
     try:
         rid_obj = int(round_id or 0)
-        rows = [x for x in list(norm_rows or []) if isinstance(x, dict)]
-        if rid_obj <= 1 or not rows:
+        if rid_obj <= 1:
             return 0
-        idx = next((i for i, rr in enumerate(rows) if _mrv_5v1x_to_int(rr.get("round_id", 0), 0) == rid_obj), len(rows) - 1)
-        return int(calcular_prev_full_green_streak_por_historial(rows, idx, expected=6))
+        rows = list(norm_rows or [])
+        if not rows:
+            return 0
+        by_rid = {}
+        for rr in rows:
+            if not isinstance(rr, dict):
+                continue
+            rid = _mrv_5v1x_to_int(rr.get("round_id", 0), 0)
+            if rid > 0:
+                by_rid[rid] = rr
+        streak = 0
+        esperado = rid_obj - 1
+        while esperado > 0:
+            col = by_rid.get(esperado)
+            if not isinstance(col, dict):
+                break
+            v = _mrv_5v1x_to_int(col.get("n_verdes", -1), -1)
+            r = _mrv_5v1x_to_int(col.get("n_rojos", -1), -1)
+            if v == 6 and r == 0:
+                streak += 1
+                esperado -= 1
+                continue
+            break
+        return int(streak)
     except Exception:
         return 0
 
@@ -9966,7 +9159,6 @@ def normalizar_zona_lxv_oficial(info):
     zonas_validas = {
         "VERDE_TEMPRANO", "VERDE_MADURO", "VERDE_TARDIO", "VERDE_SATURADO_TARDIO",
         "ROJA_TEMPRANO", "ROJO_MADURO", "NEUTRO", "INSUFICIENTE", "ERROR", "UNKNOWN",
-        "REBOTE_POST_ROJO", "REBOTE_VERDE_TEMPRANO", "VERDE_SERRUCHO_SATURADO",
     }
     try:
         raw = dict(info) if isinstance(info, dict) else {}
@@ -9978,21 +9170,13 @@ def normalizar_zona_lxv_oficial(info):
         raw_decision = str(raw.get("decision", "") or "").strip().upper()
         dq_raw = str(raw.get("dq0", raw.get("data_quality", "")) or "").strip().lower()
         motivo_l = motivo_raw.lower()
-        motivo_bloqueante = any(tok in motivo_l for tok in ("bloq", "block", "tardio", "saturacion", "roja", "error", "expired", "incompleta", "missing", "partial"))
         bloqueo_duro = (
             bool(raw.get("bloqueo_mrv_v2", False))
             or raw_decision == "NO_INVERTIR"
             or (raw_has_allow and raw_allow is False)
             or dq_raw in ("missing", "partial", "closed_expired", "expired", "incomplete", "error")
-            or motivo_bloqueante
+            or any(tok in motivo_l for tok in ("bloq", "block", "tardio", "saturacion", "roja", "error", "expired", "incompleta", "missing", "partial"))
         )
-        if zona_raw in {"REBOTE_POST_ROJO", "REBOTE_VERDE_TEMPRANO"}:
-            bloqueo_duro = (
-                bool(raw.get("bloqueo_mrv_v2", False))
-                or raw_decision == "NO_INVERTIR"
-                or (raw_has_allow and raw_allow is False)
-                or dq_raw in ("missing", "partial", "closed_expired", "expired", "incomplete", "error")
-            )
         zona_base = zona_raw if zona_raw in zonas_validas else "UNKNOWN"
         if zona_raw == "VERDE_TEMPRANO_CONFIRMADO":
             zona_base = "VERDE_TEMPRANO"
@@ -10000,33 +9184,15 @@ def normalizar_zona_lxv_oficial(info):
             zona_base = "VERDE_MADURO"
         elif zona_raw == "VERDE_MADURO_CON_RUIDO":
             zona_base = "VERDE_MADURO" if raw_allow else "UNKNOWN"
-        elif zona_raw in {"REBOTE_POST_ROJO", "REBOTE_VERDE_TEMPRANO"}:
-            zona_base = "VERDE_TEMPRANO" if raw_allow else "UNKNOWN"
-        elif zona_raw == "VERDE_SERRUCHO_SATURADO":
-            zona_base = "VERDE_TARDIO"
         elif zona_raw in {"VERDE_TARDIO", "VERDE_SATURADO_TARDIO", "ROJA_TEMPRANO"}:
             zona_base = zona_raw if zona_raw in zonas_validas else "UNKNOWN"
         zonas_ok = set(globals().get("LXV_ZONAS_INVERTIBLES", {"VERDE_TEMPRANO", "VERDE_MADURO"}))
         allow_final = bool(zona_base in zonas_ok and not bloqueo_duro)
-        if zona_raw in {"VERDE_TARDIO", "VERDE_SATURADO_TARDIO", "ROJA_TEMPRANO", "VERDE_SERRUCHO_SATURADO"}:
+        if zona_raw in {"VERDE_TARDIO", "VERDE_SATURADO_TARDIO", "ROJA_TEMPRANO"}:
             allow_final = False
-        if zona_raw == "REBOTE_POST_ROJO":
-            allow_final = bool(raw_allow and raw_decision != "NO_INVERTIR" and zona_base == "VERDE_TEMPRANO" and not bloqueo_duro)
-            if motivo_bloqueante:
-                raw.setdefault("motivo_original_extra", motivo_raw)
-                motivo_raw = "rebote_post_rojo_impulse_ok"
-        if zona_raw == "REBOTE_VERDE_TEMPRANO":
-            allow_final = bool(raw_allow and raw_decision != "NO_INVERTIR" and zona_base == "VERDE_TEMPRANO" and not bloqueo_duro and str(raw.get("marca_rebote", "")).upper() == "REBOTE_CONTROLADO")
-            if motivo_bloqueante and allow_final:
-                raw.setdefault("motivo_original_extra", motivo_raw)
-                motivo_raw = "rebote_controlado_ok"
         if zona_raw == "VERDE_MADURO_CON_RUIDO":
             allow_final = bool(raw_allow and (zona_base in zonas_ok) and not bloqueo_duro)
         decision = str(raw.get("decision", "") or "").strip().upper()
-        if zona_raw in {"REBOTE_POST_ROJO", "REBOTE_VERDE_TEMPRANO"} and allow_final:
-            decision = ZONA_SI_INVERTIR
-        elif zona_raw == "VERDE_SERRUCHO_SATURADO":
-            decision = ZONA_NO_INVERTIR
         if not decision:
             decision = ZONA_SI_INVERTIR if allow_final else ZONA_NO_INVERTIR
         if zona_base == "UNKNOWN" and not motivo_raw:
@@ -10207,26 +9373,6 @@ def _selftest_zona_lxv_minimo():
                 ok = ok and bool(inv_ok) is False
             print(f"[SELFTEST_ZONA_LXV] {name}: {'OK' if ok else 'FAIL'} zona={info.get('zona')} decision={info.get('decision')} inv={inv_ok} reason={inv_reason} dq0={info.get('dq0','')}")
             all_ok = all_ok and ok
-        extra_cases = [
-            ("I_REBOTE_POST_ROJO_5V1X", [1,2,5], "REBOTE_POST_ROJO", ZONA_SI_INVERTIR, True),
-            ("J_REBOTE_POST_ROJO_4V2X_ESTRICTO_OK", [1,2,4], "REBOTE_POST_ROJO", ZONA_SI_INVERTIR, True),
-            ("K_SERRUCHO_SATURADO_4V2X", [6,6,1,4], "VERDE_SERRUCHO_SATURADO", ZONA_NO_INVERTIR, False),
-        ]
-        for name, verdes_seq, zona_exp, decision_exp, allow_exp in extra_cases:
-            rows_case = [{"round_id":i+1,"n_verdes":v,"n_rojos":6-v,"round_complete":True,"data_quality":"ok"} for i,v in enumerate(verdes_seq)]
-            info = clasificar_zona_operativa_lxv(rows=rows_case)
-            ok = str(info.get("zona")) == zona_exp and str(info.get("decision")) == decision_exp and bool(info.get("allow_real")) == bool(allow_exp)
-            print(f"[SELFTEST_ZONA_LXV] {name}: {'OK' if ok else 'FAIL'} zona={info.get('zona')} decision={info.get('decision')} allow={info.get('allow_real')} motivo={info.get('motivo')}")
-            all_ok = all_ok and ok
-        rows_bad = [
-            {"round_id":1,"n_verdes":1,"n_rojos":5,"round_complete":True,"data_quality":"ok"},
-            {"round_id":2,"n_verdes":2,"n_rojos":4,"round_complete":True,"data_quality":"ok"},
-            {"round_id":3,"n_verdes":5,"n_rojos":1,"round_complete":False,"data_quality":"missing"},
-        ]
-        info_bad = clasificar_zona_operativa_lxv(rows=rows_bad)
-        ok_bad = str(info_bad.get("decision")) == ZONA_NO_INVERTIR and bool(info_bad.get("allow_real")) is False and str(info_bad.get("zona")) != "REBOTE_POST_ROJO"
-        print(f"[SELFTEST_ZONA_LXV] L_DATA_QUALITY_MALA_NO_DESBLOQUEA: {'OK' if ok_bad else 'FAIL'} zona={info_bad.get('zona')} decision={info_bad.get('decision')} allow={info_bad.get('allow_real')}")
-        all_ok = all_ok and ok_bad
         return bool(all_ok)
     except Exception as e:
         print(f"[SELFTEST_ZONA_LXV] ERROR: {e}")
@@ -10831,7 +9977,7 @@ def _sync_round_release_now(round_id, payload, reason="release_now", real_emitid
         _lxv_5v1x_event_cooldown(
             key=f"release_now_frozen:{pending_bot}",
             msg="🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro" if _real_close_incident_active() else "SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI",
-            cooldown_s=25.0 if _real_close_incident_active() else 10.0,
+            cooldown_s=10.0,
         )
         return False
     try:
@@ -11773,7 +10919,7 @@ def _sync_round_read_recovery_requests(max_age_s=90.0) -> dict:
             if bot not in valid_bots:
                 continue
             rid = int(data.get("round_id", 0) or 0)
-            ts = float(data.get("last_seen_ts", data.get("ts", 0.0)) or 0.0)
+            ts = float(data.get("ts", 0.0) or 0.0)
             if rid <= 0 or ts <= 0:
                 continue
             if (now_ts - ts) > float(max_age_s):
@@ -11783,551 +10929,301 @@ def _sync_round_read_recovery_requests(max_age_s=90.0) -> dict:
             continue
     return out
 
-
-def _sync_pending_payload_mode(payload: dict | None) -> str:
-    """Clasifica un pending_contract como REAL/DEMO/desconocido sin cambiar compra."""
-    try:
-        pld = payload if isinstance(payload, dict) else {}
-        txt = " ".join(str(pld.get(k, "") or "") for k in (
-            "mode", "modo", "source", "token", "token_status", "ciclo_en_progreso_modo",
-            "modo_ciclo", "contract_mode", "order_mode", "real_status",
-        )).upper()
-        if "REAL:" in txt or "ORDEN_REAL" in txt or "REAL_ORDER" in txt or " REAL" in f" {txt}":
-            return "REAL"
-        if "DEMO" in txt or "SYNC_DEMO" in txt or "LXV_SYNC" in txt:
-            return "DEMO"
-    except Exception:
-        pass
-    return "UNKNOWN"
-
-
-def _sync_pending_payload_age_s(payload: dict | None, fallback_path: str | None = None) -> float:
-    now_ts = float(time.time())
-    pld = payload if isinstance(payload, dict) else {}
-    for key in ("pending_since_ts", "pending_ts", "contract_pending_ts", "created_at", "start_ts", "last_seen_ts", "ts"):
-        try:
-            ts = float(pld.get(key, 0.0) or 0.0)
-            if ts > 0:
-                return max(0.0, now_ts - ts)
-        except Exception:
-            pass
-    try:
-        if fallback_path and os.path.exists(fallback_path):
-            return max(0.0, now_ts - float(os.path.getmtime(fallback_path) or now_ts))
-    except Exception:
-        pass
-    return 0.0
-
-
-def _sync_payload_has_pending_contract(payload: dict | None) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    for key in (
-        "pending_contract_resolution", "contract_pending", "contrato_pendiente",
-        "contract_pending_ack", "pending_contract", "fence_active",
-        "ciclo_en_progreso_real", "real_contract_open",
-    ):
-        try:
-            if bool(payload.get(key, False)):
-                return True
-        except Exception:
-            pass
-    try:
-        if bool(payload.get("ciclo_en_progreso", False)) and _sync_pending_payload_mode(payload) == "REAL":
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def _sync_hay_bloqueo_real_duro():
-    """Devuelve (bloqueado, motivo, owner) solo para candados duros de REAL."""
-    def _owner_check(owner="--", real_evidence=False, stale=False, bloquea=False):
-        owner_txt = str(owner or "--").strip() or "--"
-        evidence_txt = "SI" if bool(real_evidence) else "NO"
-        stale_txt = "SI" if bool(stale) else "NO"
-        bloquea_txt = "SI" if bool(bloquea) else "NO"
-        print_rate_limited(
-            f"RECOVERY_OWNER_CHECK:{owner_txt}:{evidence_txt}:{stale_txt}:{bloquea_txt}",
-            f"🧾 RECOVERY_OWNER_CHECK | owner={owner_txt} | real_evidence={evidence_txt} | stale={stale_txt} | bloquea={bloquea_txt}",
-            ttl=20.0,
-        )
-
-    def _blocked(motivo, owner="--"):
-        owner_txt = str(owner or "--").strip() or "--"
-        motivo_txt = str(motivo or "real_block").strip() or "real_block"
-        _owner_check(owner_txt, real_evidence=True, stale=False, bloquea=True)
-        print_rate_limited(
-            f"RECOVERY_RELEASE_BLOQUEADO_REAL:{motivo_txt}:{owner_txt}",
-            f"⛔ RECOVERY_RELEASE_BLOQUEADO_REAL | motivo={motivo_txt} | owner={owner_txt}",
-            ttl=10.0,
-        )
-        return True, motivo_txt, owner_txt
-
-    def _owner_state_age_s(st: dict):
-        now_ts = float(time.time())
-        for key in ("real_owner_ts", "owner_ts", "updated_ts", "ts", "last_seen_ts"):
-            try:
-                ts = float((st if isinstance(st, dict) else {}).get(key, 0.0) or 0.0)
-                if ts > 0:
-                    return max(0.0, now_ts - ts)
-            except Exception:
-                pass
-        return None
-
-    try:
-        pending_on, pending_bot, _pending_payload = _hay_real_close_pending_activo()
-        if pending_on:
-            return _blocked("real_close_pending", pending_bot or "--")
-    except Exception:
-        return _blocked("real_close_pending_check_error", "--")
-    try:
-        if _real_close_incident_active():
-            lock = globals().get("REAL_CLOSE_INCIDENT_LOCK", {}) or {}
-            return _blocked("real_close_incident_lock", lock.get("bot") or "--")
-    except Exception:
-        pass
-    try:
-        token_raw = ""
-        if callable(globals().get("_read_token_file_raw")):
-            token_raw = str(_read_token_file_raw() or "").strip()
-        elif os.path.exists(TOKEN_FILE):
-            with open(TOKEN_FILE, encoding="utf-8", errors="replace") as f:
-                token_raw = str(f.read() or "").strip()
-        token_owner = str(leer_token_actual() or "").strip()
-        if _token_real_ocupado(token_raw) or _token_real_ocupado(token_owner) or token_owner in BOT_NAMES:
-            owner = token_raw.split(":", 1)[1].strip() if ":" in token_raw else (token_owner.split(":", 1)[1].strip() if ":" in token_owner else token_owner)
-            return _blocked("token_actual_real", owner or "--")
-    except Exception:
-        return _blocked("token_real_check_error", "--")
-    try:
-        hold_on, hold_owner, hold_reason = _sync_round_real_hold_owner("recovery_release")
-        if hold_on:
-            return _blocked(hold_reason or "real_hold_owner", hold_owner or "--")
-    except Exception:
-        return _blocked("real_hold_owner_check_error", "--")
-    try:
-        order_on, order_bot = _sync_real_order_viva_any()
-        if order_on:
-            return _blocked("orden_real_viva", order_bot or "--")
-    except Exception:
-        return _blocked("orden_real_check_error", "--")
-    try:
-        real_on, real_bot, real_reason = _sync_real_turn_activo()
-        if real_on:
-            return _blocked(real_reason or "turno_real_activo", real_bot or "--")
-    except Exception:
-        return _blocked("real_turn_check_error", "--")
-    try:
-        st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
-        if isinstance(st, dict):
-            owner = str(st.get("real_owner") or st.get("owner_real") or st.get("bot_real") or st.get("real_pending_bot") or "").strip()
-            owner_valido = bool(owner and owner not in ("--", "None", "NONE", "null", "NULL"))
-            token_status = str(st.get("token_status") or st.get("sync_round_token_status") or "").strip()
-            if _token_real_ocupado(token_status) or token_status.upper().startswith("REAL"):
-                owner2 = token_status.split(":", 1)[1].strip() if ":" in token_status else owner
-                return _blocked("sync_round_token_status_real", owner2 or "--")
-            if bool(st.get("real_global", False)):
-                return _blocked("real_global_activo", owner or "--")
-            status_txt = str(st.get("status", "") or "").strip().lower()
-            state_real_activo = bool(
-                status_txt in ("holding_real_result", "holding_real_turn", "waiting_real_close", "closing", "real_close_pending")
-                or st.get("holding_real_result", False)
-                or st.get("holding_real_turn", False)
-                or st.get("waiting_real_close", False)
-                or st.get("closing", False)
-                or st.get("real_close_pending", False)
-                or st.get("real_lock", False)
-                or st.get("lock_real", False)
-            )
-            if state_real_activo:
-                return _blocked("estado_real_activo", owner or "--")
-            if owner_valido:
-                age_s = _owner_state_age_s(st)
-                ttl_owner = float(globals().get("REAL_OWNER_STALE_TTL_S", 180.0) or 180.0)
-                if age_s is not None and age_s <= ttl_owner:
-                    return _blocked("owner_real_fresco", owner)
-                _owner_check(owner, real_evidence=False, stale=True, bloquea=False)
-                if age_s is None:
-                    print_rate_limited(
-                        f"OWNER_REAL_STALE_IGNORADO_RECOVERY:{owner}:sin_ts",
-                        f"🧯 OWNER_REAL_STALE_IGNORADO_RECOVERY | owner={owner} | motivo=sin_evidencia_real_fresca",
-                        ttl=20.0,
-                    )
-                else:
-                    print_rate_limited(
-                        f"OWNER_REAL_STALE_IGNORADO_RECOVERY:{owner}:{int(age_s)}",
-                        f"🧯 OWNER_REAL_STALE_IGNORADO_RECOVERY | owner={owner} | edad={int(age_s)}s",
-                        ttl=20.0,
-                    )
-            else:
-                _owner_check("--", real_evidence=False, stale=False, bloquea=False)
-    except Exception:
-        return _blocked("state_real_check_error", "--")
-    try:
-        owner_mem = str(globals().get("REAL_OWNER_LOCK") or "").strip()
-        if owner_mem:
-            return _blocked("real_owner_lock", owner_mem)
-    except Exception:
-        pass
-    return False, "no_real", "--"
-
-
-def _sync_demo_pending_fresco_bloquea_recovery() -> tuple[bool, str, str]:
-    """Bloquea solo pending REAL o pending DEMO fresco; DEMO viejo se ignora para recovery."""
-    now_ttl = float(globals().get("DEMO_PENDING_TTL_S", 180.0) or 180.0)
-    for bot in BOT_NAMES:
-        for source, payload, path in (
-            ("ack", _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}, _sync_round_ack_path(bot)),
-            ("estado", estado_bots.get(bot, {}) if isinstance(estado_bots.get(bot, {}), dict) else {}, None),
-        ):
-            if not _sync_payload_has_pending_contract(payload):
-                continue
-            mode = _sync_pending_payload_mode(payload)
-            age = _sync_pending_payload_age_s(payload, fallback_path=path)
-            if mode != "REAL" and age <= 0.0 and source == "estado":
-                age = now_ttl + 1.0
-            if mode == "REAL":
-                print_rate_limited(
-                    f"PENDING_REAL_BLOQUEA_RECOVERY:{bot}:{source}",
-                    f"⛔ PENDING_REAL_BLOQUEA_RECOVERY | bot={bot} | motivo={source}",
-                    ttl=10.0,
-                )
-                return True, "pending_real", bot
-            if age < now_ttl:
-                return True, f"pending_demo_fresco:{bot}:{int(age)}s", bot
-            print_rate_limited(
-                f"DEMO_PENDING_IGNORADO_POR_RECOVERY:{bot}:{source}",
-                f"🧯 DEMO_PENDING_IGNORADO_POR_RECOVERY | bot={bot} | edad={int(age)}s | real=NO",
-                ttl=20.0,
-            )
-    return False, "", "--"
-
-
-def _sync_collect_recovery_requests():
-    now_ts = float(time.time())
-    max_age = float(globals().get("RECOVERY_REQUEST_MAX_AGE_S", 300.0) or 300.0)
-    out = {}
-    valid_bots = set(BOT_NAMES)
-
-    def _is_recovery_true(value) -> bool:
-        if value is True:
-            return True
-        txt = str(value or "").strip().upper()
-        return txt in ("SI", "SÍ", "TRUE", "1", "YES")
-
-    def _merge(bot, data, source=""):
-        if bot not in valid_bots or not isinstance(data, dict):
-            return
-        try:
-            released = int(data.get("released", data.get("released_round", 0)) or 0)
-            next_round = int(data.get("next_round", data.get("waiting_release_round", 0)) or 0)
-            rid = int(data.get("round_id", released) or released)
-        except Exception:
-            return
-        last_seen = 0.0
-        for k in ("last_seen_ts", "ts", "created_ts", "sync_wait_ts", "wait_since_ts"):
-            try:
-                last_seen = float(data.get(k, 0.0) or 0.0)
-                if last_seen > 0:
-                    break
-            except Exception:
-                last_seen = 0.0
-        if last_seen <= 0 or (now_ts - last_seen) > max_age:
-            return
-        recovery_since = 0.0
-        for k in ("recovery_since_ts", "created_ts", "sync_wait_ts", "wait_since_ts", "ts"):
-            try:
-                recovery_since = float(data.get(k, 0.0) or 0.0)
-                if recovery_since > 0:
-                    break
-            except Exception:
-                recovery_since = 0.0
-        recovery_flag = _is_recovery_true(data.get("recovery_request")) or source == "request_file"
-        if not recovery_flag:
-            return
-        valid = bool(next_round > released and next_round == released + 1)
-        out[bot] = {
-            "round_id": int(rid),
-            "next_round": int(next_round),
-            "released": int(released),
-            "recovery_request": bool(recovery_flag),
-            "recovery_since_ts": float(recovery_since or last_seen),
-            "last_seen_ts": float(last_seen),
-            "reason": str(data.get("reason") or data.get("motivo") or ""),
-            "valid": bool(valid),
-            "source": str(source or "unknown"),
-        }
-
-    req_dir = os.path.join(SYNC_ROUND_DIR, "recovery_requests")
-    try:
-        for path in glob.glob(os.path.join(req_dir, "*.json")):
-            data = _sync_round_safe_read_json(path) or {}
-            bot = str((data if isinstance(data, dict) else {}).get("bot") or os.path.splitext(os.path.basename(path))[0]).strip()
-            _merge(bot, data, source="request_file")
-    except Exception:
-        pass
-    for bot in BOT_NAMES:
-        try:
-            ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
-            if isinstance(ack, dict) and bool(ack.get("sync_wait", False)):
-                ack_data = dict(ack)
-                ack_data.setdefault("bot", bot)
-                ack_data.setdefault("next_round", ack_data.get("waiting_release_round"))
-                ack_data.setdefault("released", int(ack_data.get("waiting_release_round", 1) or 1) - 1)
-                ack_data.setdefault("recovery_request", True)
-                ack_data.setdefault("reason", "demo_wait_timeout_no_release")
-                _merge(bot, ack_data, source="ack_sync_wait")
-        except Exception:
-            continue
-    return out
-
-
-def _sync_should_block_candidate_by_recovery(candidate: dict | None) -> bool:
-    try:
-        c = candidate if isinstance(candidate, dict) else {}
-        rid = int(c.get("round_id", 0) or 0)
-        dq = str(c.get("data_quality", "") or "").strip().lower()
-        reason = str(c.get("last_release_reason", "") or "").strip()
-        if dq == "recovery_quarantine" or reason in ("DEMO_RECOVERY_FORCE_RELEASE", "DEMO_RECOVERY_ORPHAN_FORCE_RELEASE") or c.get("real_allowed") is False:
-            _lxv_5v1x_event_cooldown(f"COLUMNA_RECOVERY_NO_REAL:{rid}", f"🧯 COLUMNA_RECOVERY_NO_REAL | ronda={rid} | motivo=recovery_quarantine", cooldown_s=20.0)
-            return True
-        if rid > 0 and es_ronda_cuarentenada(rid):
-            _column_quarantine_apply_real_block(rid, motivo="recovery_quarantine")
-            return True
-    except Exception:
-        return True
-    return False
-
-
-def _sync_try_release_from_recovery_requests():
-    try:
-        st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
-        if not isinstance(st, dict) or not st:
-            return False
-        released_round = normalizar_released_round_id(st.get("released_round"), fallback=None)
-        if released_round is None:
-            return False
-        old = int(released_round)
-        target = old + 1
-        blocked, motivo, owner = _sync_hay_bloqueo_real_duro()
-        if blocked:
-            print_rate_limited(
-                f"RECOVERY_REQUEST_BLOQUEADO_REAL:{target}:{motivo}:{owner}",
-                f"⛔ RECOVERY_REQUEST_BLOQUEADO_REAL | target={target} | motivo={motivo} | owner={owner}",
-                ttl=10.0,
-            )
-            return False
-        pending_blocks, pending_reason, pending_bot = _sync_demo_pending_fresco_bloquea_recovery()
-        if pending_blocks:
-            return False
-        requests = _sync_collect_recovery_requests()
-        waiting = []
-        now_ts = float(time.time())
-        waits = []
-        for bot, info in (requests or {}).items():
-            try:
-                if bot in BOT_NAMES and bool(info.get("valid")) and int(info.get("next_round", 0) or 0) == target and int(info.get("released", 0) or 0) == old:
-                    age = max(0.0, now_ts - float(info.get("recovery_since_ts", info.get("last_seen_ts", now_ts)) or now_ts))
-                    waiting.append(bot)
-                    waits.append(age)
-            except Exception:
-                continue
-        ttl_wait = min(waits) if waits else 0.0
-        if waiting:
-            print_rate_limited(
-                f"RECOVERY_SUMMARY:{target}:{','.join(sorted(waiting))}",
-                f"🧾 RECOVERY_SUMMARY | target={target} | waiting={sorted(waiting)} | real=NO | ttl={int(ttl_wait)}s",
-                ttl=15.0,
-            )
-        min_bots = int(globals().get("RECOVERY_RELEASE_MIN_BOTS", 3) or 3)
-        strong_bots = int(globals().get("RECOVERY_RELEASE_STRONG_BOTS", 5) or 5)
-        ttl_s = float(globals().get("RECOVERY_RELEASE_TTL_S", 120.0) or 120.0)
-        orphan_ttl_s = float(globals().get("ORPHAN_RECOVERY_TTL_S", 180.0) or 180.0)
-        if waiting and len(waiting) < min_bots and ttl_wait >= orphan_ttl_s:
-            blocked_check, motivo_check, owner_check = _sync_hay_bloqueo_real_duro()
-            if blocked_check:
-                print_rate_limited(
-                    f"ORPHAN_RECOVERY_BLOQUEADO_REAL:{target}:{motivo_check}:{owner_check}",
-                    f"⛔ ORPHAN_RECOVERY_BLOQUEADO_REAL | target={target} | motivo={motivo_check} | owner={owner_check}",
-                    ttl=10.0,
-                )
-                return False
-            pending_check, pending_reason_check, pending_bot_check = _sync_demo_pending_fresco_bloquea_recovery()
-            if pending_check:
-                print_rate_limited(
-                    f"ORPHAN_RECOVERY_BLOQUEADO_PENDING:{target}:{pending_bot_check}:{pending_reason_check}",
-                    f"⛔ ORPHAN_RECOVERY_BLOQUEADO_PENDING | target={target} | motivo={pending_reason_check} | bot={pending_bot_check}",
-                    ttl=10.0,
-                )
-                return False
-            st_check = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
-            released_check = normalizar_released_round_id((st_check if isinstance(st_check, dict) else {}).get("released_round"), fallback=None)
-            if released_check is None or int(released_check) != old:
-                return False
-            payload = dict(st_check)
-            rq_rounds = list(payload.get("recovery_quarantine_rounds") or []) if isinstance(payload.get("recovery_quarantine_rounds"), list) else []
-            if old not in rq_rounds:
-                rq_rounds.append(old)
-            payload.update({
-                "round_id": int(target),
-                "released_round": int(target),
-                "expected_bots": list(BOT_NAMES),
-                "expected_bots_effective": list(BOT_NAMES),
-                "closed_bots": {},
-                "completed": False,
-                "status": "released_demo_recovery_quarantine",
-                "reason": "DEMO_RECOVERY_ORPHAN_FORCE_RELEASE",
-                "last_release_reason": "DEMO_RECOVERY_ORPHAN_FORCE_RELEASE",
-                "data_quality": "recovery_quarantine",
-                "real_allowed": False,
-                "lxv_pattern_allowed": False,
-                "source": "orphan_recovery_request_no_real",
-                "recovery_release_ts": now_ts,
-                "recovery_from_round": int(old),
-                "recovery_target_round": int(target),
-                "recovery_quarantine_round": int(old),
-                "recovery_quarantine_rounds": rq_rounds[-20:],
-                "quarantined_round": int(old),
-                "recovery_wait_bots": sorted(waiting),
-                "recovery_bots_waiting": sorted(waiting),
-                "recovery_request_bots": sorted(waiting),
-                "orphan_recovery_ttl_s": float(orphan_ttl_s),
-                "started_at": now_ts,
-                "ts": now_ts,
-                "real_global": False,
-                "real_owner": None,
-                "owner_real": None,
-                "bot_real": None,
-                "real_pending_bot": None,
-                "real_close_pending": False,
-                "real_status": "none",
-                "token_status": "DEMO",
-                "release_congelado": False,
-                "sync_sigue": True,
-            })
-            qstate = _column_quarantine_default_state()
-            qstate.update({
-                "active": True,
-                "round_id": int(old),
-                "reason": "DEMO_RECOVERY_ORPHAN_FORCE_RELEASE",
-                "since_ts": now_ts,
-                "released_to": int(target),
-                "closed_count": 0,
-                "expected": len(BOT_NAMES),
-                "source": "orphan_recovery_request_no_real",
-                "data_quality": "recovery_quarantine",
-                "real_allowed": False,
-                "lxv_pattern_allowed": False,
-            })
-            globals()["ROUND_QUARANTINE_STATE"] = qstate
-            _column_quarantine_persist_state(qstate)
-            ok = _sync_round_write_state_monotonic(payload, reason="DEMO_RECOVERY_ORPHAN_FORCE_RELEASE")
-            if ok:
-                agregar_evento(f"🧯 DEMO_RECOVERY_ORPHAN_FORCE_RELEASE | released_round {old}→{target} | bots_waiting={sorted(waiting)} | real=NO | owner=--")
-                agregar_evento(f"✅ RELEASE_OK_AFTER_ORPHAN_RECOVERY | ronda={target} | data_quality=recovery_quarantine | real_allowed=NO")
-                globals()["SYNC_STATUS_LINE"] = f"SYNC: DEMO_RECOVERY_ORPHAN_FORCE_RELEASE | {old}→{target} | bots={len(waiting)}"
-                return True
-        if len(waiting) < min_bots:
-            return False
-        if ttl_wait < ttl_s:
-            return False
-        if len(waiting) >= strong_bots or len(waiting) >= min_bots:
-            st_check = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
-            released_check = normalizar_released_round_id((st_check if isinstance(st_check, dict) else {}).get("released_round"), fallback=None)
-            if released_check is None or int(released_check) != old:
-                return False
-            payload = dict(st_check)
-            rq_rounds = list(payload.get("recovery_quarantine_rounds") or []) if isinstance(payload.get("recovery_quarantine_rounds"), list) else []
-            if old not in rq_rounds:
-                rq_rounds.append(old)
-            payload.update({
-                "round_id": int(target),
-                "released_round": int(target),
-                "expected_bots": list(BOT_NAMES),
-                "expected_bots_effective": list(BOT_NAMES),
-                "closed_bots": {},
-                "completed": False,
-                "status": "released_demo_recovery_quarantine",
-                "reason": "DEMO_RECOVERY_FORCE_RELEASE",
-                "last_release_reason": "DEMO_RECOVERY_FORCE_RELEASE",
-                "data_quality": "recovery_quarantine",
-                "real_allowed": False,
-                "lxv_pattern_allowed": False,
-                "source": "recovery_request_no_real",
-                "recovery_release_ts": now_ts,
-                "recovery_from_round": int(old),
-                "recovery_target_round": int(target),
-                "recovery_quarantine_round": int(old),
-                "recovery_quarantine_rounds": rq_rounds[-20:],
-                "quarantined_round": int(old),
-                "recovery_wait_bots": sorted(waiting),
-                "recovery_bots_waiting": sorted(waiting),
-                "recovery_request_bots": sorted(waiting),
-                "started_at": now_ts,
-                "ts": now_ts,
-                "real_global": False,
-                "real_owner": None,
-                "owner_real": None,
-                "bot_real": None,
-                "real_pending_bot": None,
-                "real_close_pending": False,
-                "real_status": "none",
-                "token_status": "DEMO",
-                "release_congelado": False,
-                "sync_sigue": True,
-            })
-            qstate = _column_quarantine_default_state()
-            qstate.update({
-                "active": True,
-                "round_id": int(old),
-                "reason": "DEMO_RECOVERY_FORCE_RELEASE",
-                "since_ts": now_ts,
-                "released_to": int(target),
-                "closed_count": 0,
-                "expected": len(BOT_NAMES),
-                "source": "recovery_request_no_real",
-                "data_quality": "recovery_quarantine",
-                "real_allowed": False,
-                "lxv_pattern_allowed": False,
-            })
-            globals()["ROUND_QUARANTINE_STATE"] = qstate
-            _column_quarantine_persist_state(qstate)
-            ok = _sync_round_write_state_monotonic(payload, reason="DEMO_RECOVERY_FORCE_RELEASE")
-            if ok:
-                agregar_evento(f"🧯 DEMO_RECOVERY_FORCE_RELEASE | released_round {old}→{target} | bots_waiting={len(waiting)} | real=NO | owner=--")
-                agregar_evento(f"✅ RELEASE_OK_AFTER_RECOVERY | ronda={target} | data_quality=recovery_quarantine | real_allowed=NO")
-                globals()["SYNC_STATUS_LINE"] = f"SYNC: DEMO_RECOVERY_FORCE_RELEASE | {old}→{target} | bots={len(waiting)}"
-                return True
-    except Exception as e:
-        try:
-            print_rate_limited(f"RECOVERY_FORCE_RELEASE_ERROR:{type(e).__name__}", f"⚠️ RECOVERY_FORCE_RELEASE error: {type(e).__name__}", ttl=20.0)
-        except Exception:
-            pass
-    return False
-
-
 def _sync_round_should_recovery_release(round_id, released_round, requests, st) -> tuple[bool, str]:
     if not isinstance(requests, dict) or not requests:
-        return False, "no_recovery_request"
-    blocked, motivo, _owner = _sync_hay_bloqueo_real_duro()
-    if blocked:
-        return False, motivo
-    target = int(released_round) + 1
+        return False, "no_requests"
+    if int(released_round) > int(round_id):
+        return False, "already_released"
+    real_on, _, _ = _sync_real_turn_activo()
+    if real_on:
+        return False, "real_turn_active"
+    if bool(_hay_real_close_pending_activo()[0]):
+        return False, "real_close_pending"
+    diag_release = diagnosticar_alineacion_rounds(released_round=released_round, expected_bots=BOT_NAMES)
+    if isinstance(diag_release, dict) and bool(diag_release.get("mixed_rounds", False)):
+        print_rate_limited(
+            f"RELEASE_HOLD_MIXED_ROUNDS:should:{diag_release.get('best_round')}",
+            f"🧷 RELEASE_HOLD_MIXED_ROUNDS | best_round=#{diag_release.get('best_round')} {int(diag_release.get('closed', 0) or 0)}/{int(diag_release.get('expected', len(BOT_NAMES)) or len(BOT_NAMES))} | behind={len(diag_release.get('behind') or {})} | acción=esperar_rejoin",
+            ttl=20.0,
+        )
+        return False, "mixed_rounds_esperar_rejoin"
+    try:
+        tok = str(leer_token_actual() or "").strip().upper()
+    except Exception:
+        tok = ""
+    if _token_real_ocupado(tok):
+        return False, "token_real_active"
     req_bots = []
-    for b, r in requests.items():
+    target = int(round_id) + 1
+    for b,r in requests.items():
         try:
             if int(r.get("next_round", 0) or 0) == target:
                 req_bots.append(b)
         except Exception:
             pass
-    if len(req_bots) < int(globals().get("RECOVERY_RELEASE_MIN_BOTS", 3) or 3):
-        return False, "no_min_recovery_bots"
+    if not req_bots:
+        return False, "no_target_next_round_request"
+    status_now = str((st or {}).get("status","")).strip().lower()
+    if status_now in ("holding_real_result","holding_real_turn"):
+        return False, "holding_real"
+    elapsed = max(0.0, time.time() - float((st or {}).get("started_at",0.0) or 0.0))
+    if elapsed < float(globals().get("ROUND_INCOMPLETE_RECOVERY_TIMEOUT_S", LXV_SYNC_ROUND_MAX_WAIT_S) or LXV_SYNC_ROUND_MAX_WAIT_S):
+        return False, "round_not_stale_yet"
     return True, "demo_wait_timeout_recovery_no_real"
 
 
 def _sync_round_try_recovery_release_global() -> bool:
-    return bool(_sync_try_release_from_recovery_requests())
+    """
+    Recovery quirúrgico del maestro: libera N+1 cuando released_round quedó
+    pegado en N, hay bots DEMO esperando esa liberación y no existe ningún
+    candado duro de REAL activo. No compra, no emite REAL y no toca tokens.
+    """
+    hold_cd = float(globals().get("SYNC_RECOVERY_GLOBAL_HOLD_COOLDOWN_S", 15.0) or 15.0)
+
+    def _hold(motivo: str, released_value: int | str = "?") -> bool:
+        motivo_txt = str(motivo or "state_corrupto").strip() or "state_corrupto"
+        try:
+            token_diag = _token_raw_actual()
+        except Exception:
+            token_diag = "?"
+        _lxv_5v1x_event_cooldown(
+            f"sync_recovery_global_force_demo_clean:{released_value}:{motivo_txt}:{token_diag}",
+            f"RECOVERY_FORCE_DEMO_CLEAN HOLD | motivo={motivo_txt} | token={token_diag}",
+            cooldown_s=hold_cd,
+        )
+        return False
+
+    def _token_raw_actual() -> str:
+        try:
+            if callable(globals().get("_read_token_file_raw")):
+                return str(_read_token_file_raw() or "").strip()
+        except Exception:
+            pass
+        try:
+            if os.path.exists(TOKEN_FILE):
+                with open(TOKEN_FILE, encoding="utf-8", errors="replace") as f:
+                    return str(f.read() or "").strip()
+        except Exception:
+            pass
+        return ""
+
+    try:
+        now_ts = float(time.time())
+        st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH)
+        if not isinstance(st, dict) or not st:
+            return _hold("state_corrupto")
+        try:
+            round_id = max(1, int(st.get("round_id", st.get("released_round", 0)) or 0))
+            released_round = _sync_round_released_or_fallback(st.get("released_round"), round_id)
+        except Exception:
+            return _hold("state_corrupto")
+        if int(released_round) > int(round_id):
+            return _hold("released_ya_avanzado", released_round)
+
+        target_round = int(released_round) + 1
+        status_now = str(st.get("status", "") or "").strip().lower()
+        if status_now in ("holding_real_result", "holding_real_turn") or bool(st.get("holding_real_result", False) or st.get("holding_real_turn", False)):
+            return _hold("owner_real_detectado", released_round)
+
+        pending_on, pending_bot, _pending = _hay_real_close_pending_activo()
+        if pending_on:
+            return _hold("real_close_pending", released_round)
+
+        owner_mem = globals().get("REAL_OWNER_LOCK")
+        if owner_mem in BOT_NAMES:
+            return _hold("owner_real_detectado", released_round)
+
+        token_raw = _token_raw_actual()
+        try:
+            token_owner = str(leer_token_actual() or "").strip()
+        except Exception:
+            token_owner = ""
+        if _token_real_ocupado(token_raw) or token_owner in BOT_NAMES or _token_real_ocupado(token_owner):
+            return _hold("token_real_detectado", released_round)
+
+        order_on, order_bot = _sync_real_order_viva_any()
+        if order_on:
+            return _hold("orden_real_viva", released_round)
+
+        real_on, real_bot, _motivo_real = _sync_real_turn_activo()
+        if real_on:
+            if real_bot in BOT_NAMES:
+                return _hold("owner_real_detectado", released_round)
+            return _hold("orden_real_viva", released_round)
+
+        if bool(st.get("pending_contract_resolution", False)):
+            return _hold("state_corrupto", released_round)
+
+        # Blindaje post-REAL: si state.json fue sobrescrito a 1 pero los ACKs
+        # muestran bots esperando N+1 con ACK en N, reconstruye desde ACKs.
+        if int(released_round) <= 1:
+            rebuild_wait_bots = []
+            rebuild_ack_rounds = []
+            for bot in BOT_NAMES:
+                ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
+                if not isinstance(ack, dict):
+                    continue
+                try:
+                    ack_round = int(ack.get("round_id", 0) or 0)
+                    waiting_release = int(ack.get("waiting_release_round", 0) or 0)
+                except Exception:
+                    continue
+                if bool(ack.get("sync_wait", False)) and ack_round > 10 and waiting_release >= (ack_round + 1):
+                    rebuild_wait_bots.append(bot)
+                    rebuild_ack_rounds.append(ack_round)
+            if rebuild_ack_rounds:
+                rebuilt_round = max(rebuild_ack_rounds)
+                target_round = rebuilt_round + 1
+                payload = dict(st)
+                payload.update({
+                    "round_id": int(target_round),
+                    "released_round": int(target_round),
+                    "expected_bots": list(BOT_NAMES),
+                    "expected_bots_effective": list(BOT_NAMES),
+                    "closed_bots": {},
+                    "completed": False,
+                    "status": "released_recovery_rebuilt_from_acks",
+                    "reason": "RECOVERY_REBUILD_RELEASE_FROM_ACKS",
+                    "last_release_reason": "RECOVERY_REBUILD_RELEASE_FROM_ACKS",
+                    "recovery_rebuild_old_release": int(released_round),
+                    "recovery_rebuild_from_ack_round": int(rebuilt_round),
+                    "recovery_bots_waiting": list(rebuild_wait_bots),
+                    "started_at": now_ts,
+                    "ts": now_ts,
+                    "real_pending_bot": None,
+                    "real_pending_round": int(rebuilt_round),
+                })
+                payload = _sync_round_apply_post_real_rejoin(payload, released_round=payload.get("released_round"))
+                ok = _sync_round_write_state_monotonic(payload, reason="RECOVERY_REBUILD_RELEASE_FROM_ACKS")
+                if ok:
+                    agregar_evento(
+                        f"🧯 RECOVERY_REBUILD_RELEASE_FROM_ACKS: old_release={released_round} | "
+                        f"rebuilt={rebuilt_round} | release={target_round}"
+                    )
+                    globals()["SYNC_STATUS_LINE"] = f"RECOVERY_REBUILD_RELEASE_FROM_ACKS: {released_round}→{target_round}"
+                    return True
+
+        if int(released_round) != int(round_id):
+            return _hold("state_corrupto", released_round)
+
+        diag_recovery_global = diagnosticar_alineacion_rounds(released_round=released_round, expected_bots=BOT_NAMES)
+        globals()["LAST_ROUND_ALIGNMENT_DIAG"] = dict(diag_recovery_global) if isinstance(diag_recovery_global, dict) else globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+        if isinstance(diag_recovery_global, dict) and bool(diag_recovery_global.get("mixed_rounds", False)):
+            print_rate_limited(
+                f"RELEASE_HOLD_MIXED_ROUNDS:global:{diag_recovery_global.get('best_round')}",
+                f"🧷 RELEASE_HOLD_MIXED_ROUNDS | best_round=#{diag_recovery_global.get('best_round')} {int(diag_recovery_global.get('closed', 0) or 0)}/{int(diag_recovery_global.get('expected', len(BOT_NAMES)) or len(BOT_NAMES))} | behind={len(diag_recovery_global.get('behind') or {})} | acción=esperar_rejoin",
+                ttl=20.0,
+            )
+            return _hold("mixed_rounds_esperar_rejoin", released_round)
+
+        wait_bots = []
+        wait_since_candidates = []
+        for bot in BOT_NAMES:
+            ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
+            st_bot = estado_bots.get(bot, {}) if isinstance(estado_bots.get(bot, {}), dict) else {}
+            if bool(st_bot.get("pending_contract_resolution", False) or (isinstance(ack, dict) and ack.get("pending_contract_resolution", False))):
+                return _hold("state_corrupto", released_round)
+            if not isinstance(ack, dict):
+                continue
+            try:
+                waiting_release = int(ack.get("waiting_release_round", 0) or 0)
+                ack_round = int(ack.get("round_id", 0) or 0)
+            except Exception:
+                continue
+            if bool(ack.get("sync_wait", False)) and waiting_release >= target_round and ack_round <= int(released_round):
+                wait_bots.append(bot)
+                for ts_key in ("sync_wait_ts", "wait_since_ts", "last_seen_ts", "ts"):
+                    try:
+                        ts_val = float(ack.get(ts_key, 0.0) or 0.0)
+                    except Exception:
+                        ts_val = 0.0
+                    if ts_val > 0:
+                        wait_since_candidates.append(ts_val)
+                        break
+
+        reqs = _sync_round_read_recovery_requests(max_age_s=float(globals().get("SYNC_RECOVERY_GLOBAL_REQUEST_MAX_AGE_S", 120.0) or 120.0))
+        req_bots = []
+        for bot, req in (reqs or {}).items():
+            try:
+                req_next = int(req.get("next_round", 0) or 0)
+                req_round = int(req.get("round_id", released_round) or released_round)
+            except Exception:
+                continue
+            if req_next >= target_round and req_round <= int(released_round):
+                req_bots.append(bot)
+                try:
+                    ts_val = float(req.get("ts", req.get("created_ts", 0.0)) or 0.0)
+                except Exception:
+                    ts_val = 0.0
+                if ts_val > 0:
+                    wait_since_candidates.append(ts_val)
+        if not req_bots:
+            return _hold("sin_recovery_request", released_round)
+        if not wait_bots:
+            return _hold("sin_bots_waiting", released_round)
+
+        started_at = float(st.get("started_at", st.get("ts", 0.0)) or 0.0)
+        wait_elapsed = max(0.0, now_ts - started_at) if started_at > 0 else 0.0
+        if wait_since_candidates:
+            wait_elapsed = max(wait_elapsed, max(0.0, now_ts - min(wait_since_candidates)))
+        threshold_s = float(globals().get("SYNC_RECOVERY_GLOBAL_MIN_WAIT_S", 10.0) or 10.0)
+        if wait_elapsed <= threshold_s:
+            return _hold("espera_minima_no_cumplida", released_round)
+
+        st_check = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+        try:
+            released_check = _sync_round_released_or_fallback(st_check.get("released_round"), released_round)
+        except Exception:
+            return _hold("state_corrupto", released_round)
+        if released_check != int(released_round):
+            return _hold("released_ya_avanzado", released_round)
+
+        after_real_context = bool(
+            isinstance(st_check.get("after_real_release"), dict)
+            or str(st_check.get("last_real_owner") or st_check.get("real_released_after_bot") or st_check.get("real_pending_bot") or "").strip() in BOT_NAMES
+            or str(token_raw or "").strip().upper() in ("REAL:NONE", "REAL:NULL", "REAL:--", "REAL:")
+        )
+        recovery_reason = "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_AFTER_REAL_CLOSE" if after_real_context else "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN"
+        payload = dict(st_check)
+        payload.update({
+            "round_id": target_round,
+            "released_round": target_round,
+            "expected_bots": list(BOT_NAMES),
+            "expected_bots_effective": list(BOT_NAMES),
+            "closed_bots": {},
+            "completed": False,
+            "status": "released_recovery_global_force_demo_clean",
+            "reason": recovery_reason,
+            "last_release_reason": recovery_reason,
+            "recovery_release_ts": now_ts,
+            "recovery_from_round": int(released_round),
+            "recovery_bots_waiting": list(wait_bots),
+            "recovery_request_bots": list(req_bots),
+            "started_at": now_ts,
+            "ts": now_ts,
+            "real_pending_bot": None,
+            "real_pending_round": int(released_round),
+        })
+        payload = _sync_round_apply_post_real_rejoin(payload, released_round=payload.get("released_round"))
+        ok = _sync_round_write_state_monotonic(payload, reason=recovery_reason)
+        if ok:
+            _lxv_5v1x_event_cooldown(
+                f"sync_recovery_global_force_demo_clean:{released_round}:released",
+                f"{recovery_reason}: {released_round}→{target_round} | bots_waiting={len(wait_bots)} | token={token_raw}",
+                cooldown_s=1.0,
+            )
+            if recovery_reason.endswith("AFTER_REAL_CLOSE"):
+                agregar_evento(f"🔓 RECOVERY_FORCE_AFTER_REAL_CLOSE: {released_round} → {target_round} | bots_waiting={len(wait_bots)} | token={token_raw or 'DEMO'}")
+            else:
+                agregar_evento(f"🔓 RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN: {released_round} → {target_round} | bots_waiting={len(wait_bots)} | token={token_raw} | real=NO | owner=--")
+            globals()["SYNC_STATUS_LINE"] = f"{recovery_reason}: {released_round}→{target_round} | bots_waiting={len(wait_bots)} | token={token_raw}"
+            return True
+        return _hold("state_corrupto", released_round)
+    except Exception:
+        try:
+            return _hold("state_corrupto")
+        except Exception:
+            return False
 
 def _sync_round_hard_hold_real_pending(round_id, released_round, pending_bot, pending_data, st):
     """Congela SYNC mientras REAL_CLOSE_PENDING siga activo y dentro de TTL."""
@@ -12362,104 +11258,8 @@ def _sync_round_hard_hold_real_pending(round_id, released_round, pending_bot, pe
             if incident_on else
             f"SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI | owner={owner} C{ciclo} | ronda={rid} | release={rel}"
         ),
-        cooldown_s=25.0 if incident_on else 8.0,
+        cooldown_s=8.0,
     )
-    try:
-        ttl = float(globals().get("REAL_CLOSE_PENDING_TTL_S", globals().get("REAL_CLOSE_PENDING_MAX_AGE_S", 240)) or 240)
-    except Exception:
-        ttl = 240.0
-    pending_ts = None
-    for _ts_key in ("ts", "created_at", "start_ts"):
-        try:
-            pending_ts = float(pdata.get(_ts_key, 0) or 0)
-            if pending_ts > 0:
-                break
-        except Exception:
-            pending_ts = None
-    age = max(0.0, time.time() - float(pending_ts or time.time()))
-    status_now = str((st or {}).get("status", "") if isinstance(st, dict) else "").upper()
-    recovery_due = bool(incident_on or age > (ttl + 10.0) or status_now == "INCIDENT_LOCK_REAL_CLOSE")
-    if recovery_due and owner in BOT_NAMES:
-        ok_recovery, recovery_info = _real_close_pending_recover_from_csv(owner, pdata, reason="incident_lock_ttl_expired")
-        if ok_recovery:
-            try:
-                _sync_real_cleanup_locks_after_close(owner, reason="REAL_CLOSE_RECOVERED_FROM_CSV")
-            except Exception:
-                pass
-            try:
-                if owner in BOT_NAMES:
-                    REAL_CLOSE_PENDING[owner] = None
-            except Exception:
-                pass
-            try:
-                _limpiar_real_close_incident_lock_after_valid_close(owner, sig="REAL_CLOSE_RECOVERED_FROM_CSV")
-            except Exception:
-                pass
-            try:
-                limpiar_orden_real(owner, reason="REAL_CLOSE_RECOVERED_FROM_CSV")
-            except Exception:
-                pass
-            try:
-                write_token_atomic(TOKEN_FILE, "REAL:none")
-            except Exception:
-                pass
-            now_ts = float(time.time())
-            try:
-                payload_recovered = dict(st) if isinstance(st, dict) else {}
-                payload_recovered.update({
-                    "round_id": rid,
-                    "released_round": rel,
-                    "real_close_pending": False,
-                    "real_pending_bot": None,
-                    "real_close_pending_owner": None,
-                    "real_global": False,
-                    "real_owner": None,
-                    "owner_real": None,
-                    "bot_real": None,
-                    "real_status": "closed_recovered_from_csv",
-                    "token_status": "REAL:none",
-                    "last_real_closed_ts": now_ts,
-                    "last_real_owner": owner,
-                    "last_real_close_recovery": recovery_info,
-                    "sync_sigue": True,
-                    "release_congelado": False,
-                    "reason": "REAL_CLOSE_RECOVERED_FROM_CSV",
-                    "status": "closed_recovered_from_csv",
-                    "ts": now_ts,
-                })
-                _sync_round_write_state_monotonic(payload_recovered, reason="REAL_CLOSE_RECOVERED_FROM_CSV")
-            except Exception:
-                pass
-            try:
-                real_round = recovery_info.get("real_round") or recovery_info.get("round_id") or pdata.get("round_id") or rid
-                released_ok = _sync_round_release_all_after_real_close(owner, real_round=real_round, reason="REAL_CLOSE_RECOVERED_FROM_CSV")
-                if not released_ok:
-                    released_ok = _sync_round_release_all_after_real_close(owner, real_round=real_round, reason="REAL_CLOSE_RECOVERED_FROM_CSV")
-            except Exception:
-                released_ok = False
-            try:
-                ciclo_txt = recovery_info.get("ciclo") if isinstance(recovery_info, dict) else ciclo
-                agregar_evento(f"🧯 REAL_CLOSE_RECOVERED_FROM_CSV | bot={owner} | resultado={recovery_info.get('resultado')} | C{ciclo_txt} | release desbloqueado")
-                globals()["SYNC_STATUS_LINE"] = f"SYNC: REAL_CLOSE_RECOVERED_FROM_CSV | bot={owner} | resultado={recovery_info.get('resultado')} | sync_sigue=SI"
-                _real_close_pending_diag_line(owner, pdata, age, ttl, recovered=True, reason="REAL_CLOSE_RECOVERED_FROM_CSV")
-            except Exception:
-                pass
-            return True
-        else:
-            try:
-                _real_close_pending_diag_line(owner, pdata, age, ttl, recovered=False, reason=str((recovery_info or {}).get("motivo") or "sin_evidencia_csv"))
-                _lxv_5v1x_event_cooldown(
-                    key=f"incident_lock_real_close_no_csv:{owner}",
-                    msg=f"🚨 INCIDENT_LOCK_REAL_CLOSE: sin evidencia CSV válida todavía | bot={owner} | age={int(age)}s | no se libera por seguridad",
-                    cooldown_s=25.0,
-                )
-            except Exception:
-                pass
-    elif owner in BOT_NAMES:
-        try:
-            _real_close_pending_diag_line(owner, pdata, age, ttl, recovered=False, reason="wait_ttl")
-        except Exception:
-            pass
     try:
         payload = dict(st) if isinstance(st, dict) else {}
         payload["round_id"] = rid
@@ -13018,8 +11818,6 @@ def _sync_round_tick_maestro():
         )
         diag_recovery = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
         if isinstance(diag_recovery, dict) and bool(diag_recovery.get("mixed_rounds", False)):
-            if _sync_round_try_recovery_release_global():
-                return
             _round_alignment_apply_real_block(diag_recovery, reason_prefix="MIXED_ROUNDS")
             print_rate_limited(
                 f"RELEASE_HOLD_MIXED_ROUNDS:{diag_recovery.get('best_round')}",
@@ -13047,8 +11845,6 @@ def _sync_round_tick_maestro():
             )
             return
         if can_req_recover:
-            if _sync_round_try_recovery_release_global():
-                return
             quarantine_req = detectar_candidato_cuarentena_columna(
                 round_id, released_round, diag_align=diag_recovery, closed_acks=closed, reasons=sync_debug_missing
             )
@@ -13056,7 +11852,7 @@ def _sync_round_tick_maestro():
                 return
             print_rate_limited(
                 f"RELEASE_HOLD_FENCE:{round_id}:recovery_request_no_quarantine",
-                f"🧷 RELEASE_HOLD_FENCE | ronda={round_id} | recovery_request=SI | motivo={quarantine_req.get('reason', 'no_quarantine')} | recovery limpio no escrito; se mantiene HOLD",
+                f"🧷 RELEASE_HOLD_FENCE | ronda={round_id} | recovery_request=SI | motivo={quarantine_req.get('reason', 'no_quarantine')} | no se libera sin cuarentena",
                 ttl=20.0,
             )
             return
@@ -13202,15 +11998,9 @@ def _sync_round_tick_maestro():
             fase_info = {}
             patron = _lxv_normalizar_patron_txt(partial_pattern or patron) or "0V0X"
             ciclo_pick = ciclo_martingala_siguiente()
-            saldo_val = obtener_valor_saldo()
-            saldo_marti_bloqueado = _marti_saldo_bloquea_real(ciclo_pick, saldo_val)
             zona_info_decision = evaluar_fase_zona_verde_lxv(round_id_objetivo=round_id) or {}
             zona_allow, zona_reason = _lxv_zona_es_invertible(zona_info_decision)
-            if saldo_marti_bloqueado:
-                real_emitido = False
-                motivo_no_real = f"saldo_bloqueado_C{int(ciclo_pick)}"
-                ok_emit = False
-            elif _sync_round_pending_blocks_real_only(real_close_pending_active):
+            if _sync_round_pending_blocks_real_only(real_close_pending_active):
                 real_emitido = False
                 motivo_no_real = "real_close_pending_active"
                 locks = (globals().get("REAL_LOCKS_PANEL", {}) or {}).setdefault("locks", {})
@@ -13327,8 +12117,8 @@ def _sync_round_tick_maestro():
             )
             ciclo_pick = ciclo_martingala_siguiente()
             saldo_val = obtener_valor_saldo()
-            if _marti_saldo_bloquea_real(ciclo_pick, saldo_val):
-                return
+            if reset_martingala_por_saldo(ciclo_pick, saldo_val):
+                ciclo_pick = 1
             agregar_evento(
                 f"🧠 LXV columna #{round_id}: {patron} → candidato REAL {bot_pick} ({motivo}) "
                 f"| snapshot=C{ciclo_snapshot} | global=C{ciclo_pick}"
@@ -13629,7 +12419,7 @@ def _sync_round_release_all_after_real_close(bot_real, real_round=None, reason="
         _lxv_5v1x_event_cooldown(
             key=f"release_all_frozen:{pending_bot}",
             msg="🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro" if _real_close_incident_active() else "SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI",
-            cooldown_s=25.0 if _real_close_incident_active() else 10.0,
+            cooldown_s=10.0,
         )
         return False
     if globals().get("REAL_OWNER_LOCK") in BOT_NAMES:
@@ -13718,7 +12508,7 @@ def _sync_round_release_all_after_real_close(bot_real, real_round=None, reason="
     return ok
 
 
-def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") -> bool:
+def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") -> None:
     reason_txt = str(reason or "real_closed").strip() or "real_closed"
     st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
     real_round = None
@@ -13729,15 +12519,13 @@ def _sync_round_release_after_real_close(bot: str, reason: str = "real_closed") 
         _lxv_5v1x_event_cooldown(
             key=f"release_after_close_frozen:{pending_bot}",
             msg="🚨 INCIDENT_LOCK_REAL_CLOSE: sync congelado, requiere cierre válido o reset seguro" if _real_close_incident_active() else "SYNC: HOLD_REAL_CLOSE_PENDING | sync_sigue=NO | release_congelado=SI",
-            cooldown_s=25.0 if _real_close_incident_active() else 10.0,
+            cooldown_s=10.0,
         )
-        return False
+        return
     _sync_real_cleanup_locks_after_close(bot, reason_txt)
     _sync_round_ensure_post_real_rejoin(bot, real_round=real_round, reason=reason_txt)
     if not _sync_round_release_all_after_real_close(bot, real_round=real_round, reason=reason_txt):
         agregar_evento(f"⚠️ REAL_CLOSED_RELEASE_ALL pendiente: bot_real={bot} reason={reason_txt} | candado REAL aún activo")
-        return False
-    return True
 
 # === PATCH: REAL INMEDIATO EN HUD AL EMITIR ORDEN (sin esperar compra) ===
 # Objetivo:
@@ -13930,193 +12718,6 @@ def _escribir_orden_real_raw(bot: str, ciclo: int):
         except Exception:
             pass
 
-
-def _real_order_parse_ts_value(value):
-    try:
-        if value in (None, ""):
-            return 0.0
-        if isinstance(value, (int, float)):
-            v = float(value)
-            return v / 1000.0 if v > 100000000000 else v
-        txt = str(value).strip()
-        if not txt:
-            return 0.0
-        try:
-            v = float(txt)
-            return v / 1000.0 if v > 100000000000 else v
-        except Exception:
-            pass
-        txt = txt.replace("Z", "+00:00")
-        try:
-            return float(datetime.fromisoformat(txt).timestamp())
-        except Exception:
-            return 0.0
-    except Exception:
-        return 0.0
-
-
-def _csv_get_first(row: dict, aliases: tuple[str, ...]):
-    try:
-        lower = {str(k).strip().lower(): v for k, v in (row or {}).items()}
-        for alias in aliases:
-            key = str(alias).strip().lower()
-            if key in lower and lower.get(key) not in (None, ""):
-                return lower.get(key)
-    except Exception:
-        pass
-    return None
-
-
-def _bot_tiene_compra_real_confirmada_despues_de_orden(bot, ts_orden):
-    """
-    Retorna True SOLO si hay evidencia fuerte de compra REAL posterior a ts_orden:
-    - id_contrato REAL vivo/reciente en estado_bots[bot], o
-    - fila CSV posterior a ts_orden con modo REAL y contrato/id válido.
-    Si no hay evidencia clara, retorna False y nunca lanza excepción.
-    """
-    try:
-        b = str(bot or "").strip()
-        ts_ref = float(ts_orden or 0.0)
-        st = estado_bots.get(b, {}) if isinstance(estado_bots, dict) else {}
-        cid = st.get("id_contrato") or st.get("contract_id") or st.get("contrato") or st.get("last_real_contract_id")
-        token_txt = str(st.get("token") or "").upper()
-        fuente_txt = str(st.get("fuente") or st.get("modo") or "").upper()
-        real_ts = float(st.get("real_activado_en") or st.get("last_buy_ts") or st.get("buy_ts") or 0.0)
-        if cid not in (None, "", 0, "0") and (token_txt == "REAL" or "REAL" in fuente_txt) and (real_ts <= 0.0 or real_ts >= (ts_ref - 5.0)):
-            return True
-    except Exception:
-        pass
-
-    try:
-        csv_path = f"registro_enriquecido_{str(bot)}.csv"
-        if not os.path.exists(csv_path):
-            return False
-        with open(csv_path, "r", encoding="utf-8", errors="replace", newline="") as f:
-            rows = deque(csv.DictReader(f), maxlen=60)
-        for row in reversed(rows):
-            cid = _csv_get_first(row, ("contract_id", "id_contrato", "contrato", "contract", "buy_id"))
-            if cid in (None, "", 0, "0"):
-                continue
-            modo = str(_csv_get_first(row, ("modo", "token", "tipo_cuenta", "cuenta", "token_usado")) or "").upper()
-            if "REAL" not in modo:
-                continue
-            row_ts = _real_order_parse_ts_value(_csv_get_first(row, ("ts", "timestamp", "epoch", "fecha", "hora", "created_ts", "buy_ts")))
-            if row_ts > float(ts_orden or 0.0):
-                return True
-    except Exception:
-        return False
-    return False
-
-
-def _real_close_pending_tiene_contract_id_confirmado(bot) -> bool:
-    try:
-        pending = REAL_CLOSE_PENDING.get(bot)
-        if isinstance(pending, dict):
-            cid = pending.get("contract_id") or pending.get("id_contrato") or pending.get("contrato")
-            if cid not in (None, "", 0, "0"):
-                return True
-        st = estado_bots.get(bot, {}) if isinstance(estado_bots, dict) else {}
-        cid_st = st.get("id_contrato") or st.get("contract_id") or st.get("contrato") or st.get("last_real_contract_id")
-        if cid_st not in (None, "", 0, "0") and str(st.get("token") or "").upper() == "REAL":
-            return True
-    except Exception:
-        return True
-    return False
-
-
-def _watchdog_liberar_orden_real_expirada_sin_compra(bot, now_ts=None) -> bool:
-    global REAL_OWNER_LOCK
-    try:
-        b = str(bot or "").strip()
-        if b not in BOT_NAMES:
-            return False
-        now = float(now_ts or time.time())
-        owner_mem = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
-        owner_file = leer_token_archivo_raw()
-        if b != owner_mem and b != owner_file:
-            return False
-        orden = _sync_round_safe_read_json(path_orden(b)) or {}
-        ts_orden = float(orden.get("created_ts") or orden.get("ts") or 0.0) if isinstance(orden, dict) else 0.0
-        if ts_orden <= 0.0:
-            pending = REAL_CLOSE_PENDING.get(b)
-            if isinstance(pending, dict):
-                ts_orden = float(pending.get("ts") or 0.0)
-        if ts_orden <= 0.0:
-            return False
-        edad = now - ts_orden
-        if edad <= (float(REAL_ORDER_TTL_S) + 15.0):
-            return False
-        if _real_close_pending_tiene_contract_id_confirmado(b):
-            print_rate_limited(
-                f"real-order-expired-review-contract:{b}",
-                f"⚠️ REAL_ORDER_EXPIRED_REVIEW_REQUIRED | bot={b} | edad={int(edad)}s | motivo=contract_id_confirmado",
-                ttl=30.0,
-            )
-            return False
-        if _bot_tiene_compra_real_confirmada_despues_de_orden(b, ts_orden):
-            print_rate_limited(
-                f"real-order-expired-review-buy:{b}",
-                f"⚠️ REAL_ORDER_EXPIRED_REVIEW_REQUIRED | bot={b} | edad={int(edad)}s | motivo=compra_real_confirmada",
-                ttl=30.0,
-            )
-            return False
-
-        liberado = False
-        try:
-            with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
-                if got:
-                    liberado = bool(write_token_atomic(TOKEN_FILE, "REAL:none"))
-                    if not liberado:
-                        agregar_evento("⚠️ REAL_ORDER_EXPIRED_NO_BUY: token REAL no liberado por fallo de escritura.")
-                else:
-                    agregar_evento("⚠️ REAL_ORDER_EXPIRED_NO_BUY: real.lock ocupado; no se libera token.")
-        except Exception:
-            liberado = False
-
-        if not liberado:
-            print_rate_limited(
-                f"real-order-expired-release-lock-failed:{b}",
-                f"⚠️ REAL_ORDER_EXPIRED_REVIEW_REQUIRED | bot={b} | motivo=real_lock_no_liberado",
-                ttl=30.0,
-            )
-            return False
-
-        limpiar_orden_real(b, reason="REAL_ORDER_EXPIRED_NO_BUY")
-        try:
-            pending = REAL_CLOSE_PENDING.get(b)
-            if isinstance(pending, dict) and str(pending.get("bot") or b) == b:
-                REAL_CLOSE_PENDING[b] = None
-        except Exception:
-            pass
-        try:
-            if _real_close_incident_active() and str(REAL_CLOSE_INCIDENT_LOCK.get("bot") or "") == b and not _real_close_pending_tiene_contract_id_confirmado(b):
-                REAL_CLOSE_INCIDENT_LOCK.update({"active": False, "bot": None, "ciclo": None, "round_id": None, "ts": 0.0, "reason": "REAL_ORDER_EXPIRED_NO_BUY"})
-        except Exception:
-            pass
-        REAL_OWNER_LOCK = None
-        try:
-            estado_bots[b]["token"] = "DEMO"
-            estado_bots[b]["trigger_real"] = False
-            estado_bots[b]["modo_real_anunciado"] = False
-            estado_bots[b]["fuente"] = None
-            estado_bots[b]["real_activado_en"] = 0.0
-            estado_bots[b]["real_timeout_first_warn"] = 0.0
-            _set_ui_token_holder(None)
-        except Exception:
-            pass
-        agregar_evento(f"🧯 REAL_ORDER_EXPIRED_NO_BUY_RELEASED | bot={b} | edad={int(edad)}s | acción=token_demo_sin_avanzar_martingala")
-        return True
-    except Exception as e:
-        try:
-            print_rate_limited(
-                f"real-order-expired-review-error:{bot}",
-                f"⚠️ REAL_ORDER_EXPIRED_REVIEW_REQUIRED | bot={bot} | motivo={type(e).__name__}",
-                ttl=30.0,
-            )
-        except Exception:
-            pass
-        return False
-
 def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> bool:
 
     """
@@ -14130,19 +12731,10 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
     global LIMPIEZA_PANEL_HASTA, sonido_disparado, marti_paso, REAL_OWNER_LOCK, REAL_ENTRY_BASELINE
 
     try:
-        if _purificacion_real_activa(source=origen, bot=bot, ciclo=ciclo):
+        if _purificacion_real_activa():
             _emitir_marca_purificacion_real()
             return False
         if bot not in BOT_NAMES:
-            return False
-
-        hay_pending, pending_bot, pending = _hay_real_close_pending_activo()
-        if hay_pending or real_indefinido_bloquea_nueva_compra(bot):
-            _real_hold_event(bot=pending_bot or bot, pending=pending if isinstance(pending, dict) else REAL_CLOSE_PENDING.get(bot), resultado=(pending or {}).get("resultado") if isinstance(pending, dict) else "INDEFINIDO", reason="activar_real_bloqueado_por_cierre_pendiente")
-            agregar_evento(
-                f"🧱 REAL bloqueado: cierre pendiente sin resultado final; no se activa REAL para {bot}. "
-                f"pendiente={pending_bot or bot} C{pending.get('ciclo') if isinstance(pending, dict) else '?'}"
-            )
             return False
 
         now = time.time()
@@ -14327,17 +12919,8 @@ def escribir_orden_real(bot: str, ciclo: int, round_id=None) -> bool:
         _maybe_log_pause_state(force=False)
         return False
 
-    if _purificacion_real_activa(bot=bot, ciclo=ciclo, round_id=round_id):
+    if _purificacion_real_activa():
         _emitir_marca_purificacion_real()
-        return False
-
-    hay_pending, pending_bot, pending = _hay_real_close_pending_activo()
-    if hay_pending or real_indefinido_bloquea_nueva_compra(bot):
-        _real_hold_event(bot=pending_bot or bot, pending=pending if isinstance(pending, dict) else REAL_CLOSE_PENDING.get(bot), resultado=(pending or {}).get("resultado") if isinstance(pending, dict) else "INDEFINIDO", reason="orden_real_bloqueada_por_cierre_pendiente")
-        agregar_evento(
-            f"🧱 REAL bloqueado: cierre pendiente sin resultado final; no se escribe orden REAL para {bot}. "
-            f"pendiente={pending_bot or bot} C{pending.get('ciclo') if isinstance(pending, dict) else '?'}"
-        )
         return False
 
     # 🔒 No crear orden si ya hay otro owner REAL activo.
@@ -14478,9 +13061,8 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
     pending_on, pending_bot, pending = _hay_real_close_pending_activo()
     if pending_on:
         reason_pending = "INCIDENT_LOCK_REAL_CLOSE" if _real_close_incident_active() else "CIERRE_REAL_PENDIENTE"
-        _real_hold_event(bot=pending_bot or bot, pending=pending, resultado=(pending or {}).get("resultado") if isinstance(pending, dict) else "INDEFINIDO", reason="emitir_real_bloqueado_por_cierre_pendiente")
         agregar_evento(
-            f"🧱 REAL bloqueado: cierre pendiente sin resultado final ({reason_pending}); no se emite {src} para {bot}; "
+            f"⏸️ REAL bloqueado por {reason_pending}: no se emite {src} para {bot}; "
             f"pendiente={pending_bot} C{pending.get('ciclo') if isinstance(pending, dict) else '?'}"
         )
         return False
@@ -15021,29 +13603,6 @@ def normalizar_resultado(texto):
     if "GAN" in t or "WIN" in t:
         return "GANANCIA"
     return "INDEFINIDO"
-
-def resultado_real_contable(res):
-    return normalizar_resultado(res) in ("GANANCIA", "PÉRDIDA")
-
-def real_indefinido_bloquea_nueva_compra(bot):
-    try:
-        if bot in BOT_NAMES:
-            p = REAL_CLOSE_PENDING.get(bot)
-            if isinstance(p, dict) and p.get("active"):
-                _real_hold_event(bot=bot, pending=p, resultado=p.get("resultado", "INDEFINIDO"), reason="real_close_pending_active")
-                return True
-            if _real_close_incident_active() and str(REAL_CLOSE_INCIDENT_LOCK.get("bot") or "") in ("", str(bot)):
-                _audit_real_close_pending_action(bot=bot, pending=REAL_CLOSE_INCIDENT_LOCK, resultado="INDEFINIDO", reason=REAL_CLOSE_INCIDENT_LOCK.get("reason"), accion="INCIDENT_LOCK")
-                return True
-            st = estado_bots.get(bot, {}) if isinstance(estado_bots, dict) else {}
-            estado = str(st.get("real_estado_cierre") or st.get("estado_contrato") or "").upper()
-            res_norm = normalizar_resultado(st.get("real_resultado_pendiente_norm") or st.get("resultado") or st.get("resultado_real"))
-            if estado in ("CONTRATO_INCIERTO_SIN_RESULTADO_CONTABLE", "VENDIDO_SIN_RESULTADO_CONTABLE", "INDEFINIDO", "ERROR_WS", "CERRADO_SIN_RESULTADO") and not resultado_real_contable(res_norm):
-                _real_hold_event(bot=bot, pending=REAL_CLOSE_PENDING.get(bot), resultado=res_norm, reason="last_state_uncertain")
-                return True
-        return False
-    except Exception:
-        return False
 def normalizar_trade_status(ts):
     """
     Normaliza trade_status a canónico del Maestro:
@@ -20437,8 +18996,6 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
         estado_bots[bot]["token"] = "DEMO"
         estado_bots[bot]["trigger_real"] = False
         estado_bots[bot]["ciclo_actual"] = 1
-        # estado_bots[bot]['ciclo_actual']=1 es solo estado local DEMO;
-        # la próxima REAL se toma de ciclo_martingala_siguiente().
         estado_bots[bot]["modo_real_anunciado"] = False
         estado_bots[bot]["fuente"] = None
 
@@ -20524,7 +19081,6 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
     # Log visual
     try:
         agregar_evento(f"🔓 Cuenta REAL liberada para {bot.upper()} ({reason})")
-        agregar_evento("🧭 estado_bots[bot]['ciclo_actual']=1 es solo estado local DEMO; la próxima REAL se toma de ciclo_martingala_siguiente()")
     except Exception:
         pass
 
@@ -21078,7 +19634,7 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
         except Exception:
             pass
     agregar_evento(
-        f"🔁 Martingala{bot_msg}: resultado={res} | pérdidas seguidas={marti_ciclos_perdidos}/{MAX_CICLOS} | próximo ciclo=C{ciclo_sig}"
+        f"🔁 Martingala{bot_msg}: resultado={res} | pérdidas seguidas={marti_ciclos_perdidos}/{MAX_CICLOS} | próximo ciclo={ciclo_sig}"
     )
     agregar_evento(f"🧾 MARTI-AUDIT: {marti_audit_resumen_linea()}")
 
@@ -21096,13 +19652,11 @@ def ciclo_martingala_siguiente() -> int:
 
 def reset_martingala_por_saldo(ciclo_objetivo: int, saldo_actual: float | None) -> bool:
     """
-    Valida saldo para C2..C{MAX_CICLOS} sin tocar la Martingala global.
-
-    La continuidad oficial REAL vive en marti_ciclos_perdidos/marti_paso; una
-    lectura de saldo ausente o baja solo puede bloquear la emisión, nunca bajar
-    la próxima REAL a C1. Se retorna False de forma conservadora para que ningún
-    caller legacy pueda interpretar esto como permiso de reset.
+    Si no alcanza el saldo para el ciclo objetivo (C2..C{MAX_CICLOS}),
+    reinicia la martingala en C1.
     """
+    global marti_ciclos_perdidos, marti_paso, bots_usados_en_esta_marti
+
     try:
         ciclo = int(ciclo_objetivo)
     except Exception:
@@ -21112,56 +19666,27 @@ def reset_martingala_por_saldo(ciclo_objetivo: int, saldo_actual: float | None) 
         return False
 
     idx = max(0, min(len(MARTI_ESCALADO) - 1, ciclo - 1))
-    try:
-        monto_necesario = float(MARTI_ESCALADO[idx])
-    except Exception:
-        monto_necesario = 0.0
+    monto_necesario = float(MARTI_ESCALADO[idx])
 
     try:
         saldo = float(saldo_actual) if saldo_actual is not None else None
     except Exception:
         saldo = None
 
-    if saldo is None:
-        agregar_evento(
-            f"⛔ REAL bloqueado: saldo no disponible para C{ciclo}; Martingala conservada en C{ciclo}"
-        )
-    elif saldo < monto_necesario:
-        agregar_evento(
-            f"⛔ REAL bloqueado: saldo insuficiente para C{ciclo}; Martingala conservada en C{ciclo}"
-        )
-    return False
-
-
-def _marti_saldo_bloquea_real(ciclo_objetivo: int, saldo_actual: float | None) -> bool:
-    """Bloquea emisión REAL por saldo en C2..C5 sin resetear el contador global."""
-    try:
-        ciclo = int(ciclo_objetivo)
-    except Exception:
-        ciclo = 1
-    if ciclo <= 1:
+    if saldo is not None and saldo >= monto_necesario:
         return False
-    idx = max(0, min(len(MARTI_ESCALADO) - 1, ciclo - 1))
-    try:
-        requerido = float(MARTI_ESCALADO[idx])
-    except Exception:
-        requerido = 0.0
-    try:
-        saldo = float(saldo_actual) if saldo_actual is not None else None
-    except Exception:
-        saldo = None
-    if saldo is None:
-        agregar_evento(
-            f"⛔ REAL bloqueado: saldo no disponible para C{ciclo}; Martingala conservada en C{ciclo}"
-        )
-        return True
-    if saldo < requerido:
-        agregar_evento(
-            f"⛔ REAL bloqueado: saldo insuficiente para C{ciclo}; Martingala conservada en C{ciclo}"
-        )
-        return True
-    return False
 
+    marti_ciclos_perdidos = 0
+    marti_paso = 0
+    bots_usados_en_esta_marti = []
+    _marti_audit_record("reset_saldo", ciclo=ciclo_objetivo, detalle="reinicio_forzado")
+    falta_msg = "saldo no disponible"
+    if saldo is not None:
+        falta_msg = f"faltan {(monto_necesario - saldo):.2f} USD"
+    agregar_evento(
+        f"🧯 Saldo insuficiente para C{ciclo} ({monto_necesario:.2f} USD): {falta_msg}. Reinicio automático a C1."
+    )
+    return True
 def elegir_candidato_rotacion_marti(
     candidatos: list,
     ciclo_objetivo: int,
@@ -21341,514 +19866,6 @@ def _y_to_bin(v) -> int | None:
         return None
     except Exception:
         return None
-
-
-def _real_close_sig_ya_procesada(bot, res, monto, ciclo, payout_total, baseline=None):
-    sig = _real_close_sig(bot, res, monto, ciclo, payout_total, baseline=baseline)
-    for prev in (LAST_REAL_CLOSE_SIG.get(bot), REAL_CLOSE_PROCESSED_SIG.get(bot)):
-        if sig == prev:
-            return True
-        try:
-            # Idempotencia adicional: una limpieza puede poner baseline=0; aun así el
-            # mismo bot/resultado/monto/ciclo/payout no debe contabilizarse dos veces.
-            if isinstance(prev, tuple) and tuple(prev[:5]) == tuple(sig[:5]):
-                return True
-        except Exception:
-            pass
-    return False
-
-
-def _extraer_ciclo_int_seguro(valor):
-    try:
-        if valor in (None, ""):
-            return None
-        txt = str(valor).strip().upper()
-        if txt.startswith("C"):
-            txt = txt[1:].strip()
-        return int(float(txt))
-    except Exception:
-        return None
-
-
-def _ciclo_real_reciente_para_cierre_tardio(bot):
-    """Ciclo esperado para un cierre REAL tardío sin depender del token actual."""
-    try:
-        p = REAL_CLOSE_PENDING.get(bot)
-        if isinstance(p, dict) and p.get("ciclo") not in (None, ""):
-            c = _extraer_ciclo_int_seguro(p.get("ciclo"))
-            if c:
-                return c
-    except Exception:
-        pass
-    try:
-        c = _extraer_ciclo_int_seguro(estado_bots.get(bot, {}).get("ciclo_actual"))
-        if c:
-            return c
-    except Exception:
-        pass
-    try:
-        mem = globals().get("REAL_EN_CURSO_AUDIT", {})
-        if isinstance(mem, dict) and str(mem.get("bot") or "") == str(bot):
-            c = _extraer_ciclo_int_seguro(mem.get("ciclo"))
-            if c:
-                return c
-    except Exception:
-        pass
-    try:
-        st = globals().get("LAST_REAL_OWNER_STATE", {})
-        if isinstance(st, dict) and str(st.get("owner_bot") or "") == str(bot):
-            c = _extraer_ciclo_int_seguro(st.get("ciclo"))
-            if c:
-                return c
-    except Exception:
-        pass
-    try:
-        ultima = globals().get("ULTIMA_OPERACION_REAL_AUDIT", {})
-        if isinstance(ultima, dict) and str(ultima.get("bot") or "") == str(bot):
-            c = _extraer_ciclo_int_seguro(ultima.get("ciclo"))
-            if c:
-                return c
-    except Exception:
-        pass
-    return None
-
-
-def _hay_contexto_real_reciente_para_cierre_tardio(bot):
-    """Señales conservadoras de que el bot acaba de operar REAL aunque ya no tenga token REAL."""
-    try:
-        if int(REAL_ENTRY_BASELINE.get(bot, 0) or 0) > 0:
-            return True, "baseline"
-    except Exception:
-        pass
-    try:
-        p = REAL_CLOSE_PENDING.get(bot)
-        if isinstance(p, dict) and p.get("active"):
-            return True, "pending"
-    except Exception:
-        pass
-    try:
-        if globals().get("REAL_OWNER_LOCK") == bot:
-            return True, "owner_lock"
-    except Exception:
-        pass
-    try:
-        fuente = str(estado_bots.get(bot, {}).get("fuente") or "").upper()
-        if any(tag in fuente for tag in ("ORDEN_REAL", "LXV", "MANUAL")):
-            return True, "fuente_real"
-    except Exception:
-        pass
-    try:
-        mem = globals().get("REAL_EN_CURSO_AUDIT", {})
-        if isinstance(mem, dict) and str(mem.get("bot") or "") == str(bot):
-            return True, "auditor_en_curso"
-    except Exception:
-        pass
-    try:
-        st = globals().get("LAST_REAL_OWNER_STATE", {})
-        if isinstance(st, dict) and str(st.get("owner_bot") or "") == str(bot):
-            return True, "last_owner_state"
-    except Exception:
-        pass
-    return False, "sin_contexto"
-
-
-def _marti_fix_post_close(res, ciclo):
-    """Defensa mínima: pérdida REAL C1..C4 conserva próxima REAL C+1."""
-    global marti_ciclos_perdidos, marti_paso
-    try:
-        ciclo_int = int(ciclo or 0)
-    except Exception:
-        ciclo_int = 0
-    if normalizar_resultado(res) == "PÉRDIDA" and 1 <= ciclo_int < int(MAX_CICLOS):
-        esperado = ciclo_int + 1
-        actual = int(ciclo_martingala_siguiente() or 1)
-        if actual != esperado:
-            marti_ciclos_perdidos = ciclo_int
-            marti_paso = ciclo_int
-            agregar_evento(f"🛠️ MARTI_FIX_POST_CLOSE | pérdida C{ciclo_int} -> próxima C{esperado}")
-
-
-def _marti_ciclo_esperado_por_resultado(res, ciclo):
-    try:
-        ciclo_int = int(ciclo or 0)
-    except Exception:
-        return None
-    res_norm = normalizar_resultado(res)
-    if res_norm == "GANANCIA":
-        return 1
-    if res_norm == "PÉRDIDA" and 1 <= ciclo_int < int(MAX_CICLOS):
-        return ciclo_int + 1
-    if res_norm == "PÉRDIDA" and ciclo_int >= int(MAX_CICLOS):
-        return 1
-    return None
-
-
-def _aplicar_estado_marti_real_commit(res, ciclo):
-    global marti_ciclos_perdidos, marti_paso, bots_usados_en_esta_marti
-    try:
-        ciclo_int = int(ciclo or 0)
-    except Exception:
-        return None
-    res_norm = normalizar_resultado(res)
-    if res_norm == "GANANCIA":
-        marti_ciclos_perdidos = 0
-        marti_paso = 0
-        bots_usados_en_esta_marti = []
-        return 1
-    if res_norm == "PÉRDIDA" and 1 <= ciclo_int < int(MAX_CICLOS):
-        marti_ciclos_perdidos = ciclo_int
-        marti_paso = ciclo_int
-        return ciclo_int + 1
-    if res_norm == "PÉRDIDA" and ciclo_int >= int(MAX_CICLOS):
-        marti_ciclos_perdidos = 0
-        marti_paso = 0
-        bots_usados_en_esta_marti = []
-        return 1
-    return None
-
-
-def _marti_commit_key(contract_id, bot, ciclo_operado):
-    cid = str(contract_id or "").strip()
-    if not cid:
-        cid = f"NO_CONTRACT:{bot}:C{int(ciclo_operado or 0)}"
-    return cid
-
-
-def _commit_martingala_real_cierre_seguro(bot, resultado, ciclo_operado, contract_id, origen):
-    """Commit único e idempotente para cierre REAL tardío/background/INCIDENT_LOCK."""
-    global marti_ciclos_perdidos, marti_paso, ultimo_bot_real, bots_usados_en_esta_marti
-    res = normalizar_resultado(resultado)
-    if res not in ("GANANCIA", "PÉRDIDA"):
-        return None
-    try:
-        ciclo_int = int(ciclo_operado or 0)
-    except Exception:
-        return None
-    if not (1 <= ciclo_int <= int(MAX_CICLOS)):
-        return None
-
-    cid_key = _marti_commit_key(contract_id, bot, ciclo_int)
-    prev = MARTI_REAL_TARDIO_COMMITS.get(cid_key) if isinstance(MARTI_REAL_TARDIO_COMMITS, dict) else None
-    if isinstance(prev, dict):
-        prox_prev = int(prev.get("proxima", 1) or 1)
-        _aplicar_estado_marti_real_commit(prev.get("resultado"), prev.get("ciclo_operado"))
-        agregar_evento(
-            f"♻️ MARTI_COMMIT_DUPLICADO_IGNORADO | contract_id={contract_id or '--'} | próxima=C{prox_prev}"
-        )
-        return dict(prev)
-
-    if bot in BOT_NAMES:
-        ultimo_bot_real = bot
-    if res == "PÉRDIDA" and bot in BOT_NAMES and bot not in bots_usados_en_esta_marti:
-        bots_usados_en_esta_marti.append(bot)
-
-    proxima = _aplicar_estado_marti_real_commit(res, ciclo_int)
-    if proxima is None:
-        return None
-    commit = {
-        "bot": str(bot or "UNKNOWN"),
-        "resultado": res,
-        "ciclo_operado": ciclo_int,
-        "proxima": int(proxima),
-        "contract_id": contract_id,
-        "origen": str(origen or "--"),
-        "ts": time.time(),
-    }
-    MARTI_REAL_TARDIO_COMMITS[cid_key] = commit
-    agregar_evento(
-        f"🧱 MARTI_COMMIT_REAL_TARDIO | bot={bot or 'UNKNOWN'} | resultado={res} | "
-        f"ciclo_operado=C{ciclo_int} | próxima=C{int(proxima)} | origen={origen or '--'} | "
-        f"contract_id={contract_id or '--'}"
-    )
-    return dict(commit)
-
-
-def _validar_marti_post_cleanup_cierre_real_tardio(resultado, ciclo_operado, contract_id=None, origen="post_cleanup"):
-    try:
-        ciclo_int = int(ciclo_operado or 0)
-    except Exception:
-        return False
-    res_norm = normalizar_resultado(resultado)
-    esperado = _marti_ciclo_esperado_por_resultado(res_norm, ciclo_int)
-    if esperado is None:
-        return False
-    actual = int(ciclo_martingala_siguiente() or 1)
-    if actual == int(esperado):
-        return True
-    _aplicar_estado_marti_real_commit(res_norm, ciclo_int)
-    motivo = f"pérdida_real_C{ciclo_int}" if res_norm == "PÉRDIDA" else "ganancia_real"
-    agregar_evento(
-        f"🛠️ MARTI_RESTORE_POST_CLEANUP | desde=C{actual} | hacia=C{int(esperado)} | "
-        f"resultado={res_norm} | operado=C{ciclo_int} | restaurado=C{int(esperado)} | "
-        f"motivo={motivo} | contract_id={contract_id or '--'} | origen={origen or '--'}"
-    )
-    return True
-
-
-def _marti_log_continuidad_post_demo(res, ciclo):
-    """Log posterior a la limpieza DEMO que confirma que el ciclo global quedó intacto."""
-    try:
-        ciclo_int = int(ciclo or 0)
-    except Exception:
-        ciclo_int = 0
-    if normalizar_resultado(res) != "PÉRDIDA" or ciclo_int <= 0:
-        return
-    if ciclo_int >= int(MAX_CICLOS):
-        agregar_evento(f"🧭 MARTI_CONTINUIDAD_OK | pérdida C{int(MAX_CICLOS)} -> reinicio oficial C1")
-    else:
-        agregar_evento(
-            f"🧭 MARTI_CONTINUIDAD_OK | pérdida C{ciclo_int} -> próxima REAL C{ciclo_int + 1} conservada tras volver a DEMO"
-        )
-
-
-def _blindar_marti_post_cierre_real_tardio(res, ciclo):
-    """Asegura la regla oficial C1..C4 pérdida => próximo C+1; C5/win => C1."""
-    global marti_ciclos_perdidos, marti_paso
-    try:
-        ciclo_int = int(ciclo or 0)
-    except Exception:
-        ciclo_int = 0
-    res_norm = normalizar_resultado(res)
-    if res_norm == "PÉRDIDA" and 1 <= ciclo_int < int(MAX_CICLOS):
-        esperado = ciclo_int + 1
-        actual = int(ciclo_martingala_siguiente() or 1)
-        if actual != esperado:
-            marti_ciclos_perdidos = ciclo_int
-            marti_paso = ciclo_int
-            agregar_evento(f"🛠️ MARTI_FIX_POST_CLOSE | pérdida C{ciclo_int} -> próxima C{esperado}")
-        # Blindaje final: una pérdida C1..C4 nunca puede quedar en C1.
-        if int(ciclo_martingala_siguiente() or 1) == 1:
-            marti_ciclos_perdidos = ciclo_int
-            marti_paso = ciclo_int
-            agregar_evento(f"🛠️ MARTI_FIX_POST_CLOSE | pérdida C{ciclo_int} -> próxima C{esperado}")
-    elif res_norm in ("GANANCIA", "PÉRDIDA"):
-        # registrar_resultado_real ya reinicia GANANCIA y pérdida en C5 a C1; este bloque solo normaliza
-        # un cierre tardío si alguna limpieza externa alteró los contadores después del commit.
-        if res_norm == "GANANCIA" or ciclo_int >= int(MAX_CICLOS):
-            marti_ciclos_perdidos = 0
-            marti_paso = 0
-
-
-def procesar_cierre_real_tardio_si_existe(bot) -> bool:
-    """
-    Commit tardío/idempotente de cierres REAL ya escritos en CSV cuando el bot liberó
-    token/owner antes de que TICK_02 pasara por el bloque token == REAL.
-    """
-    if bot not in BOT_NAMES:
-        return False
-    ok_ctx, ctx_reason = _hay_contexto_real_reciente_para_cierre_tardio(bot)
-    if not ok_ctx:
-        return False
-
-    baseline = int(REAL_ENTRY_BASELINE.get(bot, 0) or 0)
-    pending = REAL_CLOSE_PENDING.get(bot)
-    pending_activo = isinstance(pending, dict) and bool(pending.get("active"))
-    expected_ciclo = estado_bots.get(bot, {}).get("ciclo_actual", None)
-    cierre_info = detectar_cierre_martingala(
-        bot,
-        min_fila=baseline,
-        require_closed=True,
-        require_real_token=True,
-        expected_ciclo=expected_ciclo,
-    )
-
-    ciclo_contexto = _ciclo_real_reciente_para_cierre_tardio(bot)
-    if not cierre_info and ciclo_contexto is not None and expected_ciclo is not None:
-        try:
-            if int(ciclo_contexto) != int(expected_ciclo):
-                cierre_info = detectar_cierre_martingala(
-                    bot,
-                    min_fila=baseline,
-                    require_closed=True,
-                    require_real_token=True,
-                    expected_ciclo=ciclo_contexto,
-                )
-        except Exception:
-            pass
-
-    if not cierre_info and (pending_activo or baseline > 0):
-        expected_fallback = ciclo_contexto if ciclo_contexto is not None else expected_ciclo
-        cierre_info = detectar_cierre_martingala(
-            bot,
-            min_fila=baseline,
-            require_closed=True,
-            require_real_token=False,
-            expected_ciclo=expected_fallback,
-        )
-        if cierre_info:
-            try:
-                _res_fb, _monto_fb, ciclo_fb, _payout_fb = cierre_info
-                if baseline <= 0 or expected_fallback is None or int(ciclo_fb or 0) != int(expected_fallback):
-                    cierre_info = None
-            except Exception:
-                cierre_info = None
-
-    if not cierre_info or not isinstance(cierre_info, tuple) or len(cierre_info) < 4:
-        return False
-
-    res, monto, ciclo, payout_total = cierre_info
-    res = normalizar_resultado(res)
-    if res not in ("GANANCIA", "PÉRDIDA"):
-        return False
-    try:
-        ciclo_int = int(ciclo or 0)
-    except Exception:
-        return False
-    if ciclo_contexto is not None and ciclo_int != int(ciclo_contexto):
-        return False
-
-    sig = _real_close_sig(bot, res, monto, ciclo_int, payout_total, baseline=baseline)
-    contract_id_late = estado_bots.get(bot, {}).get("id_contrato")
-    if not contract_id_late and isinstance(pending, dict):
-        contract_id_late = pending.get("contract_id") or pending.get("contrato") or pending.get("id_contrato")
-    if _real_close_sig_ya_procesada(bot, res, monto, ciclo_int, payout_total, baseline=baseline):
-        _commit_martingala_real_cierre_seguro(
-            bot, res, ciclo_int, contract_id_late, "bg_resolved_duplicate"
-        )
-        _lxv_5v1x_event_cooldown(
-            key=f"real_close_duplicate_late:{bot}:{ciclo_int}",
-            msg=f"⚠️ Cierre REAL tardío duplicado detectado; no se reprocesa: {bot} C{ciclo_int}",
-            cooldown_s=15.0,
-        )
-        return False
-
-    late_commit_done = isinstance(pending, dict) and pending.get("late_commit_sig") == sig
-    commit_info = _commit_martingala_real_cierre_seguro(
-        bot, res, ciclo_int, contract_id_late, "bg_resolved"
-    )
-    if not commit_info:
-        return False
-    sig = _real_close_sig(bot, res, monto, ciclo_int, payout_total, baseline=baseline)
-    prox = int(commit_info.get("proxima", ciclo_martingala_siguiente()) or 1)
-    if late_commit_done:
-        agregar_evento(f"🔁 REAL_CLOSE_LATE_RETRY | {bot} | C{ciclo_int} | {res}")
-    else:
-        agregar_evento(f"🧾 REAL_CLOSE_LATE_COMMIT | {bot} | C{ciclo_int} | {res} | próxima=C{prox}")
-
-    if isinstance(pending, dict):
-        pending = dict(pending)
-        pending.update({
-            "active": True,
-            "late_commit_sig": sig,
-            "late_commit_resultado": res,
-            "late_commit_ciclo": ciclo_int,
-            "late_commit_pending_retry": True,
-        })
-        REAL_CLOSE_PENDING[bot] = pending
-
-    try:
-        _registrar_real_close_trace({
-            "bot": bot,
-            "resultado": res,
-            "ciclo": ciclo_int,
-            "monto": float(monto or 0.0),
-            "payout_total": float(payout_total or 0.0),
-            "pending_baseline": baseline,
-            "source_real": estado_bots.get(bot, {}).get("fuente") or ctx_reason,
-            "round_id": _resolver_ronda_audit({"bot": bot}),
-            "detector": "REAL_CLOSE_LATE",
-        })
-    except Exception:
-        pass
-
-    try:
-        _audit_real_close_pending_action(
-            bot=bot, pending=REAL_CLOSE_PENDING.get(bot), resultado=res,
-            contract_id=estado_bots.get(bot, {}).get("id_contrato"),
-            reason="late_real_close", accion="LIBERAR_WIN" if res == "GANANCIA" else "LIBERAR_LOSS",
-        )
-    except Exception:
-        pass
-    release_reason = "real_late_close_win" if res == "GANANCIA" else "real_late_close_loss"
-    pending_snapshot = dict(pending) if isinstance(pending, dict) else None
-    pending_restore_needed = False
-    if isinstance(pending_snapshot, dict) and bool(pending_snapshot.get("active")):
-        try:
-            pending_release = dict(pending_snapshot)
-            pending_release["active"] = False
-            pending_release["late_release_in_progress"] = True
-            REAL_CLOSE_PENDING[bot] = pending_release
-            pending_restore_needed = True
-        except Exception:
-            pending_restore_needed = False
-    sync_release_ok = False
-    try:
-        sync_release_ok = bool(_sync_round_release_after_real_close(bot, reason=release_reason))
-    except Exception as e:
-        agregar_evento(f"⚠️ REAL_CLOSE_LATE_SYNC_RELEASE_FAIL | {bot} | C{ciclo_int} | {res} | {type(e).__name__}")
-        sync_release_ok = False
-    finally:
-        if pending_restore_needed and isinstance(pending_snapshot, dict):
-            REAL_CLOSE_PENDING[bot] = pending_snapshot
-    if not sync_release_ok:
-        retry_pending = dict(pending_snapshot or {})
-        retry_pending.update({
-            "active": True,
-            "bot": bot,
-            "ciclo": ciclo_int,
-            "baseline": baseline,
-            "ts": time.time(),
-            "late_commit_sig": sig,
-            "late_commit_resultado": res,
-            "late_commit_ciclo": ciclo_int,
-            "late_commit_pending_retry": True,
-        })
-        REAL_CLOSE_PENDING[bot] = retry_pending
-        agregar_evento(f"⚠️ REAL_CLOSE_LATE_SYNC_RELEASE_FAIL | {bot} | C{ciclo_int} | {res}")
-        return True
-    agregar_evento(f"🔓 REAL_CLOSE_LATE_SYNC_RELEASE | {bot} | C{ciclo_int} | {res} | reason={release_reason}")
-
-    try:
-        cerrar_por_fin_de_ciclo(bot, f"Cierre REAL tardío {res} C{ciclo_int}; vuelve a DEMO; próximo ciclo C{prox}")
-        _validar_marti_post_cleanup_cierre_real_tardio(res, ciclo_int, contract_id_late, origen="late_release_cleanup")
-        _marti_log_continuidad_post_demo(res, ciclo_int)
-    except Exception as e:
-        agregar_evento(f"⚠️ REAL_CLOSE_LATE_RELEASE_FAIL | {bot} | C{ciclo_int} | {type(e).__name__}")
-
-    try:
-        token_raw = leer_token_archivo_raw()
-    except Exception as e:
-        retry_pending = dict(pending_snapshot or {})
-        retry_pending.update({
-            "active": True,
-            "bot": bot,
-            "ciclo": ciclo_int,
-            "baseline": baseline,
-            "ts": time.time(),
-            "late_commit_sig": sig,
-            "late_commit_resultado": res,
-            "late_commit_ciclo": ciclo_int,
-            "late_commit_pending_retry": True,
-        })
-        REAL_CLOSE_PENDING[bot] = retry_pending
-        agregar_evento(f"⚠️ REAL_CLOSE_LATE_TOKEN_NO_LIBERADO | {bot} | C{ciclo_int} | {res} | {type(e).__name__}")
-        return True
-    if token_raw in BOT_NAMES:
-        retry_pending = dict(pending_snapshot or {})
-        retry_pending.update({
-            "active": True,
-            "bot": bot,
-            "ciclo": ciclo_int,
-            "baseline": baseline,
-            "ts": time.time(),
-            "late_commit_sig": sig,
-            "late_commit_resultado": res,
-            "late_commit_ciclo": ciclo_int,
-            "late_commit_pending_retry": True,
-        })
-        REAL_CLOSE_PENDING[bot] = retry_pending
-        agregar_evento(f"⚠️ REAL_CLOSE_LATE_TOKEN_NO_LIBERADO | {bot} | C{ciclo_int} | {res} | token_actual={token_raw}")
-        return True
-
-    try:
-        _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
-    except Exception:
-        pass
-    _validar_marti_post_cleanup_cierre_real_tardio(res, ciclo_int, contract_id_late, origen="late_final_cleanup")
-    LAST_REAL_CLOSE_SIG[bot] = sig
-    REAL_CLOSE_PROCESSED_SIG[bot] = sig
-    REAL_CLOSE_PENDING[bot] = None
-    return True
 
 def _buscar_cierre_real_pendiente(bot):
     pending = REAL_CLOSE_PENDING.get(bot)
@@ -31621,17 +29638,7 @@ async def main():
                     set_etapa("TICK_02")
                     # Watchdog para REAL pegado
                     ahora = time.time()
-                    # Commit tardío antes de limpiezas/reconciliaciones fuertes y antes del
-                    # bloque histórico que depende de estado_bots[bot]["token"] == "REAL".
-                    bots_late_handled = set()
                     for bot in BOT_NAMES:
-                        if procesar_cierre_real_tardio_si_existe(bot):
-                            bots_late_handled.add(bot)
-                            activo_real = None
-                            break
-                    for bot in BOT_NAMES:
-                        if bot in bots_late_handled:
-                            continue
                         pack = _buscar_cierre_real_pendiente(bot)
                         if not pack:
                             continue
@@ -31639,96 +29646,26 @@ async def main():
                         res, monto, ciclo, payout_total = cierre_info
                         sig = _real_close_sig(bot, res, monto, ciclo, payout_total, baseline=int(pending.get("baseline", 0) or 0))
                         if sig == LAST_REAL_CLOSE_SIG.get(bot) or sig == REAL_CLOSE_PROCESSED_SIG.get(bot):
-                            _commit_martingala_real_cierre_seguro(
-                                bot, res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), f"pending_{modo_detector}_duplicado"
-                            )
                             _lxv_5v1x_event_cooldown(
                                 key=f"real_close_duplicate_pending:{bot}:{int(ciclo or 0)}",
                                 msg=f"⚠️ Cierre REAL duplicado detectado; no se repite cierre ni release: {bot} C{int(ciclo or 0)}",
                                 cooldown_s=15.0,
                             )
                             continue
-                        if not resultado_real_contable(res):
-                            try:
-                                pending["resultado"] = normalizar_resultado(res)
-                                pending["last_hold_reason"] = "resultado_no_contable"
-                                pending["active"] = True
-                            except Exception:
-                                pass
-                            _real_hold_event(
-                                bot=bot, pending=pending, resultado=res,
-                                contract_id=estado_bots.get(bot, {}).get("id_contrato"),
-                                reason="resultado_no_contable",
+                        if res not in ("GANANCIA", "PÉRDIDA"):
+                            _lxv_5v1x_event_cooldown(
+                                key=f"real_close_invalid_result_pending:{bot}:{int(ciclo or 0)}",
+                                msg="🚨 REAL sin cierre válido: HOLD activo, no se cierra ciclo ni se libera sync",
+                                cooldown_s=15.0,
                             )
                             continue
-                        if isinstance(pending, dict) and pending.get("late_commit_sig") == sig:
-                            agregar_evento(
-                                f"🔁 REAL_CLOSE_PENDING_RETRY_POST_LATE_COMMIT | {bot} | C{int(ciclo or 0)} | {normalizar_resultado(res)}"
-                            )
-                            pending_snapshot = dict(pending)
-                            sync_release_ok = False
-                            try:
-                                pending_release = dict(pending_snapshot)
-                                pending_release["active"] = False
-                                pending_release["late_release_in_progress"] = True
-                                REAL_CLOSE_PENDING[bot] = pending_release
-                                sync_release_ok = bool(_sync_round_release_after_real_close(bot, reason="post_late_commit_retry"))
-                            except Exception as e:
-                                agregar_evento(
-                                    f"⚠️ REAL_CLOSE_PENDING_RETRY_POST_LATE_COMMIT_SYNC_FAIL | {bot} | C{int(ciclo or 0)} | {type(e).__name__}"
-                                )
-                                sync_release_ok = False
-                            if not sync_release_ok:
-                                retry_pending = dict(pending_snapshot)
-                                retry_pending["active"] = True
-                                retry_pending["late_commit_pending_retry"] = True
-                                retry_pending["ts"] = time.time()
-                                REAL_CLOSE_PENDING[bot] = retry_pending
-                                continue
-                            try:
-                                cerrar_por_fin_de_ciclo(
-                                    bot,
-                                    f"Retry post late commit {normalizar_resultado(res)} C{int(ciclo or 0)}; vuelve a DEMO",
-                                )
-                                _validar_marti_post_cleanup_cierre_real_tardio(
-                                    res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), origen="post_late_commit_retry_cleanup"
-                                )
-                            except Exception as e:
-                                agregar_evento(
-                                    f"⚠️ REAL_CLOSE_PENDING_RETRY_POST_LATE_COMMIT_TOKEN_FAIL | {bot} | C{int(ciclo or 0)} | {type(e).__name__}"
-                                )
-                            try:
-                                token_raw = leer_token_archivo_raw()
-                            except Exception:
-                                token_raw = bot
-                            if token_raw in BOT_NAMES:
-                                retry_pending = dict(pending_snapshot)
-                                retry_pending["active"] = True
-                                retry_pending["late_commit_pending_retry"] = True
-                                retry_pending["ts"] = time.time()
-                                REAL_CLOSE_PENDING[bot] = retry_pending
-                                agregar_evento(
-                                    f"⚠️ REAL_CLOSE_LATE_TOKEN_NO_LIBERADO | {bot} | C{int(ciclo or 0)} | {normalizar_resultado(res)} | token_actual={token_raw}"
-                                )
-                                continue
-                            try:
-                                _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
-                            except Exception:
-                                pass
-                            REAL_CLOSE_PENDING[bot] = None
-                            LAST_REAL_CLOSE_SIG[bot] = sig
-                            REAL_CLOSE_PROCESSED_SIG[bot] = sig
-                            activo_real = None
-                            break
                         saldo_antes = obtener_valor_saldo()
                         globals()["REAL_BALANCE_AUDIT_CONTEXT"] = {
                             "owner": bot, "ciclo": f"C{int(ciclo or 0)}", "resultado": res,
                             "ronda": pending.get("round_id"), "contract_id": estado_bots.get(bot, {}).get("id_contrato"),
                             "reason": "resultado_real",
                         }
-                        _commit_martingala_real_cierre_seguro(
-                            bot, res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), f"pending_{modo_detector}"
-                        )
+                        registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo)
                         try:
                             await refresh_saldo_real(forzado=True)
                         except Exception:
@@ -31757,10 +29694,8 @@ async def main():
                             "detector": f"REAL_CLOSE_PENDING_{modo_detector}",
                         })
                         if res == "GANANCIA":
-                            _audit_real_close_pending_action(bot=bot, pending=pending, resultado=res, contract_id=estado_bots.get(bot, {}).get("id_contrato"), reason=f"pending_{modo_detector}", accion="LIBERAR_WIN")
                             agregar_evento(f"✅ REAL C{int(ciclo)} GANANCIA registrada por pending ({modo_detector}): {bot} -> C1")
                             cerrar_por_fin_de_ciclo(bot, "Ganancia REAL cerrada por pending; vuelve a DEMO")
-                            _validar_marti_post_cleanup_cierre_real_tardio(res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), origen=f"pending_{modo_detector}_cleanup")
                             _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
                             REAL_CLOSE_PENDING[bot] = None
                             _sync_round_release_after_real_close(bot, reason="real_win_pending")
@@ -31769,12 +29704,9 @@ async def main():
                             activo_real = None
                             break
                         if res == "PÉRDIDA":
-                            _audit_real_close_pending_action(bot=bot, pending=pending, resultado=res, contract_id=estado_bots.get(bot, {}).get("id_contrato"), reason=f"pending_{modo_detector}", accion="LIBERAR_LOSS")
                             prox = int(ciclo_martingala_siguiente() or 1)
                             agregar_evento(f"❌ REAL C{int(ciclo)} PÉRDIDA registrada por pending ({modo_detector}): {bot} -> próxima C{prox}")
                             cerrar_por_fin_de_ciclo(bot, f"Pérdida REAL C{int(ciclo)} cerrada por pending")
-                            _validar_marti_post_cleanup_cierre_real_tardio(res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), origen=f"pending_{modo_detector}_cleanup")
-                            _marti_log_continuidad_post_demo(res, ciclo)
                             _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
                             REAL_CLOSE_PENDING[bot] = None
                             _sync_round_release_after_real_close(bot, reason="real_loss_pending")
@@ -31782,28 +29714,10 @@ async def main():
                             REAL_CLOSE_PROCESSED_SIG[bot] = sig
                             activo_real = None
                             break
-                    try:
-                        owner_archivo = leer_token_archivo_raw()
-                    except Exception:
-                        owner_archivo = None
-
-                    if owner_archivo in BOT_NAMES:
-                        try:
-                            if _watchdog_liberar_orden_real_expirada_sin_compra(owner_archivo, now_ts=ahora):
-                                activo_real = None
-                                break
-                        except Exception:
-                            pass
-
                     for bot in BOT_NAMES:
-                        if bot in bots_late_handled:
-                            continue
                         if estado_bots[bot]["token"] == "REAL":
                             t_last = last_update_time.get(bot, 0)
                             t_real = estado_bots[bot].get("real_activado_en", 0.0)
-                            if _watchdog_liberar_orden_real_expirada_sin_compra(bot, now_ts=ahora):
-                                activo_real = None
-                                break
                             # Si lleva demasiado sin actualizarse desde que entró a REAL:
                             # NO salir a DEMO aquí: la salida solo ocurre con cierre GANANCIA/PÉRDIDA.
                             if t_real > 0:
@@ -31834,8 +29748,6 @@ async def main():
                                     break
 
                     for bot in BOT_NAMES:
-                        if bot in bots_late_handled:
-                            continue
                         if estado_bots[bot]["token"] == "REAL":
                             # Detecta el último cierre REAL de forma robusta (sin depender de SNAPSHOT_FILAS,
                             # porque TICK_01 ya puede haber avanzado el snapshot antes de este bloque).
@@ -31854,58 +29766,14 @@ async def main():
                             # Cierre inmediato: en REAL siempre 1 operación y vuelve a DEMO (gane o pierda)
                             if cierre_info and isinstance(cierre_info, tuple) and len(cierre_info) >= 4:
                                 res, monto, ciclo, payout_total = cierre_info
-                                pending_direct = REAL_CLOSE_PENDING.get(bot)
-                                baseline_direct = 0
-                                if isinstance(pending_direct, dict):
-                                    baseline_direct = int(pending_direct.get("baseline", 0) or 0)
-                                if baseline_direct <= 0:
-                                    baseline_direct = int(REAL_ENTRY_BASELINE.get(bot, 0) or 0)
-                                sig = _real_close_sig(
-                                    bot,
-                                    res,
-                                    monto,
-                                    ciclo,
-                                    payout_total,
-                                    baseline=baseline_direct,
-                                )
-
-                                if isinstance(pending_direct, dict) and pending_direct.get("late_commit_sig") == sig:
-                                    agregar_evento(
-                                        f"🔁 REAL_DIRECT_SKIP_POST_LATE_COMMIT | {bot} | C{int(ciclo or 0)} | {normalizar_resultado(res)}"
-                                    )
-                                    continue
+                                sig = _real_close_sig(bot, res, monto, ciclo, payout_total)
 
                                 # Evita reprocesar el mismo cierre en ticks consecutivos sin liberar por duplicado.
                                 if sig == LAST_REAL_CLOSE_SIG.get(bot) or sig == REAL_CLOSE_PROCESSED_SIG.get(bot):
-                                    _commit_martingala_real_cierre_seguro(
-                                        bot, res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), "direct_real_close_duplicado"
-                                    )
                                     _lxv_5v1x_event_cooldown(
                                         key=f"real_close_duplicate_direct:{bot}:{int(ciclo or 0)}",
                                         msg=f"⚠️ Cierre REAL duplicado detectado; no se repite cierre ni release: {bot} C{int(ciclo or 0)}",
                                         cooldown_s=15.0,
-                                    )
-                                    continue
-
-                                if not resultado_real_contable(res):
-                                    if not isinstance(pending_direct, dict):
-                                        pending_direct = {
-                                            "active": True,
-                                            "bot": bot,
-                                            "ciclo": int(ciclo or estado_bots.get(bot, {}).get("ciclo_actual", 1) or 1),
-                                            "baseline": int(REAL_ENTRY_BASELINE.get(bot, 0) or 0),
-                                            "ts": float(time.time()),
-                                            "source": str(estado_bots.get(bot, {}).get("fuente") or "DIRECT"),
-                                            "round_id": _resolver_ronda_audit({"bot": bot}),
-                                        }
-                                        REAL_CLOSE_PENDING[bot] = pending_direct
-                                    pending_direct["resultado"] = normalizar_resultado(res)
-                                    pending_direct["last_hold_reason"] = "direct_resultado_no_contable"
-                                    pending_direct["active"] = True
-                                    _real_hold_event(
-                                        bot=bot, pending=pending_direct, resultado=res,
-                                        contract_id=estado_bots.get(bot, {}).get("id_contrato"),
-                                        reason="direct_resultado_no_contable",
                                     )
                                     continue
 
@@ -31917,9 +29785,7 @@ async def main():
                                         "contract_id": estado_bots.get(bot, {}).get("id_contrato"),
                                         "reason": "resultado_real",
                                     }
-                                    _commit_martingala_real_cierre_seguro(
-                                        bot, res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), "direct_real_close"
-                                    )
+                                    registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo)
                                     try:
                                         await refresh_saldo_real(forzado=True)
                                     except Exception:
@@ -31955,11 +29821,9 @@ async def main():
                                     except Exception:
                                         pass
                                     if res == "GANANCIA":
-                                        _audit_real_close_pending_action(bot=bot, pending=REAL_CLOSE_PENDING.get(bot), resultado=res, contract_id=estado_bots.get(bot, {}).get("id_contrato"), reason="direct_real_close", accion="LIBERAR_WIN")
                                         prox = int(ciclo_martingala_siguiente() or 1)
                                         agregar_evento(f"✅ REAL WIN: {bot} C{int(ciclo or 0)} -> DEMO | próximo ciclo C{prox}")
                                         cerrar_por_fin_de_ciclo(bot, "Ganancia REAL cerrada; vuelve a DEMO")
-                                        _validar_marti_post_cleanup_cierre_real_tardio(res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), origen="direct_win_cleanup")
                                         _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
                                         REAL_CLOSE_PENDING[bot] = None
                                         _sync_round_release_after_real_close(bot, reason="real_win")
@@ -31968,15 +29832,12 @@ async def main():
                                         activo_real = None
                                         break
                                     if res == "PÉRDIDA":
-                                        _audit_real_close_pending_action(bot=bot, pending=REAL_CLOSE_PENDING.get(bot), resultado=res, contract_id=estado_bots.get(bot, {}).get("id_contrato"), reason="direct_real_close", accion="LIBERAR_LOSS")
                                         prox = int(ciclo_martingala_siguiente() or 1)
                                         if int(ciclo or 0) >= int(MAX_CICLOS):
                                             agregar_evento(f"❌ REAL LOSS FINAL: {bot} C{int(ciclo or 0)} -> DEMO | reinicio próximo ciclo C{prox}")
                                         else:
                                             agregar_evento(f"❌ REAL LOSS: {bot} C{int(ciclo or 0)} -> DEMO | próximo ciclo C{prox}")
                                         cerrar_por_fin_de_ciclo(bot, f"Pérdida REAL C{int(ciclo or 0)}; vuelve a DEMO; próximo ciclo C{prox}")
-                                        _validar_marti_post_cleanup_cierre_real_tardio(res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), origen="direct_loss_cleanup")
-                                        _marti_log_continuidad_post_demo(res, ciclo)
                                         _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
                                         REAL_CLOSE_PENDING[bot] = None
                                         _sync_round_release_after_real_close(bot, reason="real_loss_next_cycle")
@@ -31989,9 +29850,8 @@ async def main():
                         set_etapa("TICK_03")
                         pending_on, pending_bot, pending = _hay_real_close_pending_activo()
                         if pending_on:
-                            _real_hold_event(bot=pending_bot, pending=pending, resultado=(pending or {}).get("resultado") if isinstance(pending, dict) else "INDEFINIDO", reason="tick_bloqueo_nueva_compra")
                             agregar_evento(
-                                f"🧱 REAL bloqueado: cierre pendiente sin resultado final; no se evalúa nueva entrada REAL hasta cerrar {pending_bot} C{pending.get('ciclo') if isinstance(pending, dict) else '?'}"
+                                f"⏸️ REAL pendiente: no se evalúa nueva entrada REAL hasta cerrar {pending_bot} C{pending.get('ciclo')}"
                             )
                             set_etapa("TICK_02")
                             continue
@@ -32384,8 +30244,8 @@ async def main():
                             owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
                             if candidatos and (PENDIENTE_FORZAR_BOT is None) and (owner in (None, "none")):
                                 ciclo_auto = ciclo_martingala_siguiente()
-                                if _marti_saldo_bloquea_real(ciclo_auto, saldo_val):
-                                    continue
+                                if reset_martingala_por_saldo(ciclo_auto, saldo_val):
+                                    ciclo_auto = 1
                                 emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
                                 mejor_bot = str(emb.get("top1_bot") or "").strip()
                                 mejor = next((c for c in candidatos if str(c[1]) == mejor_bot), None)
@@ -32421,8 +30281,8 @@ async def main():
 
                         if candidatos and not MODO_REAL_MANUAL:
                             ciclo_auto = ciclo_martingala_siguiente()
-                            if _marti_saldo_bloquea_real(ciclo_auto, saldo_val):
-                                continue
+                            if reset_martingala_por_saldo(ciclo_auto, saldo_val):
+                                ciclo_auto = 1
                             emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
                             mejor_bot = str(emb.get("top1_bot") or "").strip()
                             mejor = next((c for c in candidatos if str(c[1]) == mejor_bot), None)
@@ -32431,8 +30291,6 @@ async def main():
                                 agregar_evento(f"⚙️ IA AUTO (embudo único): {mejor_bot} p_oper={prob*100:.1f}% risk={emb.get('risk_mode','--')} gate={emb.get('gate_quality','--')}")
                                 monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_auto - 1))]
                                 val = obtener_valor_saldo()
-                                if _marti_saldo_bloquea_real(ciclo_auto, val):
-                                    continue
                                 if val is None or val < monto:
                                     pass
                                 else:
@@ -32547,6 +30405,46 @@ if __name__ == "__main__":
             time.sleep(5)
 
 # === FIN BLOQUE 13 ===
+# === BLOQUE 99 — RESUMEN FINAL DE LO QUE SE LOGRA ===
+#
+# - Bot maestro 5R6M-1-2-4-8-16 con:
+#   * Martingala 1-2-4-8-16 intacta.
+#   * Tokens DEMO/REAL y handshake maestro→bots intactos.
+#   * CSV enriquecidos, dataset_incremental.csv, IA XGBoost, reentrenos intactos.
+#   * HUD visual con Prob IA, % éxito, saldo, meta, eventos
+#   * Audio para GANANCIA/PÉRDIDA, racha, meta, IA 53%, etc.
+# - Organización por bloques numerados:
+#   ver índice de bloques al inicio del archivo.
+#
+# Esta organización no cambia la lógica original, solo la hace más mantenible.
+# === FIN BLOQUE 99 ===
+        if len(src_rows) <= 0:
+            src_rows = list(LXV_FASE_COLUMNS_CACHE)
+            cache_has_target = True if target_rid is None else any(int((x or {}).get("round_id", 0) or 0) == target_rid for x in src_rows)
+            if (not src_rows) or ((target_rid is not None) and (not cache_has_target)):
+                src_rows = _lxv_5v1x_load_recent_matrix_rows(max_rows=40)
+                matrix_has_target = True if target_rid is None else any(_mrv_5v1x_to_int((x or {}).get("round_id", 0), 0) == target_rid for x in src_rows)
+                if target_rid is not None and not matrix_has_target:
+                    try:
+                        rows_pack = _ack_live_build_rows()
+                        fb = _ack_live_calc_summary(rows_pack)
+                        rid_fb = _mrv_5v1x_to_int((fb or {}).get("obj_round", 0), 0)
+                        if rid_fb == target_rid:
+                            src_rows.append({
+                                "round_id": rid_fb,
+                                "n_verdes": int((fb or {}).get("verdes_count", 0) or 0),
+                                "n_rojos": int((fb or {}).get("rojas_count", 0) or 0),
+                                "round_complete": bool((fb or {}).get("complete", False)),
+                                "data_quality": str((fb or {}).get("data_quality", "") or ""),
+                                "source": "ack_live_summary",
+                            })
+                    except Exception:
+                        pass
+    _lxv_5v1x_event_cooldown(
+        key=f"5v1x_green_ok:{rid}",
+        msg=f"✅ LXV VERDE OK: rid={rid} patron=5V1X prev_full_green_streak={int((info_exh or {}).get('prev_full_green_streak',0))}",
+        cooldown_s=8.0,
+    )
 
 def _selftest_real_activo_prepatron_lxv():
     tests = [
@@ -32961,16 +30859,3 @@ def _selftest_dq_released_hud():
 
 if os.environ.get("RUN_DQ_RELEASED_HUD_SELFTEST") == "1":
     _selftest_dq_released_hud()
-# === BLOQUE 99 — RESUMEN FINAL DE LO QUE SE LOGRA ===
-#
-# - Bot maestro 5R6M-1-2-4-8-16 con:
-#   * Martingala 1-2-4-8-16 intacta.
-#   * Tokens DEMO/REAL y handshake maestro→bots intactos.
-#   * CSV enriquecidos, dataset_incremental.csv, IA XGBoost, reentrenos intactos.
-#   * HUD visual con Prob IA, % éxito, saldo, meta, eventos
-#   * Audio para GANANCIA/PÉRDIDA, racha, meta, IA 53%, etc.
-# - Organización por bloques numerados:
-#   ver índice de bloques al inicio del archivo.
-#
-# Esta organización no cambia la lógica original, solo la hace más mantenible.
-# === FIN BLOQUE 99 ===
