@@ -217,6 +217,7 @@ estado_bot = {
     "pending_since_ts": 0.0,
     "pending_round_id": None,
     "pending_sync_round_id_original": 0,
+    "reset_demo_ciclo_post_real_pending": False,
 }  # Added modo_manual and barra_activa
 racha_actual_bot = 0  # racha del bot: >0 = racha de GANANCIAS, <0 = racha de PÉRDIDAS
 
@@ -2443,6 +2444,42 @@ def release_real_token_if_owned():
 
     return False
 
+def _marcar_reset_ciclo_local_demo_post_real(reason="post_real"):
+    try:
+        estado_bot["reset_demo_ciclo_post_real_pending"] = True
+        estado_bot["reset_demo_ciclo_post_real_reason"] = str(reason or "post_real")
+    except Exception:
+        pass
+
+def _hay_orden_real_valida_activa_maestro():
+    try:
+        ciclo_orden, _ts, _quiet, _src = leer_orden_real(NOMBRE_BOT)
+        if ciclo_orden is None:
+            return False
+        ciclo_int = int(ciclo_orden)
+        return 1 <= ciclo_int <= MAX_CICLOS
+    except Exception:
+        return False
+
+def _reset_ciclo_local_demo_post_real_si_corresponde(current_token, reason="post_real"):
+    # La Martingala REAL pertenece al maestro. Este reset solo limpia estado visual/local DEMO.
+    try:
+        if current_token == TOKEN_REAL:
+            return False
+        if _hay_orden_real_valida_activa_maestro():
+            return False
+        if not estado_bot.get("reset_demo_ciclo_post_real_pending", False):
+            return False
+        ciclo_prev = estado_bot.get("ciclo_forzado")
+        if ciclo_prev is not None:
+            estado_bot["ciclo_forzado"] = None
+            print(Fore.CYAN + Style.BRIGHT + f"🧼 CICLO_LOCAL_DEMO_RESET_POST_REAL | {NOMBRE_BOT} | ciclo_forzado limpiado | próxima REAL la decide maestro")
+        estado_bot["reset_demo_ciclo_post_real_pending"] = False
+        estado_bot["reset_demo_ciclo_post_real_reason"] = str(reason or "post_real")
+        return ciclo_prev is not None
+    except Exception:
+        return False
+
 def write_csv_atomic(path: str, row):
     """
     Escritura atómica + auto-reparación de filas inconsistentes (columnas corridas / len != header).
@@ -3138,6 +3175,8 @@ async def check_token_and_reconnect(ws, current_token):
                 # Saliste de REAL: prepara el sonido para la próxima ventana
                 primer_ingreso_real = False
                 estado_bot["real_first_cycle_reset_pending"] = False
+                _marcar_reset_ciclo_local_demo_post_real("token_real_a_demo")
+                _reset_ciclo_local_demo_post_real_si_corresponde(token_desde_archivo, "token_real_a_demo")
                 reinicio_forzado.set()
             ultimo_token = token_desde_archivo  # mantén vigilante y lazo alineados
             return ws, token_desde_archivo
@@ -3227,8 +3266,13 @@ async def vigilar_token():
                         print(Fore.YELLOW + Style.BRIGHT + "⚠️ REAL/DEMO cambió mientras había contrato abierto. Esperando cierre seguro antes de nueva compra." + Style.RESET_ALL)
                     estado_bot["token_msg_mostrado"] = True
                 estado_bot["interrumpir_ciclo"] = True
+                if ultimo_token == TOKEN_REAL and token_desde_archivo != TOKEN_REAL:
+                    _marcar_reset_ciclo_local_demo_post_real("token_cambio_con_contrato_abierto")
                 reinicio_forzado.set()
             else:
+                if ultimo_token == TOKEN_REAL and token_desde_archivo != TOKEN_REAL:
+                    _marcar_reset_ciclo_local_demo_post_real("watcher_real_a_demo")
+                    _reset_ciclo_local_demo_post_real_si_corresponde(token_desde_archivo, "watcher_real_a_demo")
                 ultimo_token = token_desde_archivo
                 reinicio_forzado.set()
 
@@ -3946,6 +3990,7 @@ async def ejecutar_panel():
                     )
 
             if not modo_real:
+                _reset_ciclo_local_demo_post_real_si_corresponde(current_token, "pre_demo_cycle_selection")
                 _sync_round_adopt_official_if_stale(motivo="pre_demo_buy")
 
             martingala = MARTINGALA_REAL if modo_real else MARTINGALA_DEMO
@@ -4105,6 +4150,7 @@ async def ejecutar_panel():
                                 pass
                             # ✅ Liberación segura (CAS): solo si aún soy el dueño del REAL
                             release_real_token_if_owned()
+                            _marcar_reset_ciclo_local_demo_post_real("release_real_token_if_owned")
                             estado_bot["intentos_saldo"] = 0
                             reinicio_forzado.set()
                         else:
@@ -4469,6 +4515,7 @@ async def ejecutar_panel():
 
                         try:
                             release_real_token_if_owned()
+                            _marcar_reset_ciclo_local_demo_post_real("release_real_token_if_owned")
                         except Exception:
                             pass
                         try:
@@ -4500,6 +4547,7 @@ async def ejecutar_panel():
 
                     try:
                         release_real_token_if_owned()
+                        _marcar_reset_ciclo_local_demo_post_real("release_real_token_if_owned")
                     except Exception:
                         pass
                     try:
