@@ -9197,6 +9197,28 @@ def validar_bot_objetivo_para_rebote(bot, historial_columnas, idx_actual):
         out["motivo"] = "validacion_bot_error"
         return out
 
+
+
+def calcular_full_green_streak_inmediato_previo(columnas, idx_actual):
+    try:
+        rows = [x for x in list(columnas or []) if isinstance(x, dict)]
+        idx = int(idx_actual)
+        if idx <= 0 or not rows:
+            return 0
+        if idx > len(rows):
+            idx = len(rows)
+        streak = 0
+        for pos in range(idx - 1, -1, -1):
+            row = rows[pos]
+            verdes = _mrv_5v1x_to_int(row.get("n_verdes", row.get("verdes", -1)), -1)
+            if verdes >= 5:
+                streak += 1
+                continue
+            break
+        return int(streak)
+    except Exception:
+        return 0
+
 def detectar_rebote_verde_temprano_controlado(rows_validas, idx_actual=None, metrics=None, patron_actual=None):
     base = {"zona_extra": None, "allow_extra": False, "block_extra": False, "motivo_extra": "sin_match_rebote_verde_temprano", "decision_extra": ZONA_NO_INVERTIR}
     try:
@@ -9288,14 +9310,29 @@ def _lxv_extra_zona_emit_event(zona_extra, data):
             if now - float(globals().get("_LXV_REBOTE_POST_ROJO_LAST_LOG_TS", 0.0) or 0.0) < cooldown:
                 return
             _LXV_REBOTE_POST_ROJO_LAST_LOG_TS = now
-            fn_evt(f"🟢 REBOTE_POST_ROJO: desbloqueo controlado | patrón={data.get('patron_actual','--')} | impulse={float(data.get('impulse',0.0) or 0.0):.2f} | prom_prev={float(data.get('prom_prev',0.0) or 0.0):.2f}")
+            patron = str(data.get("patron_actual", "--") or "--").upper()
+            bot = str(data.get("bot_objetivo", "--") or "--")
+            motivo = str(data.get("motivo_extra", data.get("motivo", "--")) or "--")
+            if patron == "4V2X":
+                if bool(data.get("allow_extra", False)):
+                    fn_evt(f"🟢 REBOTE_POST_ROJO 4V2X VALIDADO | bot={bot} | motivo={motivo}")
+                else:
+                    fn_evt(f"🟡 REBOTE_POST_ROJO 4V2X BLOQUEADO | bot={bot} | motivo={motivo}")
+            else:
+                fn_evt(f"🟢 REBOTE_POST_ROJO: desbloqueo controlado | patrón={patron} | impulse={float(data.get('impulse',0.0) or 0.0):.2f} | prom_prev={float(data.get('prom_prev',0.0) or 0.0):.2f}")
         elif zona_extra == "VERDE_SERRUCHO_SATURADO":
             cooldown = float(globals().get("LXV_VERDE_SERRUCHO_LOG_COOLDOWN_S", 20.0) or 20.0)
             if now - float(globals().get("_LXV_VERDE_SERRUCHO_LAST_LOG_TS", 0.0) or 0.0) < cooldown:
                 return
             _LXV_VERDE_SERRUCHO_LAST_LOG_TS = now
-            red_drop_txt = "sí" if bool(data.get("red_drop_prev", False)) else "no"
-            fn_evt(f"🟠 VERDE_SERRUCHO_SATURADO: bloqueado | full_prev={int(data.get('full_green_prev',0) or 0)} | red_drop={red_drop_txt} | patrón={data.get('patron_actual','--')}")
+            ruptura_txt = "SI" if bool(data.get("ruptura_clara", data.get("red_drop_prev", False))) else "NO"
+            fn_evt(f"🔴 VERDE_SERRUCHO_SATURADO | streak_inmediato={int(data.get('streak_inmediato', data.get('full_green_prev',0)) or 0)} | ruptura={ruptura_txt} | patrón={data.get('patron_actual','--')} | decisión=NO_INVERTIR")
+        elif zona_extra == "SERRUCHO_NO_APLICA":
+            cooldown = float(globals().get("LXV_VERDE_SERRUCHO_LOG_COOLDOWN_S", 20.0) or 20.0)
+            if now - float(globals().get("_LXV_VERDE_SERRUCHO_LAST_LOG_TS", 0.0) or 0.0) < cooldown:
+                return
+            _LXV_VERDE_SERRUCHO_LAST_LOG_TS = now
+            fn_evt(f"🟢 SERRUCHO NO APLICA | streak_inmediato={int(data.get('streak_inmediato',0) or 0)} | motivo={data.get('motivo_extra','sin_saturacion_consecutiva')}")
     except Exception:
         return
 
@@ -9340,17 +9377,36 @@ def _lxv_extra_zona_rebote_serrucho(rows_validas, idx_actual=None, patron_actual
         prom_prev = sum(max(0.0, min(1.0, float(_mrv_5v1x_to_int(x.get("n_verdes", 0), 0)) / 6.0)) for x in prev_rebote) / max(1, len(prev_rebote))
         red_cols = sum(1 for x in prev_rebote if _mrv_5v1x_to_int(x.get("n_rojos", 0), 0) >= int(globals().get("LXV_REBOTE_POST_ROJO_RED_MIN", 4) or 4))
         full_green_prev = sum(1 for x in prev_serrucho if _mrv_5v1x_to_int(x.get("n_verdes", 0), 0) >= 5)
-        red_drop_prev = any(_mrv_5v1x_to_int(x.get("n_rojos", 0), 0) >= int(globals().get("LXV_VERDE_SERRUCHO_RED_DROP_MIN_ROJOS", 4) or 4) for x in prev_serrucho)
+        streak_inmediato = calcular_full_green_streak_inmediato_previo(rows, idx)
+        red_drop_min = int(globals().get("LXV_VERDE_SERRUCHO_RED_DROP_MIN_ROJOS", 4) or 4)
+        prev_1 = rows[idx - 1] if idx > 0 else {}
+        red_drop_prev = _mrv_5v1x_to_int(prev_1.get("n_rojos", 0), 0) >= red_drop_min
+        vals = [max(0.0, min(1.0, float(_mrv_5v1x_to_int(x.get("n_verdes", 0), 0)) / 6.0)) for x in rows[:idx + 1]]
+        prom3_actual = sum(vals[-3:]) / max(1, len(vals[-3:]))
+        prom8_actual = sum(vals[-8:]) / max(1, len(vals[-8:]))
+        delta_3_8_actual = float(prom3_actual - prom8_actual)
+        ruptura_clara = bool(
+            rojos_actual >= red_drop_min
+            or red_drop_prev
+            or delta_3_8_actual <= -float(globals().get("LXV_ZONA_DROP_TARDIO", 0.08) or 0.08)
+        )
         impulse = float(g_actual - prom_prev)
-        metrics = {"patron_actual": patron or "--", "g_actual": g_actual, "r_actual": r_actual, "prom_prev": prom_prev, "red_cols": red_cols, "full_green_prev": full_green_prev, "red_drop_prev": red_drop_prev, "impulse": impulse}
+        metrics = {"patron_actual": patron or "--", "g_actual": g_actual, "r_actual": r_actual, "prom_prev": prom_prev, "red_cols": red_cols, "full_green_prev": full_green_prev, "streak_inmediato": streak_inmediato, "red_drop_prev": red_drop_prev, "ruptura_clara": ruptura_clara, "delta_3_8": delta_3_8_actual, "impulse": impulse}
         if bool(globals().get("LXV_VERDE_SERRUCHO_SATURADO_ENABLE", True)):
             patron_block = (patron == "4V2X" and bool(globals().get("LXV_VERDE_SERRUCHO_BLOCK_4V2X", True))) or (patron == "5V1X" and bool(globals().get("LXV_VERDE_SERRUCHO_BLOCK_5V1X", False)))
-            if patron_block and verdes_actual <= int(globals().get("LXV_VERDE_SERRUCHO_CURRENT_MAX_GREEN", 4) or 4) and full_green_prev >= int(globals().get("LXV_VERDE_SERRUCHO_MIN_FULL_GREEN_PREV", 2) or 2) and red_drop_prev:
+            min_full_green = int(globals().get("LXV_VERDE_SERRUCHO_MIN_FULL_GREEN_PREV", 2) or 2)
+            current_riesgoso = verdes_actual <= int(globals().get("LXV_VERDE_SERRUCHO_CURRENT_MAX_GREEN", 4) or 4)
+            if patron_block and current_riesgoso and streak_inmediato >= min_full_green and ruptura_clara:
                 out = dict(base)
                 out.update(metrics)
-                out.update({"zona_extra": "VERDE_SERRUCHO_SATURADO", "allow_extra": False, "block_extra": True, "motivo_extra": "serrucho_saturado_fullgreen_red_drop"})
+                out.update({"zona_extra": "VERDE_SERRUCHO_SATURADO", "allow_extra": False, "block_extra": True, "motivo_extra": "serrucho_saturado_streak_inmediato_ruptura"})
                 _lxv_extra_zona_emit_event("VERDE_SERRUCHO_SATURADO", out)
                 return out
+            if patron_block and full_green_prev >= min_full_green and streak_inmediato < min_full_green:
+                out_log = dict(base)
+                out_log.update(metrics)
+                out_log.update({"motivo_extra": "sin_saturacion_consecutiva"})
+                _lxv_extra_zona_emit_event("SERRUCHO_NO_APLICA", out_log)
         if bool(globals().get("LXV_REBOTE_POST_ROJO_ENABLE", True)) and bool(globals().get("LXV_REBOTE_POST_ROJO_CAN_UNLOCK", True)):
             base_ok = (
                 patron in {"5V1X", "4V2X"}
@@ -9360,11 +9416,40 @@ def _lxv_extra_zona_rebote_serrucho(rows_validas, idx_actual=None, patron_actual
                 and impulse >= float(globals().get("LXV_REBOTE_POST_ROJO_MIN_IMPULSE", 0.18) or 0.18)
             )
             if base_ok and patron == "4V2X" and bool(globals().get("LXV_REBOTE_POST_ROJO_4V2X_REQUIRE_STRICT", True)):
-                base_ok = impulse >= (float(globals().get("LXV_REBOTE_POST_ROJO_MIN_IMPULSE", 0.18) or 0.18) + 0.05) and full_green_prev < int(globals().get("LXV_VERDE_SERRUCHO_MIN_FULL_GREEN_PREV", 2) or 2)
+                bot_obj = _lxv_pick_bot_objetivo_rebote(curr)
+                bot_val = validar_bot_objetivo_para_rebote(bot_obj, rows, idx)
+                motivo_bot = str(bot_val.get("motivo", "datos_insuficientes") or "datos_insuficientes")
+                strict_ok = (
+                    bool(bot_val.get("ok", False))
+                    and bool(bot_val.get("patron_fresco", False))
+                    and int(bot_val.get("apariciones", 0) or 0) >= 4
+                    and int(bot_val.get("x_ult4", 0) or 0) < 3
+                    and "bot_objetivo_debil" not in motivo_bot
+                    and streak_inmediato < int(globals().get("LXV_VERDE_SERRUCHO_MIN_FULL_GREEN_PREV", 2) or 2)
+                )
+                out_strict = dict(base)
+                out_strict.update(metrics)
+                out_strict.update({"bot_objetivo": bot_obj or "--", "bot_rebote_info": dict(bot_val)})
+                if not strict_ok:
+                    motivo_strict = motivo_bot
+                    if not bot_obj:
+                        motivo_strict = "datos_insuficientes"
+                    elif not bool(bot_val.get("patron_fresco", False)):
+                        motivo_strict = "patron_no_fresco"
+                    elif int(bot_val.get("x_ult4", 0) or 0) >= 3 or "bot_objetivo_debil" in motivo_bot:
+                        motivo_strict = "bot_objetivo_debil"
+                    elif streak_inmediato >= int(globals().get("LXV_VERDE_SERRUCHO_MIN_FULL_GREEN_PREV", 2) or 2):
+                        motivo_strict = "saturacion_verde_previa"
+                    out_strict.update({"zona_extra": "REBOTE_POST_ROJO", "allow_extra": False, "block_extra": False, "motivo_extra": motivo_strict})
+                    _lxv_extra_zona_emit_event("REBOTE_POST_ROJO", out_strict)
+                    base_ok = False
+                else:
+                    metrics.update({"bot_objetivo": bot_obj or "--", "bot_rebote_info": dict(bot_val)})
+                    metrics["motivo_extra"] = "bot_objetivo_ok"
             if base_ok:
                 out = dict(base)
                 out.update(metrics)
-                out.update({"zona_extra": "REBOTE_POST_ROJO", "allow_extra": True, "block_extra": False, "motivo_extra": "rebote_post_rojo_impulse_ok"})
+                out.update({"zona_extra": "REBOTE_POST_ROJO", "allow_extra": True, "block_extra": False, "motivo_extra": str(metrics.get("motivo_extra", "rebote_post_rojo_impulse_ok") or "rebote_post_rojo_impulse_ok")})
                 _lxv_extra_zona_emit_event("REBOTE_POST_ROJO", out)
                 return out
         out = dict(base)
