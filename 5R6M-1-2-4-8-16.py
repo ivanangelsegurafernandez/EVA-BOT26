@@ -12935,9 +12935,15 @@ def _sync_round_tick_maestro():
             fase_info = {}
             patron = _lxv_normalizar_patron_txt(partial_pattern or patron) or "0V0X"
             ciclo_pick = ciclo_martingala_siguiente()
+            saldo_val = obtener_valor_saldo()
+            saldo_marti_bloqueado = _marti_saldo_bloquea_real(ciclo_pick, saldo_val)
             zona_info_decision = evaluar_fase_zona_verde_lxv(round_id_objetivo=round_id) or {}
             zona_allow, zona_reason = _lxv_zona_es_invertible(zona_info_decision)
-            if _sync_round_pending_blocks_real_only(real_close_pending_active):
+            if saldo_marti_bloqueado:
+                real_emitido = False
+                motivo_no_real = f"saldo_bloqueado_C{int(ciclo_pick)}"
+                ok_emit = False
+            elif _sync_round_pending_blocks_real_only(real_close_pending_active):
                 real_emitido = False
                 motivo_no_real = "real_close_pending_active"
                 locks = (globals().get("REAL_LOCKS_PANEL", {}) or {}).setdefault("locks", {})
@@ -13054,8 +13060,8 @@ def _sync_round_tick_maestro():
             )
             ciclo_pick = ciclo_martingala_siguiente()
             saldo_val = obtener_valor_saldo()
-            if reset_martingala_por_saldo(ciclo_pick, saldo_val):
-                ciclo_pick = 1
+            if _marti_saldo_bloquea_real(ciclo_pick, saldo_val):
+                return
             agregar_evento(
                 f"🧠 LXV columna #{round_id}: {patron} → candidato REAL {bot_pick} ({motivo}) "
                 f"| snapshot=C{ciclo_snapshot} | global=C{ciclo_pick}"
@@ -20164,6 +20170,8 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
         estado_bots[bot]["token"] = "DEMO"
         estado_bots[bot]["trigger_real"] = False
         estado_bots[bot]["ciclo_actual"] = 1
+        # estado_bots[bot]['ciclo_actual']=1 es solo estado local DEMO;
+        # la próxima REAL se toma de ciclo_martingala_siguiente().
         estado_bots[bot]["modo_real_anunciado"] = False
         estado_bots[bot]["fuente"] = None
 
@@ -20249,6 +20257,7 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
     # Log visual
     try:
         agregar_evento(f"🔓 Cuenta REAL liberada para {bot.upper()} ({reason})")
+        agregar_evento("🧭 estado_bots[bot]['ciclo_actual']=1 es solo estado local DEMO; la próxima REAL se toma de ciclo_martingala_siguiente()")
     except Exception:
         pass
 
@@ -20802,7 +20811,7 @@ def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_opera
         except Exception:
             pass
     agregar_evento(
-        f"🔁 Martingala{bot_msg}: resultado={res} | pérdidas seguidas={marti_ciclos_perdidos}/{MAX_CICLOS} | próximo ciclo={ciclo_sig}"
+        f"🔁 Martingala{bot_msg}: resultado={res} | pérdidas seguidas={marti_ciclos_perdidos}/{MAX_CICLOS} | próximo ciclo=C{ciclo_sig}"
     )
     agregar_evento(f"🧾 MARTI-AUDIT: {marti_audit_resumen_linea()}")
 
@@ -20820,11 +20829,13 @@ def ciclo_martingala_siguiente() -> int:
 
 def reset_martingala_por_saldo(ciclo_objetivo: int, saldo_actual: float | None) -> bool:
     """
-    Si no alcanza el saldo para el ciclo objetivo (C2..C{MAX_CICLOS}),
-    reinicia la martingala en C1.
-    """
-    global marti_ciclos_perdidos, marti_paso, bots_usados_en_esta_marti
+    Valida saldo para C2..C{MAX_CICLOS} sin tocar la Martingala global.
 
+    La continuidad oficial REAL vive en marti_ciclos_perdidos/marti_paso; una
+    lectura de saldo ausente o baja solo puede bloquear la emisión, nunca bajar
+    la próxima REAL a C1. Se retorna False de forma conservadora para que ningún
+    caller legacy pueda interpretar esto como permiso de reset.
+    """
     try:
         ciclo = int(ciclo_objetivo)
     except Exception:
@@ -20834,27 +20845,56 @@ def reset_martingala_por_saldo(ciclo_objetivo: int, saldo_actual: float | None) 
         return False
 
     idx = max(0, min(len(MARTI_ESCALADO) - 1, ciclo - 1))
-    monto_necesario = float(MARTI_ESCALADO[idx])
+    try:
+        monto_necesario = float(MARTI_ESCALADO[idx])
+    except Exception:
+        monto_necesario = 0.0
 
     try:
         saldo = float(saldo_actual) if saldo_actual is not None else None
     except Exception:
         saldo = None
 
-    if saldo is not None and saldo >= monto_necesario:
-        return False
+    if saldo is None:
+        agregar_evento(
+            f"⛔ REAL bloqueado: saldo no disponible para C{ciclo}; Martingala conservada en C{ciclo}"
+        )
+    elif saldo < monto_necesario:
+        agregar_evento(
+            f"⛔ REAL bloqueado: saldo insuficiente para C{ciclo}; Martingala conservada en C{ciclo}"
+        )
+    return False
 
-    marti_ciclos_perdidos = 0
-    marti_paso = 0
-    bots_usados_en_esta_marti = []
-    _marti_audit_record("reset_saldo", ciclo=ciclo_objetivo, detalle="reinicio_forzado")
-    falta_msg = "saldo no disponible"
-    if saldo is not None:
-        falta_msg = f"faltan {(monto_necesario - saldo):.2f} USD"
-    agregar_evento(
-        f"🧯 Saldo insuficiente para C{ciclo} ({monto_necesario:.2f} USD): {falta_msg}. Reinicio automático a C1."
-    )
-    return True
+
+def _marti_saldo_bloquea_real(ciclo_objetivo: int, saldo_actual: float | None) -> bool:
+    """Bloquea emisión REAL por saldo en C2..C5 sin resetear el contador global."""
+    try:
+        ciclo = int(ciclo_objetivo)
+    except Exception:
+        ciclo = 1
+    if ciclo <= 1:
+        return False
+    idx = max(0, min(len(MARTI_ESCALADO) - 1, ciclo - 1))
+    try:
+        requerido = float(MARTI_ESCALADO[idx])
+    except Exception:
+        requerido = 0.0
+    try:
+        saldo = float(saldo_actual) if saldo_actual is not None else None
+    except Exception:
+        saldo = None
+    if saldo is None:
+        agregar_evento(
+            f"⛔ REAL bloqueado: saldo no disponible para C{ciclo}; Martingala conservada en C{ciclo}"
+        )
+        return True
+    if saldo < requerido:
+        agregar_evento(
+            f"⛔ REAL bloqueado: saldo insuficiente para C{ciclo}; Martingala conservada en C{ciclo}"
+        )
+        return True
+    return False
+
 def elegir_candidato_rotacion_marti(
     candidatos: list,
     ciclo_objetivo: int,
@@ -21145,6 +21185,38 @@ def _hay_contexto_real_reciente_para_cierre_tardio(bot):
     return False, "sin_contexto"
 
 
+def _marti_fix_post_close(res, ciclo):
+    """Defensa mínima: pérdida REAL C1..C4 conserva próxima REAL C+1."""
+    global marti_ciclos_perdidos, marti_paso
+    try:
+        ciclo_int = int(ciclo or 0)
+    except Exception:
+        ciclo_int = 0
+    if normalizar_resultado(res) == "PÉRDIDA" and 1 <= ciclo_int < int(MAX_CICLOS):
+        esperado = ciclo_int + 1
+        actual = int(ciclo_martingala_siguiente() or 1)
+        if actual != esperado:
+            marti_ciclos_perdidos = ciclo_int
+            marti_paso = ciclo_int
+            agregar_evento(f"🛠️ MARTI_FIX_POST_CLOSE | pérdida C{ciclo_int} -> próxima C{esperado}")
+
+
+def _marti_log_continuidad_post_demo(res, ciclo):
+    """Log posterior a la limpieza DEMO que confirma que el ciclo global quedó intacto."""
+    try:
+        ciclo_int = int(ciclo or 0)
+    except Exception:
+        ciclo_int = 0
+    if normalizar_resultado(res) != "PÉRDIDA" or ciclo_int <= 0:
+        return
+    if ciclo_int >= int(MAX_CICLOS):
+        agregar_evento(f"🧭 MARTI_CONTINUIDAD_OK | pérdida C{int(MAX_CICLOS)} -> reinicio oficial C1")
+    else:
+        agregar_evento(
+            f"🧭 MARTI_CONTINUIDAD_OK | pérdida C{ciclo_int} -> próxima REAL C{ciclo_int + 1} conservada tras volver a DEMO"
+        )
+
+
 def _blindar_marti_post_cierre_real_tardio(res, ciclo):
     """Asegura la regla oficial C1..C4 pérdida => próximo C+1; C5/win => C1."""
     global marti_ciclos_perdidos, marti_paso
@@ -21159,12 +21231,12 @@ def _blindar_marti_post_cierre_real_tardio(res, ciclo):
         if actual != esperado:
             marti_ciclos_perdidos = ciclo_int
             marti_paso = ciclo_int
-            agregar_evento(f"🛠️ MARTI_FIX_APLICADO | pérdida C{ciclo_int} -> próxima C{esperado}")
+            agregar_evento(f"🛠️ MARTI_FIX_POST_CLOSE | pérdida C{ciclo_int} -> próxima C{esperado}")
         # Blindaje final: una pérdida C1..C4 nunca puede quedar en C1.
         if int(ciclo_martingala_siguiente() or 1) == 1:
             marti_ciclos_perdidos = ciclo_int
             marti_paso = ciclo_int
-            agregar_evento(f"🛠️ MARTI_FIX_APLICADO | pérdida C{ciclo_int} -> próxima C{esperado}")
+            agregar_evento(f"🛠️ MARTI_FIX_POST_CLOSE | pérdida C{ciclo_int} -> próxima C{esperado}")
     elif res_norm in ("GANANCIA", "PÉRDIDA"):
         # registrar_resultado_real ya reinicia GANANCIA y pérdida en C5 a C1; este bloque solo normaliza
         # un cierre tardío si alguna limpieza externa alteró los contadores después del commit.
@@ -21253,6 +21325,7 @@ def procesar_cierre_real_tardio_si_existe(bot) -> bool:
     late_commit_done = isinstance(pending, dict) and pending.get("late_commit_sig") == sig
     if not late_commit_done:
         registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo_int)
+        _marti_fix_post_close(res, ciclo_int)
         _blindar_marti_post_cierre_real_tardio(res, ciclo_int)
         sig = _real_close_sig(bot, res, monto, ciclo_int, payout_total, baseline=baseline)
     prox = int(ciclo_martingala_siguiente() or 1)
@@ -21336,6 +21409,7 @@ def procesar_cierre_real_tardio_si_existe(bot) -> bool:
 
     try:
         cerrar_por_fin_de_ciclo(bot, f"Cierre REAL tardío {res} C{ciclo_int}; vuelve a DEMO; próximo ciclo C{prox}")
+        _marti_log_continuidad_post_demo(res, ciclo_int)
     except Exception as e:
         agregar_evento(f"⚠️ REAL_CLOSE_LATE_RELEASE_FAIL | {bot} | C{ciclo_int} | {type(e).__name__}")
 
@@ -31254,6 +31328,7 @@ async def main():
                             "reason": "resultado_real",
                         }
                         registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo)
+                        _marti_fix_post_close(res, ciclo)
                         try:
                             await refresh_saldo_real(forzado=True)
                         except Exception:
@@ -31297,6 +31372,7 @@ async def main():
                             prox = int(ciclo_martingala_siguiente() or 1)
                             agregar_evento(f"❌ REAL C{int(ciclo)} PÉRDIDA registrada por pending ({modo_detector}): {bot} -> próxima C{prox}")
                             cerrar_por_fin_de_ciclo(bot, f"Pérdida REAL C{int(ciclo)} cerrada por pending")
+                            _marti_log_continuidad_post_demo(res, ciclo)
                             _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
                             REAL_CLOSE_PENDING[bot] = None
                             _sync_round_release_after_real_close(bot, reason="real_loss_pending")
@@ -31437,6 +31513,7 @@ async def main():
                                         "reason": "resultado_real",
                                     }
                                     registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo)
+                                    _marti_fix_post_close(res, ciclo)
                                     try:
                                         await refresh_saldo_real(forzado=True)
                                     except Exception:
@@ -31491,6 +31568,7 @@ async def main():
                                         else:
                                             agregar_evento(f"❌ REAL LOSS: {bot} C{int(ciclo or 0)} -> DEMO | próximo ciclo C{prox}")
                                         cerrar_por_fin_de_ciclo(bot, f"Pérdida REAL C{int(ciclo or 0)}; vuelve a DEMO; próximo ciclo C{prox}")
+                                        _marti_log_continuidad_post_demo(res, ciclo)
                                         _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
                                         REAL_CLOSE_PENDING[bot] = None
                                         _sync_round_release_after_real_close(bot, reason="real_loss_next_cycle")
@@ -31898,8 +31976,8 @@ async def main():
                             owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else leer_token_actual()
                             if candidatos and (PENDIENTE_FORZAR_BOT is None) and (owner in (None, "none")):
                                 ciclo_auto = ciclo_martingala_siguiente()
-                                if reset_martingala_por_saldo(ciclo_auto, saldo_val):
-                                    ciclo_auto = 1
+                                if _marti_saldo_bloquea_real(ciclo_auto, saldo_val):
+                                    continue
                                 emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
                                 mejor_bot = str(emb.get("top1_bot") or "").strip()
                                 mejor = next((c for c in candidatos if str(c[1]) == mejor_bot), None)
@@ -31935,8 +32013,8 @@ async def main():
 
                         if candidatos and not MODO_REAL_MANUAL:
                             ciclo_auto = ciclo_martingala_siguiente()
-                            if reset_martingala_por_saldo(ciclo_auto, saldo_val):
-                                ciclo_auto = 1
+                            if _marti_saldo_bloquea_real(ciclo_auto, saldo_val):
+                                continue
                             emb = EMBUDO_DECISION_STATE if isinstance(EMBUDO_DECISION_STATE, dict) else {}
                             mejor_bot = str(emb.get("top1_bot") or "").strip()
                             mejor = next((c for c in candidatos if str(c[1]) == mejor_bot), None)
@@ -31945,6 +32023,8 @@ async def main():
                                 agregar_evento(f"⚙️ IA AUTO (embudo único): {mejor_bot} p_oper={prob*100:.1f}% risk={emb.get('risk_mode','--')} gate={emb.get('gate_quality','--')}")
                                 monto = MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO)-1, ciclo_auto - 1))]
                                 val = obtener_valor_saldo()
+                                if _marti_saldo_bloquea_real(ciclo_auto, val):
+                                    continue
                                 if val is None or val < monto:
                                     pass
                                 else:
