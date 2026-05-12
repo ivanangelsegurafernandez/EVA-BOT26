@@ -1039,13 +1039,25 @@ async def _sync_round_wait_release(round_id: int) -> int:
                     )
                     last_global_hold_print_ts = now_ts
                 try:
-                    _sync_round_write_release_heartbeat(rid, next_round)
+                    _sync_round_write_wait_heartbeat(rid, next_round)
+                    last_hb_ts = now_ts
+                    last_released = released
+                    last_state_ts = state_ts
+                    first_wait_tick = False
                 except Exception:
                     pass
                 last_progress_ts = now_ts
                 await asyncio.sleep(1.0)
                 continue
             if released < next_round:
+                try:
+                    _sync_round_write_wait_heartbeat(rid, next_round)
+                    last_hb_ts = now_ts
+                    last_released = released
+                    last_state_ts = state_ts
+                    first_wait_tick = False
+                except Exception:
+                    pass
                 _sync_round_write_recovery_request(
                     bot=NOMBRE_BOT,
                     round_id=rid,
@@ -1069,7 +1081,7 @@ async def _sync_round_wait_release(round_id: int) -> int:
                     )
                     last_global_hold_print_ts = now_ts
                 last_progress_ts = now_ts
-                first_wait_tick = True
+                first_wait_tick = False
                 await asyncio.sleep(1.0)
                 continue
             estado_bot["sync_wait"] = False
