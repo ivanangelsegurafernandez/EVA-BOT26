@@ -1412,6 +1412,84 @@ def _emitir_sync_recovery_incident_demo_neutral(round_id, contract_id, ciclo, as
         return False
 
 
+
+
+def _emitir_sync_recovery_incident_demo_sin_evidencia_neutral(round_id, ciclo, asset, direction, attempts, edad):
+    try:
+        rid = int(round_id or 0)
+        if rid <= 0:
+            return False
+        source = "INCIDENT_LOCK_SIN_EVIDENCIA_DEMO"
+        key = f"incident-demo-sin-evidencia:{rid}:{source}:{ciclo}:{asset}:{direction}"
+        if globals().get("_LAST_INCIDENT_DEMO_SIN_EVIDENCIA_KEY") == key:
+            return True
+        st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
+        try:
+            released = int(st.get("released_round", rid) or rid)
+        except Exception:
+            released = rid
+        ok = _sync_round_write_recovery_request(
+            bot=NOMBRE_BOT,
+            round_id=rid,
+            next_round=rid + 1,
+            released=released,
+            reason="incident_lock_demo_sin_evidencia",
+            contract_id=None,
+            ciclo=ciclo,
+            asset=asset,
+            direction=direction,
+            attempts=int(attempts or 0),
+            edad=float(edad or 0.0),
+            neutral=True,
+            no_trade_result=True,
+            quarantine=True,
+            source=source,
+        )
+        if ok:
+            globals()["_LAST_INCIDENT_DEMO_SIN_EVIDENCIA_KEY"] = key
+            print(
+                Fore.CYAN + Style.BRIGHT +
+                f"🧷 INCIDENT_LOCK_SYNC_RECOVERY_REQUEST | bot={NOMBRE_BOT} | ronda=#{rid} | next=#{rid + 1} | "
+                f"reason=incident_lock_demo_sin_evidencia | neutral=SI"
+            )
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def _incident_lock_demo_sin_evidencia_permitido(pending_id, pending_round, token_ctx, elapsed, attempts):
+    try:
+        rid = int(pending_round or 0)
+    except Exception:
+        return False
+    token_is_real = bool(token_ctx == TOKEN_REAL or str(token_ctx or "").strip().upper().startswith("REAL"))
+    modo_is_real = bool(str(estado_bot.get("tipo_cuenta", "") or estado_bot.get("modo", "")).strip().upper() == "REAL")
+    any_real_active, _owner_real, _real_reason = (True, "", "real_owner_check_failed")
+    try:
+        any_real_active, _owner_real, _real_reason = _sync_any_real_owner_active()
+    except Exception:
+        any_real_active = True
+    try:
+        real_close_pending_raw = globals().get("REAL_CLOSE_PENDING", False)
+        real_close_pending_live = any(bool(v) for v in real_close_pending_raw.values()) if isinstance(real_close_pending_raw, dict) else bool(real_close_pending_raw)
+    except Exception:
+        real_close_pending_live = True
+    try:
+        real_order_live = bool(callable(globals().get("_manual_real_order_targets_this_bot")) and _manual_real_order_targets_this_bot())
+    except Exception:
+        real_order_live = True
+    return (
+        pending_id is None
+        and rid > 0
+        and not modo_is_real
+        and not token_is_real
+        and not any_real_active
+        and not real_close_pending_live
+        and not real_order_live
+        and float(elapsed or 0.0) >= float(INCIDENT_LOCK_MAX_AGE_S)
+        and int(attempts or 0) >= int(INCIDENT_LOCK_RECOVERY_ATTEMPTS)
+    )
+
 def _emitir_ack_sync_incident_demo_resuelto(round_id, resultado, contract_id=None, asset=None, ciclo=None, token_usado=None):
     """ACK DEMO específico para INCIDENT_LOCK resuelto; nunca emite ACK para token REAL."""
     try:
@@ -1550,29 +1628,38 @@ async def _procesar_incident_lock_sold(poc, source="proposal_open_contract"):
 
     token_is_real = bool(token_ctx == TOKEN_REAL or str(token_ctx or "").strip().upper().startswith("REAL"))
     ack_ok = False
+
+    try:
+        if cid not in _contratos_procesados:
+            await finalizar_contrato_bg(
+                cid, 0, asset, direction,
+                estado_bot.get("pending_monto", 0.0),
+                estado_bot.get("pending_rsi9", 0.0),
+                estado_bot.get("pending_rsi14", 0.0),
+                estado_bot.get("pending_sma5", 0.0),
+                estado_bot.get("pending_sma20", 0.0),
+                estado_bot.get("pending_cruce", 0),
+                estado_bot.get("pending_breakout", 0),
+                estado_bot.get("pending_rsi_reversion", 0),
+                ciclo,
+                estado_bot.get("pending_payout", 0.0),
+                estado_bot.get("pending_condiciones", {}),
+                token_ctx,
+                epoch_pretrade=estado_bot.get("pending_epoch_pretrade"),
+                trade_uid=estado_bot.get("pending_trade_uid"),
+                close_snapshot=estado_bot.get("pending_close_snapshot"),
+            )
+        _contratos_procesados.add(cid)
+    except Exception as e:
+        print(
+            Fore.YELLOW + Style.BRIGHT +
+            f"⚠️ INCIDENT_LOCK_SOLD_FINALIZAR_FALLO | bot={NOMBRE_BOT} | contract_id={cid} | error={type(e).__name__}: {e}"
+        )
+        return False
+
     if not token_is_real:
         ack_ok = _emitir_ack_sync_incident_demo_resuelto(pending_round, resultado, contract_id=cid, asset=asset, ciclo=ciclo, token_usado=token_ctx)
 
-    if cid not in _contratos_procesados:
-        await finalizar_contrato_bg(
-            cid, 0, asset, direction,
-            estado_bot.get("pending_monto", 0.0),
-            estado_bot.get("pending_rsi9", 0.0),
-            estado_bot.get("pending_rsi14", 0.0),
-            estado_bot.get("pending_sma5", 0.0),
-            estado_bot.get("pending_sma20", 0.0),
-            estado_bot.get("pending_cruce", 0),
-            estado_bot.get("pending_breakout", 0),
-            estado_bot.get("pending_rsi_reversion", 0),
-            ciclo,
-            estado_bot.get("pending_payout", 0.0),
-            estado_bot.get("pending_condiciones", {}),
-            token_ctx,
-            epoch_pretrade=estado_bot.get("pending_epoch_pretrade"),
-            trade_uid=estado_bot.get("pending_trade_uid"),
-            close_snapshot=estado_bot.get("pending_close_snapshot"),
-        )
-    _contratos_procesados.add(cid)
     _clear_pending_contract_resolution(reason="incident_lock_resuelto_sold")
     print(
         Fore.GREEN + Style.BRIGHT +
@@ -1639,6 +1726,29 @@ async def resolver_contrato_incierto_seguro(ws):
 
     # Sin evidencia después de edad+intentos: solo DEMO puede liberar neutral; nunca se inventa PÉRDIDA.
     token_is_real = bool(token_ctx == TOKEN_REAL or str(token_ctx or "").strip().upper().startswith("REAL"))
+    if _incident_lock_demo_sin_evidencia_permitido(pending_id, pending_round, token_ctx, elapsed, attempts):
+        estado_bot["pending_contract_state"] = "COMPRA_NO_CONFIRMADA_SIN_EVIDENCIA_DEMO"
+        estado_bot["pending_contract_action"] = "LIBERAR_SIN_EVIDENCIA_DEMO"
+        estado_bot["ciclo_forzado"] = ciclo_actual
+        estado_bot["pending_ciclo"] = ciclo_actual
+        estado_bot["ciclo_actual"] = ciclo_actual
+        print(
+            Fore.YELLOW + Style.BRIGHT +
+            f"🧯 INCIDENT_LOCK_SIN_EVIDENCIA_DEMO_LIBERADO | bot={NOMBRE_BOT} | ronda=#{pending_round} | C{ciclo_actual} | "
+            f"edad={elapsed:.0f}s | attempts={attempts}/{INCIDENT_LOCK_RECOVERY_ATTEMPTS} | "
+            f"acción=recovery_request_neutral | mismo_ciclo=SI"
+        )
+        _emitir_sync_recovery_incident_demo_sin_evidencia_neutral(pending_round, ciclo_actual, asset, direction, attempts, elapsed)
+        _clear_pending_contract_resolution(
+            reason="COMPRA_NO_CONFIRMADA_SIN_EVIDENCIA_DEMO",
+            resultado_final="COMPRA_NO_CONFIRMADA_SIN_EVIDENCIA_DEMO",
+        )
+        estado_bot["ciclo_forzado"] = ciclo_actual
+        estado_bot["pending_ciclo"] = ciclo_actual
+        estado_bot["ciclo_actual"] = ciclo_actual
+        if callable(globals().get("_sync_round_wait_release")):
+            estado_bot["sync_round_id"] = await _sync_round_wait_release(pending_round)
+        return False
     if pending_id and not token_is_real and pending_round > 0:
         poc_empty = {"is_sold": False, "profit": None}
         if _incident_lock_demo_stale_open_permitido(poc_empty, pending_id, pending_round, token_ctx, elapsed, attempts):
