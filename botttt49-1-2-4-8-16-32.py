@@ -4028,7 +4028,21 @@ async def ejecutar_panel():
                 continue
             estado_bot["real_sin_orden_maestro"] = False
             estado_bot["real_sin_orden_maestro_since_ts"] = 0.0
-            ciclo = ciclo_maestro if ciclo_maestro is not None else (ciclo_forzado if ciclo_forzado is not None else 1)
+            if not modo_real:
+                if ciclo_forzado is not None:
+                    estado_bot["ciclo_forzado"] = None
+                    ciclo_forzado = None
+                    print(Fore.CYAN + Style.BRIGHT + f"🧼 CICLO_LOCAL_DEMO_RESET_POST_REAL | {NOMBRE_BOT} | ciclo_forzado limpiado | próxima REAL la decide maestro")
+
+            if modo_real:
+                if ciclo_maestro is not None:
+                    ciclo = ciclo_maestro
+                elif ciclo_forzado is not None:
+                    ciclo = ciclo_forzado
+                else:
+                    ciclo = 1
+            else:
+                ciclo = 1
             if modo_real:
                 now_guard = time.time()
                 last_guard = float(estado_bot.get("real_cycle_guard_last_ts", 0.0) or 0.0)
@@ -4064,7 +4078,11 @@ async def ejecutar_panel():
                 ws, current_token = await check_token_and_reconnect(ws, current_token)
 
                 if reinicio_forzado.is_set():
-                    estado_bot["ciclo_forzado"] = ciclo
+                    if current_token == TOKEN_REAL:
+                        estado_bot["ciclo_forzado"] = ciclo
+                    else:
+                        estado_bot["ciclo_forzado"] = None
+                        print(Fore.CYAN + Style.BRIGHT + f"🧼 CICLO_LOCAL_DEMO_RESET_POST_REAL | {NOMBRE_BOT} | ciclo_forzado limpiado | próxima REAL la decide maestro")
                     proximo = estado_bot.get("ciclo_forzado") or ciclo
                     print(Fore.YELLOW + Style.BRIGHT + f"Reinicio forzado durante ciclo. Ciclo actual #{ciclo} → siguiente #{proximo}.")
                     reinicio_forzado.clear()
@@ -4121,7 +4139,11 @@ async def ejecutar_panel():
                 ws, current_token = await check_token_and_reconnect(ws, current_token)
 
                 if reinicio_forzado.is_set():
-                    estado_bot["ciclo_forzado"] = ciclo
+                    if current_token == TOKEN_REAL:
+                        estado_bot["ciclo_forzado"] = ciclo
+                    else:
+                        estado_bot["ciclo_forzado"] = None
+                        print(Fore.CYAN + Style.BRIGHT + f"🧼 CICLO_LOCAL_DEMO_RESET_POST_REAL | {NOMBRE_BOT} | ciclo_forzado limpiado | próxima REAL la decide maestro")
                     print(Fore.YELLOW + Style.BRIGHT + f"Reinicio forzado tras buscar estrategia. Mantengo ciclo #{ciclo}.")
                     reinicio_forzado.clear()
                     await asyncio.sleep(2)
@@ -4130,7 +4152,11 @@ async def ejecutar_panel():
 
                 modo_real_now = (current_token == TOKEN_REAL)
                 if modo_real_now != modo_real:
-                    estado_bot["ciclo_forzado"] = ciclo
+                    if current_token == TOKEN_REAL:
+                        estado_bot["ciclo_forzado"] = ciclo
+                    else:
+                        estado_bot["ciclo_forzado"] = None
+                        print(Fore.CYAN + Style.BRIGHT + f"🧼 CICLO_LOCAL_DEMO_RESET_POST_REAL | {NOMBRE_BOT} | ciclo_forzado limpiado | próxima REAL la decide maestro")
                     print(Fore.YELLOW + Style.BRIGHT + "Token cambió justo antes de validar saldo/compra. Reinicio limpio para mantener sincronía con el maestro.")
                     reinicio_forzado.set()
                     break
@@ -4212,7 +4238,11 @@ async def ejecutar_panel():
 
                 # Si token cambió DURANTE proposal → NO compramos, reinicio limpio
                 if reinicio_forzado.is_set():
-                    estado_bot["ciclo_forzado"] = ciclo
+                    if current_token == TOKEN_REAL:
+                        estado_bot["ciclo_forzado"] = ciclo
+                    else:
+                        estado_bot["ciclo_forzado"] = None
+                        print(Fore.CYAN + Style.BRIGHT + f"🧼 CICLO_LOCAL_DEMO_RESET_POST_REAL | {NOMBRE_BOT} | ciclo_forzado limpiado | próxima REAL la decide maestro")
                     print(Fore.YELLOW + Style.BRIGHT + f"Token cambió durante proposal. Cancelo compra y reinicio en ciclo #{ciclo}.")
                     reinicio_forzado.clear()
                     await asyncio.sleep(1.2)
@@ -4347,7 +4377,11 @@ async def ejecutar_panel():
 
                     # Si el token cambió durante la ventana, NO compramos con estado viejo.
                     if reinicio_forzado.is_set():
-                        estado_bot["ciclo_forzado"] = ciclo
+                        if current_token == TOKEN_REAL:
+                            estado_bot["ciclo_forzado"] = ciclo
+                        else:
+                            estado_bot["ciclo_forzado"] = None
+                            print(Fore.CYAN + Style.BRIGHT + f"🧼 CICLO_LOCAL_DEMO_RESET_POST_REAL | {NOMBRE_BOT} | ciclo_forzado limpiado | próxima REAL la decide maestro")
                         print(
                             Fore.YELLOW + Style.BRIGHT +
                             f"[VENTANA IA] Token cambió durante la decisión. Reintentando ciclo #{ciclo} (sin comprar)."
