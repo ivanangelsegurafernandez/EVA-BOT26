@@ -1534,6 +1534,7 @@ t_inicio_indef = {bot: None for bot in BOT_NAMES}
 last_update_time = {bot: time.time() for bot in BOT_NAMES}
 LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # firma del último cierre REAL completamente procesado
 REAL_CLOSE_PROCESSED_SIG = {bot: None for bot in BOT_NAMES}
+MARTI_REAL_TARDIO_COMMITS = {}
 REAL_CLOSE_PENDING = {bot: None for bot in BOT_NAMES}
 REAL_CLOSE_PENDING_TTL_S = 240
 REAL_OWNER_STALE_TTL_S = 180.0
@@ -21201,6 +21202,123 @@ def _marti_fix_post_close(res, ciclo):
             agregar_evento(f"🛠️ MARTI_FIX_POST_CLOSE | pérdida C{ciclo_int} -> próxima C{esperado}")
 
 
+def _marti_ciclo_esperado_por_resultado(res, ciclo):
+    try:
+        ciclo_int = int(ciclo or 0)
+    except Exception:
+        return None
+    res_norm = normalizar_resultado(res)
+    if res_norm == "GANANCIA":
+        return 1
+    if res_norm == "PÉRDIDA" and 1 <= ciclo_int < int(MAX_CICLOS):
+        return ciclo_int + 1
+    if res_norm == "PÉRDIDA" and ciclo_int >= int(MAX_CICLOS):
+        return 1
+    return None
+
+
+def _aplicar_estado_marti_real_commit(res, ciclo):
+    global marti_ciclos_perdidos, marti_paso, bots_usados_en_esta_marti
+    try:
+        ciclo_int = int(ciclo or 0)
+    except Exception:
+        return None
+    res_norm = normalizar_resultado(res)
+    if res_norm == "GANANCIA":
+        marti_ciclos_perdidos = 0
+        marti_paso = 0
+        bots_usados_en_esta_marti = []
+        return 1
+    if res_norm == "PÉRDIDA" and 1 <= ciclo_int < int(MAX_CICLOS):
+        marti_ciclos_perdidos = ciclo_int
+        marti_paso = ciclo_int
+        return ciclo_int + 1
+    if res_norm == "PÉRDIDA" and ciclo_int >= int(MAX_CICLOS):
+        marti_ciclos_perdidos = 0
+        marti_paso = 0
+        bots_usados_en_esta_marti = []
+        return 1
+    return None
+
+
+def _marti_commit_key(contract_id, bot, ciclo_operado):
+    cid = str(contract_id or "").strip()
+    if not cid:
+        cid = f"NO_CONTRACT:{bot}:C{int(ciclo_operado or 0)}"
+    return cid
+
+
+def _commit_martingala_real_cierre_seguro(bot, resultado, ciclo_operado, contract_id, origen):
+    """Commit único e idempotente para cierre REAL tardío/background/INCIDENT_LOCK."""
+    global marti_ciclos_perdidos, marti_paso, ultimo_bot_real, bots_usados_en_esta_marti
+    res = normalizar_resultado(resultado)
+    if res not in ("GANANCIA", "PÉRDIDA"):
+        return None
+    try:
+        ciclo_int = int(ciclo_operado or 0)
+    except Exception:
+        return None
+    if not (1 <= ciclo_int <= int(MAX_CICLOS)):
+        return None
+
+    cid_key = _marti_commit_key(contract_id, bot, ciclo_int)
+    prev = MARTI_REAL_TARDIO_COMMITS.get(cid_key) if isinstance(MARTI_REAL_TARDIO_COMMITS, dict) else None
+    if isinstance(prev, dict):
+        prox_prev = int(prev.get("proxima", 1) or 1)
+        _aplicar_estado_marti_real_commit(prev.get("resultado"), prev.get("ciclo_operado"))
+        agregar_evento(
+            f"♻️ MARTI_COMMIT_DUPLICADO_IGNORADO | contract_id={contract_id or '--'} | próxima=C{prox_prev}"
+        )
+        return dict(prev)
+
+    if bot in BOT_NAMES:
+        ultimo_bot_real = bot
+    if res == "PÉRDIDA" and bot in BOT_NAMES and bot not in bots_usados_en_esta_marti:
+        bots_usados_en_esta_marti.append(bot)
+
+    proxima = _aplicar_estado_marti_real_commit(res, ciclo_int)
+    if proxima is None:
+        return None
+    commit = {
+        "bot": str(bot or "UNKNOWN"),
+        "resultado": res,
+        "ciclo_operado": ciclo_int,
+        "proxima": int(proxima),
+        "contract_id": contract_id,
+        "origen": str(origen or "--"),
+        "ts": time.time(),
+    }
+    MARTI_REAL_TARDIO_COMMITS[cid_key] = commit
+    agregar_evento(
+        f"🧱 MARTI_COMMIT_REAL_TARDIO | bot={bot or 'UNKNOWN'} | resultado={res} | "
+        f"ciclo_operado=C{ciclo_int} | próxima=C{int(proxima)} | origen={origen or '--'} | "
+        f"contract_id={contract_id or '--'}"
+    )
+    return dict(commit)
+
+
+def _validar_marti_post_cleanup_cierre_real_tardio(resultado, ciclo_operado, contract_id=None, origen="post_cleanup"):
+    try:
+        ciclo_int = int(ciclo_operado or 0)
+    except Exception:
+        return False
+    res_norm = normalizar_resultado(resultado)
+    esperado = _marti_ciclo_esperado_por_resultado(res_norm, ciclo_int)
+    if esperado is None:
+        return False
+    actual = int(ciclo_martingala_siguiente() or 1)
+    if actual == int(esperado):
+        return True
+    _aplicar_estado_marti_real_commit(res_norm, ciclo_int)
+    motivo = f"pérdida_real_C{ciclo_int}" if res_norm == "PÉRDIDA" else "ganancia_real"
+    agregar_evento(
+        f"🛠️ MARTI_RESTORE_POST_CLEANUP | desde=C{actual} | hacia=C{int(esperado)} | "
+        f"resultado={res_norm} | operado=C{ciclo_int} | restaurado=C{int(esperado)} | "
+        f"motivo={motivo} | contract_id={contract_id or '--'} | origen={origen or '--'}"
+    )
+    return True
+
+
 def _marti_log_continuidad_post_demo(res, ciclo):
     """Log posterior a la limpieza DEMO que confirma que el ciclo global quedó intacto."""
     try:
@@ -21314,7 +21432,13 @@ def procesar_cierre_real_tardio_si_existe(bot) -> bool:
         return False
 
     sig = _real_close_sig(bot, res, monto, ciclo_int, payout_total, baseline=baseline)
+    contract_id_late = estado_bots.get(bot, {}).get("id_contrato")
+    if not contract_id_late and isinstance(pending, dict):
+        contract_id_late = pending.get("contract_id") or pending.get("contrato") or pending.get("id_contrato")
     if _real_close_sig_ya_procesada(bot, res, monto, ciclo_int, payout_total, baseline=baseline):
+        _commit_martingala_real_cierre_seguro(
+            bot, res, ciclo_int, contract_id_late, "bg_resolved_duplicate"
+        )
         _lxv_5v1x_event_cooldown(
             key=f"real_close_duplicate_late:{bot}:{ciclo_int}",
             msg=f"⚠️ Cierre REAL tardío duplicado detectado; no se reprocesa: {bot} C{ciclo_int}",
@@ -21323,12 +21447,13 @@ def procesar_cierre_real_tardio_si_existe(bot) -> bool:
         return False
 
     late_commit_done = isinstance(pending, dict) and pending.get("late_commit_sig") == sig
-    if not late_commit_done:
-        registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo_int)
-        _marti_fix_post_close(res, ciclo_int)
-        _blindar_marti_post_cierre_real_tardio(res, ciclo_int)
-        sig = _real_close_sig(bot, res, monto, ciclo_int, payout_total, baseline=baseline)
-    prox = int(ciclo_martingala_siguiente() or 1)
+    commit_info = _commit_martingala_real_cierre_seguro(
+        bot, res, ciclo_int, contract_id_late, "bg_resolved"
+    )
+    if not commit_info:
+        return False
+    sig = _real_close_sig(bot, res, monto, ciclo_int, payout_total, baseline=baseline)
+    prox = int(commit_info.get("proxima", ciclo_martingala_siguiente()) or 1)
     if late_commit_done:
         agregar_evento(f"🔁 REAL_CLOSE_LATE_RETRY | {bot} | C{ciclo_int} | {res}")
     else:
@@ -21409,6 +21534,7 @@ def procesar_cierre_real_tardio_si_existe(bot) -> bool:
 
     try:
         cerrar_por_fin_de_ciclo(bot, f"Cierre REAL tardío {res} C{ciclo_int}; vuelve a DEMO; próximo ciclo C{prox}")
+        _validar_marti_post_cleanup_cierre_real_tardio(res, ciclo_int, contract_id_late, origen="late_release_cleanup")
         _marti_log_continuidad_post_demo(res, ciclo_int)
     except Exception as e:
         agregar_evento(f"⚠️ REAL_CLOSE_LATE_RELEASE_FAIL | {bot} | C{ciclo_int} | {type(e).__name__}")
@@ -21452,6 +21578,7 @@ def procesar_cierre_real_tardio_si_existe(bot) -> bool:
         _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
     except Exception:
         pass
+    _validar_marti_post_cleanup_cierre_real_tardio(res, ciclo_int, contract_id_late, origen="late_final_cleanup")
     LAST_REAL_CLOSE_SIG[bot] = sig
     REAL_CLOSE_PROCESSED_SIG[bot] = sig
     REAL_CLOSE_PENDING[bot] = None
@@ -31246,6 +31373,9 @@ async def main():
                         res, monto, ciclo, payout_total = cierre_info
                         sig = _real_close_sig(bot, res, monto, ciclo, payout_total, baseline=int(pending.get("baseline", 0) or 0))
                         if sig == LAST_REAL_CLOSE_SIG.get(bot) or sig == REAL_CLOSE_PROCESSED_SIG.get(bot):
+                            _commit_martingala_real_cierre_seguro(
+                                bot, res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), f"pending_{modo_detector}_duplicado"
+                            )
                             _lxv_5v1x_event_cooldown(
                                 key=f"real_close_duplicate_pending:{bot}:{int(ciclo or 0)}",
                                 msg=f"⚠️ Cierre REAL duplicado detectado; no se repite cierre ni release: {bot} C{int(ciclo or 0)}",
@@ -31294,6 +31424,9 @@ async def main():
                                     bot,
                                     f"Retry post late commit {normalizar_resultado(res)} C{int(ciclo or 0)}; vuelve a DEMO",
                                 )
+                                _validar_marti_post_cleanup_cierre_real_tardio(
+                                    res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), origen="post_late_commit_retry_cleanup"
+                                )
                             except Exception as e:
                                 agregar_evento(
                                     f"⚠️ REAL_CLOSE_PENDING_RETRY_POST_LATE_COMMIT_TOKEN_FAIL | {bot} | C{int(ciclo or 0)} | {type(e).__name__}"
@@ -31327,8 +31460,9 @@ async def main():
                             "ronda": pending.get("round_id"), "contract_id": estado_bots.get(bot, {}).get("id_contrato"),
                             "reason": "resultado_real",
                         }
-                        registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo)
-                        _marti_fix_post_close(res, ciclo)
+                        _commit_martingala_real_cierre_seguro(
+                            bot, res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), f"pending_{modo_detector}"
+                        )
                         try:
                             await refresh_saldo_real(forzado=True)
                         except Exception:
@@ -31360,6 +31494,7 @@ async def main():
                             _audit_real_close_pending_action(bot=bot, pending=pending, resultado=res, contract_id=estado_bots.get(bot, {}).get("id_contrato"), reason=f"pending_{modo_detector}", accion="LIBERAR_WIN")
                             agregar_evento(f"✅ REAL C{int(ciclo)} GANANCIA registrada por pending ({modo_detector}): {bot} -> C1")
                             cerrar_por_fin_de_ciclo(bot, "Ganancia REAL cerrada por pending; vuelve a DEMO")
+                            _validar_marti_post_cleanup_cierre_real_tardio(res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), origen=f"pending_{modo_detector}_cleanup")
                             _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
                             REAL_CLOSE_PENDING[bot] = None
                             _sync_round_release_after_real_close(bot, reason="real_win_pending")
@@ -31372,6 +31507,7 @@ async def main():
                             prox = int(ciclo_martingala_siguiente() or 1)
                             agregar_evento(f"❌ REAL C{int(ciclo)} PÉRDIDA registrada por pending ({modo_detector}): {bot} -> próxima C{prox}")
                             cerrar_por_fin_de_ciclo(bot, f"Pérdida REAL C{int(ciclo)} cerrada por pending")
+                            _validar_marti_post_cleanup_cierre_real_tardio(res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), origen=f"pending_{modo_detector}_cleanup")
                             _marti_log_continuidad_post_demo(res, ciclo)
                             _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
                             REAL_CLOSE_PENDING[bot] = None
@@ -31475,6 +31611,9 @@ async def main():
 
                                 # Evita reprocesar el mismo cierre en ticks consecutivos sin liberar por duplicado.
                                 if sig == LAST_REAL_CLOSE_SIG.get(bot) or sig == REAL_CLOSE_PROCESSED_SIG.get(bot):
+                                    _commit_martingala_real_cierre_seguro(
+                                        bot, res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), "direct_real_close_duplicado"
+                                    )
                                     _lxv_5v1x_event_cooldown(
                                         key=f"real_close_duplicate_direct:{bot}:{int(ciclo or 0)}",
                                         msg=f"⚠️ Cierre REAL duplicado detectado; no se repite cierre ni release: {bot} C{int(ciclo or 0)}",
@@ -31512,8 +31651,9 @@ async def main():
                                         "contract_id": estado_bots.get(bot, {}).get("id_contrato"),
                                         "reason": "resultado_real",
                                     }
-                                    registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo)
-                                    _marti_fix_post_close(res, ciclo)
+                                    _commit_martingala_real_cierre_seguro(
+                                        bot, res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), "direct_real_close"
+                                    )
                                     try:
                                         await refresh_saldo_real(forzado=True)
                                     except Exception:
@@ -31553,6 +31693,7 @@ async def main():
                                         prox = int(ciclo_martingala_siguiente() or 1)
                                         agregar_evento(f"✅ REAL WIN: {bot} C{int(ciclo or 0)} -> DEMO | próximo ciclo C{prox}")
                                         cerrar_por_fin_de_ciclo(bot, "Ganancia REAL cerrada; vuelve a DEMO")
+                                        _validar_marti_post_cleanup_cierre_real_tardio(res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), origen="direct_win_cleanup")
                                         _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
                                         REAL_CLOSE_PENDING[bot] = None
                                         _sync_round_release_after_real_close(bot, reason="real_win")
@@ -31568,6 +31709,7 @@ async def main():
                                         else:
                                             agregar_evento(f"❌ REAL LOSS: {bot} C{int(ciclo or 0)} -> DEMO | próximo ciclo C{prox}")
                                         cerrar_por_fin_de_ciclo(bot, f"Pérdida REAL C{int(ciclo or 0)}; vuelve a DEMO; próximo ciclo C{prox}")
+                                        _validar_marti_post_cleanup_cierre_real_tardio(res, ciclo, estado_bots.get(bot, {}).get("id_contrato"), origen="direct_loss_cleanup")
                                         _marti_log_continuidad_post_demo(res, ciclo)
                                         _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
                                         REAL_CLOSE_PENDING[bot] = None
