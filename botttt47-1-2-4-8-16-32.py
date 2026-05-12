@@ -100,7 +100,7 @@ SFX_FILES = {
     "NO_CONCLUYO": "ia_scifi_06_no_concluyo_dry.wav",
     "NO_PASAR_REAL": "ia_scifi_07_no_pasar_real_dry.wav",
 }
-SFX = {}
+SFX = {k: None for k in SFX_FILES}
 _SFX_LAST_TS = {}
 _SFX_MIN_INTERVAL = {
     "FELICITACIONES": 4.0,
@@ -110,6 +110,23 @@ _SFX_MIN_INTERVAL = {
     "NO_CONCLUYO": 10.0,
     "NO_PASAR_REAL": 6.0,
 }
+_SFX_PRINT_ONCE_KEYS = set()
+
+def _sfx_print_once(key: str) -> bool:
+    try:
+        fn = globals().get("_print_once")
+        if callable(fn):
+            return bool(fn(f"sfx_diag:{key}", ttl=86400.0))
+    except Exception:
+        pass
+    try:
+        key = str(key)
+        if key in _SFX_PRINT_ONCE_KEYS:
+            return False
+        _SFX_PRINT_ONCE_KEYS.add(key)
+        return True
+    except Exception:
+        return True
 
 def _sfx_load_all():
     if not AUDIO_ENABLED:
@@ -120,19 +137,25 @@ def _sfx_load_all():
             if os.path.exists(p):
                 SFX[k] = pygame.mixer.Sound(p)
             else:
-                # Silencioso si no existe, no rompemos nada
+                if _sfx_print_once(f"missing:{k}"):
+                    print(f"⚠️ SFX faltante: {k} -> {fname}")
                 SFX[k] = None
         except Exception as e:
-            print(f"No se pudo cargar SFX {k}: {e}")
+            if _sfx_print_once(f"load:{k}"):
+                print(f"⚠️ SFX no cargó: {k} -> {fname} | error={e}")
             SFX[k] = None
 
 def play_sfx(key: str, vol: float = 0.9):
     # Respeta MODO_SILENCIOSO y modo_manual (definidos en tu código)
-    if not AUDIO_ENABLED:
-        return
     if key not in SFX:
+        if _sfx_print_once(f"unknown:{key}"):
+            print(f"⚠️ SFX key desconocida: {key}")
         return
     if SFX.get(key) is None:
+        if _sfx_print_once(f"unavailable:{key}"):
+            print(f"⚠️ SFX no disponible: {key}")
+        return
+    if not AUDIO_ENABLED:
         return
     # Rate-limit
     now = time.time()
