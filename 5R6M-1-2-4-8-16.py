@@ -21256,7 +21256,10 @@ def procesar_cierre_real_tardio_si_existe(bot) -> bool:
         _blindar_marti_post_cierre_real_tardio(res, ciclo_int)
         sig = _real_close_sig(bot, res, monto, ciclo_int, payout_total, baseline=baseline)
     prox = int(ciclo_martingala_siguiente() or 1)
-    agregar_evento(f"🧾 REAL_CLOSE_LATE_COMMIT | {bot} | C{ciclo_int} | {res} | próxima=C{prox}")
+    if late_commit_done:
+        agregar_evento(f"🔁 REAL_CLOSE_LATE_RETRY | {bot} | C{ciclo_int} | {res}")
+    else:
+        agregar_evento(f"🧾 REAL_CLOSE_LATE_COMMIT | {bot} | C{ciclo_int} | {res} | próxima=C{prox}")
 
     if isinstance(pending, dict):
         pending = dict(pending)
@@ -21292,11 +21295,6 @@ def procesar_cierre_real_tardio_si_existe(bot) -> bool:
         )
     except Exception:
         pass
-    try:
-        _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
-    except Exception:
-        pass
-
     release_reason = "real_late_close_win" if res == "GANANCIA" else "real_late_close_loss"
     pending_snapshot = dict(pending) if isinstance(pending, dict) else None
     pending_restore_needed = False
@@ -21359,7 +21357,7 @@ def procesar_cierre_real_tardio_si_existe(bot) -> bool:
         REAL_CLOSE_PENDING[bot] = retry_pending
         agregar_evento(f"⚠️ REAL_CLOSE_LATE_TOKEN_NO_LIBERADO | {bot} | C{ciclo_int} | {res} | {type(e).__name__}")
         return True
-    if token_raw == bot:
+    if token_raw in BOT_NAMES:
         retry_pending = dict(pending_snapshot or {})
         retry_pending.update({
             "active": True,
@@ -21373,9 +21371,13 @@ def procesar_cierre_real_tardio_si_existe(bot) -> bool:
             "late_commit_pending_retry": True,
         })
         REAL_CLOSE_PENDING[bot] = retry_pending
-        agregar_evento(f"⚠️ REAL_CLOSE_LATE_TOKEN_NO_LIBERADO | {bot} | C{ciclo_int} | {res}")
+        agregar_evento(f"⚠️ REAL_CLOSE_LATE_TOKEN_NO_LIBERADO | {bot} | C{ciclo_int} | {res} | token_actual={token_raw}")
         return True
 
+    try:
+        _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
+    except Exception:
+        pass
     LAST_REAL_CLOSE_SIG[bot] = sig
     REAL_CLOSE_PROCESSED_SIG[bot] = sig
     REAL_CLOSE_PENDING[bot] = None
@@ -31226,14 +31228,14 @@ async def main():
                                 token_raw = leer_token_archivo_raw()
                             except Exception:
                                 token_raw = bot
-                            if token_raw == bot:
+                            if token_raw in BOT_NAMES:
                                 retry_pending = dict(pending_snapshot)
                                 retry_pending["active"] = True
                                 retry_pending["late_commit_pending_retry"] = True
                                 retry_pending["ts"] = time.time()
                                 REAL_CLOSE_PENDING[bot] = retry_pending
                                 agregar_evento(
-                                    f"⚠️ REAL_CLOSE_PENDING_RETRY_POST_LATE_COMMIT_TOKEN_PENDIENTE | {bot} | C{int(ciclo or 0)} | {normalizar_resultado(res)}"
+                                    f"⚠️ REAL_CLOSE_LATE_TOKEN_NO_LIBERADO | {bot} | C{int(ciclo or 0)} | {normalizar_resultado(res)} | token_actual={token_raw}"
                                 )
                                 continue
                             try:
@@ -31316,6 +31318,8 @@ async def main():
                             pass
 
                     for bot in BOT_NAMES:
+                        if bot in bots_late_handled:
+                            continue
                         if estado_bots[bot]["token"] == "REAL":
                             t_last = last_update_time.get(bot, 0)
                             t_real = estado_bots[bot].get("real_activado_en", 0.0)
@@ -31352,6 +31356,8 @@ async def main():
                                     break
 
                     for bot in BOT_NAMES:
+                        if bot in bots_late_handled:
+                            continue
                         if estado_bots[bot]["token"] == "REAL":
                             # Detecta el último cierre REAL de forma robusta (sin depender de SNAPSHOT_FILAS,
                             # porque TICK_01 ya puede haber avanzado el snapshot antes de este bloque).
@@ -31370,7 +31376,26 @@ async def main():
                             # Cierre inmediato: en REAL siempre 1 operación y vuelve a DEMO (gane o pierda)
                             if cierre_info and isinstance(cierre_info, tuple) and len(cierre_info) >= 4:
                                 res, monto, ciclo, payout_total = cierre_info
-                                sig = _real_close_sig(bot, res, monto, ciclo, payout_total)
+                                pending_direct = REAL_CLOSE_PENDING.get(bot)
+                                baseline_direct = 0
+                                if isinstance(pending_direct, dict):
+                                    baseline_direct = int(pending_direct.get("baseline", 0) or 0)
+                                if baseline_direct <= 0:
+                                    baseline_direct = int(REAL_ENTRY_BASELINE.get(bot, 0) or 0)
+                                sig = _real_close_sig(
+                                    bot,
+                                    res,
+                                    monto,
+                                    ciclo,
+                                    payout_total,
+                                    baseline=baseline_direct,
+                                )
+
+                                if isinstance(pending_direct, dict) and pending_direct.get("late_commit_sig") == sig:
+                                    agregar_evento(
+                                        f"🔁 REAL_DIRECT_SKIP_POST_LATE_COMMIT | {bot} | C{int(ciclo or 0)} | {normalizar_resultado(res)}"
+                                    )
+                                    continue
 
                                 # Evita reprocesar el mismo cierre en ticks consecutivos sin liberar por duplicado.
                                 if sig == LAST_REAL_CLOSE_SIG.get(bot) or sig == REAL_CLOSE_PROCESSED_SIG.get(bot):
@@ -31382,7 +31407,6 @@ async def main():
                                     continue
 
                                 if not resultado_real_contable(res):
-                                    pending_direct = REAL_CLOSE_PENDING.get(bot)
                                     if not isinstance(pending_direct, dict):
                                         pending_direct = {
                                             "active": True,
