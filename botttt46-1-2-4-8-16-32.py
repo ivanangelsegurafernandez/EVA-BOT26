@@ -1350,10 +1350,18 @@ def _set_pending_contract_resolution(round_id: int, contract_id=None, reason: st
     estado_bot["pending_round_id"] = int(round_id or estado_bot.get("sync_round_id", 1) or 1)
     estado_bot["pending_reason"] = str(reason or "")
     estado_bot["pending_attempts"] = 0
-    estado_bot["pending_token_usado"] = token_usado
-    estado_bot["pending_asset"] = asset
-    estado_bot["pending_direction"] = direction
-    estado_bot["pending_ciclo"] = ciclo
+    if token_usado is not None:
+        estado_bot["pending_token_usado"] = token_usado
+    elif estado_bot.get("pending_token_usado") is None:
+        estado_bot["pending_token_usado"] = estado_bot.get("ultimo_token_usado") or None
+    if asset is not None:
+        estado_bot["pending_asset"] = asset
+    if direction is not None:
+        estado_bot["pending_direction"] = direction
+    if ciclo is not None:
+        estado_bot["pending_ciclo"] = ciclo
+    elif estado_bot.get("pending_ciclo") is None:
+        estado_bot["pending_ciclo"] = estado_bot.get("ciclo_actual") or 1
     if isinstance(ctx, dict) and ctx:
         for k, v in ctx.items():
             if str(k).startswith("pending_"):
@@ -1511,6 +1519,53 @@ def _emitir_sync_recovery_incident_demo_closed_sin_profit_neutral(round_id, cont
         return bool(ok)
     except Exception:
         return False
+
+def _emitir_sync_recovery_incident_demo_sold_sin_contexto_neutral(round_id, contract_id, ciclo, asset, direction, attempts, edad):
+    try:
+        rid = int(round_id or 0)
+        cid = int(contract_id or 0)
+        if rid <= 0 or cid <= 0:
+            return False
+        source = "INCIDENT_LOCK_SOLD_SIN_CONTEXTO_DEMO"
+        key = f"incident-demo-sold-sin-contexto:{rid}:{cid}:{source}"
+        if globals().get("_LAST_INCIDENT_DEMO_SOLD_SIN_CONTEXTO_KEY") == key:
+            return True
+        st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
+        try:
+            released = int(st.get("released_round", rid) or rid)
+        except Exception:
+            released = rid
+        ok = _sync_round_write_recovery_request(
+            bot=NOMBRE_BOT,
+            round_id=rid,
+            next_round=rid + 1,
+            released=released,
+            reason="incident_lock_demo_sold_sin_contexto",
+            contract_id=cid,
+            ciclo=ciclo,
+            asset=asset,
+            direction=direction,
+            attempts=int(attempts or 0),
+            edad=float(edad or 0.0),
+            neutral=True,
+            no_trade_result=True,
+            quarantine=True,
+            usable_for_real=False,
+            usable_for_lxv=False,
+            usable_for_training=False,
+            source=source,
+        )
+        if ok:
+            globals()["_LAST_INCIDENT_DEMO_SOLD_SIN_CONTEXTO_KEY"] = key
+            print(
+                Fore.CYAN + Style.BRIGHT +
+                f"🧷 INCIDENT_LOCK_SYNC_RECOVERY_REQUEST | bot={NOMBRE_BOT} | ronda=#{rid} | next=#{rid + 1} | "
+                f"reason=incident_lock_demo_sold_sin_contexto | neutral=SI"
+            )
+        return bool(ok)
+    except Exception:
+        return False
+
 
 
 def _incident_lock_demo_sin_evidencia_permitido(pending_id, pending_round, token_ctx, elapsed, attempts):
@@ -1749,15 +1804,25 @@ async def buscar_contrato_reciente_deriv_seguro(ws, token_usado=None, contract_i
 
 async def _procesar_incident_lock_sold(poc, source="proposal_open_contract"):
     cid = estado_bot.get("pending_contract_id") or (poc or {}).get("contract_id")
-    asset = estado_bot.get("pending_asset")
-    direction = estado_bot.get("pending_direction")
-    ciclo = estado_bot.get("pending_ciclo")
-    token_ctx = estado_bot.get("pending_token_usado")
+    asset = estado_bot.get("pending_asset") or (poc or {}).get("symbol") or (poc or {}).get("underlying")
+    direction = estado_bot.get("pending_direction") or (poc or {}).get("contract_type") or (poc or {}).get("contract_type_display")
+    ciclo = estado_bot.get("pending_ciclo") or estado_bot.get("ciclo_actual") or estado_bot.get("ciclo_forzado") or 1
+    token_ctx = estado_bot.get("pending_token_usado") or ultimo_token
     pending_round = estado_bot.get("pending_sync_round_id_original") or estado_bot.get("pending_round_id")
+    attempts = int(estado_bot.get("pending_attempts", 0) or 0)
+    since = float(estado_bot.get("pending_since_ts", 0.0) or 0.0)
+    elapsed = max(0.0, time.time() - since) if since else 0.0
+
+    estado_bot["pending_asset"] = asset
+    estado_bot["pending_direction"] = direction
+    estado_bot["pending_ciclo"] = ciclo
+    estado_bot["pending_token_usado"] = token_ctx
+
     try:
         profit = float((poc or {}).get("profit"))
     except Exception:
-        print(Fore.RED + Style.BRIGHT + f"⚠️ INCIDENT_LOCK_SOLD_SIN_CONTEXTO_COMPLETO | bot={NOMBRE_BOT} | contract_id={cid} | falta=profit")
+        if _print_once(f"incident-sold-sin-contexto-{NOMBRE_BOT}-{cid}-{pending_round}-profit", ttl=10.0):
+            print(Fore.RED + Style.BRIGHT + f"⚠️ INCIDENT_LOCK_SOLD_SIN_CONTEXTO_COMPLETO | bot={NOMBRE_BOT} | contract_id={cid} | falta=profit")
         return False
     resultado = "GANANCIA" if profit > 0 else "PÉRDIDA"
     criticos = {
@@ -1770,8 +1835,44 @@ async def _procesar_incident_lock_sold(poc, source="proposal_open_contract"):
     }
     faltantes = [k for k, v in criticos.items() if v in (None, "", 0)]
     if faltantes:
-        print(Fore.RED + Style.BRIGHT + f"⚠️ INCIDENT_LOCK_SOLD_SIN_CONTEXTO_COMPLETO | bot={NOMBRE_BOT} | contract_id={cid} | faltan={','.join(faltantes)}")
-        estado_bot["incident_lock_manual_review"] = "INCIDENT_LOCK_SOLD_SIN_CONTEXTO_COMPLETO"
+        modo_is_real = bool(str(estado_bot.get("tipo_cuenta", "") or estado_bot.get("modo", "")).strip().upper() == "REAL")
+        token_is_real = bool(token_ctx == TOKEN_REAL or str(token_ctx or "").strip().upper().startswith("REAL") or modo_is_real)
+        if token_is_real:
+            estado_bot["incident_lock_manual_review"] = "INCIDENT_LOCK_REAL_SOLD_SIN_CONTEXTO_REQUIERE_REVISION"
+            if _print_once(f"incident-sold-sin-contexto-{NOMBRE_BOT}-{cid}-{pending_round}", ttl=10.0):
+                print(
+                    Fore.RED + Style.BRIGHT +
+                    f"🚨 INCIDENT_LOCK_REAL_SOLD_SIN_CONTEXTO_REQUIERE_REVISION | bot={NOMBRE_BOT} | "
+                    f"contract_id={cid} | NO se libera token REAL | revisión manual requerida"
+                )
+            return False
+
+        ciclo_ctx = ciclo or estado_bot.get("ciclo_actual") or 1
+        estado_bot["pending_contract_state"] = "COMPRA_NO_CONFIRMADA_SOLD_SIN_CONTEXTO_DEMO"
+        estado_bot["pending_contract_action"] = "LIBERAR_SOLD_SIN_CONTEXTO_DEMO"
+        estado_bot["ciclo_forzado"] = ciclo_ctx
+        estado_bot["pending_ciclo"] = ciclo_ctx
+        estado_bot["ciclo_actual"] = ciclo_ctx
+        if _print_once(f"incident-sold-sin-contexto-{NOMBRE_BOT}-{cid}-{pending_round}", ttl=10.0):
+            print(Fore.RED + Style.BRIGHT + f"⚠️ INCIDENT_LOCK_SOLD_SIN_CONTEXTO_COMPLETO | bot={NOMBRE_BOT} | contract_id={cid} | faltan={','.join(faltantes)}")
+        print(
+            Fore.YELLOW + Style.BRIGHT +
+            f"🧯 INCIDENT_LOCK_SOLD_SIN_CONTEXTO_DEMO_LIBERADO | bot={NOMBRE_BOT} | ronda=#{pending_round} | C{ciclo_ctx} | "
+            f"contract_id={cid} | acción=recovery_request_neutral | mismo_ciclo=SI"
+        )
+        _emitir_sync_recovery_incident_demo_sold_sin_contexto_neutral(
+            pending_round, cid, ciclo_ctx, asset, direction, attempts, elapsed
+        )
+        _clear_pending_contract_resolution(
+            reason="COMPRA_NO_CONFIRMADA_SOLD_SIN_CONTEXTO_DEMO",
+            resultado_final="COMPRA_NO_CONFIRMADA_SOLD_SIN_CONTEXTO_DEMO",
+        )
+        estado_bot["ciclo_forzado"] = ciclo_ctx
+        estado_bot["ciclo_actual"] = ciclo_ctx
+        estado_bot["ciclo_en_progreso"] = False
+        estado_bot["token_msg_mostrado"] = False
+        if callable(globals().get("_sync_round_wait_release")) and pending_round:
+            estado_bot["sync_round_id"] = await _sync_round_wait_release(pending_round)
         return False
 
     token_is_real = bool(token_ctx == TOKEN_REAL or str(token_ctx or "").strip().upper().startswith("REAL"))
@@ -1817,6 +1918,7 @@ async def _procesar_incident_lock_sold(poc, source="proposal_open_contract"):
     return True
 
 
+
 async def resolver_contrato_incierto_seguro(ws):
     """Recuperación robusta INCIDENT_LOCK: buscar fantasma, procesar closed real o liberar stale-open DEMO neutral."""
     if not estado_bot.get("pending_contract_resolution"):
@@ -1844,6 +1946,11 @@ async def resolver_contrato_incierto_seguro(ws):
             poc["profit"] = found.get("profit")
         if bool(found.get("is_closed")) or bool(poc.get("is_sold", False)):
             if bool(found.get("profit_reliable", False)) and found.get("profit") is not None:
+                poc = dict(poc or {})
+                poc["contract_id"] = cid
+                poc["symbol"] = asset or poc.get("symbol")
+                poc["contract_type"] = direction or poc.get("contract_type")
+                poc["pending_round"] = pending_round
                 return await _procesar_incident_lock_sold(poc, source=found.get("source"))
             if elapsed < float(INCIDENT_LOCK_MAX_AGE_S) or attempts < int(INCIDENT_LOCK_RECOVERY_ATTEMPTS):
                 if _print_once("incident-lock-closed-sin-profit-wait", ttl=6.0):
@@ -4307,7 +4414,28 @@ async def ejecutar_panel():
                     continue
                 except Exception as e:
                     if _es_error_transitorio_ws(e):
-                        _set_pending_contract_resolution(round_id=int(estado_bot.get("sync_round_id", 1) or 1), contract_id=None, reason=f"buy_transient_{type(e).__name__}")
+                        _set_pending_contract_resolution(
+                            round_id=int(estado_bot.get("sync_round_id", 1) or 1),
+                            contract_id=None,
+                            reason=f"buy_transient_{type(e).__name__}",
+                            token_usado=current_token,
+                            asset=symbol,
+                            direction=direccion,
+                            ciclo=ciclo,
+                            monto=monto,
+                            rsi9=rsi9,
+                            rsi14=rsi14,
+                            sma5=sma5,
+                            sma20=sma20,
+                            cruce=cruce,
+                            breakout=breakout,
+                            rsi_reversion=rsi_reversion,
+                            payout=payout,
+                            condiciones=condiciones,
+                            epoch_pretrade=epoch_pre,
+                            trade_uid=trade_uid,
+                            close_snapshot=close_snapshot,
+                        )
                         if _print_once("buy-transient", ttl=8):
                             print(Fore.YELLOW + Style.BRIGHT + f"[WARN] Compra inestable ({type(e).__name__}). Reabro WS y mantengo ciclo #{ciclo}.")
                         await _cerrar_ws(ws)
