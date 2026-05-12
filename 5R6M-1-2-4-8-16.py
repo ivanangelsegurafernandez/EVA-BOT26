@@ -7888,8 +7888,29 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
             p["zona"] = str(zi.get("zona_base", zi.get("zona", zi.get("fase", ""))) or "")
             p["decision"] = str(zi.get("decision", "") or "")
             zona_ok, zona_reason = _lxv_zona_es_invertible(zi)
-        zona_ok = bool(zi.get("zona_base", "UNKNOWN") in LXV_ZONAS_INVERTIBLES and bool(zi.get("allow_real", False)))
-        _real_lock_set("ZONA_OK", bool(zona_ok), str(zona_reason or "zona_no_invertible"))
+        if patron_ok and str(patron) in ("4V2X", "5V1X"):
+            zi_ref_input = dict(zi)
+            zi_ref_input.setdefault("data_quality", str(data_quality or ""))
+            zi_ref_input.setdefault("round_complete", bool(round_complete))
+            zi_ref_input.setdefault("patron_lxv", str(patron))
+            zi_ref = refinar_zona_lxv_para_real(zi_ref_input, patron_lxv=str(patron))
+            if isinstance(zi_ref, dict):
+                zi = zi_ref
+                p["zona_real_refinada"] = str(zi.get("zona_real_refinada", ""))
+                p["decision_real_refinada"] = str(zi.get("decision_real_refinada", ""))
+                p["motivo_real_refinado"] = str(zi.get("motivo_real_refinado", ""))
+                p["nivel_real_zona"] = str(zi.get("nivel_real_zona", ""))
+                nivel_ref = str(zi.get("zona_real_refinada", ""))
+                motivo_ref = str(zi.get("motivo_real_refinado", ""))
+                if nivel_ref == "VERDE_PREMIUM_INVERTIBLE":
+                    _lxv_5v1x_event_cooldown(key=f"zona_ref_premium:{round_id}", msg=f"✅ 5V1X VERDE_PREMIUM_INVERTIBLE | rid={round_id} | motivo={motivo_ref}", cooldown_s=float(globals().get("LXV_GREEN_OPPORTUNITY_LOG_COOLDOWN_S", 15.0)))
+                elif nivel_ref == "VERDE_MODERADO_INVERTIBLE":
+                    _lxv_5v1x_event_cooldown(key=f"zona_ref_moderado:{round_id}", msg=f"✅ 4V2X VERDE_MODERADO_INVERTIBLE | rid={round_id} | motivo={motivo_ref}", cooldown_s=float(globals().get("LXV_GREEN_OPPORTUNITY_LOG_COOLDOWN_S", 15.0)))
+                elif nivel_ref == "VERDE_OBSERVAR_NO_REAL":
+                    _lxv_5v1x_event_cooldown(key=f"zona_ref_observar:{str(patron)}:{round_id}:{motivo_ref}", msg=f"🟡 LXV verde OBSERVAR_NO_REAL | patrón={patron} | rid={round_id} | motivo={motivo_ref}", cooldown_s=float(globals().get("LXV_GREEN_OPPORTUNITY_LOG_COOLDOWN_S", 15.0)))
+        zona_ok = bool(str(zi.get("decision_real_refinada", "")).upper() == "SI_INVERTIR") if patron_ok and str(patron) in ("4V2X", "5V1X") else bool(zi.get("zona_base", "UNKNOWN") in LXV_ZONAS_INVERTIBLES and bool(zi.get("allow_real", False)))
+        zona_reason_ref = str(zi.get("motivo_real_refinado", zona_reason or "zona_no_invertible"))
+        _real_lock_set("ZONA_OK", bool(zona_ok), zona_reason_ref)
         _real_lock_set("NO_DUPLICADO_RONDA", bool(round_id) and (not _lxv_real_round_already_emitted(round_id)), f"rid={round_id}")
         try:
             if callable(globals().get("_hay_real_close_pending_activo")):
@@ -8698,6 +8719,31 @@ def _lxv_count_prev_full_green_from_norm(norm_rows, rid_obj, expected=6):
         return 0
 
 
+def _lxv_count_prev_full_green_seq_from_norm(norm_rows, expected=6):
+    """Cuenta 6V0X previas por secuencia real de filas normalizadas, sin exigir round_id consecutivo."""
+    try:
+        expected = int(expected or 6)
+        if expected <= 0:
+            expected = 6
+        rows = list(norm_rows or [])
+        if len(rows) <= 1:
+            return 0
+        streak = 0
+        for rr in reversed(rows[:-1]):
+            if not isinstance(rr, dict):
+                break
+            v = int(rr.get("n_verdes", -1))
+            r = int(rr.get("n_rojos", -1))
+            completa = bool(rr.get("round_complete", rr.get("complete", (v + r) == expected)))
+            if completa and v == expected and r == 0:
+                streak += 1
+                continue
+            break
+        return int(streak)
+    except Exception:
+        return 0
+
+
 def _lxv_zona_dynamic_metrics(norm_rows, expected=6):
     try:
         rows = list(norm_rows or [])
@@ -8717,7 +8763,9 @@ def _lxv_zona_dynamic_metrics(norm_rows, expected=6):
         prom3 = _lxv_avg_last_ratios(rows, short_n, expected)
         prom8 = _lxv_avg_last_ratios(rows, min(mid_n, len(rows)), expected)
         prom20 = _lxv_avg_last_ratios(rows, min(long_n, len(rows)), expected)
-        return {"round_id": rid0, "v0": v0, "r0": r0, "g_actual": g_actual, "prom3": prom3, "prom8": prom8, "prom20": prom20, "delta_3_8": float(prom3 - prom8), "delta_8_20": float(prom8 - prom20), "prev_full_green_streak": _lxv_count_prev_full_green_from_norm(rows, rid0, expected), "n_cols": len(rows)}
+        prev_rid = _lxv_count_prev_full_green_from_norm(rows, rid0, expected)
+        prev_seq = _lxv_count_prev_full_green_seq_from_norm(rows, expected)
+        return {"round_id": rid0, "v0": v0, "r0": r0, "g_actual": g_actual, "prom3": prom3, "prom8": prom8, "prom20": prom20, "delta_3_8": float(prom3 - prom8), "delta_8_20": float(prom8 - prom20), "prev_full_green_streak": int(prev_rid), "prev_full_green_streak_seq": int(prev_seq), "prev_full_green_streak_final": int(max(prev_rid, prev_seq)), "n_cols": len(rows)}
     except Exception:
         return {}
 
@@ -8784,8 +8832,18 @@ def combinar_zona_lxv_con_mrv2(info):
     if dq!='ok': out.update({'allow_real':False,'decision':'NO_INVERTIR'}); return out
     if not comp and str(out.get('zona','')).upper()=='PRE_ZONA_VISUAL': out.update({'allow_real':False,'decision':'ESPERANDO_COLUMNA'}); return out
     if z2 in {'VERDE_TARDIO','VERDE_SATURADO_TARDIO','ROJA_TEMPRANO'}: out.update({'decision':'NO_INVERTIR','allow_real':False,'motivo':m2,'bloqueo_mrv_v2':True,'subzona':z2,'zona_mrv_bloqueante':z2}); return out
+    zona_oficial = str(out.get('zona', out.get('fase', '')) or '').upper()
+    motivo_oficial = str(out.get('motivo', '') or '').lower()
+    oficial_bloqueada = (
+        zona_oficial in {'ROJO_MADURO','ROJA_TEMPRANO','VERDE_TARDIO','VERDE_SATURADO_TARDIO'}
+        or dq != 'ok'
+        or (not comp and ('cerrados' in out or 'esperados' in out))
+        or any(tok in motivo_oficial for tok in ('saturacion', 'tardio', 'roja', 'expired', 'partial', 'missing'))
+    )
     if str(out.get('decision','')).upper()=='SI_INVERTIR' and d2=='SI_INVERTIR': out['confirmacion_mrv_v2']=True; return out
-    if str(out.get('decision','')).upper()!='SI_INVERTIR' and z2 in {'VERDE_TEMPRANO_CONFIRMADO','VERDE_MADURO_SANO','VERDE_MADURO_CON_RUIDO'} and bool(globals().get('MRV_ZONA_V2_CAN_UNLOCK_ZONE',True)) and comp and dq=='ok':
+    if oficial_bloqueada:
+        out['mrv2_no_desbloquea_zona_oficial_bloqueada'] = True
+    elif str(out.get('decision','')).upper()!='SI_INVERTIR' and z2 in {'VERDE_TEMPRANO_CONFIRMADO','VERDE_MADURO_SANO','VERDE_MADURO_CON_RUIDO'} and bool(globals().get('MRV_ZONA_V2_CAN_UNLOCK_ZONE',True)) and comp and dq=='ok':
         out.update({'zona':z2,'fase':z2,'decision':'SI_INVERTIR','allow_real':True,'motivo':f'mrv2_unlock:{m2}','desbloqueo_mrv_v2':True})
     elif z2=='NEUTRO_MIXTO': out['advertencia_mrv_v2']='neutro_mixto'
     return out
@@ -8849,7 +8907,7 @@ def combinar_zona_lxv_con_regional(info_zona, info_regional, patron_valido=False
     return out
 
 def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
-    base = {"zona":"INSUFICIENTE","fase":"INSUFICIENTE","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"GRAY","emoji":"⬜","motivo":"historial_insuficiente","g0":0.0,"g1":0.0,"g2":0.0,"verdes0":0,"rojos0":0,"verdes1":0,"rojos1":0,"verdes2":0,"rojos2":0,"streak_verde":0,"prev_full_green_streak":0,"round_id":None,"source":"none","ok":True,"cols_usadas":0,"cols_requeridas":int(globals().get("LXV_ZONA_MIN_COLUMNS",3) or 3)}
+    base = {"zona":"INSUFICIENTE","fase":"INSUFICIENTE","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"GRAY","emoji":"⬜","motivo":"historial_insuficiente","g0":0.0,"g1":0.0,"g2":0.0,"verdes0":0,"rojos0":0,"verdes1":0,"rojos1":0,"verdes2":0,"rojos2":0,"streak_verde":0,"prev_full_green_streak":0,"prev_full_green_streak_seq":0,"prev_full_green_streak_final":0,"round_id":None,"source":"none","ok":True,"cols_usadas":0,"cols_requeridas":int(globals().get("LXV_ZONA_MIN_COLUMNS",3) or 3)}
     base.setdefault("cols_usadas", 0)
     base.setdefault("cols_requeridas", int(globals().get("LXV_ZONA_MIN_COLUMNS", globals().get("LXV_FASE_MIN_COLUMNS", 3)) or 3))
     base.setdefault("source", "none")
@@ -9032,13 +9090,22 @@ def clasificar_zona_operativa_lxv(round_id_objetivo=None, rows=None):
         d38 = float(metrics.get("delta_3_8", 0.0))
         d820 = float(metrics.get("delta_8_20", 0.0))
         prev_streak = int(metrics.get("prev_full_green_streak", 0) or 0)
-        out=dict(base); out.update({"g0":g0,"g1":g1,"g2":g2,"verdes0":v0,"rojos0":r0,"verdes1":v1,"rojos1":r1,"verdes2":v2,"rojos2":r2,"streak_verde":streak,"prev_full_green_streak":prev_streak,"round_id":rid0,"source":source_resumen,"sources":source_resumen,"cols_usadas":len(norm),"dq0":str(c0.get("data_quality","")),"dq1":str(c1.get("data_quality","")),"dq2":str(c2.get("data_quality","")),"g_actual":g,"prom3":p3,"prom8":p8,"prom20":p20,"delta_3_8":d38,"delta_8_20":d820,"zona_model":"PROM3_PROM8_PROM20"})
+        prev_streak_seq = int(metrics.get("prev_full_green_streak_seq", 0) or 0)
+        prev_streak_final = int(max(prev_streak, prev_streak_seq, int(metrics.get("prev_full_green_streak_final", 0) or 0)))
+        out=dict(base); out.update({"g0":g0,"g1":g1,"g2":g2,"verdes0":v0,"rojos0":r0,"verdes1":v1,"rojos1":r1,"verdes2":v2,"rojos2":r2,"streak_verde":streak,"prev_full_green_streak":prev_streak,"prev_full_green_streak_seq":prev_streak_seq,"prev_full_green_streak_final":prev_streak_final,"round_id":rid0,"source":source_resumen,"sources":source_resumen,"cols_usadas":len(norm),"dq0":str(c0.get("data_quality","")),"dq1":str(c1.get("data_quality","")),"dq2":str(c2.get("data_quality","")),"g_actual":g,"prom3":p3,"prom8":p8,"prom20":p20,"delta_3_8":d38,"delta_8_20":d820,"zona_model":"PROM3_PROM8_PROM20"})
         if (r0 >= 4 and r1 >= 4) or (p3 <= 0.40 and p8 <= 0.50):
             out.update({"zona":"ROJO_MADURO","fase":"ROJO_MADURO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"rojo_maduro_promedios"}); out = combinar_zona_lxv_con_mrv2(out); return out
         if r0 >= 4 or (p3 < p8 - float(globals().get("LXV_ZONA_DROP_TARDIO", 0.08)) and g <= 0.50):
             out.update({"zona":"ROJA_TEMPRANO","fase":"ROJA_TEMPRANO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_ORANGE","emoji":"🟥","motivo":"caida_hacia_rojo"}); out = combinar_zona_lxv_con_mrv2(out); return out
-        if (prev_streak >= int(globals().get("LXV_ZONA_FULL_GREEN_PREV_BLOCK", 3) or 3) and g <= (5/6)) or (p8 >= float(globals().get("LXV_ZONA_PROM8_SATURADO", 0.92)) and p3 < p8 - float(globals().get("LXV_ZONA_DROP_SATURADO", 0.04)) and g <= (5/6)):
-            out.update({"zona":"VERDE_SATURADO_TARDIO","fase":"VERDE_SATURADO_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":"prev_full_green_streak" if prev_streak >= int(globals().get("LXV_ZONA_FULL_GREEN_PREV_BLOCK", 3) or 3) else "saturacion_con_caida"}); out = combinar_zona_lxv_con_mrv2(out); return out
+        prev_block_min = int(globals().get("LXV_ZONA_FULL_GREEN_PREV_BLOCK", 3) or 3)
+        if (prev_streak_final >= prev_block_min and g <= (5/6)) or (p8 >= float(globals().get("LXV_ZONA_PROM8_SATURADO", 0.92)) and p3 < p8 - float(globals().get("LXV_ZONA_DROP_SATURADO", 0.04)) and g <= (5/6)):
+            motivo_sat = "prev_full_green_streak_seq" if prev_streak_seq >= prev_block_min and prev_streak_seq >= prev_streak else ("prev_full_green_streak" if prev_streak_final >= prev_block_min else "saturacion_con_caida")
+            if motivo_sat == "prev_full_green_streak_seq":
+                try:
+                    _lxv_5v1x_event_cooldown(key=f"zona_sat_seq:{rid0}", msg=f"⛔ LXV VERDE_SATURADO_TARDIO por secuencia normalizada | rid={rid0} prev_full_seq={prev_streak_seq} prev_full_rid={prev_streak}", cooldown_s=float(globals().get("LXV_GREEN_EXHAUSTION_LOG_COOLDOWN_S", 20.0)))
+                except Exception:
+                    pass
+            out.update({"zona":"VERDE_SATURADO_TARDIO","fase":"VERDE_SATURADO_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"RED_STRONG","emoji":"🟥","motivo":motivo_sat}); out = combinar_zona_lxv_con_mrv2(out); return out
         if p8 >= float(globals().get("LXV_ZONA_PROM8_TARDIO_MIN", 0.70)) and p3 < p8 - float(globals().get("LXV_ZONA_DROP_TARDIO", 0.08)) and g <= (4/6):
             out.update({"zona":"VERDE_TARDIO","fase":"VERDE_TARDIO","decision":ZONA_NO_INVERTIR,"allow_real":False,"color_key":"ORANGE","emoji":"🟧","motivo":"verde_perdiendo_fuerza"}); out = combinar_zona_lxv_con_mrv2(out); return out
         if g >= (4/6) and p8 >= 0.45 and p8 < 0.68 and p3 >= p8 + float(globals().get("LXV_ZONA_DELTA_TEMPRANO", 0.02)):
@@ -9246,6 +9313,82 @@ def resolver_zona_final_lxv(round_id_objetivo=None, zona_info_previa=None):
         }
 
 
+def refinar_zona_lxv_para_real(info_zona, patron_lxv=None):
+    """Refina la zona LXV oficial para la compuerta REAL automática; falla cerrado."""
+    hard_zonas = {"ROJO_MADURO", "ROJA_TEMPRANO", "VERDE_TARDIO", "VERDE_SATURADO_TARDIO"}
+    out = dict(info_zona) if isinstance(info_zona, dict) else {}
+    try:
+        patron = str(patron_lxv or out.get("patron_lxv", out.get("patron_live", "")) or "").upper().replace("/", "").strip()
+        zona_base = str(out.get("zona_base", out.get("zona", out.get("fase", "UNKNOWN"))) or "UNKNOWN").upper()
+        zona = str(out.get("zona", out.get("fase", zona_base)) or zona_base).upper()
+        subzona = str(out.get("subzona", zona) or zona).upper()
+        dq = str(out.get("data_quality", out.get("dq0", "")) or "").strip().lower()
+        motivo = str(out.get("motivo", "") or "")
+        motivo_l = motivo.lower()
+        allow_original = bool(out.get("allow_real", False))
+        prom3 = float(out.get("prom3", 0.0) or 0.0)
+        prom8 = float(out.get("prom8", 0.0) or 0.0)
+        delta_3_8 = float(out.get("delta_3_8", out.get("d38", prom3 - prom8)) or 0.0)
+        prev_full = int(max(int(out.get("prev_full_green_streak", 0) or 0), int(out.get("prev_full_green_streak_seq", 0) or 0), int(out.get("prev_full_green_streak_final", 0) or 0)))
+        cerrados = out.get("cerrados", None)
+        esperados = out.get("esperados", None)
+        round_complete = out.get("round_complete", out.get("complete", None))
+        columna_incompleta = False
+        if round_complete is False:
+            columna_incompleta = True
+        if cerrados is not None and esperados is not None:
+            try:
+                columna_incompleta = columna_incompleta or (int(cerrados) < int(esperados))
+            except Exception:
+                columna_incompleta = True
+        bloquea_motivo = any(tok in motivo_l for tok in ("saturacion", "tardio", "roja", "expired", "partial", "missing"))
+        def cerrar(nivel, motivo_ref):
+            out.update({
+                "zona_real_refinada": str(nivel),
+                "decision_real_refinada": "NO_INVERTIR",
+                "motivo_real_refinado": str(motivo_ref),
+                "nivel_real_zona": str(nivel),
+            })
+            return out
+        if dq != "ok":
+            return cerrar("BLOQUEADA_NO_REAL", f"data_quality_no_ok:{dq or 'missing'}")
+        if columna_incompleta:
+            return cerrar("BLOQUEADA_NO_REAL", "columna_incompleta")
+        if zona_base in hard_zonas or zona in hard_zonas or subzona in hard_zonas or bloquea_motivo:
+            return cerrar("VERDE_TARDIO_SATURADO_NO_REAL", "zona_oficial_bloqueada_no_desbloquear_mrv")
+        if prev_full >= 3:
+            return cerrar("VERDE_TARDIO_SATURADO_NO_REAL", "verde_saturado_por_racha_previa")
+        if not allow_original:
+            return cerrar("BLOQUEADA_NO_REAL", "allow_real_original_false")
+        verdes_validas_5 = {"VERDE_TEMPRANO", "VERDE_MADURO", "VERDE_TEMPRANO_CONFIRMADO", "VERDE_MADURO_SANO"}
+        if patron == "5V1X":
+            if (zona_base in verdes_validas_5 or zona in verdes_validas_5) and prom8 >= 0.60 and delta_3_8 >= 0.02 and subzona not in hard_zonas:
+                out.update({"zona_real_refinada":"VERDE_PREMIUM_INVERTIBLE","decision_real_refinada":"SI_INVERTIR","motivo_real_refinado":"5V1X_premium_confirmado","nivel_real_zona":"PREMIUM"})
+                return out
+            if zona_base in verdes_validas_5 or zona in verdes_validas_5:
+                return cerrar("VERDE_OBSERVAR_NO_REAL", "verde_valido_pero_sin_confirmacion_premium")
+            return cerrar("BLOQUEADA_NO_REAL", "5V1X_zona_no_valida_para_premium")
+        if patron == "4V2X":
+            z_mrv = str(out.get("zona_mrv_v2", "") or "").upper()
+            red_cols_3_raw = out.get("red_cols_3", None)
+            red_cols_ok = True
+            if red_cols_3_raw is not None:
+                try:
+                    red_cols_ok = int(red_cols_3_raw) <= 1
+                except Exception:
+                    red_cols_ok = False
+            if z_mrv == "VERDE_TEMPRANO_CONFIRMADO" and prom3 >= prom8 and delta_3_8 >= 0.00 and red_cols_ok and subzona not in hard_zonas:
+                out.update({"zona_real_refinada":"VERDE_MODERADO_INVERTIBLE","decision_real_refinada":"SI_INVERTIR","motivo_real_refinado":"4V2X_mrv_temprano_confirmado","nivel_real_zona":"MODERADO"})
+                return out
+            if z_mrv in {"VERDE_MADURO_CON_RUIDO", "VERDE_MADURO"} or zona_base in {"VERDE_MADURO_CON_RUIDO", "VERDE_MADURO"} or zona in {"VERDE_MADURO_CON_RUIDO", "VERDE_MADURO"}:
+                return cerrar("VERDE_OBSERVAR_NO_REAL", "4V2X_con_ruido_o_sin_confirmacion_fuerte")
+            return cerrar("BLOQUEADA_NO_REAL", "4V2X_sin_confirmacion_mrv_fuerte")
+        return cerrar("BLOQUEADA_NO_REAL", "patron_no_soportado_para_refinado")
+    except Exception as e:
+        out.update({"zona_real_refinada":"BLOQUEADA_NO_REAL","decision_real_refinada":"NO_INVERTIR","motivo_real_refinado":f"refinado_error:{e.__class__.__name__}","nivel_real_zona":"BLOQUEADA_NO_REAL"})
+        return out
+
+
 def _lxv_zona_es_invertible(info: dict | None) -> tuple[bool, str]:
     try:
         zona_norm = normalizar_zona_lxv_oficial(info)
@@ -9291,6 +9434,8 @@ def _fase_zv_gate_allow_real(origen="LXV", rid=0):
         )
         return False
     info = resolver_zona_final_lxv(round_id_objetivo=rid_int if rid_ok else None)
+    if origen_txt in {"LXV_4V2X", "LXV_5V1X"}:
+        info = refinar_zona_lxv_para_real(info, patron_lxv="4V2X" if origen_txt == "LXV_4V2X" else "5V1X")
     _LXV_FASE_ZV_LAST_INFO = dict(info)
     _LXV_LAST_REAL_GATE_INFO = {
         "ts": time.time(),
@@ -9308,6 +9453,9 @@ def _fase_zv_gate_allow_real(origen="LXV", rid=0):
     if not bool(globals().get("LXV_FASE_ZONA_VERDE_ENABLE", True)):
         return True
     allow, allow_reason = _lxv_zona_es_invertible(info)
+    if origen_txt in {"LXV_4V2X", "LXV_5V1X"}:
+        allow = bool(str(info.get("decision_real_refinada", "")).upper() == "SI_INVERTIR")
+        allow_reason = str(info.get("motivo_real_refinado", allow_reason))
     cols_txt = f"cols={int(info.get('cols_usadas',0))}/{int(info.get('cols_requeridas', int(globals().get('LXV_FASE_MIN_COLUMNS',3))))}"
     source_txt = str(info.get("fuente_zona", info.get("source", info.get("sources", "none"))))
     zona_base = str(info.get("zona_base", info.get("zona", info.get("fase", "--"))))
@@ -23355,6 +23503,9 @@ def _hud_zona_operativa_lxv_line(width=None):
             f"cols={cols_usadas}/{cols_req} | cerrados={cerrados}/{esperados} | patrón={patron_live} | dq={dq} | "
             f"columna_visual={_hud_trim(col_visual, 28)}"
         )
+        zona_ref = refinar_zona_lxv_para_real(dict(zona_final, data_quality=dq, cerrados=cerrados, esperados=esperados, patron_lxv=patron_live), patron_lxv=patron_live)
+        ref_line = f" || ZONA_REAL_REFINADA: {zona_ref.get('nivel_real_zona','--')} | decisión={'SI' if str(zona_ref.get('decision_real_refinada','')).upper() == 'SI_INVERTIR' else 'NO'} | motivo={_hud_trim(str(zona_ref.get('motivo_real_refinado','--')), 38)}"
+        line_hud = f"{line_hud}{ref_line}"
         gate = dict(globals().get("_LXV_LAST_REAL_GATE_INFO", {}) or {})
         rid_gate = int(gate.get("round_id", 0) or 0)
         if rid_gate > 0:
@@ -23733,13 +23884,15 @@ def render_zona_lxv_panel():
         cerr=int(info.get("cerrados",0) or 0); esp=int(info.get("esperados",0) or 0)
         dq=str(info.get("data_quality","--")); patron=str(info.get("patron_live","--"))
         zona_allow = bool(zf.get("allow_real", False)) and str(zf.get("zona_base", "UNKNOWN")) in LXV_ZONAS_INVERTIBLES
+        zref = refinar_zona_lxv_para_real(dict(zf, data_quality=dq, cerrados=cerr, esperados=esp, patron_lxv=patron), patron_lxv=patron)
+        zref_txt = f"{zref.get('nivel_real_zona','--')} | decisión={'SI' if str(zref.get('decision_real_refinada','')).upper() == 'SI_INVERTIR' else 'NO'} | motivo={zref.get('motivo_real_refinado','--')}"
         real_txt = "POSIBLE si patrón/candidato/token/cierre están OK"
         if dq != "ok": real_txt = "NO, data_quality no ok"
         elif esp <= 0 or cerr < esp: real_txt = "NO, esperando columna completa"
         elif bool(zf.get("bloqueo_mrv_v2", False)): real_txt = "NO, bloqueo MRV_ZONA_V2"
         elif not zona_allow: real_txt = "NO, zona oficial no invertible"
         reg_line = f"ZONA REGIONAL: {str(info.get('zona_regional','NEUTRO_REGIONAL'))} | R1={float(info.get('green_ratio_r1',0.0)):.2f} R2={float(info.get('green_ratio_r2',0.0)):.2f} R3={float(info.get('green_ratio_r3',0.0)):.2f} | decisión={str(info.get('decision_regional','NO_INVERTIR'))}"
-        return ["╔════════════════════════════════════════════════════════════╗","║ 🧭 ZONA LXV / MRV_ZONA_V2                                ║","╠════════════════════════════════════════════════════════════╣",f"║ ZONA OFICIAL REAL : {z[:37].ljust(37)}║",f"║ SUBZONA / VISUAL  : {subz[:37].ljust(37)}║",f"║ DECISIÓN ZONA     : {d[:37].ljust(37)}║",f"║ MOTIVO            : {m[:37].ljust(37)}║",f"║ FUENTE            : {fuente[:37].ljust(37)}║",f"║ MRV_V2      : {z2[:43].ljust(43)}║",f"║ Decisión V2 : {d2[:43].ljust(43)}║",f"║ Motivo V2   : {m2[:43].ljust(43)}║",f"║ V3          : {'OFF / sin influencia operativa'[:43].ljust(43)}║",f"║ Columna     : {cerr}/{esp} | dq={dq} | patrón={patron}"[:61].ljust(61)+"║",f"║ Regional    : SOLO_DIAGNOSTICO, NO_HABILITA_REAL"[:61].ljust(61)+"║",f"║ Regional+   : {reg_line[:47].ljust(47)}║",f"║ REAL        : {real_txt[:47].ljust(47)}║","╚════════════════════════════════════════════════════════════╝"]
+        return ["╔════════════════════════════════════════════════════════════╗","║ 🧭 ZONA LXV / MRV_ZONA_V2                                ║","╠════════════════════════════════════════════════════════════╣",f"║ ZONA OFICIAL REAL : {z[:37].ljust(37)}║",f"║ SUBZONA / VISUAL  : {subz[:37].ljust(37)}║",f"║ DECISIÓN ZONA     : {d[:37].ljust(37)}║",f"║ MOTIVO            : {m[:37].ljust(37)}║",f"║ FUENTE            : {fuente[:37].ljust(37)}║",f"║ MRV_V2      : {z2[:43].ljust(43)}║",f"║ Decisión V2 : {d2[:43].ljust(43)}║",f"║ Motivo V2   : {m2[:43].ljust(43)}║",f"║ V3          : {'OFF / sin influencia operativa'[:43].ljust(43)}║",f"║ Columna     : {cerr}/{esp} | dq={dq} | patrón={patron}"[:61].ljust(61)+"║",f"║ Regional    : SOLO_DIAGNOSTICO, NO_HABILITA_REAL"[:61].ljust(61)+"║",f"║ Regional+   : {reg_line[:47].ljust(47)}║",f"║ REAL        : {real_txt[:47].ljust(47)}║",f"║ ZONA_REAL_REFINADA: {zref_txt[:39].ljust(39)}║","╚════════════════════════════════════════════════════════════╝"]
     except Exception:
         return []
 
@@ -30445,6 +30598,49 @@ if __name__ == "__main__":
         msg=f"✅ LXV VERDE OK: rid={rid} patron=5V1X prev_full_green_streak={int((info_exh or {}).get('prev_full_green_streak',0))}",
         cooldown_s=8.0,
     )
+
+
+
+def _selftest_lxv_real_refinada():
+    try:
+        base5 = {"zona":"VERDE_MADURO","zona_base":"VERDE_MADURO","subzona":"VERDE_MADURO","allow_real":True,"data_quality":"ok","prom3":0.64,"prom8":0.61,"delta_3_8":0.03,"prev_full_green_streak":0}
+        r = refinar_zona_lxv_para_real(base5, "5V1X")
+        assert r["decision_real_refinada"] == "SI_INVERTIR" and r["zona_real_refinada"] == "VERDE_PREMIUM_INVERTIBLE"
+
+        r = refinar_zona_lxv_para_real(dict(base5, prom8=0.59, delta_3_8=0.03), "5V1X")
+        assert r["decision_real_refinada"] == "NO_INVERTIR" and r["zona_real_refinada"] == "VERDE_OBSERVAR_NO_REAL"
+
+        base4 = {"zona":"VERDE_MADURO","zona_base":"VERDE_MADURO","subzona":"VERDE_MADURO","allow_real":True,"data_quality":"ok","prom3":0.66,"prom8":0.65,"delta_3_8":0.01,"prev_full_green_streak":0,"zona_mrv_v2":"VERDE_TEMPRANO_CONFIRMADO","red_cols_3":1}
+        r = refinar_zona_lxv_para_real(base4, "4V2X")
+        assert r["decision_real_refinada"] == "SI_INVERTIR" and r["zona_real_refinada"] == "VERDE_MODERADO_INVERTIBLE"
+
+        r = refinar_zona_lxv_para_real(dict(base4, zona_mrv_v2="VERDE_MADURO_CON_RUIDO"), "4V2X")
+        assert r["decision_real_refinada"] == "NO_INVERTIR" and r["zona_real_refinada"] == "VERDE_OBSERVAR_NO_REAL"
+
+        rows_sat = [
+            {"round_id":1,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},
+            {"round_id":3,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},
+            {"round_id":5,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},
+            {"round_id":7,"n_verdes":5,"n_rojos":1,"round_complete":True,"data_quality":"ok"},
+        ]
+        info_sat = clasificar_zona_operativa_lxv(rows=rows_sat)
+        assert info_sat.get("zona") == "VERDE_SATURADO_TARDIO" and int(info_sat.get("prev_full_green_streak_seq", 0)) == 3
+        r = refinar_zona_lxv_para_real(dict(base5, prev_full_green_streak_seq=3), "5V1X")
+        assert r["decision_real_refinada"] == "NO_INVERTIR" and "saturado" in r["zona_real_refinada"].lower()
+        r = refinar_zona_lxv_para_real(dict(base4, prev_full_green_streak_seq=3), "4V2X")
+        assert r["decision_real_refinada"] == "NO_INVERTIR" and "saturado" in r["zona_real_refinada"].lower()
+
+        for dq in ("partial", "closed_expired"):
+            r = refinar_zona_lxv_para_real(dict(base5, data_quality=dq), "5V1X")
+            assert r["decision_real_refinada"] == "NO_INVERTIR"
+        print("SELFTEST LXV_REAL_REFINADA OK")
+        return True
+    except Exception as e:
+        print(f"SELFTEST LXV_REAL_REFINADA FAIL: {e}")
+        return False
+
+if os.environ.get("RUN_LXV_REAL_REFINADA_SELFTEST") == "1":
+    _selftest_lxv_real_refinada()
 
 def _selftest_real_activo_prepatron_lxv():
     tests = [
