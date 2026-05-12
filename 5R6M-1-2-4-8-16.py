@@ -11355,6 +11355,8 @@ def _sync_round_try_recovery_release_global() -> bool:
 
         reqs = _sync_round_read_recovery_requests(max_age_s=float(globals().get("SYNC_RECOVERY_GLOBAL_REQUEST_MAX_AGE_S", 120.0) or 120.0))
         req_bots = []
+        request_only_req_bots = []
+        request_only_release = False
         incident_req_bots = []
         for bot, req in (reqs or {}).items():
             try:
@@ -11385,8 +11387,34 @@ def _sync_round_try_recovery_release_global() -> bool:
                     wait_since_candidates.append(ts_val)
         if not req_bots:
             return _hold("sin_recovery_request", released_round)
-        if not wait_bots:
-            return _hold("sin_bots_waiting", released_round)
+        if req_bots and not wait_bots:
+            for bot, req in (reqs or {}).items():
+                if bot not in req_bots or not isinstance(req, dict):
+                    continue
+                try:
+                    req_next = int(req.get("next_round", 0) or 0)
+                    req_round = int(req.get("round_id", released_round) or released_round)
+                except Exception:
+                    continue
+                req_reason_txt = str(req.get("reason") or "").strip()
+                if (
+                    req_reason_txt == "demo_wait_timeout_no_release"
+                    and req_round <= int(released_round)
+                    and req_next >= int(target_round)
+                    and not bool(req.get("any_real_active", False))
+                ):
+                    request_only_req_bots.append(bot)
+                    try:
+                        ts_val = float(req.get("ts", req.get("created_ts", 0.0)) or 0.0)
+                    except Exception:
+                        ts_val = 0.0
+                    if ts_val > 0:
+                        wait_since_candidates.append(ts_val)
+            if request_only_req_bots:
+                wait_bots = list(request_only_req_bots)
+                request_only_release = True
+            else:
+                return _hold("sin_bots_waiting", released_round)
 
         started_at = float(st.get("started_at", st.get("ts", 0.0)) or 0.0)
         wait_elapsed = max(0.0, now_ts - started_at) if started_at > 0 else 0.0
@@ -11409,7 +11437,9 @@ def _sync_round_try_recovery_release_global() -> bool:
             or str(st_check.get("last_real_owner") or st_check.get("real_released_after_bot") or st_check.get("real_pending_bot") or "").strip() in BOT_NAMES
             or str(token_raw or "").strip().upper() in ("REAL:NONE", "REAL:NULL", "REAL:--", "REAL:")
         )
-        if incident_req_bots and not after_real_context:
+        if request_only_release:
+            recovery_reason = "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_FROM_REQUEST_ONLY"
+        elif incident_req_bots and not after_real_context:
             incident_req_lookup = reqs or {}
             incident_reason_txt = ""
             try:
@@ -11455,6 +11485,9 @@ def _sync_round_try_recovery_release_global() -> bool:
             if recovery_reason.startswith("RECOVERY_RELEASE_INCIDENT_LOCK_"):
                 bot_txt = incident_req_bots[0] if incident_req_bots else "--"
                 agregar_evento(f"🧯 {recovery_reason} | bot={bot_txt} | ronda=#{released_round} | release=#{target_round} | neutral=SI")
+            elif recovery_reason == "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_FROM_REQUEST_ONLY":
+                req_txt = list(request_only_req_bots or wait_bots)
+                agregar_evento(f"🔓 RECOVERY_RELEASE_FROM_REQUEST_ONLY: released={released_round} → target={target_round} | req_bots={req_txt} | motivo=demo_wait_timeout_no_release | real=NO | owner=--")
             elif recovery_reason.endswith("AFTER_REAL_CLOSE"):
                 agregar_evento(f"🔓 RECOVERY_FORCE_AFTER_REAL_CLOSE: {released_round} → {target_round} | bots_waiting={len(wait_bots)} | token={token_raw or 'DEMO'}")
             else:
