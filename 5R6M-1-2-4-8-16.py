@@ -384,7 +384,7 @@ IA_METRIC_THRESHOLD = AUTO_REAL_THR_MIN
 # Modo clásico: activación REAL con umbral operativo vigente (hoy 65%, con techo dinámico base 70%).
 # Mantiene lock de un solo bot en REAL y ciclo martingala global en HUD.
 REAL_CLASSIC_GATE = True
-MODO_PURIFICACION_REAL = True  # Llave maestra: bypassea toda promoción/activación REAL sin apagar IA/HUD.
+MODO_PURIFICACION_REAL = False  # Modo normal operativo: no bloquea REAL; True solo para diagnóstico/purificación explícita.
 LXV_SYNC_REAL_ROUTE_ENABLE = True
 LXV_SYNC_REAL_SOURCE = "LXV_SYNC"
 LXV_5V1X_ENABLE = True
@@ -889,10 +889,34 @@ def _pattern_v1_log_bot(bot: str, pattern_score: float, bonus_dual: float, penal
         pass
 
 
-def _purificacion_real_activa() -> bool:
+def _purificacion_real_activa(source=None, bot=None, round_id=None, ciclo=None) -> bool:
     """Llave maestra centralizada para apagar capa REAL sin romper flujo IA/HUD."""
     try:
         route_src = str(globals().get("_REAL_ROUTE_SOURCE", "") or "").strip().upper()
+        purif_on = bool(globals().get("MODO_PURIFICACION_REAL", False))
+        src_log = str(source or route_src or "UNKNOWN").strip() or "UNKNOWN"
+        bot_log = str(bot or globals().get("_REAL_ROUTE_BOT", "UNKNOWN") or "UNKNOWN").strip() or "UNKNOWN"
+        rid_log = str(round_id if round_id is not None else globals().get("_REAL_ROUTE_ROUND_ID", "UNKNOWN"))
+        ciclo_log = str(ciclo if ciclo is not None else globals().get("_REAL_ROUTE_CICLO", "UNKNOWN"))
+        if purif_on:
+            try:
+                _lxv_5v1x_event_cooldown(
+                    key=f"purif:on:{src_log}",
+                    msg="🧪 REAL OFF | PURIFICACION ACTIVA | MODO_PURIFICACION_REAL=True",
+                    cooldown_s=15.0,
+                )
+            except Exception:
+                pass
+            try:
+                _lxv_5v1x_event_cooldown(
+                    key=f"purif:block:{src_log}:{bot_log}:{rid_log}:{ciclo_log}",
+                    msg=f"🧪 REAL BLOQUEADO POR MODO_PURIFICACION_REAL=True | source={src_log} | bot={bot_log} | round_id={rid_log} | ciclo={ciclo_log}",
+                    cooldown_s=15.0,
+                )
+            except Exception:
+                pass
+            return True
+
         allow_sync = str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper()
         allow_5v1x = str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X")).upper()
         allow_4v2x = str(globals().get("LXV_4V2X_REAL_SOURCE", "LXV_4V2X")).upper()
@@ -915,18 +939,7 @@ def _purificacion_real_activa() -> bool:
                 )
             except Exception:
                 pass
-            return False
-        purif_on = bool(globals().get("MODO_PURIFICACION_REAL", False))
-        if purif_on and route_src:
-            try:
-                _lxv_5v1x_event_cooldown(
-                    key=f"purif:block:{route_src}",
-                    msg=f"🧪 Purificación activa: source REAL bloqueada={route_src}",
-                    cooldown_s=15.0,
-                )
-            except Exception:
-                pass
-        return purif_on
+        return False
     except Exception:
         return False
 
@@ -941,7 +954,7 @@ def _emitir_marca_purificacion_real() -> None:
         if (now - float(_LAST_PURIFICACION_REAL_EVENT_TS or 0.0)) < float(PURIFICACION_REAL_EVENT_COOLDOWN_S):
             return
         _LAST_PURIFICACION_REAL_EVENT_TS = now
-        agregar_evento("🧪 MODO PURIFICACION REAL ACTIVO: promoción/orden REAL desactivada (bypass).")
+        agregar_evento("🧪 REAL OFF | PURIFICACION ACTIVA | MODO_PURIFICACION_REAL=True")
     except Exception:
         pass
 
@@ -14117,7 +14130,7 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
     global LIMPIEZA_PANEL_HASTA, sonido_disparado, marti_paso, REAL_OWNER_LOCK, REAL_ENTRY_BASELINE
 
     try:
-        if _purificacion_real_activa():
+        if _purificacion_real_activa(source=origen, bot=bot, ciclo=ciclo):
             _emitir_marca_purificacion_real()
             return False
         if bot not in BOT_NAMES:
@@ -14314,7 +14327,7 @@ def escribir_orden_real(bot: str, ciclo: int, round_id=None) -> bool:
         _maybe_log_pause_state(force=False)
         return False
 
-    if _purificacion_real_activa():
+    if _purificacion_real_activa(bot=bot, ciclo=ciclo, round_id=round_id):
         _emitir_marca_purificacion_real()
         return False
 
