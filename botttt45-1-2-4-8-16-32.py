@@ -655,7 +655,7 @@ def _sync_round_write_release_heartbeat(round_id: int, next_round: int):
 
 
 
-def _sync_round_write_recovery_request(bot, round_id, next_round, released, reason, any_real_active=False, any_real_owner="", any_real_reason="") -> bool:
+def _sync_round_write_recovery_request(bot, round_id, next_round, released, reason, any_real_active=False, any_real_owner="", any_real_reason="", **extra_fields) -> bool:
     try:
         req_dir = os.path.join(SYNC_ROUND_DIR, "recovery_requests")
         os.makedirs(req_dir, exist_ok=True)
@@ -671,6 +671,10 @@ def _sync_round_write_recovery_request(bot, round_id, next_round, released, reas
             "any_real_owner": str(any_real_owner or ""),
             "any_real_reason": str(any_real_reason or ""),
         }
+        if isinstance(extra_fields, dict) and extra_fields:
+            for k, v in extra_fields.items():
+                if k and k not in payload:
+                    payload[str(k)] = v
         return _sync_round_write_json_atomic(path, payload)
     except Exception:
         return False
@@ -1325,13 +1329,21 @@ COOLDOWN_REAL_S = 12
 REFRESCO_SALDO = 12
 _last_saldo_ts = 0.0
 PENDING_CONTRACT_FENCE_S = 35.0
+INCIDENT_LOCK_RECOVERY_ATTEMPTS = 5
+INCIDENT_LOCK_MAX_AGE_S = PENDING_CONTRACT_FENCE_S
 
 
-def _set_pending_contract_resolution(round_id: int, contract_id=None, reason: str = ""):
+def _set_pending_contract_resolution(round_id: int, contract_id=None, reason: str = "", token_usado=None, asset=None, direction=None, ciclo=None):
     estado_bot["pending_contract_resolution"] = True
     estado_bot["pending_contract_id"] = contract_id
     estado_bot["pending_since_ts"] = float(time.time())
     estado_bot["pending_round_id"] = int(round_id or estado_bot.get("sync_round_id", 1) or 1)
+    estado_bot["pending_reason"] = str(reason or "")
+    estado_bot["pending_attempts"] = 0
+    estado_bot["pending_token_usado"] = token_usado
+    estado_bot["pending_asset"] = asset
+    estado_bot["pending_direction"] = direction
+    estado_bot["pending_ciclo"] = ciclo
     if _print_once("pending-contract-set", ttl=6.0):
         cid_txt = f" contract_id={contract_id}" if contract_id is not None else ""
         reason_txt = reason or "unknown"
@@ -1345,6 +1357,55 @@ def _clear_pending_contract_resolution(reason: str = ""):
     estado_bot["pending_contract_id"] = None
     estado_bot["pending_since_ts"] = 0.0
     estado_bot["pending_round_id"] = None
+    estado_bot["pending_reason"] = ""
+    estado_bot["pending_attempts"] = 0
+    estado_bot["pending_token_usado"] = None
+    estado_bot["pending_asset"] = None
+    estado_bot["pending_direction"] = None
+    estado_bot["pending_ciclo"] = None
+
+
+def _emitir_sync_recovery_incident_demo_neutral(round_id, contract_id, ciclo, asset, direction, attempts, edad):
+    try:
+        rid = int(round_id or 0)
+        cid = int(contract_id or 0)
+        if rid <= 0 or cid <= 0:
+            return False
+        key = f"incident-demo-stale-open:{rid}:{cid}"
+        if globals().get("_LAST_INCIDENT_DEMO_STALE_OPEN_KEY") == key:
+            return True
+        st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
+        try:
+            released = int(st.get("released_round", rid) or rid)
+        except Exception:
+            released = rid
+        ok = _sync_round_write_recovery_request(
+            bot=NOMBRE_BOT,
+            round_id=rid,
+            next_round=rid + 1,
+            released=released,
+            reason="incident_lock_demo_stale_open",
+            contract_id=cid,
+            ciclo=ciclo,
+            asset=asset,
+            direction=direction,
+            attempts=int(attempts or 0),
+            edad=float(edad or 0.0),
+            neutral=True,
+            no_trade_result=True,
+            quarantine=True,
+            source="INCIDENT_LOCK_STALE_OPEN_DEMO",
+        )
+        if ok:
+            globals()["_LAST_INCIDENT_DEMO_STALE_OPEN_KEY"] = key
+            print(
+                Fore.CYAN + Style.BRIGHT +
+                f"🧷 INCIDENT_LOCK_SYNC_RECOVERY_REQUEST | bot={NOMBRE_BOT} | ronda=#{rid} | next=#{rid + 1} | "
+                f"reason=incident_lock_demo_stale_open | neutral=SI"
+            )
+        return bool(ok)
+    except Exception:
+        return False
 
 
 async def _pending_contract_fence_tick(ws):
@@ -1354,6 +1415,9 @@ async def _pending_contract_fence_tick(ws):
     pending_id = estado_bot.get("pending_contract_id")
     since = float(estado_bot.get("pending_since_ts", 0.0) or 0.0)
     elapsed = max(0.0, time.time() - since)
+    attempts = min(int(INCIDENT_LOCK_RECOVERY_ATTEMPTS), int(estado_bot.get("pending_attempts", 0) or 0) + 1)
+    estado_bot["pending_attempts"] = attempts
+    pending_round = int(estado_bot.get("pending_round_id") or estado_bot.get("sync_round_id", 0) or 0)
 
     if isinstance(pending_id, int) and ws is not None:
         try:
@@ -1367,6 +1431,46 @@ async def _pending_contract_fence_tick(ws):
             if bool(poc.get("is_sold", False)):
                 _clear_pending_contract_resolution(reason="reconciled_sold")
                 return True
+            token_ctx = estado_bot.get("pending_token_usado")
+            token_is_real = bool(token_ctx == TOKEN_REAL or str(token_ctx or "").strip().upper().startswith("REAL"))
+            modo_is_real = bool(str(estado_bot.get("tipo_cuenta", "") or estado_bot.get("modo", "")).strip().upper() == "REAL")
+            profit_final = poc.get("profit")
+            has_final_profit = profit_final not in (None, "") and bool(poc.get("is_sold", False))
+            any_real_active, _owner_real, _real_reason = (False, "", "")
+            try:
+                any_real_active, _owner_real, _real_reason = _sync_any_real_owner_active()
+            except Exception:
+                any_real_active = True
+            if (
+                pending_round > 0
+                and not modo_is_real
+                and not token_is_real
+                and not any_real_active
+                and not has_final_profit
+                and not bool(poc.get("is_sold", False))
+                and elapsed >= float(INCIDENT_LOCK_MAX_AGE_S)
+                and attempts >= int(INCIDENT_LOCK_RECOVERY_ATTEMPTS)
+            ):
+                rid = pending_round
+                cid = int(pending_id)
+                ciclo_actual = estado_bot.get("pending_ciclo") or estado_bot.get("ciclo_actual")
+                asset = estado_bot.get("pending_asset")
+                direction = estado_bot.get("pending_direction")
+                estado_bot["pending_contract_state"] = "COMPRA_NO_CONFIRMADA_STALE_OPEN_DEMO"
+                estado_bot["pending_contract_action"] = "LIBERAR_STALE_OPEN_DEMO"
+                estado_bot["ciclo_forzado"] = ciclo_actual
+                print(
+                    Fore.YELLOW + Style.BRIGHT +
+                    f"🧯 INCIDENT_LOCK_STALE_OPEN_DEMO_LIBERADO | bot={NOMBRE_BOT} | ronda=#{rid} | C{ciclo_actual} | "
+                    f"contract_id={cid} | edad={elapsed:.0f}s | attempts={attempts}/{INCIDENT_LOCK_RECOVERY_ATTEMPTS} | "
+                    f"acción=recovery_request_neutral | mismo_ciclo=SI"
+                )
+                _emitir_sync_recovery_incident_demo_neutral(rid, cid, ciclo_actual, asset, direction, attempts, elapsed)
+                _clear_pending_contract_resolution(reason="COMPRA_NO_CONFIRMADA_STALE_OPEN_DEMO")
+                estado_bot["ciclo_en_progreso"] = False
+                estado_bot["token_msg_mostrado"] = False
+                estado_bot["sync_round_id"] = await _sync_round_wait_release(rid)
+                return False
         except Exception:
             pass
 
@@ -3747,7 +3851,7 @@ async def ejecutar_panel():
                 )
 
                 if resultado == "INDEFINIDO":
-                    _set_pending_contract_resolution(round_id=int(estado_bot.get("sync_round_id", 1) or 1), contract_id=contract_id, reason="resultado_indefinido")
+                    _set_pending_contract_resolution(round_id=int(estado_bot.get("sync_round_id", 1) or 1), contract_id=contract_id, reason="resultado_indefinido", token_usado=current_token, asset=symbol, direction=direccion, ciclo=ciclo)
                     print(Fore.YELLOW + "INDEFINIDO: WS/Token restart. Se mantiene MISMO ciclo (BG resolverá).")
                     indefinidos_consecutivos += 1
 

@@ -11120,6 +11120,40 @@ def _sync_round_should_recovery_release(round_id, released_round, requests, st) 
     return True, "demo_wait_timeout_recovery_no_real"
 
 
+
+
+def _sync_round_neutral_incident_stale_open_request(round_id, released_round, requests) -> dict:
+    out = {"ok": False, "bot": "", "contract_id": None, "reason": "no_incident_request"}
+    try:
+        rid = int(round_id or 0)
+        rel = int(released_round or 0)
+        if rid <= 0 or rel != rid or not isinstance(requests, dict):
+            out["reason"] = "round_mismatch"
+            return out
+        target = rid + 1
+        for bot, req in requests.items():
+            if bot not in BOT_NAMES or not isinstance(req, dict):
+                continue
+            if str(req.get("reason") or "").strip() != "incident_lock_demo_stale_open":
+                continue
+            if int(req.get("round_id", 0) or 0) != rid or int(req.get("next_round", 0) or 0) != target:
+                continue
+            if not (bool(req.get("neutral", False)) and bool(req.get("no_trade_result", False)) and bool(req.get("quarantine", False))):
+                out["reason"] = "incident_request_not_neutral_quarantine"
+                continue
+            out.update({
+                "ok": True,
+                "bot": bot,
+                "contract_id": req.get("contract_id"),
+                "reason": "incident_lock_demo_stale_open",
+                "source": req.get("source", "INCIDENT_LOCK_STALE_OPEN_DEMO"),
+            })
+            return out
+        return out
+    except Exception as e:
+        out["reason"] = f"incident_request_error_{type(e).__name__}"
+        return out
+
 def _sync_round_try_recovery_release_global() -> bool:
     """
     Recovery quirúrgico del maestro: libera N+1 cuando released_round quedó
@@ -11291,6 +11325,7 @@ def _sync_round_try_recovery_release_global() -> bool:
 
         reqs = _sync_round_read_recovery_requests(max_age_s=float(globals().get("SYNC_RECOVERY_GLOBAL_REQUEST_MAX_AGE_S", 120.0) or 120.0))
         req_bots = []
+        incident_req_bots = []
         for bot, req in (reqs or {}).items():
             try:
                 req_next = int(req.get("next_round", 0) or 0)
@@ -11299,6 +11334,13 @@ def _sync_round_try_recovery_release_global() -> bool:
                 continue
             if req_next >= target_round and req_round <= int(released_round):
                 req_bots.append(bot)
+                if (
+                    str(req.get("reason") or "").strip() == "incident_lock_demo_stale_open"
+                    and bool(req.get("neutral", False))
+                    and bool(req.get("no_trade_result", False))
+                    and bool(req.get("quarantine", False))
+                ):
+                    incident_req_bots.append(bot)
                 try:
                     ts_val = float(req.get("ts", req.get("created_ts", 0.0)) or 0.0)
                 except Exception:
@@ -11331,7 +11373,10 @@ def _sync_round_try_recovery_release_global() -> bool:
             or str(st_check.get("last_real_owner") or st_check.get("real_released_after_bot") or st_check.get("real_pending_bot") or "").strip() in BOT_NAMES
             or str(token_raw or "").strip().upper() in ("REAL:NONE", "REAL:NULL", "REAL:--", "REAL:")
         )
-        recovery_reason = "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_AFTER_REAL_CLOSE" if after_real_context else "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN"
+        if incident_req_bots and not after_real_context:
+            recovery_reason = "RECOVERY_RELEASE_INCIDENT_LOCK_STALE_OPEN_DEMO"
+        else:
+            recovery_reason = "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_AFTER_REAL_CLOSE" if after_real_context else "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN"
         payload = dict(st_check)
         payload.update({
             "round_id": target_round,
@@ -11360,7 +11405,10 @@ def _sync_round_try_recovery_release_global() -> bool:
                 f"{recovery_reason}: {released_round}→{target_round} | bots_waiting={len(wait_bots)} | token={token_raw}",
                 cooldown_s=1.0,
             )
-            if recovery_reason.endswith("AFTER_REAL_CLOSE"):
+            if recovery_reason == "RECOVERY_RELEASE_INCIDENT_LOCK_STALE_OPEN_DEMO":
+                bot_txt = incident_req_bots[0] if incident_req_bots else "--"
+                agregar_evento(f"🧯 RECOVERY_RELEASE_INCIDENT_LOCK_STALE_OPEN_DEMO | bot={bot_txt} | ronda=#{released_round} | release=#{target_round} | neutral=SI")
+            elif recovery_reason.endswith("AFTER_REAL_CLOSE"):
                 agregar_evento(f"🔓 RECOVERY_FORCE_AFTER_REAL_CLOSE: {released_round} → {target_round} | bots_waiting={len(wait_bots)} | token={token_raw or 'DEMO'}")
             else:
                 agregar_evento(f"🔓 RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN: {released_round} → {target_round} | bots_waiting={len(wait_bots)} | token={token_raw} | real=NO | owner=--")
@@ -11993,6 +12041,25 @@ def _sync_round_tick_maestro():
             )
             return
         if can_req_recover:
+            incident_req = _sync_round_neutral_incident_stale_open_request(round_id, released_round, reqs)
+            if bool(incident_req.get("ok", False)):
+                qi_incident = {
+                    "eligible": True,
+                    "round_id": int(round_id),
+                    "missing_bot": incident_req.get("bot"),
+                    "reason": "incident_lock_demo_stale_open",
+                    "elapsed_s": float(elapsed_round_s),
+                    "closed": int(closed_count),
+                    "expected": int(expected_count),
+                    "contract_id": incident_req.get("contract_id"),
+                    "source": "INCIDENT_LOCK_STALE_OPEN_DEMO",
+                }
+                if liberar_ronda_por_cuarentena_demo_only(round_id, int(round_id) + 1, qi_incident):
+                    agregar_evento(
+                        f"🧯 RECOVERY_RELEASE_INCIDENT_LOCK_STALE_OPEN_DEMO | bot={incident_req.get('bot')} | "
+                        f"ronda=#{round_id} | release=#{int(round_id) + 1} | neutral=SI"
+                    )
+                    return
             quarantine_req = detectar_candidato_cuarentena_columna(
                 round_id, released_round, diag_align=diag_recovery, closed_acks=closed, reasons=sync_debug_missing
             )
