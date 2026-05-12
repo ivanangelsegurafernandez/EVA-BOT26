@@ -11160,6 +11160,7 @@ def _sync_round_neutral_incident_stale_open_request(round_id, released_round, re
                 "incident_lock_demo_stale_open": "INCIDENT_LOCK_STALE_OPEN_DEMO",
                 "incident_lock_demo_sin_evidencia": "INCIDENT_LOCK_SIN_EVIDENCIA_DEMO",
                 "incident_lock_demo_closed_sin_profit": "INCIDENT_LOCK_CLOSED_SIN_PROFIT_DEMO",
+                "incident_lock_demo_sold_sin_contexto": "INCIDENT_LOCK_SOLD_SIN_CONTEXTO_DEMO",
             }
             if req_reason not in incident_neutral_sources:
                 continue
@@ -11373,6 +11374,7 @@ def _sync_round_try_recovery_release_global() -> bool:
                         (req_reason_txt == "incident_lock_demo_stale_open" and req_source_txt == "INCIDENT_LOCK_STALE_OPEN_DEMO")
                         or (req_reason_txt == "incident_lock_demo_sin_evidencia" and req_source_txt == "INCIDENT_LOCK_SIN_EVIDENCIA_DEMO")
                         or (req_reason_txt == "incident_lock_demo_closed_sin_profit" and req_source_txt == "INCIDENT_LOCK_CLOSED_SIN_PROFIT_DEMO")
+                        or (req_reason_txt == "incident_lock_demo_sold_sin_contexto" and req_source_txt == "INCIDENT_LOCK_SOLD_SIN_CONTEXTO_DEMO")
                     )
                     and bool(req.get("neutral", False))
                     and bool(req.get("no_trade_result", False))
@@ -11450,6 +11452,7 @@ def _sync_round_try_recovery_release_global() -> bool:
                 "incident_lock_demo_stale_open": "RECOVERY_RELEASE_INCIDENT_LOCK_STALE_OPEN_DEMO",
                 "incident_lock_demo_sin_evidencia": "RECOVERY_RELEASE_INCIDENT_LOCK_SIN_EVIDENCIA_DEMO",
                 "incident_lock_demo_closed_sin_profit": "RECOVERY_RELEASE_INCIDENT_LOCK_CLOSED_SIN_PROFIT_DEMO",
+                "incident_lock_demo_sold_sin_contexto": "RECOVERY_RELEASE_INCIDENT_LOCK_SOLD_SIN_CONTEXTO_DEMO",
             }
             recovery_reason = recovery_reason_by_req.get(incident_reason_txt, "RECOVERY_RELEASE_INCIDENT_LOCK_STALE_OPEN_DEMO")
         else:
@@ -12135,13 +12138,14 @@ def _sync_round_tick_maestro():
                     "source": incident_req.get("source") or "INCIDENT_LOCK_STALE_OPEN_DEMO",
                     "neutral": True,
                     "no_trade_result": True,
+                    "quarantine": True,
                     "usable_for_real": False,
                     "usable_for_lxv": False,
                     "usable_for_training": False,
                 }
                 if liberar_ronda_por_cuarentena_demo_only(round_id, int(round_id) + 1, qi_incident):
                     agregar_evento(
-                        f"🧯 {('RECOVERY_RELEASE_INCIDENT_LOCK_CLOSED_SIN_PROFIT_DEMO' if incident_req.get('reason') == 'incident_lock_demo_closed_sin_profit' else ('RECOVERY_RELEASE_INCIDENT_LOCK_SIN_EVIDENCIA_DEMO' if incident_req.get('reason') == 'incident_lock_demo_sin_evidencia' else 'RECOVERY_RELEASE_INCIDENT_LOCK_STALE_OPEN_DEMO'))} | bot={incident_req.get('bot')} | "
+                        f"🧯 {('RECOVERY_RELEASE_INCIDENT_LOCK_SOLD_SIN_CONTEXTO_DEMO' if incident_req.get('reason') == 'incident_lock_demo_sold_sin_contexto' else ('RECOVERY_RELEASE_INCIDENT_LOCK_CLOSED_SIN_PROFIT_DEMO' if incident_req.get('reason') == 'incident_lock_demo_closed_sin_profit' else ('RECOVERY_RELEASE_INCIDENT_LOCK_SIN_EVIDENCIA_DEMO' if incident_req.get('reason') == 'incident_lock_demo_sin_evidencia' else 'RECOVERY_RELEASE_INCIDENT_LOCK_STALE_OPEN_DEMO')))} | bot={incident_req.get('bot')} | "
                         f"ronda=#{round_id} | release=#{int(round_id) + 1} | neutral=SI"
                     )
                     return
