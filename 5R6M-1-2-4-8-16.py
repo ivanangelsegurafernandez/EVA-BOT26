@@ -11154,9 +11154,15 @@ def _sync_round_neutral_incident_stale_open_request(round_id, released_round, re
         for bot, req in requests.items():
             if bot not in BOT_NAMES or not isinstance(req, dict):
                 continue
-            if str(req.get("reason") or "").strip() != "incident_lock_demo_stale_open":
+            req_reason = str(req.get("reason") or "").strip()
+            req_source = str(req.get("source") or "").strip()
+            incident_neutral_sources = {
+                "incident_lock_demo_stale_open": "INCIDENT_LOCK_STALE_OPEN_DEMO",
+                "incident_lock_demo_sin_evidencia": "INCIDENT_LOCK_SIN_EVIDENCIA_DEMO",
+            }
+            if req_reason not in incident_neutral_sources:
                 continue
-            if str(req.get("source") or "").strip() != "INCIDENT_LOCK_STALE_OPEN_DEMO":
+            if req_source != incident_neutral_sources.get(req_reason):
                 out["reason"] = "incident_request_bad_source"
                 continue
             if int(req.get("round_id", 0) or 0) != rid or int(req.get("next_round", 0) or 0) != target:
@@ -11168,8 +11174,8 @@ def _sync_round_neutral_incident_stale_open_request(round_id, released_round, re
                 "ok": True,
                 "bot": bot,
                 "contract_id": req.get("contract_id"),
-                "reason": "incident_lock_demo_stale_open",
-                "source": "INCIDENT_LOCK_STALE_OPEN_DEMO",
+                "reason": req_reason,
+                "source": req_source,
             })
             return out
         return out
@@ -11357,8 +11363,13 @@ def _sync_round_try_recovery_release_global() -> bool:
                 continue
             if req_next >= target_round and req_round <= int(released_round):
                 req_bots.append(bot)
+                req_reason_txt = str(req.get("reason") or "").strip()
+                req_source_txt = str(req.get("source") or "").strip()
                 if (
-                    str(req.get("reason") or "").strip() == "incident_lock_demo_stale_open"
+                    (
+                        (req_reason_txt == "incident_lock_demo_stale_open" and req_source_txt == "INCIDENT_LOCK_STALE_OPEN_DEMO")
+                        or (req_reason_txt == "incident_lock_demo_sin_evidencia" and req_source_txt == "INCIDENT_LOCK_SIN_EVIDENCIA_DEMO")
+                    )
                     and bool(req.get("neutral", False))
                     and bool(req.get("no_trade_result", False))
                     and bool(req.get("quarantine", False))
@@ -12070,12 +12081,12 @@ def _sync_round_tick_maestro():
                     "eligible": True,
                     "round_id": int(round_id),
                     "missing_bot": incident_req.get("bot"),
-                    "reason": "incident_lock_demo_stale_open",
+                    "reason": incident_req.get("reason") or "incident_lock_demo_stale_open",
                     "elapsed_s": float(elapsed_round_s),
                     "closed": int(closed_count),
                     "expected": int(expected_count),
                     "contract_id": incident_req.get("contract_id"),
-                    "source": "INCIDENT_LOCK_STALE_OPEN_DEMO",
+                    "source": incident_req.get("source") or "INCIDENT_LOCK_STALE_OPEN_DEMO",
                     "neutral": True,
                     "no_trade_result": True,
                     "usable_for_real": False,
