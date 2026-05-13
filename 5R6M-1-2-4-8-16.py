@@ -11077,6 +11077,45 @@ def _sync_round_read_recovery_requests(max_age_s=90.0) -> dict:
             continue
     return out
 
+
+
+def _sync_round_ack_missing_after_trade_request(round_id, requests=None, missing_bot=None) -> dict:
+    try:
+        rid = int(round_id or 0)
+    except Exception:
+        rid = 0
+    reqs = requests if isinstance(requests, dict) else _sync_round_read_recovery_requests(max_age_s=float(globals().get("SYNC_RECOVERY_GLOBAL_REQUEST_MAX_AGE_S", 120.0) or 120.0))
+    for bot, req in (reqs or {}).items():
+        if bot not in BOT_NAMES or not isinstance(req, dict):
+            continue
+        if missing_bot and str(bot) != str(missing_bot):
+            continue
+        try:
+            req_round = int(req.get("round_id", 0) or 0)
+        except Exception:
+            req_round = 0
+        if rid > 0 and req_round != rid:
+            continue
+        if str(req.get("reason") or "").strip() != "ack_close_missing_after_trade_result":
+            continue
+        if not (bool(req.get("neutral", False)) and bool(req.get("no_trade_result", False)) and bool(req.get("quarantine", False))):
+            continue
+        out = dict(req)
+        out["bot"] = bot
+        return out
+    return {}
+
+def _sync_round_log_ack_missing_after_trade(round_id, missing_bot, requests=None) -> bool:
+    req = _sync_round_ack_missing_after_trade_request(round_id, requests=requests, missing_bot=missing_bot)
+    if not req:
+        return False
+    print_rate_limited(
+        f"ACK_MISSING_AFTER_TRADE_RESULT:{round_id}:{missing_bot}",
+        f"⚠️ ACK_MISSING_AFTER_TRADE_RESULT | missing={missing_bot} | ronda=#{int(round_id or 0)} | acción=RECOVERY_NEUTRAL_SI_REAL_LIBRE",
+        ttl=10.0,
+    )
+    return True
+
 def _sync_round_should_recovery_release(round_id, released_round, requests, st) -> tuple[bool, str]:
     if not isinstance(requests, dict) or not requests:
         return False, "no_requests"
@@ -11337,6 +11376,7 @@ def _sync_round_try_final_safe_demo_recovery_release(
         "request_only_mixed_demo_timeout_and_rollback",
         "sync_demo_hold_recovery",
         "recovery_request_no_quarantine",
+        "ack_close_missing_after_trade_result",
     }
     SAFE_OWNER_VALUES = {"", "--", "NONE", "NULL"}
 
@@ -11532,12 +11572,16 @@ def _sync_round_try_final_safe_demo_recovery_release(
         elif isinstance(missing, str):
             missing_bot = missing.strip() or None
 
+    ack_missing_req = _sync_round_ack_missing_after_trade_request(rid, requests=requests, missing_bot=missing_bot)
+    if ack_missing_req:
+        _sync_round_log_ack_missing_after_trade(rid, missing_bot or ack_missing_req.get("bot"), requests=requests)
+
     quarantine_info = {
         "eligible": True,
         "round_id": int(rid),
         "missing_bot": missing_bot,
-        "reason": "final_safe_demo_recovery_release",
-        "source": "FINAL_SAFE_DEMO_RECOVERY_RELEASE",
+        "reason": "ack_close_missing_after_trade_result" if ack_missing_req else "final_safe_demo_recovery_release",
+        "source": "ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY" if ack_missing_req else "FINAL_SAFE_DEMO_RECOVERY_RELEASE",
         "neutral": True,
         "no_trade_result": True,
         "quarantine": True,
@@ -11829,6 +11873,7 @@ def _sync_round_try_recovery_release_global() -> bool:
         request_only_req_bots = []
         request_only_release = False
         incident_req_bots = []
+        ack_missing_req_bots = []
         for bot, req in (reqs or {}).items():
             try:
                 req_next = int(req.get("next_round", 0) or 0)
@@ -11851,6 +11896,14 @@ def _sync_round_try_recovery_release_global() -> bool:
                     and bool(req.get("quarantine", False))
                 ):
                     incident_req_bots.append(bot)
+                if (
+                    req_reason_txt == "ack_close_missing_after_trade_result"
+                    and bool(req.get("neutral", False))
+                    and bool(req.get("no_trade_result", False))
+                    and bool(req.get("quarantine", False))
+                ):
+                    ack_missing_req_bots.append(bot)
+                    _sync_round_log_ack_missing_after_trade(released_round, bot, requests=reqs)
                 try:
                     ts_val = float(req.get("ts", req.get("created_ts", 0.0)) or 0.0)
                 except Exception:
@@ -11911,6 +11964,8 @@ def _sync_round_try_recovery_release_global() -> bool:
         )
         if request_only_release:
             recovery_reason = "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_FROM_REQUEST_ONLY"
+        elif ack_missing_req_bots and not after_real_context:
+            recovery_reason = "ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY"
         elif incident_req_bots and not after_real_context:
             incident_req_lookup = reqs or {}
             incident_reason_txt = ""
@@ -11942,6 +11997,12 @@ def _sync_round_try_recovery_release_global() -> bool:
             "recovery_from_round": int(released_round),
             "recovery_bots_waiting": list(wait_bots),
             "recovery_request_bots": list(req_bots),
+            "neutral": bool(recovery_reason == "ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY"),
+            "no_trade_result": bool(recovery_reason == "ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY"),
+            "quarantine": bool(recovery_reason == "ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY"),
+            "usable_for_real": False if recovery_reason == "ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY" else st_check.get("usable_for_real", False),
+            "usable_for_lxv": False if recovery_reason == "ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY" else st_check.get("usable_for_lxv", False),
+            "usable_for_training": False if recovery_reason == "ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY" else st_check.get("usable_for_training", False),
             "started_at": now_ts,
             "ts": now_ts,
             "real_pending_bot": None,
@@ -11955,7 +12016,10 @@ def _sync_round_try_recovery_release_global() -> bool:
                 f"{recovery_reason}: {released_round}→{target_round} | bots_waiting={len(wait_bots)} | token={token_raw}",
                 cooldown_s=1.0,
             )
-            if recovery_reason.startswith("RECOVERY_RELEASE_INCIDENT_LOCK_"):
+            if recovery_reason == "ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY":
+                bot_txt = ack_missing_req_bots[0] if ack_missing_req_bots else "--"
+                agregar_evento(f"🔓 FINAL_SAFE_DEMO_RECOVERY_RELEASE | reason=ack_close_missing_after_trade_result | source=ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY | bot={bot_txt} | ronda=#{released_round} | release=#{target_round} | neutral=SI | quarantine=SI | REAL=NO | LXV=NO | IA=NO")
+            elif recovery_reason.startswith("RECOVERY_RELEASE_INCIDENT_LOCK_"):
                 bot_txt = incident_req_bots[0] if incident_req_bots else "--"
                 agregar_evento(f"🧯 {recovery_reason} | bot={bot_txt} | ronda=#{released_round} | release=#{target_round} | neutral=SI")
             elif recovery_reason == "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_FROM_REQUEST_ONLY":
