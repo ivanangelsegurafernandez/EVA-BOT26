@@ -5842,7 +5842,7 @@ def _column_quarantine_real_guard_reason() -> str:
         pass
     try:
         owner = str(globals().get("REAL_OWNER_LOCK") or "").strip()
-        if owner:
+        if owner and owner.upper() not in ("--", "NONE", "NULL"):
             return f"owner_real:{owner}"
     except Exception:
         pass
@@ -11314,6 +11314,269 @@ def _sync_round_try_request_only_before_rejoin_return(round_id, released_round, 
         )
     return True
 
+
+def _sync_round_try_final_safe_demo_recovery_release(
+    round_id,
+    released_round,
+    reqs=None,
+    wait_bots=None,
+    diag=None,
+    closed_count=None,
+    expected_count=None,
+    missing_txt=None,
+    source_hint="",
+):
+    """
+    Fusible maestro final: libera N -> N+1 como DEMO neutral/cuarentena
+    únicamente cuando hay recovery/wait quorum y todos los candados REAL duros
+    están libres. No compra, no emite señal, no toca Martingala/IA/LXV.
+    """
+    REQUEST_SAFE_REASONS = {
+        "demo_wait_timeout_no_release",
+        "released_round_rollback_detected",
+        "request_only_mixed_demo_timeout_and_rollback",
+        "sync_demo_hold_recovery",
+        "recovery_request_no_quarantine",
+    }
+    SAFE_OWNER_VALUES = {"", "--", "NONE", "NULL"}
+
+    def _no_release(motivo: str) -> bool:
+        try:
+            print_rate_limited(
+                f"FINAL_SAFE_DEMO_RECOVERY_NO_RELEASE:{round_id}:{motivo}",
+                f"⚠️ FINAL_SAFE_DEMO_RECOVERY_NO_RELEASE | ronda=#{round_id} | motivo={motivo}",
+                ttl=20.0,
+            )
+        except Exception:
+            pass
+        return False
+
+    def _safe_owner(value) -> bool:
+        txt = str(value or "").strip().upper()
+        return txt in SAFE_OWNER_VALUES
+
+    def _read_token_raw_final() -> str:
+        try:
+            if callable(globals().get("_leer_token_linea_raw")):
+                return str(_leer_token_linea_raw() or "").strip()
+        except Exception:
+            pass
+        try:
+            if callable(globals().get("_read_token_file_raw")):
+                return str(_read_token_file_raw() or "").strip()
+        except Exception:
+            pass
+        try:
+            if os.path.exists(TOKEN_FILE):
+                with open(TOKEN_FILE, encoding="utf-8", errors="replace") as f:
+                    return str(f.read() or "").strip()
+        except Exception:
+            pass
+        return ""
+
+    def _real_lock_fresh_reason() -> str:
+        try:
+            if not os.path.exists("real.lock"):
+                return ""
+            age = max(0.0, time.time() - float(os.path.getmtime("real.lock") or 0.0))
+            stale_after = float(globals().get("REQUEST_ONLY_REAL_LOCK_STALE_AFTER_S", 30.0) or 30.0)
+            if age > stale_after:
+                return ""
+            owner_txt = ""
+            try:
+                with open("real.lock", encoding="utf-8", errors="replace") as f:
+                    owner_txt = str(f.read() or "").strip()
+            except Exception:
+                owner_txt = ""
+            if owner_txt:
+                return f"real_lock_fresco:{owner_txt[:80]}"
+            return "real_lock_fresco"
+        except Exception:
+            return "real_lock_guard_error"
+
+    def _current_wait_bots(target: int, rel: int) -> list[str]:
+        confirmed = []
+        if isinstance(wait_bots, (list, tuple, set)):
+            for bot in wait_bots:
+                b = str(bot or "").strip()
+                if b in BOT_NAMES and b not in confirmed:
+                    confirmed.append(b)
+            if confirmed:
+                return confirmed
+        for bot in BOT_NAMES:
+            try:
+                ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
+                if not isinstance(ack, dict):
+                    continue
+                waiting_release = int(ack.get("waiting_release_round", 0) or 0)
+                ack_round = int(ack.get("round_id", 0) or 0)
+                if bool(ack.get("sync_wait", False)) and waiting_release >= target and ack_round <= rel:
+                    confirmed.append(bot)
+            except Exception:
+                continue
+        return confirmed
+
+    try:
+        rid = int(round_id or 0)
+        rel = int(released_round or 0)
+    except Exception:
+        return _no_release("round_id_invalid")
+    if rid <= 10:
+        return _no_release("round_id_le_10")
+    if rid != rel:
+        return _no_release("round_released_mismatch")
+    target_round = int(rel) + 1
+
+    max_age_s = float(globals().get("SYNC_RECOVERY_GLOBAL_REQUEST_MAX_AGE_S", 120.0) or 120.0)
+    requests = reqs if isinstance(reqs, dict) else _sync_round_read_recovery_requests(max_age_s=max_age_s)
+    now_ts = float(time.time())
+    valid_reqs = []
+    valid_req_bots = []
+    for bot, req in (requests or {}).items():
+        if bot not in BOT_NAMES or not isinstance(req, dict):
+            continue
+        try:
+            req_round = int(req.get("round_id", 0) or 0)
+            req_next = int(req.get("next_round", 0) or 0)
+            req_ts = float(req.get("ts", req.get("created_ts", 0.0)) or 0.0)
+        except Exception:
+            continue
+        reason = str(req.get("reason") or "").strip()
+        if bool(req.get("consumed", False)):
+            continue
+        if req_ts <= 0.0 or (now_ts - req_ts) > max_age_s:
+            continue
+        if req_round <= 0 or req_round > rel or req_next != target_round:
+            continue
+        if reason not in REQUEST_SAFE_REASONS:
+            continue
+        valid_reqs.append((bot, req))
+        valid_req_bots.append(bot)
+    if not valid_reqs:
+        return _no_release("sin_recovery_request_valido")
+
+    wait_confirmed = _current_wait_bots(target_round, rel)
+    try:
+        exp = int(expected_count if expected_count is not None else len(BOT_NAMES))
+    except Exception:
+        exp = len(BOT_NAMES)
+    exp = max(1, min(int(exp or len(BOT_NAMES)), len(BOT_NAMES)))
+    if exp >= 6:
+        req_quorum = 3
+        wait_quorum = 4
+    else:
+        q = max(3, int(math.ceil(float(exp) * 0.50)))
+        req_quorum = q
+        wait_quorum = q
+    if not (len(valid_req_bots) >= req_quorum or len(wait_confirmed) >= wait_quorum):
+        return _no_release(f"quorum_insuficiente:req={len(valid_req_bots)}/{req_quorum}:wait={len(wait_confirmed)}/{wait_quorum}")
+
+    try:
+        pending_on, pending_bot, _pending = _hay_real_close_pending_activo()
+        if pending_on:
+            return _no_release(f"real_close_pending:{pending_bot or '--'}")
+    except Exception:
+        return _no_release("real_close_pending_guard_error")
+    try:
+        order_on, order_bot = _sync_real_order_viva_any()
+        if order_on:
+            return _no_release(f"orden_real_viva:{order_bot or '--'}")
+    except Exception:
+        return _no_release("orden_real_guard_error")
+    try:
+        real_on, real_bot, motivo_real = _sync_real_turn_activo()
+        if real_on:
+            return _no_release(f"real_global_activo:{real_bot or motivo_real or '--'}")
+    except Exception:
+        return _no_release("real_global_guard_error")
+
+    token_raw = _read_token_raw_final()
+    try:
+        token_owner = str(leer_token_actual() or "").strip()
+    except Exception:
+        token_owner = ""
+    if _token_real_ocupado(token_raw) or _token_real_ocupado(token_owner) or token_owner in BOT_NAMES:
+        return _no_release("token_real_activo")
+    owner_mem = str(globals().get("REAL_OWNER_LOCK") or "").strip()
+    if not _safe_owner(owner_mem):
+        return _no_release(f"owner_real:{owner_mem}")
+    lock_reason = _real_lock_fresh_reason()
+    if lock_reason:
+        return _no_release(lock_reason)
+
+    st_now = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+    if not isinstance(st_now, dict):
+        st_now = {}
+    status_now = str(st_now.get("status", "") or "").strip().lower()
+    if status_now in ("holding_real_result", "holding_real_turn"):
+        return _no_release(status_now)
+    if bool(st_now.get("holding_real_result", False) or st_now.get("holding_real_turn", False)):
+        return _no_release("holding_real_flag")
+    if bool(st_now.get("real_global", False) or st_now.get("REAL_GLOBAL", False) or st_now.get("real_activo", False)):
+        return _no_release("real_global_state_activo")
+    real_pending_bot = str(st_now.get("real_pending_bot") or "").strip()
+    try:
+        real_pending_round = int(st_now.get("real_pending_round", 0) or 0)
+    except Exception:
+        real_pending_round = 0
+    if real_pending_bot in BOT_NAMES and real_pending_round > 0 and real_pending_round <= rel:
+        return _no_release(f"real_pending_activo:{real_pending_bot}:{real_pending_round}")
+
+    missing_bot = None
+    if missing_txt:
+        missing_bot = str(missing_txt).split(",", 1)[0].strip() or None
+    if not missing_bot and isinstance(diag, dict):
+        missing = diag.get("missing") or diag.get("missing_bots") or []
+        if isinstance(missing, (list, tuple, set)):
+            missing_bot = next((str(b) for b in missing if str(b) in BOT_NAMES), None)
+        elif isinstance(missing, str):
+            missing_bot = missing.strip() or None
+
+    quarantine_info = {
+        "eligible": True,
+        "round_id": int(rid),
+        "missing_bot": missing_bot,
+        "reason": "final_safe_demo_recovery_release",
+        "source": "FINAL_SAFE_DEMO_RECOVERY_RELEASE",
+        "neutral": True,
+        "no_trade_result": True,
+        "quarantine": True,
+        "usable_for_real": False,
+        "usable_for_lxv": False,
+        "usable_for_training": False,
+        "released_from": int(rel),
+        "released_to": int(target_round),
+        "req_bots": list(valid_req_bots),
+        "wait_bots": list(wait_confirmed),
+        "closed": closed_count,
+        "expected": expected_count if expected_count is not None else exp,
+        "source_hint": str(source_hint or ""),
+    }
+    ok = bool(liberar_ronda_por_cuarentena_demo_only(int(rid), int(target_round), quarantine_info))
+    if not ok:
+        return _no_release("liberar_ronda_por_cuarentena_demo_only_fallo")
+
+    try:
+        req_dir = os.path.join(SYNC_ROUND_DIR, "recovery_requests")
+        consumed_ts = float(time.time())
+        for bot, req in valid_reqs:
+            path = os.path.join(req_dir, f"{bot}.json")
+            payload = dict(req)
+            payload.update({
+                "consumed": True,
+                "consumed_ts": consumed_ts,
+                "consumed_by": "FINAL_SAFE_DEMO_RECOVERY_RELEASE",
+                "consumed_release": int(target_round),
+            })
+            _sync_round_write_json_atomic(path, payload)
+    except Exception:
+        pass
+    agregar_evento(
+        f"🔓 FINAL_SAFE_DEMO_RECOVERY_RELEASE | ronda=#{int(rid)} | release=#{int(target_round)} | "
+        f"req_bots={len(valid_req_bots)} | wait_bots={len(wait_confirmed)} | real=NO | neutral=SI | source={source_hint or '--'}"
+    )
+    return True
+
 def _sync_round_neutral_incident_stale_open_request(round_id, released_round, requests) -> dict:
     out = {"ok": False, "bot": "", "contract_id": None, "reason": "no_incident_request"}
     try:
@@ -11524,6 +11787,16 @@ def _sync_round_try_recovery_release_global() -> bool:
                     return True
             except Exception as e:
                 agregar_evento(f"⚠️ REQUEST_ONLY_BEFORE_REJOIN_ERROR | {e}")
+            try:
+                if _sync_round_try_final_safe_demo_recovery_release(
+                    round_id=round_id,
+                    released_round=released_round,
+                    diag=diag_recovery_global,
+                    source_hint="mixed_rounds_esperar_rejoin",
+                ):
+                    return True
+            except Exception as e:
+                agregar_evento(f"⚠️ FINAL_SAFE_DEMO_RECOVERY_ERROR | ronda={round_id} | {e}")
             return _hold("mixed_rounds_esperar_rejoin", released_round)
 
         wait_bots = []
@@ -12305,6 +12578,19 @@ def _sync_round_tick_maestro():
                     return
             except Exception as e:
                 agregar_evento(f"⚠️ REQUEST_ONLY_BEFORE_REJOIN_ERROR | {e}")
+            try:
+                if _sync_round_try_final_safe_demo_recovery_release(
+                    round_id=round_id,
+                    released_round=released_round,
+                    diag=diag_recovery,
+                    closed_count=closed_count,
+                    expected_count=expected_count,
+                    missing_txt=missing_txt if "missing_txt" in locals() else None,
+                    source_hint="mixed_rounds_esperar_rejoin",
+                ):
+                    return
+            except Exception as e:
+                agregar_evento(f"⚠️ FINAL_SAFE_DEMO_RECOVERY_ERROR | ronda={round_id} | {e}")
             return
         reqs = _sync_round_read_recovery_requests(max_age_s=90.0)
         req_ok, req_reason = _sync_round_should_recovery_release(round_id, released_round, reqs, st)
@@ -12324,6 +12610,20 @@ def _sync_round_tick_maestro():
                 f"real_on={real_on_now} pending={real_close_pending_now} "
                 f"orden_real={real_order_pending_now} hold={hold_status}"
             )
+            try:
+                if _sync_round_try_final_safe_demo_recovery_release(
+                    round_id=round_id,
+                    released_round=released_round,
+                    reqs=reqs,
+                    diag=diag_recovery,
+                    closed_count=closed_count,
+                    expected_count=expected_count,
+                    missing_txt=missing_txt,
+                    source_hint="recovery_request_blocked_no_recover",
+                ):
+                    return
+            except Exception as e:
+                agregar_evento(f"⚠️ FINAL_SAFE_DEMO_RECOVERY_ERROR | ronda={round_id} | {e}")
             return
         if can_req_recover:
             incident_req = _sync_round_neutral_incident_stale_open_request(round_id, released_round, reqs)
@@ -12356,6 +12656,20 @@ def _sync_round_tick_maestro():
             )
             if bool(quarantine_req.get("eligible", False)) and liberar_ronda_por_cuarentena_demo_only(round_id, int(round_id) + 1, quarantine_req):
                 return
+            try:
+                if _sync_round_try_final_safe_demo_recovery_release(
+                    round_id=round_id,
+                    released_round=released_round,
+                    reqs=reqs,
+                    diag=diag_recovery,
+                    closed_count=closed_count,
+                    expected_count=expected_count,
+                    missing_txt=missing_txt,
+                    source_hint="recovery_request_no_quarantine",
+                ):
+                    return
+            except Exception as e:
+                agregar_evento(f"⚠️ FINAL_SAFE_DEMO_RECOVERY_ERROR | ronda={round_id} | {e}")
             print_rate_limited(
                 f"RELEASE_HOLD_FENCE:{round_id}:recovery_request_no_quarantine",
                 f"🧷 RELEASE_HOLD_FENCE | ronda={round_id} | recovery_request=SI | motivo={quarantine_req.get('reason', 'no_quarantine')} | no se libera sin cuarentena",
@@ -12369,6 +12683,20 @@ def _sync_round_tick_maestro():
         )
         if bool(quarantine_timeout.get("eligible", False)) and liberar_ronda_por_cuarentena_demo_only(round_id, int(round_id) + 1, quarantine_timeout):
             return
+        try:
+            if _sync_round_try_final_safe_demo_recovery_release(
+                round_id=round_id,
+                released_round=released_round,
+                reqs=reqs,
+                diag=diag_recovery,
+                closed_count=closed_count,
+                expected_count=expected_count,
+                missing_txt=missing_txt,
+                source_hint="recovery_incomplete_timeout",
+            ):
+                return
+        except Exception as e:
+            agregar_evento(f"⚠️ FINAL_SAFE_DEMO_RECOVERY_ERROR | ronda={round_id} | {e}")
         print_rate_limited(
             f"RELEASE_HOLD_FENCE:{round_id}:recovery_incomplete_timeout",
             f"🧷 RELEASE_HOLD_FENCE | ronda={round_id} | cerrados={closed_count}/{expected_count} | faltan={missing_txt} | motivo={quarantine_timeout.get('reason', 'no_quarantine')} | no se libera",
