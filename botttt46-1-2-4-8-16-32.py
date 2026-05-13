@@ -594,8 +594,8 @@ def _sync_bot_es_owner_real() -> bool:
     return False
 
 def _sync_round_emit_close_ack(round_id: int, resultado: str, contract_id=None, asset=None, ciclo=None, modo_real_contrato=False) -> bool:
-    res = str(resultado or "").upper().strip()
-    if res not in ("GANANCIA", "PÉRDIDA"):
+    res = str(resultado or "").upper().strip().replace("PERDIDA", "PÉRDIDA")
+    if res not in ("GANANCIA", "PÉRDIDA", "INDEFINIDO"):
         return False
     rid = max(1, int(round_id or 1))
     prev = _sync_round_safe_read_json(_sync_round_ack_path()) or {}
@@ -618,14 +618,88 @@ def _sync_round_emit_close_ack(round_id: int, resultado: str, contract_id=None, 
         "asset": asset,
         "ciclo": ciclo,
         "status": "closed",
+        "sync_wait": False,
         "mode": mode_sync,
         "source": "ORDEN_REAL" if mode_sync == "REAL" else "SYNC_DEMO",
         "token": "DEMO" if mode_sync == "DEMO" else str(leer_token_actual() or ""),
     }
-    ok = _sync_round_write_json_atomic(_sync_round_ack_path(), payload)
-    if ok:
-        print(Fore.YELLOW + f"🧷 LXV_SYNC_COLUMN ACK cierre | {NOMBRE_BOT} | ronda #{rid} | {res}")
-    return ok
+    return _sync_round_write_json_atomic(_sync_round_ack_path(), payload)
+
+
+def _sync_round_emit_close_ack_confirmado(round_id, resultado, max_retries=3, **ack_kwargs) -> bool:
+    res = str(resultado or "").upper().strip().replace("PERDIDA", "PÉRDIDA")
+    rid = max(1, int(round_id or 1))
+    valid_results = ("GANANCIA", "PÉRDIDA", "INDEFINIDO")
+    if bool(ack_kwargs.get("modo_real_contrato", False)):
+        try:
+            _sync_round_emit_close_ack(rid, res, **ack_kwargs)
+        except Exception:
+            pass
+        return False
+
+    def _ack_confirmado() -> bool:
+        data = _sync_round_safe_read_json(_sync_round_ack_path()) or {}
+        if not isinstance(data, dict):
+            return False
+        try:
+            ack_round = int(data.get("round_id", 0) or 0)
+        except Exception:
+            ack_round = 0
+        ack_res = str(data.get("resultado", "") or "").upper().strip().replace("PERDIDA", "PÉRDIDA")
+        return (
+            str(data.get("bot", "") or "").strip() == str(NOMBRE_BOT)
+            and ack_round == rid
+            and str(data.get("status", "") or "").strip().lower() == "closed"
+            and ack_res == res
+            and ack_res in valid_results
+            and bool(data.get("sync_wait", False)) is False
+        )
+
+    attempts = max(1, int(max_retries or 1))
+    for attempt in range(attempts):
+        try:
+            _sync_round_emit_close_ack(rid, res, **ack_kwargs)
+        except Exception:
+            pass
+        if _ack_confirmado():
+            print(Fore.YELLOW + f"🧷 LXV_SYNC_COLUMN ACK cierre | {NOMBRE_BOT} | ronda #{rid} | {res}")
+            return True
+        if attempt < attempts - 1:
+            time.sleep(0.2)
+
+    try:
+        st = _sync_round_safe_read_json(SYNC_ROUND_STATE) or {}
+        try:
+            released = int(st.get("released_round", rid) or rid)
+        except Exception:
+            released = rid
+        modo_real = bool(ack_kwargs.get("modo_real_contrato", False))
+        token_txt = ""
+        try:
+            token_txt = str(leer_token_actual() or "").strip()
+        except Exception:
+            token_txt = ""
+        mode_txt = "REAL" if (modo_real or token_txt.upper().startswith("REAL")) else "DEMO"
+        _sync_round_write_recovery_request(
+            bot=NOMBRE_BOT,
+            round_id=rid,
+            next_round=rid + 1,
+            released=released,
+            reason="ack_close_missing_after_trade_result",
+            mode=mode_txt,
+            resultado=res,
+            source="ACK_CLOSE_NO_CONFIRMADO",
+            neutral=True,
+            no_trade_result=True,
+            quarantine=True,
+            usable_for_real=False,
+            usable_for_lxv=False,
+            usable_for_training=False,
+        )
+    except Exception:
+        pass
+    print(Fore.YELLOW + Style.BRIGHT + f"⚠️ ACK_CLOSE_NO_CONFIRMADO | bot={NOMBRE_BOT} | ronda=#{rid} | resultado={res} | recovery_request=SI")
+    return False
 
 def _sync_round_write_wait_heartbeat(round_id: int, next_round: int):
     path = _sync_round_ack_path()
@@ -1608,7 +1682,7 @@ def _emitir_ack_sync_incident_demo_resuelto(round_id, resultado, contract_id=Non
         token_is_real = bool(token_usado == TOKEN_REAL or str(token_usado or "").strip().upper().startswith("REAL"))
         if token_is_real or res not in ("GANANCIA", "PÉRDIDA"):
             return False
-        return bool(_sync_round_emit_close_ack(round_id, res, contract_id=contract_id, asset=asset, ciclo=ciclo, modo_real_contrato=False))
+        return bool(_sync_round_emit_close_ack_confirmado(round_id, res, contract_id=contract_id, asset=asset, ciclo=ciclo, modo_real_contrato=False))
     except Exception:
         return False
 
@@ -4506,7 +4580,7 @@ async def ejecutar_panel():
 
                 # LXV_SYNC_COLUMN: cierre definido -> ACK inmediato para maestro/HUD
                 round_id_local = int(estado_bot.get("sync_round_id", 1) or 1)
-                _sync_round_emit_close_ack(
+                _sync_round_emit_close_ack_confirmado(
                     round_id_local,
                     resultado,
                     contract_id=contract_id,
