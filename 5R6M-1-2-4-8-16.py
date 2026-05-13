@@ -11129,6 +11129,20 @@ def _sync_round_try_request_only_before_rejoin_return(round_id, released_round, 
     ESPERAR_REJOIN_SEGURO. No evalúa columna, no activa REAL y solo avanza
     N -> N+1 como cuarentena DEMO neutral cuando no hay candados REAL duros.
     """
+    REQUEST_ONLY_SAFE_REASONS = {
+        "demo_wait_timeout_no_release",
+        "released_round_rollback_detected",
+    }
+    ROLLBACK_SAFE_OWNER_VALUES = {"", "--", "NONE", "NULL"}
+
+    def _rollback_released_safe(value) -> bool:
+        if value in (0, 1, "0", "1", True, False):
+            return True
+        try:
+            return int(value) <= 1
+        except Exception:
+            return False
+
     try:
         rid = int(round_id or 0)
         rel = int(released_round or 0)
@@ -11152,10 +11166,22 @@ def _sync_round_try_request_only_before_rejoin_return(round_id, released_round, 
             req_next = int(req.get("next_round", 0) or 0)
         except Exception:
             continue
-        if str(req.get("reason") or "").strip() != "demo_wait_timeout_no_release":
+        req_reason = str(req.get("reason") or "").strip()
+        if req_reason not in REQUEST_ONLY_SAFE_REASONS:
             continue
         if req_next != target_round or req_round > int(rel) or req_round <= 0:
             continue
+        if req_reason == "released_round_rollback_detected":
+            req_owner = req.get("any_real_owner")
+            req_owner_txt = "" if req_owner is None else str(req_owner).strip().upper()
+            if req_round <= 10:
+                continue
+            if not _rollback_released_safe(req.get("released", 1)):
+                continue
+            if bool(req.get("any_real_active", True)):
+                continue
+            if req_owner_txt not in ROLLBACK_SAFE_OWNER_VALUES:
+                continue
         valid_reqs.append((bot, req))
     if not valid_reqs:
         return False
@@ -11221,11 +11247,25 @@ def _sync_round_try_request_only_before_rejoin_return(round_id, released_round, 
     except Exception:
         closed_count = 0
     req_bots = [bot for bot, _req in valid_reqs]
+    valid_reasons = {str(req.get("reason") or "").strip() for _bot, req in valid_reqs}
+    if valid_reasons == {"released_round_rollback_detected"}:
+        quarantine_reason = "released_round_rollback_detected"
+        quarantine_source = "SYNC_STATE_ROLLBACK_REQUEST_ONLY_BEFORE_REJOIN"
+        log_label = "RECOVERY_RELEASE_ROLLBACK_BEFORE_REJOIN"
+    elif "released_round_rollback_detected" in valid_reasons:
+        quarantine_reason = "request_only_mixed_demo_timeout_and_rollback"
+        quarantine_source = "SYNC_REQUEST_ONLY_MIXED_BEFORE_REJOIN"
+        log_label = "RECOVERY_RELEASE_MIXED_BEFORE_REJOIN"
+    else:
+        quarantine_reason = "demo_wait_timeout_no_release"
+        quarantine_source = "SYNC_DEMO_HOLD_RECOVERY_REQUEST_ONLY_BEFORE_REJOIN"
+        log_label = "RECOVERY_RELEASE_BEFORE_REJOIN_RETURN"
+
     quarantine_info = {
         "eligible": True,
         "round_id": int(rel),
-        "reason": "demo_wait_timeout_no_release",
-        "source": "SYNC_DEMO_HOLD_RECOVERY_REQUEST_ONLY_BEFORE_REJOIN",
+        "reason": quarantine_reason,
+        "source": quarantine_source,
         "neutral": True,
         "no_trade_result": True,
         "quarantine": True,
@@ -11254,18 +11294,24 @@ def _sync_round_try_request_only_before_rejoin_return(round_id, released_round, 
             payload.update({
                 "consumed": True,
                 "consumed_ts": now_ts,
-                "consumed_by": "SYNC_DEMO_HOLD_RECOVERY_REQUEST_ONLY_BEFORE_REJOIN",
+                "consumed_by": quarantine_source,
                 "consumed_release": int(target_round),
             })
             _sync_round_write_json_atomic(path, payload)
     except Exception:
         pass
 
-    agregar_evento(
-        f"🔓 RECOVERY_RELEASE_BEFORE_REJOIN_RETURN | ronda=#{int(rel)} | "
-        f"release=#{int(target_round)} | req_bots={list(req_bots)} | "
-        f"missing={missing_bot or '--'} | real=NO | neutral=SI"
-    )
+    if log_label == "RECOVERY_RELEASE_ROLLBACK_BEFORE_REJOIN":
+        agregar_evento(
+            f"🔓 {log_label} | ronda=#{int(rel)} | release=#{int(target_round)} | "
+            f"req_bots={list(req_bots)} | real=NO | neutral=SI"
+        )
+    else:
+        agregar_evento(
+            f"🔓 {log_label} | ronda=#{int(rel)} | "
+            f"release=#{int(target_round)} | req_bots={list(req_bots)} | "
+            f"missing={missing_bot or '--'} | real=NO | neutral=SI"
+        )
     return True
 
 def _sync_round_neutral_incident_stale_open_request(round_id, released_round, requests) -> dict:
