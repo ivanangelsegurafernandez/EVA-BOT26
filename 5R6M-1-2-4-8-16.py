@@ -11122,6 +11122,152 @@ def _sync_round_should_recovery_release(round_id, released_round, requests, st) 
 
 
 
+
+def _sync_round_try_request_only_before_rejoin_return(round_id, released_round, diag=None):
+    """
+    Rescate conservador REQUEST_ONLY antes de retornar por mixed_rounds /
+    ESPERAR_REJOIN_SEGURO. No evalúa columna, no activa REAL y solo avanza
+    N -> N+1 como cuarentena DEMO neutral cuando no hay candados REAL duros.
+    """
+    try:
+        rid = int(round_id or 0)
+        rel = int(released_round or 0)
+    except Exception:
+        return False
+    if rid <= 0 or rel <= 0 or rid < rel:
+        return False
+    target_round = int(rel) + 1
+
+    max_age_s = float(globals().get("SYNC_RECOVERY_GLOBAL_REQUEST_MAX_AGE_S", 120.0) or 120.0)
+    reqs = _sync_round_read_recovery_requests(max_age_s=max_age_s)
+    if not isinstance(reqs, dict) or not reqs:
+        return False
+
+    valid_reqs = []
+    for bot, req in (reqs or {}).items():
+        if bot not in BOT_NAMES or not isinstance(req, dict):
+            continue
+        try:
+            req_round = int(req.get("round_id", 0) or 0)
+            req_next = int(req.get("next_round", 0) or 0)
+        except Exception:
+            continue
+        if str(req.get("reason") or "").strip() != "demo_wait_timeout_no_release":
+            continue
+        if req_next != target_round or req_round > int(rel) or req_round <= 0:
+            continue
+        valid_reqs.append((bot, req))
+    if not valid_reqs:
+        return False
+
+    try:
+        real_on, _real_bot, _real_motivo = _sync_real_turn_activo()
+    except Exception:
+        real_on = True
+    if bool(real_on):
+        return False
+
+    try:
+        pending_on, _pending_bot, _pending = _hay_real_close_pending_activo()
+    except Exception:
+        pending_on = True
+    if bool(pending_on):
+        return False
+
+    try:
+        order_on, _order_bot = _sync_real_order_viva_any()
+    except Exception:
+        order_on = True
+    if bool(order_on):
+        return False
+
+    try:
+        token_raw = _leer_token_linea_raw() if callable(globals().get("_leer_token_linea_raw")) else ""
+    except Exception:
+        token_raw = ""
+    try:
+        token_owner = str(leer_token_archivo_raw() or "").strip() if callable(globals().get("leer_token_archivo_raw")) else ""
+    except Exception:
+        token_owner = ""
+    if _token_real_ocupado(token_raw) or _token_real_ocupado(token_owner) or token_owner in BOT_NAMES:
+        return False
+
+    owner_mem = str(globals().get("REAL_OWNER_LOCK") or "").strip()
+    if owner_mem and owner_mem != "--":
+        return False
+
+    try:
+        if os.path.exists("real.lock"):
+            lock_age = max(0.0, time.time() - float(os.path.getmtime("real.lock") or 0.0))
+            if lock_age <= float(globals().get("REQUEST_ONLY_REAL_LOCK_STALE_AFTER_S", 30.0) or 30.0):
+                return False
+    except Exception:
+        return False
+
+    st_now = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+    if not isinstance(st_now, dict):
+        st_now = {}
+    hold_status_now = str(st_now.get("status", "") or "").strip().lower()
+    if hold_status_now in ("holding_real_result", "holding_real_turn"):
+        return False
+    if bool(st_now.get("holding_real_result", False) or st_now.get("holding_real_turn", False)):
+        return False
+
+    d = diag if isinstance(diag, dict) else {}
+    missing = d.get("missing") if isinstance(d.get("missing"), (list, tuple, set)) else []
+    missing_bot = next((str(b) for b in missing if str(b) in BOT_NAMES), None)
+    try:
+        closed_count = int(d.get("closed", d.get("closed_count", 0)) or 0)
+    except Exception:
+        closed_count = 0
+    req_bots = [bot for bot, _req in valid_reqs]
+    quarantine_info = {
+        "eligible": True,
+        "round_id": int(rel),
+        "reason": "demo_wait_timeout_no_release",
+        "source": "SYNC_DEMO_HOLD_RECOVERY_REQUEST_ONLY_BEFORE_REJOIN",
+        "neutral": True,
+        "no_trade_result": True,
+        "quarantine": True,
+        "usable_for_real": False,
+        "usable_for_lxv": False,
+        "usable_for_training": False,
+        "released_from": int(rel),
+        "released_to": int(target_round),
+        "req_bots": list(req_bots),
+        "missing_bot": missing_bot,
+        "closed": int(closed_count),
+        "expected": int(len(BOT_NAMES)),
+        "expected_count": int(len(BOT_NAMES)),
+    }
+
+    ok = bool(liberar_ronda_por_cuarentena_demo_only(int(rel), int(target_round), quarantine_info))
+    if not ok:
+        return False
+
+    try:
+        req_dir = os.path.join(SYNC_ROUND_DIR, "recovery_requests")
+        now_ts = float(time.time())
+        for bot, req in valid_reqs:
+            path = os.path.join(req_dir, f"{bot}.json")
+            payload = dict(req)
+            payload.update({
+                "consumed": True,
+                "consumed_ts": now_ts,
+                "consumed_by": "SYNC_DEMO_HOLD_RECOVERY_REQUEST_ONLY_BEFORE_REJOIN",
+                "consumed_release": int(target_round),
+            })
+            _sync_round_write_json_atomic(path, payload)
+    except Exception:
+        pass
+
+    agregar_evento(
+        f"🔓 RECOVERY_RELEASE_BEFORE_REJOIN_RETURN | ronda=#{int(rel)} | "
+        f"release=#{int(target_round)} | req_bots={list(req_bots)} | "
+        f"missing={missing_bot or '--'} | real=NO | neutral=SI"
+    )
+    return True
+
 def _sync_round_neutral_incident_stale_open_request(round_id, released_round, requests) -> dict:
     out = {"ok": False, "bot": "", "contract_id": None, "reason": "no_incident_request"}
     try:
@@ -11327,6 +11473,11 @@ def _sync_round_try_recovery_release_global() -> bool:
                 f"🧷 RELEASE_HOLD_MIXED_ROUNDS | best_round=#{diag_recovery_global.get('best_round')} {int(diag_recovery_global.get('closed', 0) or 0)}/{int(diag_recovery_global.get('expected', len(BOT_NAMES)) or len(BOT_NAMES))} | behind={len(diag_recovery_global.get('behind') or {})} | acción=esperar_rejoin",
                 ttl=20.0,
             )
+            try:
+                if _sync_round_try_request_only_before_rejoin_return(round_id, released_round, diag=diag_recovery_global):
+                    return True
+            except Exception as e:
+                agregar_evento(f"⚠️ REQUEST_ONLY_BEFORE_REJOIN_ERROR | {e}")
             return _hold("mixed_rounds_esperar_rejoin", released_round)
 
         wait_bots = []
@@ -12103,6 +12254,11 @@ def _sync_round_tick_maestro():
                 f"🧷 RELEASE_HOLD_MIXED_ROUNDS | best_round=#{diag_recovery.get('best_round')} {int(diag_recovery.get('closed', 0) or 0)}/{int(diag_recovery.get('expected', len(BOT_NAMES)) or len(BOT_NAMES))} | behind={len(diag_recovery.get('behind') or {})} | acción=esperar_rejoin",
                 ttl=20.0,
             )
+            try:
+                if _sync_round_try_request_only_before_rejoin_return(round_id, released_round, diag=diag_recovery):
+                    return
+            except Exception as e:
+                agregar_evento(f"⚠️ REQUEST_ONLY_BEFORE_REJOIN_ERROR | {e}")
             return
         reqs = _sync_round_read_recovery_requests(max_age_s=90.0)
         req_ok, req_reason = _sync_round_should_recovery_release(round_id, released_round, reqs, st)
