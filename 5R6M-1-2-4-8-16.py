@@ -9369,20 +9369,115 @@ def refinar_zona_lxv_para_real(info_zona, patron_lxv=None):
                 return cerrar("VERDE_OBSERVAR_NO_REAL", "verde_valido_pero_sin_confirmacion_premium")
             return cerrar("BLOQUEADA_NO_REAL", "5V1X_zona_no_valida_para_premium")
         if patron == "4V2X":
-            z_mrv = str(out.get("zona_mrv_v2", "") or "").upper()
-            red_cols_3_raw = out.get("red_cols_3", None)
-            red_cols_ok = True
-            if red_cols_3_raw is not None:
+            def _num_opt(key, default=None):
                 try:
-                    red_cols_ok = int(red_cols_3_raw) <= 1
+                    value = out.get(key, default)
+                    if value is None or value == "":
+                        return default
+                    return float(value)
                 except Exception:
-                    red_cols_ok = False
-            if z_mrv == "VERDE_TEMPRANO_CONFIRMADO" and prom3 >= prom8 and delta_3_8 >= 0.00 and red_cols_ok and subzona not in hard_zonas:
+                    return default
+
+            def _int_opt(key, default=None):
+                try:
+                    value = out.get(key, default)
+                    if value is None or value == "":
+                        return default
+                    return int(value)
+                except Exception:
+                    return default
+
+            z_mrv = str(out.get("zona_mrv_v2", "") or "").upper().strip()
+            z_base4 = str(zona_base or "").upper().strip()
+            z_zona4 = str(zona or "").upper().strip()
+            z_sub4 = str(subzona or "").upper().strip()
+            prom3_4 = _num_opt("prom3", prom3)
+            prom8_4 = _num_opt("prom8", prom8)
+            delta_3_8_4 = _num_opt("delta_3_8", _num_opt("d38", delta_3_8))
+            red_cols_3 = _int_opt("red_cols_3", 0)
+            red_cols_5 = _int_opt("red_cols_5", None)
+            green_cols_3 = _int_opt("green_cols_3", None)
+            green_pressure = _num_opt("green_pressure", None)
+            red_pressure = _num_opt("red_pressure", None)
+            noise_ratio = _num_opt("noise_ratio", None)
+            prev_full_green_streak = _int_opt("prev_full_green_streak", 0)
+            prev_full_green_streak_seq = _int_opt("prev_full_green_streak_seq", 0)
+            full_green_prev_streak_mrv2 = _int_opt("full_green_prev_streak_mrv2", 0)
+            zonas_verdes_4v2x = {"VERDE_TEMPRANO", "VERDE_MADURO", "VERDE_TEMPRANO_CONFIRMADO", "VERDE_MADURO_SANO", "VERDE_MADURO_CON_RUIDO"}
+            zonas_fallback_4v2x = {"VERDE_TEMPRANO", "VERDE_MADURO"}
+            z_mrv_vacia = z_mrv in {"", "--", "UNKNOWN", "NONE"}
+            hay_presion_roja = (red_cols_3 is not None and red_cols_3 > 1) or (green_pressure is not None and red_pressure is not None and red_pressure > green_pressure)
+            hay_saturacion = (prev_full_green_streak >= 3 or prev_full_green_streak_seq >= 3 or full_green_prev_streak_mrv2 >= 3)
+
+            if hay_saturacion:
+                return cerrar("VERDE_TARDIO_SATURADO_NO_REAL", "4V2X_bloqueado_saturacion_verde_full_green")
+
+            if (
+                z_mrv == "VERDE_TEMPRANO_CONFIRMADO"
+                and prom3_4 is not None and prom8_4 is not None and delta_3_8_4 is not None
+                and prom3_4 >= prom8_4
+                and delta_3_8_4 >= 0.00
+                and red_cols_3 is not None and red_cols_3 <= 1
+                and z_sub4 not in hard_zonas
+            ):
                 out.update({"zona_real_refinada":"VERDE_MODERADO_INVERTIBLE","decision_real_refinada":"SI_INVERTIR","motivo_real_refinado":"4V2X_mrv_temprano_confirmado","nivel_real_zona":"MODERADO"})
                 return out
-            if z_mrv in {"VERDE_MADURO_CON_RUIDO", "VERDE_MADURO"} or zona_base in {"VERDE_MADURO_CON_RUIDO", "VERDE_MADURO"} or zona in {"VERDE_MADURO_CON_RUIDO", "VERDE_MADURO"}:
-                return cerrar("VERDE_OBSERVAR_NO_REAL", "4V2X_con_ruido_o_sin_confirmacion_fuerte")
-            return cerrar("BLOQUEADA_NO_REAL", "4V2X_sin_confirmacion_mrv_fuerte")
+
+            presion_verde_ok = green_pressure is None or red_pressure is None or green_pressure >= red_pressure
+            presion_verde_fuerte = green_pressure is None or red_pressure is None or green_pressure > red_pressure
+
+            if (
+                z_mrv == "VERDE_MADURO_SANO"
+                and prom8_4 is not None and delta_3_8_4 is not None
+                and 0.55 <= prom8_4 <= 0.88
+                and delta_3_8_4 >= -0.03
+                and red_cols_3 is not None and red_cols_3 <= 1
+                and (red_cols_5 is None or red_cols_5 <= 2)
+                and presion_verde_ok
+                and prev_full_green_streak < 3
+                and prev_full_green_streak_seq < 3
+                and full_green_prev_streak_mrv2 < 3
+            ):
+                out.update({"zona_real_refinada":"VERDE_4V2X_MODERADO_INVERTIBLE","decision_real_refinada":"SI_INVERTIR","motivo_real_refinado":"4V2X_mrv_maduro_sano","nivel_real_zona":"MODERADO"})
+                return out
+
+            if (
+                z_mrv in {"VERDE_MADURO_CON_RUIDO", "VERDE_MADURO"}
+                and prom8_4 is not None and delta_3_8_4 is not None
+                and 0.55 <= prom8_4 <= 0.86
+                and delta_3_8_4 >= -0.02
+                and red_cols_3 == 0
+                and presion_verde_fuerte
+                and (noise_ratio is None or noise_ratio <= 0.35)
+                and prev_full_green_streak < 2
+                and prev_full_green_streak_seq < 2
+                and full_green_prev_streak_mrv2 < 2
+            ):
+                out.update({"zona_real_refinada":"VERDE_4V2X_RUIDO_CONTROLADO_INVERTIBLE","decision_real_refinada":"SI_INVERTIR","motivo_real_refinado":"4V2X_ruido_controlado","nivel_real_zona":"MODERADO_RIESGO_CONTROLADO"})
+                return out
+
+            if (
+                z_mrv_vacia
+                and (z_base4 in zonas_fallback_4v2x or z_zona4 in zonas_fallback_4v2x or z_sub4 in zonas_fallback_4v2x)
+                and prom3_4 is not None and prom8_4 is not None and delta_3_8_4 is not None
+                and prom3_4 >= 0.60
+                and 0.55 <= prom8_4 <= 0.86
+                and delta_3_8_4 >= -0.02
+                and red_cols_3 is not None and red_cols_3 <= 1
+                and (green_cols_3 is None or green_cols_3 >= 2)
+                and presion_verde_ok
+                and prev_full_green_streak < 3
+                and prev_full_green_streak_seq < 3
+                and full_green_prev_streak_mrv2 < 3
+            ):
+                out.update({"zona_real_refinada":"VERDE_4V2X_FALLBACK_METRICO_INVERTIBLE","decision_real_refinada":"SI_INVERTIR","motivo_real_refinado":"4V2X_fallback_metrico_sano","nivel_real_zona":"MODERADO_FALLBACK"})
+                return out
+
+            if hay_presion_roja:
+                return cerrar("VERDE_OBSERVAR_NO_REAL", "4V2X_bloqueado_presion_roja")
+            if z_mrv in zonas_verdes_4v2x or z_base4 in zonas_verdes_4v2x or z_zona4 in zonas_verdes_4v2x or z_sub4 in zonas_verdes_4v2x:
+                return cerrar("VERDE_OBSERVAR_NO_REAL", "4V2X_verde_sin_metricas_suficientes")
+            return cerrar("BLOQUEADA_NO_REAL", "4V2X_zona_no_valida")
         return cerrar("BLOQUEADA_NO_REAL", "patron_no_soportado_para_refinado")
     except Exception as e:
         out.update({"zona_real_refinada":"BLOQUEADA_NO_REAL","decision_real_refinada":"NO_INVERTIR","motivo_real_refinado":f"refinado_error:{e.__class__.__name__}","nivel_real_zona":"BLOQUEADA_NO_REAL"})
@@ -31360,12 +31455,24 @@ def _selftest_lxv_real_refinada():
         r = refinar_zona_lxv_para_real(dict(base5, prom8=0.59, delta_3_8=0.03), "5V1X")
         assert r["decision_real_refinada"] == "NO_INVERTIR" and r["zona_real_refinada"] == "VERDE_OBSERVAR_NO_REAL"
 
-        base4 = {"zona":"VERDE_MADURO","zona_base":"VERDE_MADURO","subzona":"VERDE_MADURO","allow_real":True,"data_quality":"ok","prom3":0.66,"prom8":0.65,"delta_3_8":0.01,"prev_full_green_streak":0,"zona_mrv_v2":"VERDE_TEMPRANO_CONFIRMADO","red_cols_3":1}
+        base4 = {"zona":"VERDE_MADURO","zona_base":"VERDE_MADURO","subzona":"VERDE_MADURO","allow_real":True,"data_quality":"ok","prom3":0.66,"prom8":0.65,"delta_3_8":0.01,"prev_full_green_streak":0,"prev_full_green_streak_seq":0,"full_green_prev_streak_mrv2":0,"zona_mrv_v2":"VERDE_TEMPRANO_CONFIRMADO","red_cols_3":1}
         r = refinar_zona_lxv_para_real(base4, "4V2X")
         assert r["decision_real_refinada"] == "SI_INVERTIR" and r["zona_real_refinada"] == "VERDE_MODERADO_INVERTIBLE"
 
+        r = refinar_zona_lxv_para_real(dict(base4, zona_mrv_v2="VERDE_MADURO_SANO", red_cols_5=2, green_pressure=0.70, red_pressure=0.30), "4V2X")
+        assert r["decision_real_refinada"] == "SI_INVERTIR" and r["zona_real_refinada"] == "VERDE_4V2X_MODERADO_INVERTIBLE"
+
+        r = refinar_zona_lxv_para_real(dict(base4, prom3=0.65, prom8=0.62, zona_mrv_v2="VERDE_MADURO_CON_RUIDO", red_cols_3=0, green_pressure=0.68, red_pressure=0.25, noise_ratio=0.25), "4V2X")
+        assert r["decision_real_refinada"] == "SI_INVERTIR" and r["zona_real_refinada"] == "VERDE_4V2X_RUIDO_CONTROLADO_INVERTIBLE"
+
         r = refinar_zona_lxv_para_real(dict(base4, zona_mrv_v2="VERDE_MADURO_CON_RUIDO"), "4V2X")
         assert r["decision_real_refinada"] == "NO_INVERTIR" and r["zona_real_refinada"] == "VERDE_OBSERVAR_NO_REAL"
+
+        r = refinar_zona_lxv_para_real(dict(base4, zona_mrv_v2="VERDE_MADURO_CON_RUIDO", red_cols_3=2, green_pressure=0.30, red_pressure=0.70), "4V2X")
+        assert r["decision_real_refinada"] == "NO_INVERTIR" and "presion_roja" in r["motivo_real_refinado"]
+
+        r = refinar_zona_lxv_para_real(dict(base4, zona_mrv_v2="", prom3=0.64, prom8=0.60, delta_3_8=0.00, red_cols_3=1, green_cols_3=2, green_pressure=0.65, red_pressure=0.30), "4V2X")
+        assert r["decision_real_refinada"] == "SI_INVERTIR" and r["zona_real_refinada"] == "VERDE_4V2X_FALLBACK_METRICO_INVERTIBLE"
 
         rows_sat = [
             {"round_id":1,"n_verdes":6,"n_rojos":0,"round_complete":True,"data_quality":"ok"},
