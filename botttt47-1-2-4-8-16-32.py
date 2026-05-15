@@ -273,6 +273,7 @@ MAX_CICLOS = len(MARTINGALA_REAL)
 # === LXV_SYNC_COLUMN: sincronización por ronda/columna ===
 SYNC_ROUND_DIR = "sync_round"
 SYNC_ROUND_STATE = os.path.join(SYNC_ROUND_DIR, "state.json")
+SYNC_ROUND_STATE_REAL_HOLD_TTL_S = 180.0
 
 try:
     os.makedirs(SYNC_ROUND_DIR, exist_ok=True)
@@ -859,7 +860,24 @@ def _sync_any_real_owner_active() -> tuple[bool, str, str]:
                 if _valid_bot(token_owner):
                     return True, token_owner, "sync_round_token_status"
             if (real_global or close_pending or status in active_statuses) and _valid_bot(owner):
-                return True, owner, "sync_round_state"
+                state_ts = _sync_round_state_ts(st)
+                state_age = (now_ts - state_ts) if state_ts > 0 else 999999.0
+                ttl_state = float(globals().get("SYNC_ROUND_STATE_REAL_HOLD_TTL_S", 180.0) or 180.0)
+                if state_ts <= 0 or state_age > ttl_state:
+                    try:
+                        stale_key = "sync_round_state_stale_ignorado_ts"
+                        last = float(estado_bot.get(stale_key, 0.0) or 0.0)
+                        if (now_ts - last) >= 60.0:
+                            print(
+                                Fore.YELLOW + Style.BRIGHT +
+                                f"⚠️ SYNC_ROUND_STATE_STALE_IGNORADO | bot={NOMBRE_BOT} | owner={owner or '--'} "
+                                f"| status={status or '--'} | age={state_age:.0f}s | token libre"
+                            )
+                            estado_bot[stale_key] = now_ts
+                    except Exception:
+                        pass
+                else:
+                    return True, owner, "sync_round_state"
     except Exception:
         pass
 
@@ -906,9 +924,11 @@ def _selftest_sync_demo_hold_global():
     base_dir = tempfile.mkdtemp(prefix="sync_demo_hold_global_")
     old_script_dir = globals().get("script_dir")
     old_token = globals().get("ARCHIVO_TOKEN")
+    old_sync_state = globals().get("SYNC_ROUND_STATE")
     try:
         globals()["script_dir"] = base_dir
         globals()["ARCHIVO_TOKEN"] = os.path.join(base_dir, "token_actual.txt")
+        globals()["SYNC_ROUND_STATE"] = os.path.join(base_dir, "sync_round", "state.json")
         os.makedirs(os.path.join(base_dir, "orden_real"), exist_ok=True)
 
         def wr(path, data):
@@ -931,12 +951,16 @@ def _selftest_sync_demo_hold_global():
         ok, owner, reason = _sync_any_real_owner_active(); assert ok and owner=="fulll47" and reason=="orden_real_viva"
 
         os.remove(os.path.join(base_dir, "orden_real", "fulll47.json"))
-        wr(os.path.join(base_dir, "real_owner_state.json"), {"owner_bot":"fulll47", "assigned_ts":now})
-        ok, owner, reason = _sync_any_real_owner_active(); assert ok and owner=="fulll47" and reason=="real_owner_state"
-
-        os.remove(os.path.join(base_dir, "real_owner_state.json"))
         wr(os.path.join(base_dir, "real_close_pending.json"), {"bot":"fulll47", "ts":now})
         ok, owner, reason = _sync_any_real_owner_active(); assert ok and owner=="fulll47" and reason=="real_close_pending"
+
+        os.remove(os.path.join(base_dir, "real_close_pending.json"))
+        wr(os.path.join(base_dir, "sync_round", "state.json"), {"real_global": True, "real_owner": "fulll47", "status": "real_active", "ts": now})
+        ok, owner, reason = _sync_any_real_owner_active(); assert ok and owner=="fulll47" and reason=="sync_round_state"
+
+        wr(os.path.join(base_dir, "sync_round", "state.json"), {"real_global": True, "real_owner": "fulll47", "status": "real_active", "ts": now - 9999})
+        wt("REAL:none")
+        ok, owner, reason = _sync_any_real_owner_active(); assert not ok
 
         print("SELFTEST SYNC_DEMO_HOLD_GLOBAL OK")
         raise SystemExit(0)
@@ -945,6 +969,8 @@ def _selftest_sync_demo_hold_global():
             globals()["script_dir"] = old_script_dir
         if old_token is not None:
             globals()["ARCHIVO_TOKEN"] = old_token
+        if old_sync_state is not None:
+            globals()["SYNC_ROUND_STATE"] = old_sync_state
 
 
 
@@ -960,7 +986,7 @@ SYNC_STANDBY_PRINT_COOLDOWN_S = 3.0
 def _sync_round_state_ts(st: dict) -> float:
     if not isinstance(st, dict):
         return 0.0
-    for key in ("ts", "updated_ts", "updated_at", "last_seen_ts"):
+    for key in ("ts", "updated_ts", "updated_at", "last_seen_ts", "started_at"):
         try:
             val = float(st.get(key, 0.0) or 0.0)
         except Exception:
@@ -4718,6 +4744,7 @@ async def main():
     await monitor()
 
 if __name__ == "__main__":
+    _selftest_sync_demo_hold_global()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

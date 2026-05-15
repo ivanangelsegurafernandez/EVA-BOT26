@@ -3130,6 +3130,7 @@ COLUMN_QUARANTINE_RELEASE_DEMO_ONLY = True
 COLUMN_QUARANTINE_BLOCK_REAL_ALWAYS = True
 COLUMN_QUARANTINE_MAX_PER_HOUR = 6
 COLUMN_QUARANTINE_LOG_COOLDOWN_S = 20.0
+COLUMN_QUARANTINE_DISPLAY_TTL_S = 900.0
 ACK_SYNC_ROUND_FUTURE_DRIFT_S = 20.0
 LXV_SYNC_ROUND_FAILSAFE_ENABLE = True
 LXV_SYNC_ROUND_MAX_WAIT_S = 90.0
@@ -5811,6 +5812,45 @@ def _column_quarantine_load_state() -> dict:
         return _column_quarantine_default_state()
 
 
+
+def _column_quarantine_state_is_current(q_state, current_round=None, released_round=None, now_ts=None) -> bool:
+    try:
+        q = q_state if isinstance(q_state, dict) else {}
+        if not q or q.get("active") is not True:
+            return False
+        rid = int(q.get("round_id", 0) or 0)
+        released_to = int(q.get("released_to", 0) or 0)
+        rel = int(released_round or 0)
+        cur = int(current_round or 0)
+        now = float(now_ts if now_ts is not None else time.time())
+        since = float(q.get("since_ts", q.get("ts", 0.0)) or 0.0)
+        if rid <= 0 or released_to <= 0:
+            return False
+        if rel > 0 and released_to < rel:
+            return False
+        if rel > 0 and rid < (rel - 1):
+            return False
+        if since > 0 and (now - since) > float(globals().get("COLUMN_QUARANTINE_DISPLAY_TTL_S", 900.0) or 900.0):
+            return False
+        if cur > 0 and rid < (cur - 1):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _column_quarantine_archive_if_stale(q_state, current_round=None, released_round=None, now_ts=None) -> dict:
+    q = dict(q_state) if isinstance(q_state, dict) else _column_quarantine_default_state()
+    if not _column_quarantine_state_is_current(q, current_round=current_round, released_round=released_round, now_ts=now_ts):
+        if q.get("active") is True:
+            q.update({"active": False, "archived": True, "archived_reason": "stale_quarantine_state", "archived_ts": float(now_ts if now_ts is not None else time.time())})
+            globals()["ROUND_QUARANTINE_STATE"] = q
+            try:
+                _column_quarantine_persist_state(q)
+            except Exception:
+                pass
+    return q
+
 def _column_quarantine_token_real_activo() -> bool:
     try:
         token_raw = ""
@@ -6096,14 +6136,24 @@ def es_ronda_cuarentenada(round_id):
         rid = int(round_id or 0)
         if rid <= 0:
             return False
-        st_mem = globals().get("ROUND_QUARANTINE_STATE", {})
-        if isinstance(st_mem, dict) and int(st_mem.get("round_id", 0) or 0) == rid:
-            return True
         st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
-        if isinstance(st, dict) and int(st.get("quarantined_round", 0) or 0) == rid:
+        current_round = int((st if isinstance(st, dict) else {}).get("round_id", 0) or 0)
+        released_round = int((st if isinstance(st, dict) else {}).get("released_round", current_round) or current_round or 0)
+        now_ts = float(time.time())
+        st_mem = _column_quarantine_archive_if_stale(globals().get("ROUND_QUARANTINE_STATE", {}), current_round=current_round, released_round=released_round, now_ts=now_ts)
+        if _column_quarantine_state_is_current(st_mem, current_round=current_round, released_round=released_round, now_ts=now_ts) and int(st_mem.get("round_id", 0) or 0) == rid:
             return True
-        qf = _column_quarantine_load_state()
-        if isinstance(qf, dict) and int(qf.get("round_id", 0) or 0) == rid:
+        if isinstance(st, dict) and int(st.get("quarantined_round", 0) or 0) == rid:
+            q_active = {
+                "active": True,
+                "round_id": int(st.get("quarantined_round", 0) or 0),
+                "released_to": int(st.get("released_round", 0) or 0),
+                "since_ts": float(st.get("quarantine_ts", st.get("ts", 0.0)) or 0.0),
+            }
+            if _column_quarantine_state_is_current(q_active, current_round=current_round, released_round=released_round, now_ts=now_ts):
+                return True
+        qf = _column_quarantine_archive_if_stale(_column_quarantine_load_state(), current_round=current_round, released_round=released_round, now_ts=now_ts)
+        if _column_quarantine_state_is_current(qf, current_round=current_round, released_round=released_round, now_ts=now_ts) and int(qf.get("round_id", 0) or 0) == rid:
             return True
     except Exception:
         return False
@@ -6142,6 +6192,12 @@ def _column_quarantine_apply_real_block(round_id, motivo="columna_cuarentenada_n
 def _column_quarantine_print_panel(state=None):
     try:
         q = state if isinstance(state, dict) else _column_quarantine_load_state()
+        st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+        current_round = int((st if isinstance(st, dict) else {}).get("round_id", 0) or 0)
+        released_round = int((st if isinstance(st, dict) else {}).get("released_round", current_round) or current_round or 0)
+        if not _column_quarantine_state_is_current(q, current_round=current_round, released_round=released_round, now_ts=time.time()):
+            _column_quarantine_archive_if_stale(q, current_round=current_round, released_round=released_round, now_ts=time.time())
+            return
         if not isinstance(q, dict) or not q.get("round_id"):
             return
         W = 60
@@ -9394,7 +9450,7 @@ def refinar_zona_lxv_para_real(info_zona, patron_lxv=None):
             prom3_4 = _num_opt("prom3", prom3)
             prom8_4 = _num_opt("prom8", prom8)
             delta_3_8_4 = _num_opt("delta_3_8", _num_opt("d38", delta_3_8))
-            red_cols_3 = _int_opt("red_cols_3", 0)
+            red_cols_3 = _int_opt("red_cols_3", None)
             red_cols_5 = _int_opt("red_cols_5", None)
             green_cols_3 = _int_opt("green_cols_3", None)
             green_pressure = _num_opt("green_pressure", None)
@@ -9423,8 +9479,10 @@ def refinar_zona_lxv_para_real(info_zona, patron_lxv=None):
                 out.update({"zona_real_refinada":"VERDE_MODERADO_INVERTIBLE","decision_real_refinada":"SI_INVERTIR","motivo_real_refinado":"4V2X_mrv_temprano_confirmado","nivel_real_zona":"MODERADO"})
                 return out
 
-            presion_verde_ok = green_pressure is None or red_pressure is None or green_pressure >= red_pressure
-            presion_verde_fuerte = green_pressure is None or red_pressure is None or green_pressure > red_pressure
+            presion_verde_ok = (green_pressure is not None and red_pressure is not None and green_pressure >= red_pressure)
+            presion_verde_fuerte = (green_pressure is not None and red_pressure is not None and green_pressure > red_pressure)
+            presion_verde_ok_o_cols = presion_verde_ok or ((green_pressure is None or red_pressure is None) and green_cols_3 is not None and green_cols_3 >= 2)
+            presion_verde_fuerte_o_cols = presion_verde_fuerte or ((green_pressure is None or red_pressure is None) and green_cols_3 is not None and green_cols_3 >= 2)
 
             if (
                 z_mrv == "VERDE_MADURO_SANO"
@@ -9446,8 +9504,8 @@ def refinar_zona_lxv_para_real(info_zona, patron_lxv=None):
                 and prom8_4 is not None and delta_3_8_4 is not None
                 and 0.55 <= prom8_4 <= 0.86
                 and delta_3_8_4 >= -0.02
-                and red_cols_3 == 0
-                and presion_verde_fuerte
+                and red_cols_3 is not None and red_cols_3 == 0
+                and presion_verde_fuerte_o_cols
                 and (noise_ratio is None or noise_ratio <= 0.35)
                 and prev_full_green_streak < 2
                 and prev_full_green_streak_seq < 2
@@ -9463,9 +9521,10 @@ def refinar_zona_lxv_para_real(info_zona, patron_lxv=None):
                 and prom3_4 >= 0.60
                 and 0.55 <= prom8_4 <= 0.86
                 and delta_3_8_4 >= -0.02
-                and red_cols_3 is not None and red_cols_3 <= 1
-                and (green_cols_3 is None or green_cols_3 >= 2)
-                and presion_verde_ok
+                and red_cols_3 is not None and green_cols_3 is not None
+                and red_cols_3 <= 1
+                and green_cols_3 >= 2
+                and presion_verde_ok_o_cols
                 and prev_full_green_streak < 3
                 and prev_full_green_streak_seq < 3
                 and full_green_prev_streak_mrv2 < 3
@@ -9473,6 +9532,10 @@ def refinar_zona_lxv_para_real(info_zona, patron_lxv=None):
                 out.update({"zona_real_refinada":"VERDE_4V2X_FALLBACK_METRICO_INVERTIBLE","decision_real_refinada":"SI_INVERTIR","motivo_real_refinado":"4V2X_fallback_metrico_sano","nivel_real_zona":"MODERADO_FALLBACK"})
                 return out
 
+            if red_cols_3 is None and green_cols_3 is None:
+                return cerrar("VERDE_OBSERVAR_NO_REAL", "4V2X_metricas_mrv_incompletas")
+            if z_mrv_vacia and (red_cols_3 is None or green_cols_3 is None):
+                return cerrar("VERDE_OBSERVAR_NO_REAL", "4V2X_fallback_metricas_insuficientes")
             if hay_presion_roja:
                 return cerrar("VERDE_OBSERVAR_NO_REAL", "4V2X_bloqueado_presion_roja")
             if z_mrv in zonas_verdes_4v2x or z_base4 in zonas_verdes_4v2x or z_zona4 in zonas_verdes_4v2x or z_sub4 in zonas_verdes_4v2x:
@@ -11716,6 +11779,146 @@ def _sync_round_try_final_safe_demo_recovery_release(
     )
     return True
 
+
+def _sync_round_try_partial_neutral_recovery_release(
+    round_id,
+    released_round,
+    closed_count,
+    expected_count,
+    data_quality,
+    elapsed_round_s,
+    hold_status="",
+    diag=None,
+    missing_txt=None,
+):
+    """Libera una columna parcial 4/6 o 5/6 vieja solo como DEMO neutral no usable."""
+    def _deny(motivo):
+        try:
+            print_rate_limited(
+                f"PARTIAL_NEUTRAL_RECOVERY_NO_RELEASE:{round_id}:{motivo}",
+                f"🧷 PARTIAL_NEUTRAL_RECOVERY_HOLD | ronda=#{round_id} | motivo={motivo}",
+                ttl=20.0,
+            )
+        except Exception:
+            pass
+        return False
+
+    try:
+        rid = int(round_id or 0)
+        rel = int(released_round or 0)
+        closed_n = int(closed_count or 0)
+        expected_n = int(expected_count or len(BOT_NAMES) or 6)
+    except Exception:
+        return _deny("round_invalid")
+    if rid <= 0 or rel > rid:
+        return _deny("round_release_invalid")
+    if closed_n < int(globals().get("LXV_SYNC_MIN_CLOSED_FOR_EVAL", 4) or 4):
+        return _deny("closed_below_min_eval")
+    if closed_n >= expected_n:
+        return _deny("round_not_partial")
+    dq = str(data_quality or "").strip().lower()
+    if dq not in {"partial", "waiting_bots", "missing", "future_partial"}:
+        return _deny(f"dq_not_partial:{dq or 'missing'}")
+    timeout_s = float(globals().get("ROUND_INCOMPLETE_RECOVERY_TIMEOUT_S", globals().get("LXV_SYNC_ROUND_MAX_WAIT_S", 90.0)) or 90.0)
+    max_wait_s = float(globals().get("LXV_SYNC_ROUND_MAX_WAIT_S", timeout_s) or timeout_s)
+    if float(elapsed_round_s or 0.0) < min(timeout_s, max_wait_s):
+        return _deny("timeout_not_reached")
+    if str(hold_status or "").strip().lower() in {"holding_real_result", "holding_real_turn"}:
+        return _deny("hold_real_status")
+    if isinstance(diag, dict) and bool(diag.get("mixed_rounds", False)):
+        return _deny("mixed_rounds_present")
+    try:
+        if _real_close_incident_active():
+            return _deny("real_close_incident_lock")
+    except Exception:
+        return _deny("incident_guard_error")
+    try:
+        pending_on, pending_bot, _pending = _hay_real_close_pending_activo()
+        if pending_on:
+            return _deny(f"real_close_pending:{pending_bot or '--'}")
+    except Exception:
+        return _deny("real_close_pending_guard_error")
+    try:
+        order_on, order_bot = _sync_real_order_viva_any()
+        if order_on:
+            return _deny(f"orden_real_viva:{order_bot or '--'}")
+    except Exception:
+        return _deny("orden_real_guard_error")
+    try:
+        real_on, real_bot, motivo_real = _sync_real_turn_activo()
+        if real_on:
+            return _deny(f"real_activo:{real_bot or motivo_real or '--'}")
+    except Exception:
+        return _deny("real_turn_guard_error")
+    try:
+        token_raw = str(_read_token_file_raw() or "").strip() if callable(globals().get("_read_token_file_raw")) else ""
+    except Exception:
+        token_raw = ""
+    try:
+        token_owner = str(leer_token_actual() or "").strip()
+    except Exception:
+        token_owner = ""
+    if _token_real_ocupado(token_raw) or _token_real_ocupado(token_owner) or token_owner in BOT_NAMES:
+        return _deny("token_real_activo")
+
+    target = rid + 1
+    now_ts = float(time.time())
+    st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+    payload = dict(st) if isinstance(st, dict) else {}
+    payload.update({
+        "round_id": target,
+        "released_round": target,
+        "expected_bots": list(BOT_NAMES),
+        "expected_bots_effective": list(BOT_NAMES),
+        "closed_bots": {},
+        "completed": False,
+        "status": "released_partial_neutral_recovery",
+        "reason": "PARTIAL_NEUTRAL_RECOVERY_RELEASE",
+        "release_reason": "PARTIAL_NEUTRAL_RECOVERY_RELEASE",
+        "quarantined_round": rid,
+        "quarantine_real_allowed": False,
+        "quarantine_lxv_allowed": False,
+        "quarantine_ia_train_allowed": False,
+        "usable_for_real": False,
+        "usable_for_lxv": False,
+        "usable_for_training": False,
+        "real_emitido": False,
+        "motivo_no_real": "partial_neutral_recovery_no_usable_para_real",
+        "partial_neutral_recovery": True,
+        "partial_recovery_closed_count": closed_n,
+        "partial_recovery_expected_count": expected_n,
+        "partial_recovery_data_quality": dq,
+        "partial_recovery_missing": str(missing_txt or ""),
+        "ts": now_ts,
+        "started_at": now_ts,
+    })
+    ok = bool(_sync_round_write_state_monotonic(payload, reason="PARTIAL_NEUTRAL_RECOVERY_RELEASE"))
+    if not ok:
+        return _deny("write_state_failed")
+    q_state = _column_quarantine_default_state()
+    q_state.update({
+        "active": True,
+        "round_id": rid,
+        "missing_bot": None,
+        "reason": "PARTIAL_NEUTRAL_RECOVERY_RELEASE",
+        "since_ts": now_ts,
+        "released_to": target,
+        "closed_count": closed_n,
+        "expected": expected_n,
+        "source": "PARTIAL_NEUTRAL_RECOVERY_RELEASE",
+    })
+    globals()["ROUND_QUARANTINE_STATE"] = q_state
+    try:
+        _column_quarantine_persist_state(q_state)
+    except Exception:
+        pass
+    faltan = max(0, expected_n - closed_n)
+    agregar_evento(
+        f"🧯 PARTIAL_NEUTRAL_RECOVERY_RELEASE | ronda=#{rid} | cerrados={closed_n}/{expected_n} | "
+        f"faltan={faltan} | release=#{target} | REAL/LXV/IA bloqueado para columna parcial"
+    )
+    return True
+
 def _sync_round_neutral_incident_stale_open_request(round_id, released_round, requests) -> dict:
     out = {"ok": False, "bot": "", "contract_id": None, "reason": "no_incident_request"}
     try:
@@ -12837,6 +13040,21 @@ def _sync_round_tick_maestro():
             return
         if not can_recover:
             return
+        try:
+            if _sync_round_try_partial_neutral_recovery_release(
+                round_id=round_id,
+                released_round=released_round,
+                closed_count=closed_count,
+                expected_count=expected_count,
+                data_quality=data_quality,
+                elapsed_round_s=elapsed_round_s,
+                hold_status=hold_status,
+                diag=diag_recovery,
+                missing_txt=missing_txt,
+            ):
+                return
+        except Exception as e:
+            agregar_evento(f"⚠️ PARTIAL_NEUTRAL_RECOVERY_ERROR | ronda={round_id} | {e}")
         quarantine_timeout = detectar_candidato_cuarentena_columna(
             round_id, released_round, diag_align=diag_recovery, closed_acks=closed, reasons=sync_debug_missing
         )
@@ -31359,48 +31577,6 @@ async def main():
         agregar_evento(f"⛔ Error en main: {str(e)}")
         _log_exception("Error en main()", e)
 
-if __name__ == "__main__":
-    # ============================================
-    # MODO LIMPIEZA INICIAL (Opción A datos buenos)
-    # ============================================
-    MODO_LIMPIEZA_DATASET = False  # ← PONER True SOLO PARA EJECUTAR LA LIMPIEZA UNA VEZ
-
-    if MODO_LIMPIEZA_DATASET:
-        print("\n🚿 MODO LIMPIEZA DATASET_INCREMENTAL ACTIVADO")
-        print("   - Se borrará dataset_incremental.csv")
-        print("   - Se borrarán modelo_ia.json y meta_ia.json")
-        print("   - Luego se reconstruirá dataset_incremental.csv")
-        print("     usando las últimas 500 filas enriquecidas de cada bot.\n")
-
-        try:
-            # 1) Borrar dataset_incremental + modelo + meta
-            resetear_incremental_y_modelos(borrar_modelos=True)
-
-            # 2) Volver a llenar dataset_incremental SOLO con datos enriquecidos buenos
-            backfill_incremental(ultimas=500)
-
-            print("\n✅ Limpieza + backfill completados correctamente.")
-            print("   dataset_incremental.csv ahora contiene solo filas con:")
-            print("   volatilidad, es_rebote, hora_bucket y resto de features nuevas.")
-        except Exception as e:
-            print(f"\n⛔ Error durante limpieza/backfill: {e}")
-
-        input("\nPulsa ENTER para cerrar este modo, luego edita el archivo y pon MODO_LIMPIEZA_DATASET = False.")
-        sys.exit(0)
-
-    # ======================
-    # MODO NORMAL (loop loop)
-    # ======================
-    while True:  
-        try:
-            asyncio.run(main())
-        except KeyboardInterrupt:
-            print("\n🔴 Programa terminado por el usuario.")
-            break
-        except Exception as e:
-            print(f"⛔ Error crítico: {str(e)}")
-            _log_exception("Error crítico en __main__", e)
-            time.sleep(5)
 
 # === FIN BLOQUE 13 ===
 # === BLOQUE 99 — RESUMEN FINAL DE LO QUE SE LOGRA ===
@@ -31416,36 +31592,6 @@ if __name__ == "__main__":
 #
 # Esta organización no cambia la lógica original, solo la hace más mantenible.
 # === FIN BLOQUE 99 ===
-        if len(src_rows) <= 0:
-            src_rows = list(LXV_FASE_COLUMNS_CACHE)
-            cache_has_target = True if target_rid is None else any(int((x or {}).get("round_id", 0) or 0) == target_rid for x in src_rows)
-            if (not src_rows) or ((target_rid is not None) and (not cache_has_target)):
-                src_rows = _lxv_5v1x_load_recent_matrix_rows(max_rows=40)
-                matrix_has_target = True if target_rid is None else any(_mrv_5v1x_to_int((x or {}).get("round_id", 0), 0) == target_rid for x in src_rows)
-                if target_rid is not None and not matrix_has_target:
-                    try:
-                        rows_pack = _ack_live_build_rows()
-                        fb = _ack_live_calc_summary(rows_pack)
-                        rid_fb = _mrv_5v1x_to_int((fb or {}).get("obj_round", 0), 0)
-                        if rid_fb == target_rid:
-                            src_rows.append({
-                                "round_id": rid_fb,
-                                "n_verdes": int((fb or {}).get("verdes_count", 0) or 0),
-                                "n_rojos": int((fb or {}).get("rojas_count", 0) or 0),
-                                "round_complete": bool((fb or {}).get("complete", False)),
-                                "data_quality": str((fb or {}).get("data_quality", "") or ""),
-                                "source": "ack_live_summary",
-                            })
-                    except Exception:
-                        pass
-    _lxv_5v1x_event_cooldown(
-        key=f"5v1x_green_ok:{rid}",
-        msg=f"✅ LXV VERDE OK: rid={rid} patron=5V1X prev_full_green_streak={int((info_exh or {}).get('prev_full_green_streak',0))}",
-        cooldown_s=8.0,
-    )
-
-
-
 def _selftest_lxv_real_refinada():
     try:
         base5 = {"zona":"VERDE_MADURO","zona_base":"VERDE_MADURO","subzona":"VERDE_MADURO","allow_real":True,"data_quality":"ok","prom3":0.64,"prom8":0.61,"delta_3_8":0.03,"prev_full_green_streak":0}
@@ -31471,6 +31617,9 @@ def _selftest_lxv_real_refinada():
         r = refinar_zona_lxv_para_real(dict(base4, zona_mrv_v2="VERDE_MADURO_CON_RUIDO", red_cols_3=2, green_pressure=0.30, red_pressure=0.70), "4V2X")
         assert r["decision_real_refinada"] == "NO_INVERTIR" and "presion_roja" in r["motivo_real_refinado"]
 
+        r = refinar_zona_lxv_para_real({"zona":"VERDE_MADURO","zona_base":"VERDE_MADURO","subzona":"VERDE_MADURO","allow_real":True,"data_quality":"ok","prom3":0.64,"prom8":0.60,"delta_3_8":0.00,"zona_mrv_v2":""}, "4V2X")
+        assert r["decision_real_refinada"] == "NO_INVERTIR" and "metricas" in r["motivo_real_refinado"]
+
         r = refinar_zona_lxv_para_real(dict(base4, zona_mrv_v2="", prom3=0.64, prom8=0.60, delta_3_8=0.00, red_cols_3=1, green_cols_3=2, green_pressure=0.65, red_pressure=0.30), "4V2X")
         assert r["decision_real_refinada"] == "SI_INVERTIR" and r["zona_real_refinada"] == "VERDE_4V2X_FALLBACK_METRICO_INVERTIBLE"
 
@@ -31490,6 +31639,35 @@ def _selftest_lxv_real_refinada():
         for dq in ("partial", "closed_expired"):
             r = refinar_zona_lxv_para_real(dict(base5, data_quality=dq), "5V1X")
             assert r["decision_real_refinada"] == "NO_INVERTIR"
+
+        now = time.time()
+        q_old = {"active": True, "round_id": 1111, "released_to": 1112, "since_ts": now - 10}
+        assert _column_quarantine_state_is_current(q_old, current_round=1975, released_round=1975, now_ts=now) is False
+
+        orig = {k: globals().get(k) for k in ("_sync_round_safe_read_json", "_sync_round_write_state_monotonic", "_hay_real_close_pending_activo", "_sync_real_order_viva_any", "_sync_real_turn_activo", "_real_close_incident_active", "leer_token_actual", "_read_token_file_raw", "_column_quarantine_persist_state", "agregar_evento")}
+        captured = {}
+        try:
+            globals()["_sync_round_safe_read_json"] = lambda path: {"round_id": 9000, "released_round": 9000, "status": "waiting_closures", "ts": now, "started_at": now - 999}
+            globals()["_sync_round_write_state_monotonic"] = lambda payload, reason="": captured.update({"payload": dict(payload), "reason": reason}) or True
+            globals()["_hay_real_close_pending_activo"] = lambda: (False, None, {})
+            globals()["_sync_real_order_viva_any"] = lambda: (False, None)
+            globals()["_sync_real_turn_activo"] = lambda: (False, None, "sin_real_activo")
+            globals()["_real_close_incident_active"] = lambda: False
+            globals()["leer_token_actual"] = lambda: "REAL:none"
+            globals()["_read_token_file_raw"] = lambda: "REAL:none"
+            globals()["_column_quarantine_persist_state"] = lambda state=None: True
+            globals()["agregar_evento"] = lambda msg: captured.update({"event": msg})
+            ok_rel = _sync_round_try_partial_neutral_recovery_release(9000, 9000, 4, 6, "partial", float(globals().get("LXV_SYNC_ROUND_MAX_WAIT_S", 90.0) or 90.0) + 5.0, hold_status="waiting_closures", diag={"mixed_rounds": False}, missing_txt="fulll49,fulll50")
+            assert ok_rel is True
+            payload = captured.get("payload", {})
+            assert payload.get("release_reason") == "PARTIAL_NEUTRAL_RECOVERY_RELEASE" and int(payload.get("released_round", 0)) == 9001
+            assert payload.get("usable_for_real") is False and payload.get("usable_for_lxv") is False and payload.get("usable_for_training") is False
+        finally:
+            for k, v in orig.items():
+                if v is None:
+                    globals().pop(k, None)
+                else:
+                    globals()[k] = v
         print("SELFTEST LXV_REAL_REFINADA OK")
         return True
     except Exception as e:
@@ -31912,3 +32090,46 @@ def _selftest_dq_released_hud():
 
 if os.environ.get("RUN_DQ_RELEASED_HUD_SELFTEST") == "1":
     _selftest_dq_released_hud()
+
+if __name__ == "__main__":
+    # ============================================
+    # MODO LIMPIEZA INICIAL (Opción A datos buenos)
+    # ============================================
+    MODO_LIMPIEZA_DATASET = False  # ← PONER True SOLO PARA EJECUTAR LA LIMPIEZA UNA VEZ
+
+    if MODO_LIMPIEZA_DATASET:
+        print("\n🚿 MODO LIMPIEZA DATASET_INCREMENTAL ACTIVADO")
+        print("   - Se borrará dataset_incremental.csv")
+        print("   - Se borrarán modelo_ia.json y meta_ia.json")
+        print("   - Luego se reconstruirá dataset_incremental.csv")
+        print("     usando las últimas 500 filas enriquecidas de cada bot.\n")
+
+        try:
+            # 1) Borrar dataset_incremental + modelo + meta
+            resetear_incremental_y_modelos(borrar_modelos=True)
+
+            # 2) Volver a llenar dataset_incremental SOLO con datos enriquecidos buenos
+            backfill_incremental(ultimas=500)
+
+            print("\n✅ Limpieza + backfill completados correctamente.")
+            print("   dataset_incremental.csv ahora contiene solo filas con:")
+            print("   volatilidad, es_rebote, hora_bucket y resto de features nuevas.")
+        except Exception as e:
+            print(f"\n⛔ Error durante limpieza/backfill: {e}")
+
+        input("\nPulsa ENTER para cerrar este modo, luego edita el archivo y pon MODO_LIMPIEZA_DATASET = False.")
+        sys.exit(0)
+
+    # ======================
+    # MODO NORMAL (loop loop)
+    # ======================
+    while True:  
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            print("\n🔴 Programa terminado por el usuario.")
+            break
+        except Exception as e:
+            print(f"⛔ Error crítico: {str(e)}")
+            _log_exception("Error crítico en __main__", e)
+            time.sleep(5)
