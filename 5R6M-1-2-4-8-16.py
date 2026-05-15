@@ -6290,8 +6290,6 @@ def _selftest_column_quarantine():
         print(f"SELFTEST COLUMN_QUARANTINE FAIL: {type(e).__name__}: {e}")
         return False
 
-if os.environ.get("RUN_COLUMN_QUARANTINE_SELFTEST") == "1":
-    _selftest_column_quarantine()
 
 _SYNC_MONOTONIC_GUARD_LAST_TS = {}
 _SYNC_GLOBAL_REAL_HOLD_STATE = {"active": False, "owner": None, "context": "", "last_ts": 0.0}
@@ -9352,8 +9350,6 @@ def _selftest_normalizador_no_reabre_bloqueos():
             raise AssertionError(f"selftest_normalizador_no_reabre_bloqueos caso={i} out={out}")
 
 
-if str(os.environ.get("RUN_NORMALIZADOR_BLOQUEOS_SELFTEST", "0") or "0").strip() == "1":
-    _selftest_normalizador_no_reabre_bloqueos()
 
 def resolver_zona_final_lxv(round_id_objetivo=None, zona_info_previa=None):
     try:
@@ -9871,47 +9867,6 @@ def _selftest_canonical_round_sync():
         globals()["TTL_ACK_SYNC_ROUND_S"] = original_ttl
 
 
-if str(os.getenv("RUN_LXV_ZONE_SELFTEST", "0")).strip() == "1":
-    try:
-        _selftest_zona_lxv_minimo()
-    except Exception:
-        pass
-if str(os.getenv("RUN_MRV_ZONA_V2_SELFTEST", "0")).strip() == "1":
-    try:
-        _selftest_mrv_zona_v2()
-    except Exception:
-        pass
-if str(os.getenv("RUN_ZONA_LXV_V3_SELFTEST", "0")).strip() == "1":
-    try:
-        _selftest_zona_lxv_v3()
-    except Exception:
-        pass
-if str(os.getenv("RUN_LXV_LIVE_ROW_SELFTEST", "0")).strip() == "1":
-    try:
-        _selftest_lxv_live_row_mapping()
-    except Exception:
-        pass
-if str(os.getenv("RUN_ZONA_REGIONAL_TEMPRANA_SELFTEST", "0")).strip() == "1":
-    try:
-        _selftest_zona_regional_temprana_lxv()
-    except Exception:
-        pass
-if str(os.getenv("RUN_ZONA_FINAL_LXV_SELFTEST", "0")).strip() == "1":
-    try:
-        _selftest_zona_final_lxv_unica()
-    except Exception:
-        pass
-if str(os.getenv("RUN_CANONICAL_ROUND_SELFTEST", "0")).strip() == "1":
-    try:
-        _selftest_canonical_round_sync()
-        _selftest_canonical_summary_hud_unificado()
-    except Exception as _e:
-        print(f"SELFTEST CANONICAL_ROUND_SYNC FAIL: {_e}")
-if str(os.getenv("RUN_CANONICAL_HUD_SELFTEST", "0")).strip() == "1":
-    try:
-        _selftest_canonical_summary_hud_unificado()
-    except Exception as _e:
-        print(f"SELFTEST CANONICAL_HUD_UNIFICADO FAIL: {_e}")
 
 def _lxv_5v1x_apply_real_route(candidate: dict | None, ciclo_pick: int) -> bool:
     bot_pick = _lxv_5v1x_pick_real_bot(candidate)
@@ -10980,8 +10935,6 @@ def _selftest_diagnosticar_alineacion_rounds():
         print(f"SELFTEST ROUND_ALIGN_DIAGNOSTICO FAIL: {type(e).__name__}: {e}")
         raise
 
-if os.environ.get("RUN_ROUND_ALIGN_SELFTEST") == "1":
-    _selftest_diagnosticar_alineacion_rounds()
 
 def _sync_round_resolver_ronda_canonica(closed_current, reasons_current, target_round, state):
     now_ts = float(time.time())
@@ -12891,13 +12844,84 @@ def _sync_round_tick_maestro():
                 ttl=20.0,
             )
 
-    incomplete_round = bool(closed_count < expected_count)
+    incomplete_round = closed_count < expected_count
+    elapsed_round_s = float(elapsed_started or 0.0)
+    timeout_s = float(globals().get("ROUND_INCOMPLETE_RECOVERY_TIMEOUT_S", LXV_SYNC_ROUND_MAX_WAIT_S) or LXV_SYNC_ROUND_MAX_WAIT_S)
     has_expired_closed = bool(expired_count > 0)
     too_old_round = bool(max_lag_s is not None and float(max_lag_s) > float(ROUND_LIVE_INVEST_WINDOW_S))
     if canonical_active and closed_count >= expected_count and data_quality == "ok":
         incomplete_round = False
         has_expired_closed = False
         too_old_round = False
+    partial_recovery_candidate = (
+        incomplete_round
+        and closed_count >= int(globals().get("LXV_SYNC_MIN_CLOSED_FOR_EVAL", 4) or 4)
+        and closed_count < expected_count
+        and str(data_quality or "").lower() in {"partial", "waiting_bots", "missing", "future_partial"}
+        and elapsed_round_s > timeout_s
+    )
+    if partial_recovery_candidate:
+        partial_missing_bots = [str(b) for b in BOT_NAMES if b not in set(closed.keys())]
+        partial_missing_txt = ",".join(partial_missing_bots) if partial_missing_bots else "--"
+        print_rate_limited(
+            f"PARTIAL_NEUTRAL_RECOVERY_CANDIDATE:{round_id}:{closed_count}:{expected_count}",
+            f"🧯 PARTIAL_NEUTRAL_RECOVERY_CANDIDATE | ronda=#{round_id} | cerrados={closed_count}/{expected_count} | elapsed={elapsed_round_s:.1f}s | dq={data_quality or '--'} | faltan={partial_missing_txt}",
+            ttl=20.0,
+        )
+        partial_diag_recovery = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+        partial_real_on_now = True
+        partial_real_close_pending_now = True
+        partial_real_order_pending_now = True
+        partial_token_busy = True
+        try:
+            partial_real_on_now, _, _ = _sync_real_turn_activo()
+        except Exception:
+            partial_real_on_now = True
+        try:
+            partial_real_close_pending_now = bool(_hay_real_close_pending_activo()[0])
+        except Exception:
+            partial_real_close_pending_now = True
+        try:
+            partial_real_order_pending_now, _partial_order_bot = _sync_real_order_viva_any()
+        except Exception:
+            partial_real_order_pending_now = True
+        try:
+            partial_token_raw = str(_read_token_file_raw() or "").strip() if callable(globals().get("_read_token_file_raw")) else ""
+        except Exception:
+            partial_token_raw = ""
+        try:
+            partial_token_owner = str(leer_token_actual() or "").strip()
+        except Exception:
+            partial_token_owner = ""
+        partial_token_busy = bool(
+            _token_real_ocupado(partial_token_raw)
+            or _token_real_ocupado(partial_token_owner)
+            or partial_token_owner in BOT_NAMES
+        )
+        partial_guards_ok = bool(
+            (not partial_real_on_now)
+            and (not partial_real_close_pending_now)
+            and (not partial_real_order_pending_now)
+            and (not partial_token_busy)
+            and str(hold_status or "").strip().lower() not in {"holding_real_result", "holding_real_turn"}
+            and not (isinstance(partial_diag_recovery, dict) and bool(partial_diag_recovery.get("mixed_rounds", False)))
+        )
+        if partial_guards_ok:
+            try:
+                if _sync_round_try_partial_neutral_recovery_release(
+                    round_id=round_id,
+                    released_round=released_round,
+                    closed_count=closed_count,
+                    expected_count=expected_count,
+                    data_quality=data_quality,
+                    elapsed_round_s=elapsed_round_s,
+                    hold_status=hold_status,
+                    diag=partial_diag_recovery,
+                    missing_txt=partial_missing_txt,
+                ):
+                    return
+            except Exception as e:
+                agregar_evento(f"⚠️ PARTIAL_NEUTRAL_RECOVERY_ERROR | ronda={round_id} | {e}")
     if incomplete_round and (has_expired_closed or too_old_round):
         release_state = "RELEASE_BLOQUEADO_POR_INCOMPLETA"
         missing_bots = [str(b) for b in BOT_NAMES if b not in set(closed.keys())]
@@ -31674,8 +31698,6 @@ def _selftest_lxv_real_refinada():
         print(f"SELFTEST LXV_REAL_REFINADA FAIL: {e}")
         return False
 
-if os.environ.get("RUN_LXV_REAL_REFINADA_SELFTEST") == "1":
-    _selftest_lxv_real_refinada()
 
 def _selftest_real_activo_prepatron_lxv():
     tests = [
@@ -31692,8 +31714,6 @@ def _selftest_real_activo_prepatron_lxv():
         assert got == expected, f"prepatron fail {v}V{r}X/{c}: got={got} expected={expected}"
     print("SELFTEST REAL_ACTIVO_PREPATRON_LXV OK")
 
-if os.environ.get("RUN_REAL_PREPATRON_SELFTEST") == "1":
-    _selftest_real_activo_prepatron_lxv()
 
 
 def _selftest_zona_visual_parcial_lxv():
@@ -31708,8 +31728,6 @@ def _selftest_zona_visual_parcial_lxv():
 
     print("SELFTEST ZONA_VISUAL_PARCIAL_LXV OK")
 
-if os.environ.get("RUN_ZONA_VISUAL_PARCIAL_SELFTEST") == "1":
-    _selftest_zona_visual_parcial_lxv()
 
 def _selftest_hud_lxv_estado_claro():
     summary = {
@@ -31740,8 +31758,6 @@ def _selftest_hud_lxv_estado_claro():
     print("SELFTEST HUD_LXV_ESTADO_CLARO OK")
 
 
-if os.environ.get("RUN_HUD_LXV_ESTADO_CLARO_SELFTEST") == "1":
-    _selftest_hud_lxv_estado_claro()
 
 def _selftest_hud_lxv_ruido_visual():
     assert _calcular_g_columna_parcial("3V2X") == 0.60
@@ -31755,8 +31771,6 @@ def _selftest_hud_lxv_ruido_visual():
     assert "3V2X" in diag
     print("SELFTEST HUD_LXV_RUIDO_VISUAL OK")
 
-if os.environ.get("RUN_HUD_LXV_RUIDO_SELFTEST") == "1":
-    _selftest_hud_lxv_ruido_visual()
 
 
 def _selftest_lxv_prearmado_seguro():
@@ -31790,8 +31804,6 @@ def _selftest_lxv_prearmado_seguro():
     assert p3["nivel"] == "ALTO"
     print("SELFTEST LXV_PREARMADO_SEGURO OK")
 
-if os.environ.get("RUN_LXV_PREARMADO_SELFTEST") == "1":
-    _selftest_lxv_prearmado_seguro()
 
 def _selftest_lxv_4v2x_candidate_panel():
     global REAL_LOCKS_PANEL
@@ -31831,8 +31843,6 @@ def _selftest_lxv_4v2x_candidate_panel():
 
     print("SELFTEST LXV_4V2X_CANDIDATE_PANEL OK")
 
-if os.environ.get("RUN_LXV_4V2X_CANDIDATE_PANEL_SELFTEST") == "1":
-    _selftest_lxv_4v2x_candidate_panel()
 
 
 def _selftest_hud_oficial_vs_regional_lxv():
@@ -31890,8 +31900,6 @@ def _selftest_hud_oficial_vs_regional_lxv():
     print("SELFTEST HUD_OFICIAL_VS_REGIONAL_LXV OK")
 
 
-if os.environ.get("RUN_HUD_OFICIAL_VS_REGIONAL_SELFTEST") == "1":
-    _selftest_hud_oficial_vs_regional_lxv()
 
 def _selftest_real_pending_release_policy():
     def _simulate(rid, pending_on, closed_count, expected_count, dq, patron):
@@ -31920,8 +31928,6 @@ def _selftest_real_pending_release_policy():
     assert e["release_reason"] == "hold_real_close_pending" and e["released_round"] is None
     print("SELFTEST REAL_PENDING_RELEASE_POLICY OK")
 
-if os.environ.get("RUN_REAL_PENDING_RELEASE_SELFTEST") == "1":
-    _selftest_real_pending_release_policy()
 
 
 def _selftest_dq_visual_unico():
@@ -31931,8 +31937,6 @@ def _selftest_dq_visual_unico():
     assert _dq_oficial_lxv(s2) == "ok"
     print("SELFTEST DQ_VISUAL_UNICO OK")
 
-if os.environ.get("RUN_DQ_VISUAL_UNICO_SELFTEST") == "1":
-    _selftest_dq_visual_unico()
 
 def _selftest_ack_heartbeat_freshness():
     now = float(time.time())
@@ -31953,8 +31957,6 @@ def _selftest_ack_heartbeat_freshness():
     assert exp_n >= 1
     print("SELFTEST ACK_HEARTBEAT_FRESHNESS OK")
 
-if os.environ.get("RUN_ACK_HEARTBEAT_FRESHNESS_SELFTEST") == "1":
-    _selftest_ack_heartbeat_freshness()
 
 def _selftest_round_drift_ahead_promotion():
     original_read = globals().get("_sync_round_safe_read_json")
@@ -32007,8 +32009,6 @@ def _selftest_round_drift_ahead_promotion():
         globals()["_sync_round_ack_path"] = original_path
         globals()["TTL_ACK_SYNC_ROUND_S"] = original_ttl
 
-if os.environ.get("RUN_ROUND_DRIFT_AHEAD_SELFTEST") == "1":
-    _selftest_round_drift_ahead_promotion()
 
 def _selftest_sync_recovery_release_gate():
     def _can_release(req_ok, can_recover):
@@ -32027,8 +32027,6 @@ def _selftest_sync_recovery_release_gate():
             )
     print("SELFTEST SYNC_RECOVERY_RELEASE_GATE OK")
 
-if os.environ.get("RUN_SYNC_RECOVERY_RELEASE_SELFTEST") == "1":
-    _selftest_sync_recovery_release_gate()
 
 def _selftest_dq_released_hud():
     sa = {"round_id": 360, "released_round": 361, "data_quality": "closed_expired"}
@@ -32088,10 +32086,58 @@ def _selftest_dq_released_hud():
     assert motivo2 == "patron_no_invertible:1V5X"
 
 
-if os.environ.get("RUN_DQ_RELEASED_HUD_SELFTEST") == "1":
-    _selftest_dq_released_hud()
+
+
+def _run_requested_selftests_and_exit_if_needed():
+    ran = False
+    ok = True
+
+    def _env_on(name):
+        return str(os.environ.get(name, "0") or "0").strip() == "1"
+
+    def _run(name, fn):
+        nonlocal ran, ok
+        if not _env_on(name):
+            return
+        ran = True
+        try:
+            result = fn()
+            ok = (bool(result) if result is not None else True) and ok
+        except Exception as e:
+            ok = False
+            print(f"SELFTEST {name} FAIL: {e}")
+
+    _run("RUN_COLUMN_QUARANTINE_SELFTEST", _selftest_column_quarantine)
+    _run("RUN_NORMALIZADOR_BLOQUEOS_SELFTEST", _selftest_normalizador_no_reabre_bloqueos)
+    _run("RUN_LXV_ZONE_SELFTEST", _selftest_zona_lxv_minimo)
+    _run("RUN_MRV_ZONA_V2_SELFTEST", _selftest_mrv_zona_v2)
+    _run("RUN_ZONA_LXV_V3_SELFTEST", _selftest_zona_lxv_v3)
+    _run("RUN_LXV_LIVE_ROW_SELFTEST", _selftest_lxv_live_row_mapping)
+    _run("RUN_ZONA_REGIONAL_TEMPRANA_SELFTEST", _selftest_zona_regional_temprana_lxv)
+    _run("RUN_ZONA_FINAL_LXV_SELFTEST", _selftest_zona_final_lxv_unica)
+    _run("RUN_CANONICAL_ROUND_SELFTEST", lambda: (_selftest_canonical_round_sync(), _selftest_canonical_summary_hud_unificado()))
+    _run("RUN_CANONICAL_HUD_SELFTEST", _selftest_canonical_summary_hud_unificado)
+    _run("RUN_ROUND_ALIGN_SELFTEST", _selftest_diagnosticar_alineacion_rounds)
+    _run("RUN_LXV_REAL_REFINADA_SELFTEST", _selftest_lxv_real_refinada)
+    _run("RUN_REAL_PREPATRON_SELFTEST", _selftest_real_activo_prepatron_lxv)
+    _run("RUN_ZONA_VISUAL_PARCIAL_SELFTEST", _selftest_zona_visual_parcial_lxv)
+    _run("RUN_HUD_LXV_ESTADO_CLARO_SELFTEST", _selftest_hud_lxv_estado_claro)
+    _run("RUN_HUD_LXV_RUIDO_SELFTEST", _selftest_hud_lxv_ruido_visual)
+    _run("RUN_LXV_PREARMADO_SELFTEST", _selftest_lxv_prearmado_seguro)
+    _run("RUN_LXV_4V2X_CANDIDATE_PANEL_SELFTEST", _selftest_lxv_4v2x_candidate_panel)
+    _run("RUN_HUD_OFICIAL_VS_REGIONAL_SELFTEST", _selftest_hud_oficial_vs_regional_lxv)
+    _run("RUN_REAL_PENDING_RELEASE_SELFTEST", _selftest_real_pending_release_policy)
+    _run("RUN_DQ_VISUAL_UNICO_SELFTEST", _selftest_dq_visual_unico)
+    _run("RUN_ACK_HEARTBEAT_FRESHNESS_SELFTEST", _selftest_ack_heartbeat_freshness)
+    _run("RUN_ROUND_DRIFT_AHEAD_SELFTEST", _selftest_round_drift_ahead_promotion)
+    _run("RUN_SYNC_RECOVERY_RELEASE_SELFTEST", _selftest_sync_recovery_release_gate)
+    _run("RUN_DQ_RELEASED_HUD_SELFTEST", _selftest_dq_released_hud)
+
+    if ran:
+        sys.exit(0 if ok else 1)
 
 if __name__ == "__main__":
+    _run_requested_selftests_and_exit_if_needed()
     # ============================================
     # MODO LIMPIEZA INICIAL (Opción A datos buenos)
     # ============================================
