@@ -2855,6 +2855,21 @@ def reparar_csv_esrebote_ciclo(archivo):
     except Exception as e:
         print(Fore.RED + f"⚠️ No se pudo reparar CSV ({archivo}): {e}")
 
+def _modo_selftest_import_seguro():
+    keys = (
+        "CHATGPT_SELFTEST",
+        "RUN_ROUND_ALIGN_SELFTEST",
+        "RUN_SYNC_RECOVERY_RELEASE_SELFTEST",
+        "RUN_ACK_HEARTBEAT_FRESHNESS_SELFTEST",
+        "RUN_LXV_4V2X_CANDIDATE_PANEL_SELFTEST",
+        "RUN_ROUND_DRIFT_AHEAD_SELFTEST",
+    )
+    for k in keys:
+        if str(os.environ.get(k, "")).strip().lower() in ("1", "true", "yes", "si", "sí"):
+            return True
+    return False
+
+
 def cargar_tokens():
     """
     tokens_usuario.txt:
@@ -2866,23 +2881,39 @@ def cargar_tokens():
     while True:
         try:
             if not os.path.exists(ruta):
+                if _modo_selftest_import_seguro():
+                    print("CHATGPT_SELFTEST activo: tokens_usuario.txt no existe, usando tokens dummy.")
+                    return "DEMO_SELFTEST_TOKEN", "REAL_SELFTEST_TOKEN"
+
                 intento += 1
                 if intento % 3 == 1:
                     print("tokens_usuario.txt no existe. Esperando a que la GUI lo genere...")
                 time.sleep(3)
                 continue
+
             with open(ruta, "r", encoding="utf-8") as f:
                 lineas = [ln.strip() for ln in f.readlines()]
+
             if len(lineas) < 2 or not lineas[0] or not lineas[1]:
+                if _modo_selftest_import_seguro():
+                    print("CHATGPT_SELFTEST activo: tokens_usuario.txt inválido, usando tokens dummy.")
+                    return "DEMO_SELFTEST_TOKEN", "REAL_SELFTEST_TOKEN"
+
                 intento += 1
                 if intento % 5 == 1:
                     print("tokens_usuario.txt inválido (faltan líneas o están vacías). Reintentando...")
                 time.sleep(3)
                 continue
+
             demo, real = lineas[0], lineas[1]
             print(f"Tokens cargados desde archivo: DEMO={demo[:4]}*** REAL={real[:4]}***")
             return demo, real
+
         except Exception as e:
+            if _modo_selftest_import_seguro():
+                print(f"CHATGPT_SELFTEST activo: error leyendo tokens_usuario.txt ({e}), usando tokens dummy.")
+                return "DEMO_SELFTEST_TOKEN", "REAL_SELFTEST_TOKEN"
+
             intento += 1
             if intento % 5 == 1:
                 print(f"Error leyendo tokens_usuario.txt: {e}. Reintentando en 3s...")
