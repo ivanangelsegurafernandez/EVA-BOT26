@@ -4800,6 +4800,8 @@ async def main():
     await monitor()
 
 if __name__ == "__main__":
+    _selftest_sync_demo_hold_global()
+
     while True:
         try:
             # stop_event puede quedar ligado a un loop anterior si hubo reinicio.
