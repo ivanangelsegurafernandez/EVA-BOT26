@@ -11519,8 +11519,24 @@ def _sync_round_try_single_bot_recovery_release(round_id, released_round, reques
             continue
         if bool(req.get("consumed", False)):
             continue
-        if str(req.get("reason") or "").strip() != "demo_wait_timeout_no_release":
+        allowed_reasons = {
+            "demo_wait_timeout_no_release",
+            "ack_close_missing_after_trade_result",
+        }
+        reason_txt = str(req.get("reason") or "").strip()
+        if reason_txt not in allowed_reasons:
             continue
+        if reason_txt == "ack_close_missing_after_trade_result":
+            safe_ack_missing = (
+                bool(req.get("neutral", False)) is True
+                and bool(req.get("no_trade_result", False)) is True
+                and bool(req.get("quarantine", False)) is True
+                and bool(req.get("usable_for_real", False)) is False
+                and bool(req.get("usable_for_lxv", False)) is False
+                and bool(req.get("usable_for_training", False)) is False
+            )
+            if not safe_ack_missing:
+                continue
         try:
             req_round = int(req.get("round_id", 0) or 0)
             req_next = int(req.get("next_round", 0) or 0)
@@ -11533,27 +11549,32 @@ def _sync_round_try_single_bot_recovery_release(round_id, released_round, reques
             continue
         if req_next <= rel:
             return _blocked(bot, f"next_round_no_avanza:{req_next}<=released:{rel}")
-        candidates.append((bot, req, req_round, req_next))
+        candidates.append((bot, req, req_round, req_next, reason_txt))
     if not candidates:
         return _blocked("--", "sin_recovery_request_single_bot_valido")
     if len(candidates) != 1:
         return _blocked("--", f"multiples_requests_single_bot:{len(candidates)}")
 
-    bot, req, req_round, req_next = candidates[0]
+    bot, req, req_round, req_next, reason_txt = candidates[0]
     guard_reason = _sync_round_single_bot_real_free_guard_reason()
     if guard_reason:
         return _blocked(bot, guard_reason)
 
     nuevo_released = max(int(rel), int(req_next))
+    release_reason_code = (
+        "ACK_MISSING_AFTER_TRADE_RESULT_SINGLE_BOT_RECOVERY"
+        if reason_txt == "ack_close_missing_after_trade_result"
+        else reason_code
+    )
     st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
     payload = dict(st) if isinstance(st, dict) else {}
     payload.update({
         "round_id": int(nuevo_released),
         "released_round": int(nuevo_released),
         "status": "released_recovery_single_bot_safe",
-        "reason": reason_code,
-        "release_reason": reason_code,
-        "last_release_reason": reason_code,
+        "reason": release_reason_code,
+        "release_reason": release_reason_code,
+        "last_release_reason": release_reason_code,
         "neutral": True,
         "quarantine": True,
         "usable_for_real": False,
@@ -11576,7 +11597,9 @@ def _sync_round_try_single_bot_recovery_release(round_id, released_round, reques
         "ts": now_ts,
         "started_at": now_ts,
     })
-    ok = bool(_sync_round_write_state_monotonic(payload, reason=reason_code))
+    if reason_txt == "ack_close_missing_after_trade_result":
+        payload["no_trade_result"] = True
+    ok = bool(_sync_round_write_state_monotonic(payload, reason=release_reason_code))
     if not ok:
         return _blocked(bot, "write_state_failed")
     try:
@@ -11586,18 +11609,25 @@ def _sync_round_try_single_bot_recovery_release(round_id, released_round, reques
         consumed.update({
             "consumed": True,
             "consumed_ts": now_ts,
-            "consumed_by": reason_code,
+            "consumed_by": release_reason_code,
             "consumed_release": int(nuevo_released),
         })
         _sync_round_write_json_atomic(path, consumed)
     except Exception:
         pass
     try:
-        print_rate_limited(
-            f"{reason_code}:{bot}:{rel}:{nuevo_released}",
-            f"🔓 {reason_code}: bot={bot} | released={int(rel)} -> {int(nuevo_released)} | REAL libre | neutral/quarantine=SI",
-            ttl=20.0,
-        )
+        if reason_txt == "ack_close_missing_after_trade_result":
+            print_rate_limited(
+                f"{release_reason_code}:{bot}:{req_round}:{nuevo_released}",
+                f"🔓 SINGLE_BOT_ACK_MISSING_RECOVERY_RELEASE | bot={bot} | ronda=#{int(req_round)} | release=#{int(nuevo_released)} | neutral=SI | quarantine=SI | REAL=NO | LXV=NO | IA=NO",
+                ttl=20.0,
+            )
+        else:
+            print_rate_limited(
+                f"{reason_code}:{bot}:{rel}:{nuevo_released}",
+                f"🔓 {reason_code}: bot={bot} | released={int(rel)} -> {int(nuevo_released)} | REAL libre | neutral/quarantine=SI",
+                ttl=20.0,
+            )
     except Exception:
         pass
     return True
@@ -12648,6 +12678,15 @@ def _sync_round_try_recovery_release_global() -> bool:
             recovery_reason = recovery_reason_by_req.get(incident_reason_txt, "RECOVERY_RELEASE_INCIDENT_LOCK_STALE_OPEN_DEMO")
         else:
             recovery_reason = "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_AFTER_REAL_CLOSE" if after_real_context else "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN"
+        recovery_reason_txt = str(recovery_reason or "").strip()
+        artificial_recovery_reason = (
+            recovery_reason_txt == "ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY"
+            or recovery_reason_txt == "ACK_MISSING_AFTER_TRADE_RESULT_SINGLE_BOT_RECOVERY"
+            or recovery_reason_txt == "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_FROM_REQUEST_ONLY"
+            or recovery_reason_txt.startswith("RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN")
+            or recovery_reason_txt.startswith("RECOVERY_RELEASE_INCIDENT_LOCK_")
+            or recovery_reason_txt.startswith("FINAL_SAFE_DEMO_RECOVERY")
+        )
         payload = dict(st_check)
         payload.update({
             "round_id": target_round,
@@ -12663,12 +12702,12 @@ def _sync_round_try_recovery_release_global() -> bool:
             "recovery_from_round": int(released_round),
             "recovery_bots_waiting": list(wait_bots),
             "recovery_request_bots": list(req_bots),
-            "neutral": bool(recovery_reason in ("ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY", "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_FROM_REQUEST_ONLY")),
-            "no_trade_result": bool(recovery_reason in ("ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY", "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_FROM_REQUEST_ONLY")),
-            "quarantine": bool(recovery_reason in ("ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY", "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_FROM_REQUEST_ONLY")),
-            "usable_for_real": False if recovery_reason in ("ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY", "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_FROM_REQUEST_ONLY") else st_check.get("usable_for_real", False),
-            "usable_for_lxv": False if recovery_reason in ("ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY", "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_FROM_REQUEST_ONLY") else st_check.get("usable_for_lxv", False),
-            "usable_for_training": False if recovery_reason in ("ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY", "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_FROM_REQUEST_ONLY") else st_check.get("usable_for_training", False),
+            "neutral": True if artificial_recovery_reason else bool(st_check.get("neutral", False)),
+            "no_trade_result": True if artificial_recovery_reason else bool(st_check.get("no_trade_result", False)),
+            "quarantine": True if artificial_recovery_reason else bool(st_check.get("quarantine", False)),
+            "usable_for_real": False if artificial_recovery_reason else bool(st_check.get("usable_for_real", False)),
+            "usable_for_lxv": False if artificial_recovery_reason else bool(st_check.get("usable_for_lxv", False)),
+            "usable_for_training": False if artificial_recovery_reason else bool(st_check.get("usable_for_training", False)),
             "started_at": now_ts,
             "ts": now_ts,
             "real_pending_bot": None,
