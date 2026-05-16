@@ -7925,12 +7925,25 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
         _real_lock_set("PATRON_VALIDO", str(patron) in ("4V2X", "5V1X"), patron)
         _real_lock_set("COLUMNA_COMPLETA", bool(round_complete), f"round_complete={bool(round_complete)}")
         diag_panel_align = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
-        if isinstance(diag_panel_align, dict) and (not bool(diag_panel_align.get("ok", False))):
+        diag_panel_align_same_round = _round_alignment_diag_aplica_a_round(diag_panel_align, round_id)
+        if diag_panel_align_same_round:
             _round_alignment_apply_real_block(
                 diag_panel_align,
                 reason_prefix="MIXED_ROUNDS" if bool(diag_panel_align.get("mixed_rounds", False)) else "COLUMNA_INCOMPLETA",
             )
             round_complete = False
+            _real_lock_set("COLUMNA_COMPLETA", False, "diag_alignment_same_round")
+            _real_lock_set("CANDIDATO_VALIDO", False, "diag_alignment_same_round")
+        elif isinstance(diag_panel_align, dict) and (not bool(diag_panel_align.get("ok", False))):
+            try:
+                diag_round = _round_alignment_diag_round_id(diag_panel_align)
+                _lxv_5v1x_event_cooldown(
+                    key=f"diag_alignment_ignorado:{round_id}:{diag_round}",
+                    msg=f"🟡 DIAG_ALIGNMENT_IGNORADO: diag viejo/otra ronda no bloquea REAL | rid_actual={round_id} | diag_round={diag_round or '--'}",
+                    cooldown_s=20.0,
+                )
+            except Exception:
+                pass
         zona_ok, zona_reason = _lxv_zona_es_invertible(zi)
         info_regional = clasificar_zona_regional_dominante_lxv(round_id_objetivo=round_id)
         patron_ok = str(patron) in ("4V2X", "5V1X")
@@ -7988,11 +8001,11 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
             cand_ok = True
             if not ci.get("reason"):
                 ci["reason"] = f"{str(patron)}_bot_candidato_ok"
-        if isinstance(diag_panel_align, dict) and (not bool(diag_panel_align.get("ok", False))):
+        if diag_panel_align_same_round:
             cand_ok = False
             ci["reason"] = "columna_oficial_incompleta_mixed_rounds" if bool(diag_panel_align.get("mixed_rounds", False)) else "columna_oficial_incompleta"
         _real_lock_set("CANDIDATO_VALIDO", cand_ok, str(ci.get("reason", "")))
-        if isinstance(diag_panel_align, dict) and (not bool(diag_panel_align.get("ok", False))):
+        if diag_panel_align_same_round:
             order_status = False
         _real_lock_set("ORDEN_REAL_OK", order_status if order_status in (True, False, None) else None, "")
         real_activo, motivo_real_activo = hay_real_activo_global()
@@ -10858,6 +10871,47 @@ def _format_round_alignment_panel(diag=None):
     return lines
 
 
+
+def _round_alignment_diag_round_id(diag) -> int:
+    try:
+        if not isinstance(diag, dict):
+            return 0
+        for key in ("canonical_round", "round_closed_eval", "round_id", "best_round"):
+            try:
+                val = int(diag.get(key, 0) or 0)
+            except Exception:
+                val = 0
+            if val > 0:
+                return val
+    except Exception:
+        pass
+    return 0
+
+
+def _round_alignment_diag_aplica_a_round(diag, round_id):
+    try:
+        if not isinstance(diag, dict):
+            return False
+        if bool(diag.get("ok", False)):
+            return False
+        try:
+            rid = int(round_id or 0)
+        except Exception:
+            rid = 0
+        diag_round = _round_alignment_diag_round_id(diag)
+        if rid <= 0 or diag_round <= 0:
+            return False
+        # Nunca bloquear REAL por diagnósticos sin ronda clara o de otra ronda.
+        try:
+            ts = float(diag.get("updated_ts", diag.get("ts", 0.0)) or 0.0)
+            if ts > 0 and (time.time() - ts) > float(globals().get("ROUND_ALIGNMENT_DIAG_MAX_AGE_PANEL_S", 600.0) or 600.0):
+                return False
+        except Exception:
+            pass
+        return diag_round == rid
+    except Exception:
+        return False
+
 def _round_alignment_apply_real_block(diag=None, reason_prefix="COLUMNA_INCOMPLETA"):
     try:
         d = diag if isinstance(diag, dict) else globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
@@ -11075,15 +11129,46 @@ def _sync_round_detect_future_ack_consensus(current_round=None, expected=None, m
     for rr in sorted(set(list(valid_by_round.keys()) + list(expired_by_round.keys()))):
         valid = dict(valid_by_round.get(rr, {}))
         expired = dict(expired_by_round.get(rr, {}))
-        closed_count = len(valid)
+        combined = dict(valid)
+        for bot, item in expired.items():
+            if bot not in combined:
+                combined[bot] = item
+        fresh_count = len(valid)
         expired_count = len(expired)
-        dq = "ok" if closed_count >= expected_count else ("partial" if closed_count > 0 else "missing")
-        p = _sync_round_build_canonical_summary(rr, valid, expected=expected_bots, source="ROUND_DRIFT_AHEAD_SCAN")
-        bots_ok = [b for b in expected_bots if b in valid]
-        bots_missing = [b for b in expected_bots if b not in valid]
-        candidate = {"ok": bool(closed_count >= expected_count and expired_count <= 0), "future_round": int(rr), "closed_count": int(closed_count), "expected_count": int(expected_count), "bots_ok": bots_ok, "bots_missing": bots_missing, "closed": valid, "pattern": _lxv_normalizar_patron_txt(p.get("partial_pattern", "")) or "0V0X", "data_quality": dq, "reason": "future_full_consensus" if (closed_count >= expected_count and expired_count <= 0) else ("future_partial_consensus" if closed_count > 0 else "no_future_consensus"), "ahead_count": int(closed_count), "expired_count": int(expired_count), "max_age": p.get("max_lag_s")}
-        if expired_count > 0 and (closed_count + expired_count) >= expected_count:
-            candidate["reason"] = "future_expired_consensus"
+        closed_total_count = len(combined)
+        if closed_total_count >= expected_count and expired_count > 0:
+            dq = "closed_expired"
+        elif fresh_count >= expected_count and expired_count == 0:
+            dq = "ok"
+        elif closed_total_count > 0:
+            dq = "partial"
+        else:
+            dq = "missing"
+        p = _sync_round_build_canonical_summary(rr, combined, expected=expected_bots, source="ROUND_DRIFT_AHEAD_SCAN")
+        bots_ok = [b for b in expected_bots if b in combined]
+        bots_missing = [b for b in expected_bots if b not in combined]
+        ok_consensus = bool(fresh_count >= expected_count and expired_count == 0 and dq == "ok")
+        reason = "future_full_consensus" if ok_consensus else ("future_partial_consensus" if closed_total_count > 0 else "no_future_consensus")
+        if closed_total_count >= expected_count and expired_count > 0:
+            ok_consensus = False
+            reason = "future_expired_consensus"
+            dq = "closed_expired"
+        candidate = {
+            "ok": ok_consensus,
+            "future_round": int(rr),
+            "closed_count": int(closed_total_count),
+            "fresh_count": int(fresh_count),
+            "expired_count": int(expired_count),
+            "expected_count": int(expected_count),
+            "bots_ok": bots_ok,
+            "bots_missing": bots_missing,
+            "closed": combined,
+            "pattern": _lxv_normalizar_patron_txt(p.get("partial_pattern", "")) or "0V0X",
+            "data_quality": dq,
+            "reason": reason,
+            "ahead_count": int(closed_total_count),
+            "max_age": p.get("max_lag_s"),
+        }
         if candidate["ok"]:
             return candidate
         if (candidate["closed_count"] > best["closed_count"]) or (candidate["closed_count"] == best["closed_count"] and candidate["future_round"] > 0 and (best["future_round"] <= 0 or candidate["future_round"] < best["future_round"])):
@@ -11111,7 +11196,7 @@ def _sync_round_precheck_future_ahead(current_round=None, expected=None):
     closed = dict(cand.get("closed") or {})
     closed_count = int(cand.get("closed_count", len(closed)) or len(closed))
     expired_count = int(cand.get("expired_count", 0) or 0)
-    fresh_count = int(min(closed_count, expected_count))
+    fresh_count = int(cand.get("fresh_count", min(closed_count, expected_count)) or 0)
     near_expired_count = 0
     max_age = 0.0
     ttl = float(TTL_ACK_SYNC_ROUND_S)
@@ -12248,12 +12333,12 @@ def _sync_round_try_recovery_release_global() -> bool:
             "recovery_from_round": int(released_round),
             "recovery_bots_waiting": list(wait_bots),
             "recovery_request_bots": list(req_bots),
-            "neutral": bool(recovery_reason == "ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY"),
-            "no_trade_result": bool(recovery_reason == "ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY"),
-            "quarantine": bool(recovery_reason == "ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY"),
-            "usable_for_real": False if recovery_reason == "ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY" else st_check.get("usable_for_real", False),
-            "usable_for_lxv": False if recovery_reason == "ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY" else st_check.get("usable_for_lxv", False),
-            "usable_for_training": False if recovery_reason == "ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY" else st_check.get("usable_for_training", False),
+            "neutral": bool(recovery_reason in ("ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY", "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_FROM_REQUEST_ONLY")),
+            "no_trade_result": bool(recovery_reason in ("ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY", "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_FROM_REQUEST_ONLY")),
+            "quarantine": bool(recovery_reason in ("ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY", "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_FROM_REQUEST_ONLY")),
+            "usable_for_real": False if recovery_reason in ("ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY", "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_FROM_REQUEST_ONLY") else st_check.get("usable_for_real", False),
+            "usable_for_lxv": False if recovery_reason in ("ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY", "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_FROM_REQUEST_ONLY") else st_check.get("usable_for_lxv", False),
+            "usable_for_training": False if recovery_reason in ("ACK_MISSING_AFTER_TRADE_RESULT_RECOVERY", "RECOVERY_RELEASE_GLOBAL_FORCE_DEMO_CLEAN_FROM_REQUEST_ONLY") else st_check.get("usable_for_training", False),
             "started_at": now_ts,
             "ts": now_ts,
             "real_pending_bot": None,
@@ -31949,10 +32034,10 @@ def _selftest_ack_heartbeat_freshness():
     c = {"status": "closed", "sync_wait": False, "ts": now - 300.0, "last_seen_ts": now - 2.0}
     assert abs(_sync_ack_effective_ts(c) - float(c["ts"])) < 0.01
     assert (now - _sync_ack_effective_ts(c)) > 100.0
-    d = {f"b{i}": {"resultado": "GANANCIA" if i < 5 else "PÉRDIDA", "ts": now - 400.0, "status": "closed", "sync_wait": True, "last_seen_ts": now - 2.0} for i in range(6)}
-    dsum = _sync_round_build_canonical_summary(1, d, expected=list(d.keys()))
+    d = {b: {"resultado": "GANANCIA" if i < 5 else "PÉRDIDA", "ts": now - 400.0, "status": "closed", "sync_wait": True, "last_seen_ts": now - 2.0} for i, b in enumerate(BOT_NAMES)}
+    dsum = _sync_round_build_canonical_summary(1, d, expected=list(BOT_NAMES))
     assert int(dsum.get("closed_count", 0)) == 6 and str(dsum.get("data_quality", "")) == "ok"
-    e = {f"b{i}": {"resultado": "GANANCIA" if i < 5 else "PÉRDIDA", "ts": now - 400.0, "status": "closed", "sync_wait": True, "last_seen_ts": (now - 2.0 if i < 5 else now - (ttl + 10.0))} for i in range(6)}
+    e = {b: {"resultado": "GANANCIA" if i < 5 else "PÉRDIDA", "ts": now - 400.0, "status": "closed", "sync_wait": True, "last_seen_ts": (now - 2.0 if i < 5 else now - (ttl + 10.0))} for i, b in enumerate(BOT_NAMES)}
     exp_n = sum(1 for v in e.values() if (now - _sync_ack_effective_ts(v)) > ttl)
     assert exp_n >= 1
     print("SELFTEST ACK_HEARTBEAT_FRESHNESS OK")
@@ -32009,6 +32094,99 @@ def _selftest_round_drift_ahead_promotion():
         globals()["_sync_round_ack_path"] = original_path
         globals()["TTL_ACK_SYNC_ROUND_S"] = original_ttl
 
+
+
+def _selftest_round_alignment_diag_panel_locks():
+    old_panel = dict(globals().get("REAL_LOCKS_PANEL", {}) or {})
+    old_diag = globals().get("LAST_ROUND_ALIGNMENT_DIAG", None)
+    old_pending = globals().get("_hay_real_close_pending_activo")
+    old_token = globals().get("leer_token_actual")
+    old_real = globals().get("hay_real_activo_global")
+    try:
+        def _reset_panel():
+            globals()["REAL_LOCKS_PANEL"] = {
+                "enabled": True, "source": "", "round_id": None, "bot": "", "patron": "", "zona": "", "decision": "",
+                "locks": {
+                    "REAL_CLOSE_LIBRE": True, "COLUMNA_COMPLETA": False, "DATA_QUALITY_OK": False, "PATRON_VALIDO": False,
+                    "CANDIDATO_VALIDO": False, "ZONA_OK": False, "NO_DUPLICADO_RONDA": True, "TOKEN_REAL_LIBRE": True, "ORDEN_REAL_OK": None,
+                },
+                "detalles": {}, "ready_pre_real": False, "resultado": "BLOQUEADO", "falta_principal": "",
+                "updated_ts": 0.0, "error": "",
+            }
+        globals()["_hay_real_close_pending_activo"] = lambda: (False, None, {})
+        globals()["leer_token_actual"] = lambda: "--"
+        globals()["hay_real_activo_global"] = lambda: (False, "")
+        zona_ok = {"zona_base": "VERDE_MADURO", "allow_real": True, "decision": "SI_INVERTIR", "decision_real_refinada": "SI_INVERTIR"}
+
+        _reset_panel()
+        globals()["LAST_ROUND_ALIGNMENT_DIAG"] = {"ok": False, "canonical_round": 199, "updated_ts": time.time()}
+        actualizar_real_locks_panel_lxv(
+            source="SELFTEST", round_id=200, patron="4V2X", bot_candidato="fulll45",
+            round_complete=True, data_quality="ok", zona_info=zona_ok,
+            candidate_info={"candidate_ok": True, "reason": "selftest_diag_old"}, order_status=None,
+        )
+        locks_old = globals()["REAL_LOCKS_PANEL"].get("locks", {})
+        assert locks_old.get("COLUMNA_COMPLETA") is True
+        assert locks_old.get("CANDIDATO_VALIDO") is True
+
+        _reset_panel()
+        globals()["LAST_ROUND_ALIGNMENT_DIAG"] = {"ok": False, "canonical_round": 200, "updated_ts": time.time()}
+        actualizar_real_locks_panel_lxv(
+            source="SELFTEST", round_id=200, patron="4V2X", bot_candidato="fulll45",
+            round_complete=True, data_quality="ok", zona_info=zona_ok,
+            candidate_info={"candidate_ok": True, "reason": "selftest_diag_same"}, order_status=None,
+        )
+        locks_same = globals()["REAL_LOCKS_PANEL"].get("locks", {})
+        assert locks_same.get("COLUMNA_COMPLETA") is False
+        assert locks_same.get("CANDIDATO_VALIDO") is False
+        print("SELFTEST ROUND_ALIGNMENT_DIAG_PANEL_LOCKS OK")
+    finally:
+        globals()["REAL_LOCKS_PANEL"] = old_panel
+        if old_diag is None:
+            globals().pop("LAST_ROUND_ALIGNMENT_DIAG", None)
+        else:
+            globals()["LAST_ROUND_ALIGNMENT_DIAG"] = old_diag
+        if old_pending is not None:
+            globals()["_hay_real_close_pending_activo"] = old_pending
+        if old_token is not None:
+            globals()["leer_token_actual"] = old_token
+        if old_real is not None:
+            globals()["hay_real_activo_global"] = old_real
+
+
+def _selftest_manual_override_bot_token_owner():
+    import importlib.util
+    import tempfile
+    old_cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            bot_path = os.path.join(script_dir, "botttt45-1-2-4-8-16-32.py")
+            spec = importlib.util.spec_from_file_location("botttt45_manual_selftest", bot_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            os.chdir(td)
+            orden_dir = os.path.join(td, "orden_real")
+            os.makedirs(orden_dir, exist_ok=True)
+            mod.ORDEN_DIR = orden_dir
+            mod.ARCHIVO_TOKEN = os.path.join(td, "token_actual.txt")
+            payload = {
+                "bot": mod.NOMBRE_BOT,
+                "source": "MANUAL",
+                "manual_override": True,
+                "created_ts": time.time(),
+                "ttl_s": 60.0,
+            }
+            with open(os.path.join(orden_dir, f"{mod.NOMBRE_BOT}.json"), "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            with open(mod.ARCHIVO_TOKEN, "w", encoding="utf-8") as f:
+                f.write("REAL:none")
+            assert mod._manual_real_order_targets_this_bot() is False
+            with open(mod.ARCHIVO_TOKEN, "w", encoding="utf-8") as f:
+                f.write(f"REAL:{mod.NOMBRE_BOT}")
+            assert mod._manual_real_order_targets_this_bot() is True
+            print("SELFTEST MANUAL_OVERRIDE_BOT_TOKEN_OWNER OK")
+        finally:
+            os.chdir(old_cwd)
 
 def _selftest_sync_recovery_release_gate():
     def _can_release(req_ok, can_recover):
@@ -32118,6 +32296,8 @@ def _run_requested_selftests_and_exit_if_needed():
     _run("RUN_CANONICAL_ROUND_SELFTEST", lambda: (_selftest_canonical_round_sync(), _selftest_canonical_summary_hud_unificado()))
     _run("RUN_CANONICAL_HUD_SELFTEST", _selftest_canonical_summary_hud_unificado)
     _run("RUN_ROUND_ALIGN_SELFTEST", _selftest_diagnosticar_alineacion_rounds)
+    _run("RUN_ROUND_ALIGN_SELFTEST", _selftest_round_alignment_diag_panel_locks)
+    _run("RUN_ROUND_ALIGN_SELFTEST", _selftest_manual_override_bot_token_owner)
     _run("RUN_LXV_REAL_REFINADA_SELFTEST", _selftest_lxv_real_refinada)
     _run("RUN_REAL_PREPATRON_SELFTEST", _selftest_real_activo_prepatron_lxv)
     _run("RUN_ZONA_VISUAL_PARCIAL_SELFTEST", _selftest_zona_visual_parcial_lxv)
