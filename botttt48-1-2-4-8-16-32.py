@@ -73,7 +73,7 @@ init(autoreset=True)
 
 # Inicio de mixer blindado
 try:
-    if not pygame.mixer.get_init():
+    if PYGAME_OK and not pygame.mixer.get_init():
         pygame.mixer.init()
 except Exception as _e:
     print("Audio deshabilitado (mixer.init):", _e)
@@ -86,8 +86,9 @@ os.chdir(script_dir)
 AUDIO_ENABLED = False
 try:
     # Si ya inicializaste mixer arriba, sólo validamos canales
-    pygame.mixer.set_num_channels(6)  # margen para solapamientos
-    AUDIO_ENABLED = True
+    if PYGAME_OK:
+        pygame.mixer.set_num_channels(6)  # margen para solapamientos
+        AUDIO_ENABLED = True
 except Exception as _e:
     print("Audio deshabilitado (pygame.mixer):", _e)
     AUDIO_ENABLED = False
@@ -112,7 +113,7 @@ _SFX_MIN_INTERVAL = {
 }
 
 def _sfx_load_all():
-    if not AUDIO_ENABLED:
+    if not AUDIO_ENABLED or not PYGAME_OK:
         return
     for k, fname in SFX_FILES.items():
         p = os.path.join(script_dir, fname)
@@ -128,7 +129,7 @@ def _sfx_load_all():
 
 def play_sfx(key: str, vol: float = 0.9):
     # Respeta MODO_SILENCIOSO y modo_manual (definidos en tu código)
-    if not AUDIO_ENABLED:
+    if not AUDIO_ENABLED or not PYGAME_OK:
         return
     if key not in SFX:
         return
@@ -2928,6 +2929,7 @@ def _modo_selftest_import_seguro():
         "RUN_ACK_HEARTBEAT_FRESHNESS_SELFTEST",
         "RUN_LXV_4V2X_CANDIDATE_PANEL_SELFTEST",
         "RUN_ROUND_DRIFT_AHEAD_SELFTEST",
+        "RUN_SYNC_DEMO_HOLD_GLOBAL_SELFTEST",
     )
     for k in keys:
         if str(os.environ.get(k, "")).strip().lower() in ("1", "true", "yes", "si", "sí"):
@@ -2943,7 +2945,7 @@ def cargar_tokens():
     """
     ruta = "tokens_usuario.txt"
     intento = 0
-    while True:
+    while not stop_event.is_set():
         try:
             if not os.path.exists(ruta):
                 if _modo_selftest_import_seguro():
@@ -2983,6 +2985,9 @@ def cargar_tokens():
             if intento % 5 == 1:
                 print(f"Error leyendo tokens_usuario.txt: {e}. Reintentando en 3s...")
             time.sleep(3)
+
+    print("Detención solicitada durante carga de tokens. Usando tokens dummy de parada segura.")
+    return "DEMO_STOP_TOKEN", "REAL_STOP_TOKEN"
 
 TOKEN_DEMO, TOKEN_REAL = cargar_tokens()
 
@@ -3767,8 +3772,9 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
             # Si fue GANANCIA en REAL -> reproducir sonido (sin tocar token)
             if resultado == "GANANCIA" and token_antes == TOKEN_REAL:
                 try:
-                    pygame.mixer.music.load("ganabot.wav")
-                    pygame.mixer.music.play()
+                    if PYGAME_OK:
+                        pygame.mixer.music.load("ganabot.wav")
+                        pygame.mixer.music.play()
                 except Exception:
                     pass
                 print(Fore.GREEN + Style.BRIGHT + "GANANCIA en cuenta REAL! (token lo maneja 5R6M; sigo en sesión)")
