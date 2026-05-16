@@ -4800,13 +4800,49 @@ async def main():
     await monitor()
 
 if __name__ == "__main__":
-    _selftest_sync_demo_hold_global()
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
+    while True:
         try:
-            if not stop_event.is_set():
-                stop_event.set()
-        except Exception:
-            pass
-        print(Fore.YELLOW + "\n⛔ Interrumpido por usuario.")
+            # stop_event puede quedar ligado a un loop anterior si hubo reinicio.
+            # Lo recreamos antes de cada corrida para evitar errores de loop cerrado.
+            try:
+                if "stop_event" in globals():
+                    stop_event = asyncio.Event()
+            except Exception:
+                pass
+
+            asyncio.run(main())
+
+            try:
+                if "stop_event" in globals() and stop_event.is_set():
+                    print(Fore.YELLOW + "\n🛑 Bot detenido de forma ordenada. No se reinicia.")
+                    break
+            except Exception:
+                pass
+
+            print(Fore.YELLOW + "\n⚠️ main() terminó sin error. Reiniciando en 5 segundos...")
+            time.sleep(5)
+
+        except KeyboardInterrupt:
+            print(Fore.YELLOW + "\n🛑 Bot detenido manualmente por Ctrl+C.")
+            break
+
+        except SystemExit:
+            print(Fore.YELLOW + "\n🛑 Bot recibió SystemExit. Salida ordenada.")
+            break
+
+        except BaseException as e:
+            try:
+                if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                    raise
+                print(Fore.RED + "\n🚨 ERROR EXTERNO NO CONTROLADO EN BOT")
+                print(Fore.RED + f"Tipo: {type(e).__name__}")
+                print(Fore.RED + f"Detalle: {e}")
+                import traceback
+                traceback.print_exc()
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                pass
+
+            print(Fore.YELLOW + "\n🔁 El bot NO se cerrará. Reiniciando en 5 segundos...")
+            time.sleep(5)
