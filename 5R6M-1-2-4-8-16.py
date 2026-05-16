@@ -41,6 +41,83 @@ from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 import sys
 import shutil
+
+if os.environ.get("RUN_SYNC_RECOVERY_SINGLE_BOT_SELFTEST") == "1":
+    import types
+
+    class _SelftestDummy:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __call__(self, *args, **kwargs):
+            return self
+        def __getattr__(self, _name):
+            return self
+        def fit(self, *args, **kwargs):
+            return self
+        def transform(self, value=None, *args, **kwargs):
+            return value
+        def fit_transform(self, value=None, *args, **kwargs):
+            return value
+        def predict(self, value=None, *args, **kwargs):
+            return []
+        def predict_proba(self, value=None, *args, **kwargs):
+            return []
+
+    def _selftest_module(name):
+        mod = types.ModuleType(name)
+        mod.__spec__ = None
+        return mod
+
+    if "joblib" not in sys.modules:
+        m_joblib = _selftest_module("joblib")
+        m_joblib.load = lambda *a, **k: None
+        m_joblib.dump = lambda *a, **k: None
+        sys.modules["joblib"] = m_joblib
+    if "numpy" not in sys.modules:
+        m_numpy = _selftest_module("numpy")
+        m_numpy.nan = float("nan")
+        m_numpy.ndarray = list
+        m_numpy.number = float
+        m_numpy.integer = int
+        m_numpy.floating = float
+        m_numpy.array = lambda value=None, *a, **k: value if value is not None else []
+        m_numpy.asarray = m_numpy.array
+        m_numpy.mean = lambda value, *a, **k: (sum(value) / len(value)) if value else 0.0
+        m_numpy.std = lambda value, *a, **k: 0.0
+        m_numpy.clip = lambda value, _lo, _hi: max(_lo, min(_hi, value))
+        m_numpy.isfinite = lambda value: True
+        m_numpy.isnan = lambda value: False
+        sys.modules["numpy"] = m_numpy
+    if "pandas" not in sys.modules:
+        m_pandas = _selftest_module("pandas")
+        m_pandas.DataFrame = _SelftestDummy
+        m_pandas.Series = _SelftestDummy
+        m_pandas.Timestamp = _SelftestDummy
+        m_pandas.to_numeric = lambda value=None, *a, **k: value
+        m_pandas.isna = lambda value: value is None
+        m_pandas.notna = lambda value: value is not None
+        m_pandas.read_csv = lambda *a, **k: _SelftestDummy()
+        m_pandas.concat = lambda value=None, *a, **k: _SelftestDummy()
+        m_errors = _selftest_module("pandas.errors")
+        m_errors.DtypeWarning = Warning
+        m_pandas.errors = m_errors
+        sys.modules["pandas"] = m_pandas
+        sys.modules["pandas.errors"] = m_errors
+    if "sklearn" not in sys.modules:
+        sys.modules["sklearn"] = _selftest_module("sklearn")
+        for sub in ("model_selection", "preprocessing", "metrics", "calibration", "linear_model", "isotonic"):
+            sys.modules[f"sklearn.{sub}"] = _selftest_module(f"sklearn.{sub}")
+        sys.modules["sklearn.model_selection"].train_test_split = lambda *a, **k: a
+        sys.modules["sklearn.model_selection"].TimeSeriesSplit = _SelftestDummy
+        sys.modules["sklearn.preprocessing"].StandardScaler = _SelftestDummy
+        sys.modules["sklearn.metrics"].roc_auc_score = lambda *a, **k: 0.0
+        sys.modules["sklearn.metrics"].f1_score = lambda *a, **k: 0.0
+        sys.modules["sklearn.metrics"].fbeta_score = lambda *a, **k: 0.0
+        sys.modules["sklearn.metrics"].brier_score_loss = lambda *a, **k: 0.0
+        sys.modules["sklearn.calibration"].CalibratedClassifierCV = _SelftestDummy
+        sys.modules["sklearn.linear_model"].LogisticRegression = _SelftestDummy
+        sys.modules["sklearn.isotonic"].IsotonicRegression = _SelftestDummy
+
 import joblib
 import numpy as np
 import pandas as pd
@@ -11275,6 +11352,239 @@ def _sync_round_read_recovery_requests(max_age_s=90.0) -> dict:
 
 
 
+
+RECOVERY_SINGLE_BOT_TTL_S = 90
+
+
+def _sync_round_token_actual_libre_single_bot_recovery() -> tuple[bool, str, str]:
+    """Token guard estricto para RECOVERY_RELEASE_SINGLE_BOT_REAL_FREE."""
+    free_values = {"", "DEMO", "DEMO:NONE", "REAL:NONE", "REAL:NULL", "REAL:--", "NONE", "NULL"}
+    try:
+        raw = ""
+        try:
+            if os.path.exists(TOKEN_FILE):
+                with open(TOKEN_FILE, encoding="utf-8", errors="replace") as f:
+                    raw = str(f.read() or "").strip()
+        except Exception:
+            raw = ""
+        raw_u = raw.upper()
+        if raw_u not in free_values:
+            return False, f"token_actual_ocupado:{raw or '--'}", raw
+        return True, "", raw
+    except Exception:
+        return False, "token_actual_guard_error", ""
+
+
+def _sync_round_single_bot_real_lock_reason() -> str:
+    try:
+        if not os.path.exists("real.lock"):
+            return ""
+        age = max(0.0, time.time() - float(os.path.getmtime("real.lock") or 0.0))
+        stale_after = float(globals().get("REQUEST_ONLY_REAL_LOCK_STALE_AFTER_S", 30.0) or 30.0)
+        if age > stale_after:
+            return ""
+        owner_txt = ""
+        try:
+            with open("real.lock", encoding="utf-8", errors="replace") as f:
+                owner_txt = str(f.read() or "").strip()
+        except Exception:
+            owner_txt = ""
+        return f"real_lock_activo:{owner_txt[:80]}" if owner_txt else "real_lock_activo"
+    except Exception:
+        return "real_lock_guard_error"
+
+
+def _sync_round_real_global_state_guard_reason(now_ts=None) -> str:
+    try:
+        st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+        if not isinstance(st, dict):
+            return ""
+        now = float(now_ts if now_ts is not None else time.time())
+        ts = float(st.get("ts", st.get("started_at", 0.0)) or 0.0)
+        fresh_s = float(globals().get("RECOVERY_SINGLE_BOT_REAL_STATE_FRESH_S", 180.0) or 180.0)
+        fresh = bool(ts <= 0.0 or (now - ts) <= fresh_s)
+        status = str(st.get("status", "") or "").strip().lower()
+        real_status = str(st.get("real_status", "") or "").strip().lower()
+        active_statuses = {"holding_real_result", "holding_real_turn", "real_active", "real_pending", "waiting_real_close", "closing", "active"}
+        if fresh and (status in active_statuses or real_status in active_statuses):
+            return f"real_global_state_status:{status or real_status}"
+        if fresh and bool(st.get("real_global", False) or st.get("REAL_GLOBAL", False) or st.get("real_activo", False)):
+            return "real_global_state_activo"
+        if fresh and bool(st.get("holding_real_result", False) or st.get("holding_real_turn", False) or st.get("real_close_pending", False)):
+            return "real_global_state_hold"
+        for key in ("real_pending_bot", "real_owner", "owner_real", "bot_real", "real_bot"):
+            owner = str(st.get(key) or "").strip()
+            if fresh and owner in BOT_NAMES:
+                return f"real_global_state_owner:{key}:{owner}"
+    except Exception:
+        return "real_global_state_guard_error"
+    return ""
+
+
+def _sync_round_single_bot_real_free_guard_reason() -> str:
+    """
+    Guard REAL 100% libre para el recovery neutral de un único bot.
+    No libera si aparece cualquier señal viva/fresca de REAL.
+    """
+    token_ok, token_reason, _token_raw = _sync_round_token_actual_libre_single_bot_recovery()
+    if not token_ok:
+        return token_reason
+    try:
+        owner_mem = str(globals().get("REAL_OWNER_LOCK") or "").strip()
+        if owner_mem and owner_mem.upper() not in ("--", "NONE", "NULL"):
+            return f"owner_real:{owner_mem}"
+    except Exception:
+        return "owner_real_guard_error"
+    try:
+        pending_on, pending_bot, _pending = _hay_real_close_pending_activo()
+        if pending_on:
+            return f"real_close_pending:{pending_bot or '--'}"
+    except Exception:
+        return "real_close_pending_guard_error"
+    try:
+        if _real_close_incident_active():
+            return f"real_close_incident_lock:{REAL_CLOSE_INCIDENT_LOCK.get('bot') or '--'}"
+    except Exception:
+        return "real_close_incident_guard_error"
+    try:
+        order_on, order_bot = _sync_real_order_viva_any()
+        if order_on:
+            return f"orden_real_viva:{order_bot or '--'}"
+    except Exception:
+        return "orden_real_guard_error"
+    lock_reason = _sync_round_single_bot_real_lock_reason()
+    if lock_reason:
+        return lock_reason
+    try:
+        real_on, real_bot, motivo_real = _sync_real_turn_activo()
+        if real_on:
+            return f"real_global_activo:{real_bot or motivo_real or '--'}"
+    except Exception:
+        return "real_global_guard_error"
+    state_reason = _sync_round_real_global_state_guard_reason()
+    if state_reason:
+        return state_reason
+    return ""
+
+
+def _sync_round_try_single_bot_recovery_release(round_id, released_round, requests=None) -> bool:
+    """
+    RECOVERY_RELEASE_SINGLE_BOT_REAL_FREE:
+    libera DEMO N->next_round para exactamente un bot atascado solo si REAL
+    está 100% libre; deja la columna neutral/cuarentena y no usable para REAL/LXV/IA.
+    """
+    reason_code = "RECOVERY_RELEASE_SINGLE_BOT_REAL_FREE"
+
+    def _blocked(bot, motivo) -> bool:
+        try:
+            print_rate_limited(
+                f"RECOVERY_SINGLE_BOT_BLOQUEADO:{bot or '--'}:{motivo}",
+                f"⛔ RECOVERY_SINGLE_BOT_BLOQUEADO: bot={bot or '--'} | motivo={motivo}",
+                ttl=20.0,
+            )
+        except Exception:
+            pass
+        return False
+
+    try:
+        rel = int(released_round or 0)
+    except Exception:
+        return _blocked("--", "released_round_invalid")
+    if rel <= 0:
+        return _blocked("--", "released_round_invalid")
+    ttl_s = float(globals().get("RECOVERY_SINGLE_BOT_TTL_S", RECOVERY_SINGLE_BOT_TTL_S) or RECOVERY_SINGLE_BOT_TTL_S)
+    reqs = requests if isinstance(requests, dict) else _sync_round_read_recovery_requests(max_age_s=ttl_s)
+    now_ts = float(time.time())
+    candidates = []
+    for bot, req in (reqs or {}).items():
+        if bot not in BOT_NAMES or not isinstance(req, dict):
+            continue
+        if bool(req.get("consumed", False)):
+            continue
+        if str(req.get("reason") or "").strip() != "demo_wait_timeout_no_release":
+            continue
+        try:
+            req_round = int(req.get("round_id", 0) or 0)
+            req_next = int(req.get("next_round", 0) or 0)
+            req_ts = float(req.get("ts", req.get("created_ts", 0.0)) or 0.0)
+        except Exception:
+            continue
+        if req_round <= 0 or req_next <= 0:
+            continue
+        if req_ts <= 0.0 or (now_ts - req_ts) > ttl_s:
+            continue
+        if req_next <= rel:
+            return _blocked(bot, f"next_round_no_avanza:{req_next}<=released:{rel}")
+        candidates.append((bot, req, req_round, req_next))
+    if not candidates:
+        return _blocked("--", "sin_recovery_request_single_bot_valido")
+    if len(candidates) != 1:
+        return _blocked("--", f"multiples_requests_single_bot:{len(candidates)}")
+
+    bot, req, req_round, req_next = candidates[0]
+    guard_reason = _sync_round_single_bot_real_free_guard_reason()
+    if guard_reason:
+        return _blocked(bot, guard_reason)
+
+    nuevo_released = max(int(rel), int(req_next))
+    st = _sync_round_safe_read_json(SYNC_ROUND_STATE_PATH) or {}
+    payload = dict(st) if isinstance(st, dict) else {}
+    payload.update({
+        "round_id": int(nuevo_released),
+        "released_round": int(nuevo_released),
+        "status": "released_recovery_single_bot_safe",
+        "reason": reason_code,
+        "release_reason": reason_code,
+        "last_release_reason": reason_code,
+        "neutral": True,
+        "quarantine": True,
+        "usable_for_real": False,
+        "usable_for_lxv": False,
+        "usable_for_training": False,
+        "real_pending_bot": None,
+        "owner": None,
+        "real_global": False,
+        "real_owner": None,
+        "owner_real": None,
+        "bot_real": None,
+        "real_bot": None,
+        "real_emitido": False,
+        "motivo_no_real": "recovery_single_bot_neutral_quarantine_demo_only",
+        "single_bot_recovery_bot": bot,
+        "single_bot_recovery_round": int(req_round),
+        "single_bot_recovery_from": int(rel),
+        "single_bot_recovery_to": int(nuevo_released),
+        "single_bot_recovery_ts": now_ts,
+        "ts": now_ts,
+        "started_at": now_ts,
+    })
+    ok = bool(_sync_round_write_state_monotonic(payload, reason=reason_code))
+    if not ok:
+        return _blocked(bot, "write_state_failed")
+    try:
+        req_dir = os.path.join(SYNC_ROUND_DIR, "recovery_requests")
+        path = os.path.join(req_dir, f"{bot}.json")
+        consumed = dict(req)
+        consumed.update({
+            "consumed": True,
+            "consumed_ts": now_ts,
+            "consumed_by": reason_code,
+            "consumed_release": int(nuevo_released),
+        })
+        _sync_round_write_json_atomic(path, consumed)
+    except Exception:
+        pass
+    try:
+        print_rate_limited(
+            f"{reason_code}:{bot}:{rel}:{nuevo_released}",
+            f"🔓 {reason_code}: bot={bot} | released={int(rel)} -> {int(nuevo_released)} | REAL libre | neutral/quarantine=SI",
+            ttl=20.0,
+        )
+    except Exception:
+        pass
+    return True
+
+
 def _sync_round_ack_missing_after_trade_request(round_id, requests=None, missing_bot=None) -> dict:
     try:
         rid = int(round_id or 0)
@@ -11705,6 +12015,8 @@ def _sync_round_try_final_safe_demo_recovery_release(
         req_quorum = q
         wait_quorum = q
     if not (len(valid_req_bots) >= req_quorum or len(wait_confirmed) >= wait_quorum):
+        if _sync_round_try_single_bot_recovery_release(rid, rel, requests=requests):
+            return True
         return _no_release(f"quorum_insuficiente:req={len(valid_req_bots)}/{req_quorum}:wait={len(wait_confirmed)}/{wait_quorum}")
 
     try:
@@ -32266,6 +32578,100 @@ def _selftest_dq_released_hud():
 
 
 
+
+def _selftest_sync_recovery_single_bot_real_free():
+    import tempfile
+    import shutil
+
+    old = {
+        "SYNC_ROUND_DIR": globals().get("SYNC_ROUND_DIR"),
+        "SYNC_ROUND_STATE_PATH": globals().get("SYNC_ROUND_STATE_PATH"),
+        "ROUND_QUARANTINE_STATE_PATH": globals().get("ROUND_QUARANTINE_STATE_PATH"),
+        "TOKEN_FILE": globals().get("TOKEN_FILE"),
+        "REAL_OWNER_LOCK": globals().get("REAL_OWNER_LOCK"),
+        "REAL_CLOSE_PENDING": globals().get("REAL_CLOSE_PENDING"),
+        "REAL_CLOSE_INCIDENT_LOCK": globals().get("REAL_CLOSE_INCIDENT_LOCK"),
+        "_sync_real_order_viva_any": globals().get("_sync_real_order_viva_any"),
+        "_sync_real_turn_activo": globals().get("_sync_real_turn_activo"),
+        "_sync_round_single_bot_real_lock_reason": globals().get("_sync_round_single_bot_real_lock_reason"),
+    }
+    tmp = tempfile.mkdtemp(prefix="sync_recovery_single_bot_")
+    try:
+        globals()["SYNC_ROUND_DIR"] = os.path.join(tmp, "sync_round")
+        globals()["SYNC_ROUND_STATE_PATH"] = os.path.join(globals()["SYNC_ROUND_DIR"], "state.json")
+        globals()["ROUND_QUARANTINE_STATE_PATH"] = os.path.join(globals()["SYNC_ROUND_DIR"], "round_quarantine_state.json")
+        globals()["TOKEN_FILE"] = os.path.join(tmp, "token_actual.txt")
+        globals()["REAL_OWNER_LOCK"] = None
+        globals()["REAL_CLOSE_PENDING"] = {bot: None for bot in BOT_NAMES}
+        globals()["REAL_CLOSE_INCIDENT_LOCK"] = {"active": False, "bot": None, "ts": 0.0, "reason": ""}
+        globals()["_sync_real_order_viva_any"] = lambda: (False, None)
+        globals()["_sync_real_turn_activo"] = lambda: (False, None, "sin_real_activo")
+        globals()["_sync_round_single_bot_real_lock_reason"] = lambda: ""
+        _ensure_dir(os.path.join(globals()["SYNC_ROUND_DIR"], "recovery_requests"))
+
+        def _write_state(released):
+            _sync_round_write_json_atomic(globals()["SYNC_ROUND_STATE_PATH"], {
+                "round_id": int(released),
+                "released_round": int(released),
+                "status": "running",
+                "reason": "selftest",
+                "real_global": False,
+                "real_owner": None,
+                "real_status": "none",
+                "real_close_pending": False,
+                "ts": time.time(),
+                "started_at": time.time(),
+            })
+
+        def _write_req(next_round):
+            req = {
+                "bot": "fulll45",
+                "round_id": 100,
+                "next_round": int(next_round),
+                "reason": "demo_wait_timeout_no_release",
+                "ts": time.time(),
+            }
+            _sync_round_write_json_atomic(os.path.join(globals()["SYNC_ROUND_DIR"], "recovery_requests", "fulll45.json"), req)
+            return {"fulll45": req}
+
+        # CASO A: REAL libre (REAL:none) debe liberar 100 -> 101.
+        _write_state(100)
+        with open(globals()["TOKEN_FILE"], "w", encoding="utf-8") as f:
+            f.write("REAL:none")
+        assert _sync_round_try_single_bot_recovery_release(100, 100, requests=_write_req(101)) is True
+        st_a = _sync_round_safe_read_json(globals()["SYNC_ROUND_STATE_PATH"]) or {}
+        assert int(st_a.get("released_round", 0) or 0) == 101
+        assert st_a.get("reason") == "RECOVERY_RELEASE_SINGLE_BOT_REAL_FREE"
+        assert st_a.get("neutral") is True
+        assert st_a.get("quarantine") is True
+        assert st_a.get("usable_for_real") is False
+        assert st_a.get("usable_for_lxv") is False
+        assert st_a.get("usable_for_training") is False
+
+        # CASO B: token REAL con owner vivo bloquea y no avanza.
+        _write_state(100)
+        with open(globals()["TOKEN_FILE"], "w", encoding="utf-8") as f:
+            f.write("REAL:fulll49")
+        assert _sync_round_try_single_bot_recovery_release(100, 100, requests=_write_req(101)) is False
+        st_b = _sync_round_safe_read_json(globals()["SYNC_ROUND_STATE_PATH"]) or {}
+        assert int(st_b.get("released_round", 0) or 0) == 100
+
+        # CASO C: next_round <= released_round no libera ni retrocede.
+        _write_state(101)
+        with open(globals()["TOKEN_FILE"], "w", encoding="utf-8") as f:
+            f.write("REAL:none")
+        assert _sync_round_try_single_bot_recovery_release(101, 101, requests=_write_req(101)) is False
+        st_c = _sync_round_safe_read_json(globals()["SYNC_ROUND_STATE_PATH"]) or {}
+        assert int(st_c.get("released_round", 0) or 0) == 101
+
+        print("SELFTEST RUN_SYNC_RECOVERY_SINGLE_BOT_SELFTEST OK")
+        return True
+    finally:
+        for k, v in old.items():
+            globals()[k] = v
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _run_requested_selftests_and_exit_if_needed():
     ran = False
     ok = True
@@ -32311,6 +32717,7 @@ def _run_requested_selftests_and_exit_if_needed():
     _run("RUN_ACK_HEARTBEAT_FRESHNESS_SELFTEST", _selftest_ack_heartbeat_freshness)
     _run("RUN_ROUND_DRIFT_AHEAD_SELFTEST", _selftest_round_drift_ahead_promotion)
     _run("RUN_SYNC_RECOVERY_RELEASE_SELFTEST", _selftest_sync_recovery_release_gate)
+    _run("RUN_SYNC_RECOVERY_SINGLE_BOT_SELFTEST", _selftest_sync_recovery_single_bot_real_free)
     _run("RUN_DQ_RELEASED_HUD_SELFTEST", _selftest_dq_released_hud)
 
     if ran:
