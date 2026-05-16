@@ -42,7 +42,7 @@ from contextlib import contextmanager
 import sys
 import shutil
 
-if os.environ.get("RUN_SYNC_RECOVERY_SINGLE_BOT_SELFTEST") == "1":
+if any(os.environ.get(name) == "1" for name in ("RUN_SYNC_RECOVERY_SINGLE_BOT_SELFTEST", "RUN_READ_JSON_HELPER_SELFTEST")):
     import types
 
     class _SelftestDummy:
@@ -4037,6 +4037,24 @@ def _sync_round_safe_read_json(path: str):
         return data if isinstance(data, dict) else None
     except Exception:
         return None
+
+def _read_json(path, default=None):
+    """
+    Lectura JSON robusta.
+    Helper de compatibilidad usado por rutas de orden_real / sync.
+    No escribe, no borra y nunca rompe el flujo.
+    """
+    try:
+        p = Path(path)
+        if not p.exists():
+            return default
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data is None:
+            return default
+        return data
+    except Exception:
+        return default
 
 def _ack_live_symbol(resultado):
     if resultado is None:
@@ -32672,6 +32690,29 @@ def _selftest_sync_recovery_single_bot_real_free():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _selftest_read_json_helper():
+    tempfile = __import__("tempfile")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="read_json_helper_selftest_"))
+    try:
+        valid_path = tmp_dir / "orden_real_valida.json"
+        valid_path.write_text(json.dumps({"bot": "fulll49", "ts": 123}), encoding="utf-8")
+        data = _read_json(valid_path, default={})
+        assert data["bot"] == "fulll49"
+
+        missing = _read_json(tmp_dir / "archivo_que_no_existe.json", default={})
+        assert missing == {}
+
+        invalid_path = tmp_dir / "orden_real_invalida.json"
+        invalid_path.write_text("{json invalido", encoding="utf-8")
+        invalid = _read_json(invalid_path, default={"ok": False})
+        assert invalid == {"ok": False}
+
+        print("SELFTEST READ_JSON_HELPER OK")
+        return True
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def _run_requested_selftests_and_exit_if_needed():
     ran = False
     ok = True
@@ -32719,6 +32760,7 @@ def _run_requested_selftests_and_exit_if_needed():
     _run("RUN_SYNC_RECOVERY_RELEASE_SELFTEST", _selftest_sync_recovery_release_gate)
     _run("RUN_SYNC_RECOVERY_SINGLE_BOT_SELFTEST", _selftest_sync_recovery_single_bot_real_free)
     _run("RUN_DQ_RELEASED_HUD_SELFTEST", _selftest_dq_released_hud)
+    _run("RUN_READ_JSON_HELPER_SELFTEST", _selftest_read_json_helper)
 
     if ran:
         sys.exit(0 if ok else 1)
