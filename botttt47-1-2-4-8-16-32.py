@@ -543,56 +543,13 @@ async def _sync_round_wait_post_real_rejoin(initial_grace_s: float = 8.0, poll_s
         await asyncio.sleep(max(0.2, min(float(poll_s), 1.0)))
 
 def _sync_bot_es_owner_real() -> bool:
-    """
-    True solo si este bot es dueño REAL real.
-    """
     try:
-        tok = str(leer_token_actual() or "").strip()
-        if tok.upper() == f"REAL:{str(NOMBRE_BOT).upper()}":
-            return True
+        tok = str(leer_token_actual() or "").strip().upper()
     except Exception:
-        pass
+        tok = ""
 
-    try:
-        base_dir = globals().get("script_dir", os.path.dirname(os.path.abspath(__file__)))
-        orden_dir = os.path.join(base_dir, "orden_real")
-        orden_path = os.path.join(orden_dir, f"{NOMBRE_BOT}.json")
-        if os.path.exists(orden_path):
-            with open(orden_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            bot = str(
-                data.get("bot")
-                or data.get("target_bot")
-                or data.get("owner_bot")
-                or ""
-            ).strip()
-
-            if bot and bot.lower() != str(NOMBRE_BOT).lower():
-                return False
-
-            if bool(data.get("consumed", False)):
-                return False
-
-            ts = float(
-                data.get("ts")
-                or data.get("created_ts")
-                or data.get("created_at")
-                or 0.0
-            )
-            ttl = float(
-                data.get("ttl_s")
-                or data.get("ttl")
-                or globals().get("REAL_ORDER_TTL_S", 45)
-                or 45
-            )
-
-            if ts > 0 and (time.time() - ts) <= max(10.0, ttl):
-                return True
-    except Exception:
-        pass
-
-    return False
+    expected = f"REAL:{str(NOMBRE_BOT).strip().upper()}"
+    return tok == expected
 
 def _sync_round_emit_close_ack(round_id: int, resultado: str, contract_id=None, asset=None, ciclo=None, modo_real_contrato=False) -> bool:
     res = str(resultado or "").upper().strip().replace("PERDIDA", "PÉRDIDA")
@@ -1000,23 +957,12 @@ async def _sync_round_wait_release(round_id: int) -> int:
     
     def _sync_bot_es_owner_real() -> bool:
         try:
-            tok = str(leer_token_actual() or '').strip().upper()
+            tok = str(leer_token_actual() or "").strip().upper()
         except Exception:
-            tok = ''
-        if tok == f"REAL:{NOMBRE_BOT}".upper():
-            return True
-        try:
-            for p in _orden_real_candidate_paths():
-                data = _sync_round_safe_read_json(p) or {}
-                if not isinstance(data, dict) or bool(data.get('consumed', False)):
-                    continue
-                ts = float(data.get('created_ts') or data.get('ts') or 0.0)
-                ttl = float(data.get('ttl_s') or 45.0)
-                if str(data.get('bot', '')).strip() == NOMBRE_BOT and ts > 0 and (time.time() - ts) <= max(1.0, ttl):
-                    return True
-        except Exception:
-            pass
-        return False
+            tok = ""
+
+        expected = f"REAL:{str(NOMBRE_BOT).strip().upper()}"
+        return tok == expected
 
     rid = max(1, int(round_id or 1))
     next_round = rid + 1
