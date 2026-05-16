@@ -1320,10 +1320,11 @@ def _manual_real_order_targets_this_bot() -> bool:
         try:
             tok = leer_token_actual()
             tok_s = str(tok or "").strip()
-            if tok_s not in (NOMBRE_BOT, f"REAL:{NOMBRE_BOT}"):
-                pass
         except Exception:
-            pass
+            return False
+        tok_u = tok_s.upper()
+        if tok_u not in (NOMBRE_BOT.upper(), f"REAL:{NOMBRE_BOT}".upper()):
+            return False
 
         return True
     except Exception:
