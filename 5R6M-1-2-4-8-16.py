@@ -704,7 +704,7 @@ SOUND_PATHS = {
     "ganancia_demo": "ganabot.wav",
     "perdida_real": "perdida.wav",
     "perdida_demo": "perdida.wav",
-    "meta_15": "meta15%.wav",
+    "meta_15": "ia_scifi_04_meta_15_dry.wav",
     "racha_detectada": "detectaracha.wav",
     "test": "test.wav",
     "ia_53": "ia_scifi_08_53porciento_dry.wav",
@@ -27442,7 +27442,7 @@ def mostrar_advertencia_meta():
         elif winsound:
             try:
                 base_dir = os.path.dirname(__file__)
-                sound_path = os.path.join(base_dir, "meta15%.wav")
+                sound_path = os.path.join(base_dir, SOUND_PATHS.get("meta_15", "ia_scifi_04_meta_15_dry.wav"))
                 winsound.PlaySound(sound_path, winsound.SND_LOOP | winsound.SND_ASYNC)
             except Exception:
                 pass
