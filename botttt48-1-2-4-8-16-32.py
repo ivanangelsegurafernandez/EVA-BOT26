@@ -824,6 +824,15 @@ def _sync_any_real_owner_active() -> tuple[bool, str, str]:
             if _token_real_ocupado(token_status):
                 token_owner = token_status.split(":", 1)[1].strip() if ":" in token_status else owner
                 if _valid_bot(token_owner):
+                    try:
+                        tok_actual = str(leer_token_actual() or "").strip().upper()
+                    except Exception:
+                        tok_actual = ""
+                    expected = f"REAL:{str(token_owner).strip().upper()}"
+                    if tok_actual != expected:
+                        if _print_once(f"sync-token-status-sin-token-real-{token_owner}", ttl=30):
+                            print(Fore.YELLOW + f"🟡 SYNC_TOKEN_STATUS_SIN_TOKEN_REAL_IGNORADO: owner={token_owner} no bloquea DEMO | token_actual={tok_actual or '--'}")
+                        return False, "", "sync_round_token_status_without_real_token_ignored"
                     return True, token_owner, "sync_round_token_status"
             if (real_global or close_pending or status in active_statuses) and _valid_bot(owner):
                 state_ts = _sync_round_state_ts(st)
@@ -937,6 +946,29 @@ def _selftest_sync_demo_hold_global():
         ok, owner, reason = _sync_any_real_owner_active(); assert ok and owner=="fulll47" and reason=="real_close_pending"
 
         os.remove(os.path.join(base_dir, "real_close_pending.json"))
+
+        wt("REAL:none")
+        wr(os.path.join(base_dir, "sync_round", "state.json"), {"token_status": "REAL:fulll47", "real_global": False, "real_owner": "fulll47", "status": "waiting", "ts": now})
+        ok, owner, reason = _sync_any_real_owner_active()
+        assert not ok
+        assert reason in (
+            None,
+            "",
+            "sync_round_token_status_without_real_token_ignored",
+            "sync_round_state_without_token_ignored",
+        )
+
+        wt("REAL:fulll47")
+        wr(os.path.join(base_dir, "sync_round", "state.json"), {"token_status": "REAL:fulll47", "real_global": False, "real_owner": "fulll47", "status": "waiting", "ts": now})
+        ok, owner, reason = _sync_any_real_owner_active()
+        assert ok
+        assert owner == "fulll47"
+        assert reason in ("token_actual", "sync_round_token_status")
+
+        wt("REAL:fulll49")
+        wr(os.path.join(base_dir, "sync_round", "state.json"), {"token_status": "REAL:fulll47", "real_owner": "fulll47", "status": "waiting", "ts": now})
+        ok, owner, reason = _sync_any_real_owner_active()
+        assert not (ok and owner == "fulll47" and reason == "sync_round_token_status")
 
         wt("REAL:none")
         wr(os.path.join(base_dir, "sync_round", "state.json"), {"real_global": True, "real_owner": "fulll47", "status": "real_active", "ts": now})
