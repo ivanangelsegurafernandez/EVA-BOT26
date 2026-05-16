@@ -761,6 +761,15 @@ def _sync_any_real_owner_active() -> tuple[bool, str, str]:
                 ts = float(data.get("ts") or data.get("created_ts") or data.get("created_at") or 0.0)
                 ttl = float(data.get("ttl_s") or data.get("ttl") or globals().get("REAL_ORDER_TTL_S", 90) or 90)
                 if ts > 0 and (now_ts - ts) <= max(1.0, ttl):
+                    try:
+                        tok = str(leer_token_actual() or "").strip().upper()
+                    except Exception:
+                        tok = ""
+                    expected = f"REAL:{str(owner).strip().upper()}"
+                    if tok != expected:
+                        if _print_once(f"orden-real-sin-token-{owner}", ttl=30):
+                            print(Fore.YELLOW + f"🟡 ORDEN_REAL_SIN_TOKEN_IGNORADA: {owner} no bloquea DEMO | token={tok or '--'}")
+                        continue
                     return True, owner, "orden_real_viva"
             except Exception:
                 continue
@@ -905,9 +914,13 @@ def _selftest_sync_demo_hold_global():
         ok, owner, reason = _sync_any_real_owner_active(); assert not ok
 
         wr(os.path.join(base_dir, "orden_real", "fulll47.json"), {"bot":"fulll47", "consumed":False, "created_ts":now, "ttl_s":90})
+        ok, owner, reason = _sync_any_real_owner_active(); assert not ok
+
+        wt("REAL:fulll47")
         ok, owner, reason = _sync_any_real_owner_active(); assert ok and owner=="fulll47" and reason=="orden_real_viva"
 
         os.remove(os.path.join(base_dir, "orden_real", "fulll47.json"))
+        wt("REAL:none")
         wr(os.path.join(base_dir, "real_close_pending.json"), {"bot":"fulll47", "ts":now})
         ok, owner, reason = _sync_any_real_owner_active(); assert ok and owner=="fulll47" and reason=="real_close_pending"
 
