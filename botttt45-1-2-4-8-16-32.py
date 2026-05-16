@@ -706,6 +706,51 @@ def _sync_round_write_recovery_request(bot, round_id, next_round, released, reas
         }
         if isinstance(extra_fields, dict) and extra_fields:
             payload.update(extra_fields)
+
+        try:
+            reason_l = str(payload.get("reason", "") or "").strip().lower()
+            source_u = str(payload.get("source", "") or "").strip().upper()
+
+            recovery_artificial = bool(
+                payload.get("neutral", False)
+                or payload.get("no_trade_result", False)
+                or payload.get("quarantine", False)
+                or reason_l.startswith("incident_lock_demo")
+                or reason_l in {
+                    "ack_close_missing_after_trade_result",
+                    "incident_lock_demo_stale_open",
+                    "incident_lock_demo_sin_evidencia",
+                    "incident_lock_demo_closed_sin_profit",
+                    "incident_lock_demo_sold_sin_contexto",
+                }
+                or source_u.startswith("INCIDENT_LOCK")
+                or source_u in {
+                    "ACK_CLOSE_NO_CONFIRMADO",
+                    "INCIDENT_LOCK_STALE_OPEN_DEMO",
+                    "INCIDENT_LOCK_SIN_EVIDENCIA_DEMO",
+                    "INCIDENT_LOCK_CLOSED_SIN_PROFIT_DEMO",
+                    "INCIDENT_LOCK_SOLD_SIN_CONTEXTO_DEMO",
+                }
+            )
+
+            if recovery_artificial:
+                payload["neutral"] = True
+                payload["no_trade_result"] = True
+                payload["quarantine"] = True
+                payload["usable_for_real"] = False
+                payload["usable_for_lxv"] = False
+                payload["usable_for_training"] = False
+                payload["recovery_artificial"] = True
+                payload["real_block_reason"] = "recovery_artificial_no_usable_para_real_lxv_training"
+        except Exception:
+            payload["neutral"] = True
+            payload["no_trade_result"] = True
+            payload["quarantine"] = True
+            payload["usable_for_real"] = False
+            payload["usable_for_lxv"] = False
+            payload["usable_for_training"] = False
+            payload["recovery_artificial"] = True
+            payload["real_block_reason"] = "recovery_artificial_guard_exception"
         return _sync_round_write_json_atomic(path, payload)
     except Exception:
         return False

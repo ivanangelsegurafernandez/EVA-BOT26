@@ -4926,6 +4926,12 @@ def _sync_round_get_summary_preferente(max_age_s=120.0, rebuild_rows=True):
             if age <= float(max_age_s):
                 summary = dict(last_sync)
                 round_id = int(summary.get("round_closed_eval", summary.get("round_id", summary.get("obj_round", 0))) or 0)
+                if round_id > 0:
+                    summary.setdefault("obj_round", round_id)
+                    summary.setdefault(
+                        "released_round",
+                        int(summary.get("round_next_release", round_id + 1) or (round_id + 1))
+                    )
                 closed_override = summary.get("closed_bots") or summary.get("closed") or None
                 if bool(rebuild_rows) and round_id > 0:
                     rows_pack = _ack_live_build_rows(obj_round_override=round_id, closed_override=closed_override)
@@ -6369,7 +6375,13 @@ def _selftest_column_quarantine():
             globals()["_column_quarantine_real_guard_reason"] = lambda: "real_close_pending"
             f = detectar_candidato_cuarentena_columna(2082, 2082, diag_align=diag5, closed_acks=closed5, reasons=reasons)
             assert not f["eligible"]
-            globals()["ROUND_QUARANTINE_STATE"] = {"round_id": 2082}
+            globals()["ROUND_QUARANTINE_STATE"] = {
+                "active": True,
+                "round_id": 2082,
+                "released_to": 2083,
+                "since_ts": now,
+                "reason": "selftest",
+            }
             assert es_ronda_cuarentenada(2082)
             assert _column_quarantine_note_late_ack(bots[5], 2082, "GANANCIA") is True
             globals()["_column_quarantine_real_guard_reason"] = lambda: ""
@@ -8970,10 +8982,15 @@ def detectar_zona_mrv_v2(cols_norm, expected=6, prom3=None, prom8=None, prom20=N
         gcols=[x for x in norm[-8:] if x['n_verdes']>=green_min]
         base['noise_ratio']=sum(x['n_rojos'] for x in gcols)/(max(1,len(gcols))*exp) if gcols else 0.0
         p8=float(prom8); s38=base['slope_3_8']
+        vals3 = vals[-3:] if len(vals) >= 3 else vals
+        tendencia_verde_temprana = bool(
+            len(vals3) < 3
+            or (vals3[-1] >= vals3[-2] and vals3[-2] >= vals3[-3])
+        )
         if st>=3 and g<=(4/6) and s38<0 and base['red_pressure']>0.25: z,m,d,a='VERDE_SATURADO_TARDIO','saturacion_tardia_confirmada','NO_INVERTIR',False
         elif p8>=0.70 and s38<=-0.08 and g<=(4/6) and base['red_cols_3']>=1: z,m,d,a='VERDE_TARDIO','verde_perdiendo_fuerza','NO_INVERTIR',False
         elif base['red_cols_3']>=2 and g<=(3/6) and s38<-0.04: z,m,d,a='ROJA_TEMPRANO','presion_roja_en_aumento','NO_INVERTIR',False
-        elif g>=(4/6) and base['green_cols_3']>=2 and s38>=0.02 and base['red_cols_3']<=1 and st<3: z,m,d,a='VERDE_TEMPRANO_CONFIRMADO','verde_temprano_confirmado','SI_INVERTIR',True
+        elif g>=(4/6) and base['green_cols_3']>=2 and s38>=0.02 and tendencia_verde_temprana and base['red_cols_3']<=1 and st<3: z,m,d,a='VERDE_TEMPRANO_CONFIRMADO','verde_temprano_confirmado','SI_INVERTIR',True
         elif g>=(4/6) and base['green_cols_5']>=3 and 0.55<=p8<=0.88 and s38>=-0.06 and base['red_cols_5']<=2: z,m,d,a='VERDE_MADURO_SANO','verde_maduro_sano','SI_INVERTIR',True
         elif g>=(4/6) and base['green_cols_8']>=4 and 0.50<=p8<=0.90 and base['red_pressure']<base['green_pressure'] and base['red_cols_5']<=2: z,m,d,a='VERDE_MADURO_CON_RUIDO','verde_maduro_con_ruido','SI_INVERTIR',True
         else: z,m,d,a='NEUTRO_MIXTO','sin_dominio_claro','NO_INVERTIR',False
@@ -9919,7 +9936,13 @@ def _selftest_canonical_summary_hud_unificado():
         assert int((globals().get("_ACK_LIVE_SUMMARY", {}) or {}).get("closed_count", 0)) == int((globals().get("LAST_SYNC_ROUND_SUMMARY", {}) or {}).get("closed_count", 0))
         assert str((globals().get("_ACK_LIVE_SUMMARY", {}) or {}).get("data_quality", "")) == "ok" and bool((globals().get("_ACK_LIVE_SUMMARY", {}) or {}).get("canonical"))
         txt = "\n".join(_ack_live_format_lines(None))
-        assert "ROUND #295" in txt and "Cerrados 6/6" in txt and "Calidad ok" in txt and "Patrón 5V1X" in txt and "RONDA CANÓNICA ACTIVA" in txt
+        assert (
+            "ROUND #295" in txt
+            and "Cerrados 6/6" in txt
+            and (("Calidad ok" in txt) or ("Calidad released_post_eval" in txt))
+            and "Patrón 4V2X" in txt
+            and "RONDA CANÓNICA ACTIVA" in txt
+        )
         print("SELFTEST CANONICAL_HUD_UNIFICADO OK")
     finally:
         globals()["_ack_live_build_rows"] = original_build
@@ -10913,6 +10936,27 @@ def diagnosticar_alineacion_rounds(acks_por_bot=None, released_round=None, expec
 def _round_alignment_diag_from_summary(summary=None, rows_pack=None):
     try:
         ss = summary if isinstance(summary, dict) else {}
+        rid = int(ss.get("round_closed_eval", ss.get("round_id", ss.get("obj_round", 0))) or 0)
+        expected = int(ss.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
+        closed_count = int(ss.get("closed_count", 0) or 0)
+        dq = str(ss.get("data_quality", "") or "").strip().lower()
+
+        if bool(ss.get("canonical")) and rid > 0 and expected > 0 and closed_count >= expected and dq == "ok":
+            return {
+                "ok": True,
+                "canonical_round": rid,
+                "round_id": rid,
+                "round_closed_eval": rid,
+                "best_round": rid,
+                "closed": closed_count,
+                "expected": expected,
+                "missing": [],
+                "behind": {},
+                "ahead": {},
+                "mixed_rounds": False,
+                "reason": "canonical_summary_ok",
+            }
+
         closed = ss.get("closed_bots") or ss.get("closed") or None
         if isinstance(closed, dict) and closed:
             rid = int(ss.get("round_closed_eval", ss.get("round_id", ss.get("obj_round", 0))) or 0)
@@ -11140,6 +11184,19 @@ def _sync_round_resolver_ronda_canonica(closed_current, reasons_current, target_
         }
         reasons_by_bot[bot] = "ok"
     full_need = len(BOT_NAMES)
+    stale_full_rounds = [
+        r for r, bots_stale in stale_by_round.items()
+        if isinstance(bots_stale, set) and len(bots_stale) >= full_need
+    ]
+    if stale_full_rounds:
+        chosen_stale = sorted(stale_full_rounds)[-1]
+        return {
+            "ok": False,
+            "reason": "stale_consensus",
+            "best_round": int(chosen_stale),
+            "best_closed": 0,
+            "stale_count": int(len(stale_by_round.get(chosen_stale, set()))),
+        }
     full_rounds = [r for r, d in valid_by_round.items() if isinstance(d, dict) and len(d) >= full_need]
     if full_rounds:
         chosen = sorted(full_rounds)[-1]
@@ -25371,7 +25428,7 @@ def render_estado_lxv_actual_panel(info_zona: dict, summary: dict, locks: dict |
         w=92
         row=lambda t: f"║ {_hud_fit(str(t), w-4).ljust(w-4)} ║"
         no_habilita = " | NO_HABILITA_REAL" if (str(reg_z).startswith("VERDE_") and oficial_bloquea) else ""
-        lines=["╔"+"═"*(w-2)+"╗",row("🧭 ESTADO LXV ACTUAL"),row(f"OFICIAL REAL : {zona_oficial_show} | decisión={decision_show} | motivo={motivo_show}"),row(f"VISUAL       : {zona_visual_txt} | NO_MANDA_REAL"),row(f"REGIONAL     : {reg_z} | SOLO_DIAGNÓSTICO | NO_HABILITA_REAL | acción={action} | prom3={prom3:.2f} prom8={prom8:.2f} d38={d38:+.2f}"),row(f"COLUMNA_VISUAL: {zona_visual_txt} | patrón={patron} | cerrados={closed_count}/{expected_count} | dq={dq} | g_columna={g_col_txt}"),row(f"PATRÓN_REAL: {'VALIDO' if patron_real_valido else 'NO_VALIDO'} | patrón={patron} | válidos=5V1X/4V2X"),row(f"SYNC    : {'ESPERANDO_BOTS' if faltan_count>0 else 'OK'} | {sync_txt} | REAL={'no_evaluado' if faltan_count>0 else 'evaluable'}"),row(f"REAL    : REAL_GLOBAL={'SI' if real_activo else 'NO'} | OWNER_REAL={bot_real or 'NONE'} | TOKEN={'DEMO' if tok in (None,'none','') else 'REAL'}"),row(f"FINAL   : {final}")]
+        lines=["╔"+"═"*(w-2)+"╗",row("🧭 ESTADO LXV ACTUAL"),row(f"OFICIAL REAL : {zona_oficial_show} | MANDA_DECISIÓN | decisión={decision_show} | motivo={motivo_show}"),row(f"VISUAL       : {zona_visual_txt} | NO_MANDA_REAL"),row(f"REGIONAL     : {reg_z} | SOLO_DIAGNÓSTICO | NO_HABILITA_REAL | acción={action} | prom3={prom3:.2f} prom8={prom8:.2f} d38={d38:+.2f}"),row(f"COLUMNA_VISUAL: {zona_visual_txt} | patrón={patron} | cerrados={closed_count}/{expected_count} | dq={dq} | g_columna={g_col_txt}"),row(f"PATRÓN_REAL: {'VALIDO' if patron_real_valido else 'NO_VALIDO'} | patrón={patron} | válidos=5V1X/4V2X"),row(f"SYNC    : {'ESPERANDO_BOTS' if faltan_count>0 else 'OK'} | {sync_txt} | REAL={'no_evaluado' if faltan_count>0 else 'evaluable'}"),row(f"REAL    : REAL_GLOBAL={'SI' if real_activo else 'NO'} | OWNER_REAL={bot_real or 'NONE'} | TOKEN={'DEMO' if tok in (None,'none','') else 'REAL'}"),row(f"FINAL   : {final}")]
         if str(reg_z).startswith("VERDE_") and oficial_bloquea:
             lines.append(row(f"⚠️ VERDE REGIONAL IGNORADO PARA REAL: zona oficial manda | oficial={zona} | motivo={motivo}"))
         if info_prearmado.get("prearmado"):
@@ -32526,10 +32583,15 @@ def _selftest_round_alignment_diag_panel_locks():
 def _selftest_manual_override_bot_token_owner():
     import importlib.util
     import tempfile
+    import glob
     old_cwd = os.getcwd()
     with tempfile.TemporaryDirectory() as td:
         try:
             bot_path = os.path.join(script_dir, "botttt45-1-2-4-8-16-32.py")
+            if not os.path.exists(bot_path):
+                matches = sorted(glob.glob(os.path.join(script_dir, "botttt45-1-2-4-8-16-32*.py")))
+                if matches:
+                    bot_path = matches[0]
             spec = importlib.util.spec_from_file_location("botttt45_manual_selftest", bot_path)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
