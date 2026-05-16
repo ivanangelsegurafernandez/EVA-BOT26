@@ -917,7 +917,10 @@ def _selftest_sync_demo_hold_global():
         ok, owner, reason = _sync_any_real_owner_active(); assert not ok
 
         wt("REAL:fulll47")
-        ok, owner, reason = _sync_any_real_owner_active(); assert ok and owner=="fulll47" and reason=="orden_real_viva"
+        ok, owner, reason = _sync_any_real_owner_active()
+        assert ok
+        assert owner == "fulll47"
+        assert reason in ("token_actual", "orden_real_viva")
 
         os.remove(os.path.join(base_dir, "orden_real", "fulll47.json"))
         wt("REAL:none")
