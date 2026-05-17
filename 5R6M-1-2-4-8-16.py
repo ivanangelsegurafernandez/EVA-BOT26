@@ -59,6 +59,7 @@ if any(os.environ.get(name) == "1" for name in (
     "RUN_REAL_CLOSE_ATOMIC_PENDING_SELFTEST",
     "RUN_REAL_NORMAL_CLOSE_NO_MARTI_ADVANCE_ON_ATOMIC_FAIL_SELFTEST",
     "RUN_DIRECT_ACK_ALIGNMENT_SELFTEST",
+    "RUN_LXV_HUD_ACK_REBUILD_SELFTEST",
 )):
     import types
 
@@ -8375,6 +8376,153 @@ def resolver_zona_lxv_para_round_live(rid, round_complete, partial_pattern):
         "ronda_liberada_previa": "si" if (rid_zona > 0 and rid_int > 0 and rid_zona != rid_int) else "no",
     }
 
+
+def _lxv_try_rebuild_summary_from_official_acks(rid=0, reason="hud_summary_missing"):
+    """
+    Reconstruye un summary LXV mínimo desde ACKs oficiales cerrados 6/6.
+
+    REGLAS:
+    - No compra.
+    - No emite REAL.
+    - No escribe token.
+    - No libera ronda.
+    - No usa historial visual.
+    - No usa ProbIA.
+    - No usa SENSOR_PLANO.
+    - Solo acepta ACK oficial 6/6 de _sync_round_collect_closed_acks(rid).
+    """
+    try:
+        rid_int = int(rid or 0)
+
+        if rid_int <= 0:
+            try:
+                hs_fn = globals().get("_hud_round_summary_safe")
+                if callable(hs_fn):
+                    hs = hs_fn()
+                    if isinstance(hs, dict):
+                        rid_int = int(hs.get("round_id", hs.get("obj_round", 0)) or 0)
+            except Exception:
+                rid_int = 0
+
+        if rid_int <= 0:
+            return None
+
+        collect_fn = globals().get("_sync_round_collect_closed_acks")
+        if not callable(collect_fn):
+            return None
+
+        collect_result = collect_fn(rid_int)
+
+        closed_direct = None
+        if isinstance(collect_result, tuple) and len(collect_result) >= 1:
+            closed_direct = collect_result[0]
+        elif isinstance(collect_result, dict):
+            closed_direct = collect_result
+
+        if not isinstance(closed_direct, dict):
+            return None
+
+        expected = list(BOT_NAMES)
+        if len(expected) <= 0:
+            return None
+
+        if len(closed_direct) < len(expected):
+            return None
+
+        if any(bot not in closed_direct for bot in expected):
+            return None
+
+        verdes = 0
+        rojas = 0
+        rows_pack = {}
+
+        for bot in expected:
+            ack = closed_direct.get(bot)
+            if not isinstance(ack, dict):
+                return None
+
+            ack_rid = int(
+                ack.get("round_id", ack.get("sync_round_id", ack.get("ronda", rid_int))) or rid_int
+            )
+            if ack_rid != rid_int:
+                return None
+
+            res_raw = str(
+                ack.get(
+                    "resultado",
+                    ack.get(
+                        "result",
+                        ack.get(
+                            "res",
+                            ack.get("resultado_real", ack.get("estado_resultado", ""))
+                        )
+                    )
+                ) or ""
+            ).strip().upper()
+
+            if res_raw in ("GANANCIA", "WIN", "✓", "✔", "1", "GREEN", "VERDE"):
+                sym = "V"
+                verdes += 1
+            elif res_raw in ("PÉRDIDA", "PERDIDA", "LOSS", "✗", "X", "0", "RED", "ROJA"):
+                sym = "X"
+                rojas += 1
+            else:
+                return None
+
+            rows_pack[bot] = {
+                "bot": bot,
+                "round_id": rid_int,
+                "resultado": res_raw,
+                "symbol": sym,
+                "source": "official_closed_ack",
+            }
+
+        if verdes + rojas != len(expected):
+            return None
+
+        partial_pattern = f"{int(verdes)}V{int(rojas)}X"
+
+        summary = {
+            "obj_round": rid_int,
+            "round_id": rid_int,
+            "closed_count": int(len(expected)),
+            "expected_count": int(len(expected)),
+            "verdes_count": int(verdes),
+            "rojas_count": int(rojas),
+            "partial_pattern": partial_pattern,
+            "data_quality": "ok",
+            "source": f"official_ack_rebuild:{reason}",
+            "canonical": True,
+        }
+
+        try:
+            fn_align = globals().get("_round_alignment_set_direct_ack_full_ok")
+            if callable(fn_align):
+                fn_align(rid_int, closed_direct, source="HUD_OFFICIAL_ACK_REBUILD")
+        except Exception:
+            pass
+
+        try:
+            log_fn = globals().get("_lxv_5v1x_event_cooldown")
+            if callable(log_fn):
+                log_fn(
+                    key=f"HUD_OFFICIAL_ACK_REBUILD:{rid_int}:{partial_pattern}",
+                    msg=f"🧩 HUD_OFFICIAL_ACK_REBUILD: rid=#{rid_int} reconstruido desde ACK oficial 6/6 | patrón={partial_pattern} | dq=ok",
+                    cooldown_s=15.0,
+                )
+        except Exception:
+            pass
+
+        return {
+            "summary": summary,
+            "rows_pack": rows_pack,
+            "source": "official_ack_rebuild",
+            "canonical": True,
+        }
+
+    except Exception:
+        return None
+
 def obtener_zona_lxv_hud_actual():
     try:
         pref = _sync_round_get_summary_preferente(max_age_s=120.0, rebuild_rows=True)
@@ -8389,7 +8537,49 @@ def obtener_zona_lxv_hud_actual():
             expected_count = int(len(BOT_NAMES) or 6)
         dq = str(summary.get("data_quality", "missing") or "missing").strip().lower()
         partial = _lxv_normalizar_patron_txt(summary.get("partial_pattern", "0V0X")) or "0V0X"
-        round_complete = bool(closed_count == expected_count and expected_count > 0)
+
+        summary_missing_or_empty = bool(
+            int(closed_count or 0) <= 0
+            or str(dq or "").strip().lower() in ("", "missing", "none", "null")
+            or str(partial or "").strip().upper() in ("", "0V0X", "UNKNOWN")
+        )
+
+        if summary_missing_or_empty:
+            rebuilt_pref = _lxv_try_rebuild_summary_from_official_acks(
+                rid,
+                reason="hud_global_summary_missing",
+            )
+
+            if isinstance(rebuilt_pref, dict):
+                pref = rebuilt_pref
+                rows_pack = pref.get("rows_pack", {})
+                summary = pref.get("summary", {})
+
+                rid = int(summary.get("obj_round", summary.get("round_id", 0)) or 0)
+                closed_count = int(summary.get("closed_count", 0) or 0)
+                expected_count = int(summary.get("expected_count", len(BOT_NAMES)) or len(BOT_NAMES))
+                if expected_count <= 0:
+                    expected_count = int(len(BOT_NAMES) or 6)
+
+                dq = str(summary.get("data_quality", "missing") or "missing").strip().lower()
+                partial = _lxv_normalizar_patron_txt(
+                    summary.get("partial_pattern", "0V0X")
+                ) or "0V0X"
+
+            else:
+                try:
+                    _lxv_5v1x_event_cooldown(
+                        key=f"HUD_OFFICIAL_ACK_REBUILD_FAIL:{rid}:{closed_count}:{dq}:{partial}",
+                        msg=f"🔎 HUD_OFFICIAL_ACK_REBUILD_FAIL: rid=#{rid or '--'} summary={closed_count}/{expected_count} dq={dq} patrón={partial}; ACK oficial 6/6 no disponible.",
+                        cooldown_s=20.0,
+                    )
+                except Exception:
+                    pass
+
+        round_complete = bool(
+            int(closed_count or 0) == int(expected_count or 0)
+            and int(expected_count or 0) > 0
+        )
         info = resolver_zona_lxv_para_round_live(rid=rid, round_complete=round_complete, partial_pattern=partial)
         info = dict(info) if isinstance(info, dict) else {}
         info["round_id_live"] = rid
@@ -34859,6 +35049,78 @@ def _selftest_direct_ack_alignment_and_purificacion():
         globals()["MODO_PURIFICACION_REAL"] = old_purif
 
 
+
+def _selftest_lxv_hud_ack_rebuild():
+    global BOT_NAMES
+
+    old_bot_names = list(BOT_NAMES)
+    old_collect = globals().get("_sync_round_collect_closed_acks")
+    old_align = globals().get("_round_alignment_set_direct_ack_full_ok")
+
+    try:
+        BOT_NAMES = ["fulll45", "fulll46", "fulll47", "fulll48", "fulll49", "fulll50"]
+        rid = 12345
+
+        fake_acks = {
+            "fulll45": {"round_id": rid, "resultado": "GANANCIA"},
+            "fulll46": {"round_id": rid, "resultado": "GANANCIA"},
+            "fulll47": {"round_id": rid, "resultado": "GANANCIA"},
+            "fulll48": {"round_id": rid, "resultado": "GANANCIA"},
+            "fulll49": {"round_id": rid, "resultado": "PÉRDIDA"},
+            "fulll50": {"round_id": rid, "resultado": "GANANCIA"},
+        }
+
+        def fake_collect(_rid):
+            assert int(_rid) == rid
+            return dict(fake_acks), {}
+
+        def fake_align(_rid, _closed, source=""):
+            assert int(_rid) == rid
+            assert isinstance(_closed, dict)
+            assert len(_closed) == 6
+            return True
+
+        globals()["_sync_round_collect_closed_acks"] = fake_collect
+        globals()["_round_alignment_set_direct_ack_full_ok"] = fake_align
+
+        rebuilt = _lxv_try_rebuild_summary_from_official_acks(
+            rid,
+            reason="selftest",
+        )
+
+        assert isinstance(rebuilt, dict), "rebuilt debe ser dict"
+        summary = rebuilt.get("summary", {})
+        assert summary.get("closed_count") == 6, "closed_count debe ser 6"
+        assert summary.get("expected_count") == 6, "expected_count debe ser 6"
+        assert summary.get("data_quality") == "ok", "dq debe ser ok"
+        assert summary.get("partial_pattern") == "5V1X", "patrón debe ser 5V1X"
+        assert rebuilt.get("canonical") is True, "canonical debe ser True"
+
+        fake_acks_5 = dict(fake_acks)
+        fake_acks_5.pop("fulll50", None)
+
+        def fake_collect_5(_rid):
+            return dict(fake_acks_5), {}
+
+        globals()["_sync_round_collect_closed_acks"] = fake_collect_5
+
+        rebuilt_5 = _lxv_try_rebuild_summary_from_official_acks(
+            rid,
+            reason="selftest_5_bots",
+        )
+
+        assert rebuilt_5 is None, "con 5/6 debe devolver None"
+
+        print("✅ SELFTEST LXV_HUD_ACK_REBUILD OK")
+
+    finally:
+        BOT_NAMES = old_bot_names
+        if old_collect is not None:
+            globals()["_sync_round_collect_closed_acks"] = old_collect
+        if old_align is not None:
+            globals()["_round_alignment_set_direct_ack_full_ok"] = old_align
+
+
 def _run_requested_selftests_and_exit_if_needed():
     ran = False
     ok = True
@@ -34921,6 +35183,10 @@ def _run_requested_selftests_and_exit_if_needed():
     _run("RUN_REAL_CLOSE_ATOMIC_PENDING_SELFTEST", _selftest_real_reconcile_releases_token_and_sync)
     _run("RUN_REAL_NORMAL_CLOSE_NO_MARTI_ADVANCE_ON_ATOMIC_FAIL_SELFTEST", _selftest_real_normal_close_no_marti_advance_on_atomic_fail)
     _run("RUN_DIRECT_ACK_ALIGNMENT_SELFTEST", _selftest_direct_ack_alignment_and_purificacion)
+
+    if os.environ.get("RUN_LXV_HUD_ACK_REBUILD_SELFTEST") == "1":
+        _selftest_lxv_hud_ack_rebuild()
+        raise SystemExit(0)
 
     if ran:
         sys.exit(0 if ok else 1)
