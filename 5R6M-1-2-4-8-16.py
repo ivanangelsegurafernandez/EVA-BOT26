@@ -57,6 +57,7 @@ if any(os.environ.get(name) == "1" for name in (
     "RUN_REAL_RECONCILE_RELEASES_TOKEN_AND_SYNC_SELFTEST",
     "RUN_REAL_RECONCILE_NO_MARK_SIG_ON_ATOMIC_FAIL_SELFTEST",
     "RUN_REAL_CLOSE_ATOMIC_PENDING_SELFTEST",
+    "RUN_REAL_NORMAL_CLOSE_NO_MARTI_ADVANCE_ON_ATOMIC_FAIL_SELFTEST",
 )):
     import types
 
@@ -21870,6 +21871,34 @@ def _validar_cierre_real_pertenece_a_pending(bot, pending, cierre_info, detector
     except Exception as e:
         return False, f"error_validacion:{e}"
 
+def _snapshot_martingala_real():
+    return {
+        "marti_ciclos_perdidos": marti_ciclos_perdidos,
+        "marti_paso": marti_paso,
+        "ultimo_bot_real": ultimo_bot_real,
+        "bots_usados_en_esta_marti": list(bots_usados_en_esta_marti),
+        "marti_audit_run_id": marti_audit_run_id,
+        "marti_audit_ultimo_ciclo_ordenado": marti_audit_ultimo_ciclo_ordenado,
+        "marti_audit_historial": deque(marti_audit_historial, maxlen=marti_audit_historial.maxlen),
+    }
+
+
+def _restore_martingala_real(snapshot):
+    global marti_ciclos_perdidos, marti_paso, ultimo_bot_real, bots_usados_en_esta_marti
+    global marti_audit_run_id, marti_audit_ultimo_ciclo_ordenado, marti_audit_historial
+
+    marti_ciclos_perdidos = snapshot["marti_ciclos_perdidos"]
+    marti_paso = snapshot["marti_paso"]
+    ultimo_bot_real = snapshot["ultimo_bot_real"]
+    bots_usados_en_esta_marti = list(snapshot["bots_usados_en_esta_marti"])
+    marti_audit_run_id = snapshot["marti_audit_run_id"]
+    marti_audit_ultimo_ciclo_ordenado = snapshot["marti_audit_ultimo_ciclo_ordenado"]
+    marti_audit_historial = deque(
+        snapshot["marti_audit_historial"],
+        maxlen=snapshot["marti_audit_historial"].maxlen
+    )
+
+
 def _reconciliar_cierre_real_antes_de_nueva_orden(motivo="pre_emit"):
     """
     Blindaje maestro:
@@ -31900,6 +31929,7 @@ async def main():
                             "ronda": pending.get("round_id"), "contract_id": estado_bots.get(bot, {}).get("id_contrato"),
                             "reason": "resultado_real",
                         }
+                        marti_snapshot = _snapshot_martingala_real()
                         registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo)
                         try:
                             await refresh_saldo_real(forzado=True)
@@ -31937,7 +31967,11 @@ async def main():
                                 ciclo_visual_siguiente=prox
                             )
                             if not ok_cierre:
-                                agregar_evento("⛔ CIERRE_REAL_FALLIDO: token no liberado; se mantiene bloqueo REAL")
+                                _restore_martingala_real(marti_snapshot)
+                                agregar_evento(
+                                    f"⛔ CIERRE_PENDING_ABORTADO: cierre no atómico para {bot}; "
+                                    f"Martingala revertida; no se limpia pending, no se libera sync."
+                                )
                                 activo_real = bot
                                 break
                             _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
@@ -31956,7 +31990,11 @@ async def main():
                                 ciclo_visual_siguiente=prox
                             )
                             if not ok_cierre:
-                                agregar_evento("⛔ CIERRE_REAL_FALLIDO: token no liberado; se mantiene bloqueo REAL")
+                                _restore_martingala_real(marti_snapshot)
+                                agregar_evento(
+                                    f"⛔ CIERRE_PENDING_ABORTADO: cierre no atómico para {bot}; "
+                                    f"Martingala revertida; no se limpia pending, no se libera sync."
+                                )
                                 activo_real = bot
                                 break
                             _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
@@ -32037,6 +32075,7 @@ async def main():
                                         "contract_id": estado_bots.get(bot, {}).get("id_contrato"),
                                         "reason": "resultado_real",
                                     }
+                                    marti_snapshot = _snapshot_martingala_real()
                                     registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo)
                                     try:
                                         await refresh_saldo_real(forzado=True)
@@ -32081,7 +32120,11 @@ async def main():
                                             ciclo_visual_siguiente=prox
                                         )
                                         if not ok_cierre:
-                                            agregar_evento("⛔ CIERRE_REAL_FALLIDO: token no liberado; se mantiene bloqueo REAL")
+                                            _restore_martingala_real(marti_snapshot)
+                                            agregar_evento(
+                                                f"⛔ CIERRE_REAL_ABORTADO: cierre no atómico para {bot}; "
+                                                f"Martingala revertida; token/pending conservados para reintento seguro."
+                                            )
                                             activo_real = bot
                                             break
                                         _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
@@ -32103,7 +32146,11 @@ async def main():
                                             ciclo_visual_siguiente=prox
                                         )
                                         if not ok_cierre:
-                                            agregar_evento("⛔ CIERRE_REAL_FALLIDO: token no liberado; se mantiene bloqueo REAL")
+                                            _restore_martingala_real(marti_snapshot)
+                                            agregar_evento(
+                                                f"⛔ CIERRE_REAL_ABORTADO: cierre no atómico para {bot}; "
+                                                f"Martingala revertida; token/pending conservados para reintento seguro."
+                                            )
                                             activo_real = bot
                                             break
                                         _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
@@ -34431,6 +34478,213 @@ def _selftest_real_reconcile_no_mark_sig_on_atomic_fail():
             globals()[k] = v
         shutil.rmtree(tmp, ignore_errors=True)
 
+def _selftest_real_normal_close_no_marti_advance_on_atomic_fail():
+    import tempfile
+    import copy
+
+    bot = "fulll46"
+    old = {
+        "cwd": os.getcwd(),
+        "TOKEN_FILE": globals().get("TOKEN_FILE"),
+        "REAL_OWNER_LOCK": globals().get("REAL_OWNER_LOCK"),
+        "REAL_CLOSE_PENDING": copy.deepcopy(globals().get("REAL_CLOSE_PENDING")),
+        "REAL_CLOSE_INCIDENT_LOCK": copy.deepcopy(globals().get("REAL_CLOSE_INCIDENT_LOCK")),
+        "LAST_REAL_CLOSE_SIG": copy.deepcopy(globals().get("LAST_REAL_CLOSE_SIG")),
+        "REAL_CLOSE_PROCESSED_SIG": copy.deepcopy(globals().get("REAL_CLOSE_PROCESSED_SIG")),
+        "estado_bots": copy.deepcopy(globals().get("estado_bots")),
+        "marti_ciclos_perdidos": globals().get("marti_ciclos_perdidos"),
+        "marti_paso": globals().get("marti_paso"),
+        "ultimo_bot_real": globals().get("ultimo_bot_real"),
+        "bots_usados_en_esta_marti": list(globals().get("bots_usados_en_esta_marti", [])),
+        "marti_audit_run_id": globals().get("marti_audit_run_id"),
+        "marti_audit_ultimo_ciclo_ordenado": globals().get("marti_audit_ultimo_ciclo_ordenado"),
+        "marti_audit_historial": deque(
+            globals().get("marti_audit_historial", []),
+            maxlen=getattr(globals().get("marti_audit_historial", []), "maxlen", 80)
+        ),
+        "cerrar_por_fin_de_ciclo": globals().get("cerrar_por_fin_de_ciclo"),
+        "limpiar_orden_real": globals().get("limpiar_orden_real"),
+        "_sync_round_release_after_real_close": globals().get("_sync_round_release_after_real_close"),
+    }
+    tmp = tempfile.mkdtemp(prefix="real_normal_atomic_fail_")
+    close_calls = []
+    clean_calls = []
+    sync_calls = []
+
+    def _token_txt():
+        with open(globals()["TOKEN_FILE"], encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+
+    def _reset_common(ciclo=1, perdidos=0, pending=True):
+        close_calls.clear()
+        clean_calls.clear()
+        sync_calls.clear()
+        ciclo = int(ciclo or 1)
+        perdidos = int(perdidos or 0)
+        globals()["TOKEN_FILE"] = os.path.join(tmp, "token_actual.txt")
+        with open(globals()["TOKEN_FILE"], "w", encoding="utf-8") as f:
+            f.write(f"REAL:{bot}")
+        globals()["REAL_OWNER_LOCK"] = bot
+        globals()["REAL_CLOSE_PENDING"] = {b: None for b in BOT_NAMES}
+        if pending:
+            globals()["REAL_CLOSE_PENDING"][bot] = {
+                "active": True,
+                "bot": bot,
+                "ciclo": ciclo,
+                "baseline": 0,
+                "ts": time.time(),
+                "round_id": 777,
+                "source": "SELFTEST",
+            }
+        globals()["REAL_CLOSE_INCIDENT_LOCK"] = {"active": False, "bot": None, "ts": 0.0, "reason": ""}
+        globals()["LAST_REAL_CLOSE_SIG"] = {b: None for b in BOT_NAMES}
+        globals()["REAL_CLOSE_PROCESSED_SIG"] = {b: None for b in BOT_NAMES}
+        globals()["marti_ciclos_perdidos"] = perdidos
+        globals()["marti_paso"] = perdidos
+        globals()["ultimo_bot_real"] = None
+        globals()["bots_usados_en_esta_marti"] = []
+        globals()["marti_audit_run_id"] = 1
+        globals()["marti_audit_ultimo_ciclo_ordenado"] = None
+        globals()["marti_audit_historial"] = deque(maxlen=80)
+        for b in BOT_NAMES:
+            estado_bots.setdefault(b, {})
+            estado_bots[b].update({
+                "token": "REAL" if b == bot else "DEMO",
+                "trigger_real": b == bot,
+                "modo_cuenta": "REAL" if b == bot else "DEMO",
+                "ciclo_actual": ciclo if b == bot else 1,
+                "ciclo_forzado": ciclo if b == bot else None,
+                "modo_real_anunciado": b == bot,
+                "fuente": "SELFTEST" if b == bot else None,
+                "real_activado_en": time.time() if b == bot else 0.0,
+            })
+        globals()["limpiar_orden_real"] = lambda *args, **kwargs: clean_calls.append((args, kwargs)) or True
+        globals()["_sync_round_release_after_real_close"] = lambda _bot, reason="": sync_calls.append((_bot, reason)) or True
+
+    def _fake_cerrar_fail(_bot, reason, ciclo_visual_siguiente=None):
+        close_calls.append((_bot, reason, ciclo_visual_siguiente))
+        return False
+
+    def _ruta_pending_normal(res, ciclo, monto=1.0, payout_total=0.0):
+        sig = _real_close_sig(bot, res, monto, ciclo, payout_total, baseline=0)
+        marti_snapshot = _snapshot_martingala_real()
+        registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo)
+        prox = int(ciclo_martingala_siguiente() or 1)
+        ok_cierre = cerrar_por_fin_de_ciclo(
+            bot,
+            f"selftest pending {res} C{int(ciclo)}",
+            ciclo_visual_siguiente=prox,
+        )
+        if not ok_cierre:
+            _restore_martingala_real(marti_snapshot)
+            return False, sig, prox
+        _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
+        REAL_CLOSE_PENDING[bot] = None
+        _sync_round_release_after_real_close(bot, reason="real_win_pending" if res == "GANANCIA" else "real_loss_pending")
+        LAST_REAL_CLOSE_SIG[bot] = sig
+        REAL_CLOSE_PROCESSED_SIG[bot] = sig
+        return True, sig, prox
+
+    def _ruta_directa_normal(res, ciclo, monto=1.0, payout_total=0.0):
+        sig = _real_close_sig(bot, res, monto, ciclo, payout_total)
+        marti_snapshot = _snapshot_martingala_real()
+        registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo)
+        prox = int(ciclo_martingala_siguiente() or 1)
+        ok_cierre = cerrar_por_fin_de_ciclo(
+            bot,
+            f"selftest directa {res} C{int(ciclo)}",
+            ciclo_visual_siguiente=prox,
+        )
+        if not ok_cierre:
+            _restore_martingala_real(marti_snapshot)
+            return False, sig, prox
+        _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
+        REAL_CLOSE_PENDING[bot] = None
+        _sync_round_release_after_real_close(bot, reason="real_win" if res == "GANANCIA" else "real_loss_next_cycle")
+        LAST_REAL_CLOSE_SIG[bot] = sig
+        REAL_CLOSE_PROCESSED_SIG[bot] = sig
+        return True, sig, prox
+
+    try:
+        os.chdir(tmp)
+
+        # CASO 1: REAL_CLOSE_PENDING pérdida C1 con cierre atómico fallido.
+        _reset_common(ciclo=1, perdidos=0, pending=True)
+        globals()["cerrar_por_fin_de_ciclo"] = _fake_cerrar_fail
+        before_pending = copy.deepcopy(REAL_CLOSE_PENDING.get(bot))
+        before_marti_ciclos_perdidos = marti_ciclos_perdidos
+        before_marti_paso = marti_paso
+        before_cycle = ciclo_martingala_siguiente()
+        ok, _sig, _prox = _ruta_pending_normal("PÉRDIDA", 1)
+        assert ok is False, "pending fallido debe devolver False"
+        assert close_calls, "pending fallido debe intentar cierre atómico"
+        assert ciclo_martingala_siguiente() == before_cycle == 1, "pending fallido no debe avanzar a C2"
+        assert marti_ciclos_perdidos == before_marti_ciclos_perdidos, "pending fallido debe restaurar marti_ciclos_perdidos"
+        assert marti_paso == before_marti_paso, "pending fallido debe restaurar marti_paso"
+        assert REAL_CLOSE_PENDING.get(bot) == before_pending, "pending fallido debe conservar REAL_CLOSE_PENDING"
+        assert _token_txt() == f"REAL:{bot}", "pending fallido debe conservar token REAL"
+        assert REAL_OWNER_LOCK == bot, "pending fallido no debe liberar owner lock"
+        assert sync_calls == [], "pending fallido no debe liberar sync"
+        assert clean_calls == [], "pending fallido no debe limpiar orden_real"
+
+        # CASO 2: ruta directa REAL pérdida C1 con cierre atómico fallido.
+        _reset_common(ciclo=1, perdidos=0, pending=True)
+        globals()["cerrar_por_fin_de_ciclo"] = _fake_cerrar_fail
+        before_pending = copy.deepcopy(REAL_CLOSE_PENDING.get(bot))
+        before_marti_ciclos_perdidos = marti_ciclos_perdidos
+        before_marti_paso = marti_paso
+        before_cycle = ciclo_martingala_siguiente()
+        ok, _sig, _prox = _ruta_directa_normal("PÉRDIDA", 1)
+        assert ok is False, "directa fallida debe devolver False"
+        assert close_calls, "directa fallida debe intentar cierre atómico"
+        assert ciclo_martingala_siguiente() == before_cycle == 1, "directa fallida no debe avanzar a C2"
+        assert marti_ciclos_perdidos == before_marti_ciclos_perdidos, "directa fallida debe restaurar marti_ciclos_perdidos"
+        assert marti_paso == before_marti_paso, "directa fallida debe restaurar marti_paso"
+        assert REAL_CLOSE_PENDING.get(bot) == before_pending, "directa fallida debe conservar pending"
+        assert _token_txt() == f"REAL:{bot}", "directa fallida debe conservar token REAL"
+        assert REAL_OWNER_LOCK == bot, "directa fallida no debe liberar owner lock"
+        assert sync_calls == [], "directa fallida no debe liberar sync"
+        assert clean_calls == [], "directa fallida no debe limpiar orden_real"
+
+        # CASO 3A: éxito normal pérdida C1 -> próxima C2; limpia pending/orden/sync/token.
+        _reset_common(ciclo=1, perdidos=0, pending=True)
+        globals()["cerrar_por_fin_de_ciclo"] = old["cerrar_por_fin_de_ciclo"]
+        ok, sig_loss, prox_loss = _ruta_pending_normal("PÉRDIDA", 1)
+        assert ok is True, "pending exitoso debe devolver True"
+        assert prox_loss == 2 and ciclo_martingala_siguiente() == 2, "PÉRDIDA C1 exitosa debe dejar próxima REAL C2"
+        assert marti_ciclos_perdidos == 1 and marti_paso == 1, "PÉRDIDA C1 exitosa debe consolidar Martingala C2"
+        assert REAL_CLOSE_PENDING.get(bot) is None, "pending exitoso debe limpiar pending"
+        assert clean_calls, "pending exitoso debe limpiar orden_real"
+        assert (bot, "real_loss_pending") in sync_calls, "pending exitoso debe liberar sync"
+        assert LAST_REAL_CLOSE_SIG.get(bot) == sig_loss and REAL_CLOSE_PROCESSED_SIG.get(bot) == sig_loss, "pending exitoso debe marcar firmas"
+        assert _token_txt() == "REAL:none", "pending exitoso debe dejar token REAL:none"
+
+        # CASO 3B: éxito normal ganancia C3 -> próxima C1; limpia pending/orden/sync/token.
+        _reset_common(ciclo=3, perdidos=2, pending=True)
+        globals()["cerrar_por_fin_de_ciclo"] = old["cerrar_por_fin_de_ciclo"]
+        ok, sig_win, prox_win = _ruta_directa_normal("GANANCIA", 3, monto=4.0, payout_total=7.6)
+        assert ok is True, "directa exitosa debe devolver True"
+        assert prox_win == 1 and ciclo_martingala_siguiente() == 1, "GANANCIA C3 exitosa debe dejar próxima REAL C1"
+        assert marti_ciclos_perdidos == 0 and marti_paso == 0, "GANANCIA C3 exitosa debe resetear Martingala"
+        assert REAL_CLOSE_PENDING.get(bot) is None, "directa exitosa debe limpiar pending"
+        assert clean_calls, "directa exitosa debe limpiar orden_real"
+        assert (bot, "real_win") in sync_calls, "directa exitosa debe liberar sync"
+        assert LAST_REAL_CLOSE_SIG.get(bot) == sig_win and REAL_CLOSE_PROCESSED_SIG.get(bot) == sig_win, "directa exitosa debe marcar firmas"
+        assert _token_txt() == "REAL:none", "directa exitosa debe dejar token REAL:none"
+
+        print("✅ SELFTEST REAL_NORMAL_CLOSE_NO_MARTI_ADVANCE_ON_ATOMIC_FAIL OK")
+        return True
+    finally:
+        try:
+            os.chdir(old["cwd"])
+        except Exception:
+            pass
+        for k, v in old.items():
+            if k == "cwd":
+                continue
+            globals()[k] = v
+        shutil.rmtree(tmp, ignore_errors=True)
+
 def _run_requested_selftests_and_exit_if_needed():
     ran = False
     ok = True
@@ -34491,6 +34745,7 @@ def _run_requested_selftests_and_exit_if_needed():
     _run("RUN_REAL_RECONCILE_RELEASES_TOKEN_AND_SYNC_SELFTEST", _selftest_real_reconcile_releases_token_and_sync)
     _run("RUN_REAL_RECONCILE_NO_MARK_SIG_ON_ATOMIC_FAIL_SELFTEST", _selftest_real_reconcile_no_mark_sig_on_atomic_fail)
     _run("RUN_REAL_CLOSE_ATOMIC_PENDING_SELFTEST", _selftest_real_reconcile_releases_token_and_sync)
+    _run("RUN_REAL_NORMAL_CLOSE_NO_MARTI_ADVANCE_ON_ATOMIC_FAIL_SELFTEST", _selftest_real_normal_close_no_marti_advance_on_atomic_fail)
 
     if ran:
         sys.exit(0 if ok else 1)
