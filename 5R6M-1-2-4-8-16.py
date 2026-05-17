@@ -48,6 +48,8 @@ if any(os.environ.get(name) == "1" for name in (
     "RUN_REAL_LOSS_NEXT_CYCLE_SELFTEST",
     "RUN_REAL_MARTINGALE_FULL_LADDER_SELFTEST",
     "RUN_REAL_RECONCILE_NO_DEMO_FANTASMA_SELFTEST",
+    "RUN_REAL_RECONCILE_PENDING_DEMO_NO_ADVANCE_SELFTEST",
+    "RUN_REAL_RECONCILE_OWNER_CYCLE_MISMATCH_SELFTEST",
 )):
     import types
 
@@ -21667,21 +21669,57 @@ def _buscar_cierre_real_pendiente(bot):
     cierre_info = detectar_cierre_martingala(bot, min_fila=baseline, require_closed=True, require_real_token=True, expected_ciclo=ciclo)
     if cierre_info:
         return cierre_info, pending, "estricto"
-    cierre_info = detectar_cierre_martingala(bot, min_fila=baseline, require_closed=True, require_real_token=False, expected_ciclo=ciclo)
-    if not cierre_info:
-        return None
-    res, monto, ciclo_detectado, payout_total = cierre_info
-    if res not in ("GANANCIA", "PÉRDIDA"):
-        return None
-    if int(ciclo_detectado or 0) != int(ciclo):
-        return None
+    # V16:
+    # No aceptar cierres sin token REAL para mover Martingala.
+    # Aunque exista pending fresco, una fila DEMO puede coincidir por bot/ciclo/monto
+    # y provocar salto fantasma C2/C3/C4/C5.
     try:
-        monto_esperado = float(MARTI_ESCALADO[int(ciclo) - 1])
-        if abs(float(monto or 0.0) - monto_esperado) > float(MONTO_TOL):
-            return None
+        agregar_evento(
+            f"🛡️ REAL_CLOSE pendiente sin cierre REAL estricto: "
+            f"{bot} C{ciclo} | no se acepta fallback sin token REAL"
+        )
     except Exception:
-        return None
-    return cierre_info, pending, "fallback_seguro"
+        pass
+    return None
+
+def _validar_cierre_real_pertenece_a_pending(bot, pending, cierre_info, detector=""):
+    """
+    V16: Solo permite mover Martingala si el cierre pertenece exactamente
+    al bot/ciclo REAL pendiente y fue detectado por una ruta estricta.
+    """
+    try:
+        if not isinstance(pending, dict) or not pending.get("active"):
+            return False, "sin_pending_activo"
+        res, monto, ciclo_detectado, payout_total = cierre_info
+        ciclo_pending = int(pending.get("ciclo", 0) or 0)
+        bot_pending = str(pending.get("bot") or bot or "").strip()
+        baseline = int(pending.get("baseline", 0) or 0)
+        if str(bot or "").strip() == "":
+            return False, "bot_vacio"
+        if bot_pending and str(bot or "").strip() != bot_pending:
+            return False, f"bot_no_coincide:cierre_{bot}_pending_{bot_pending}"
+        if res not in ("GANANCIA", "PÉRDIDA"):
+            return False, f"resultado_no_valido:{res}"
+        if int(ciclo_detectado or 0) != int(ciclo_pending):
+            return False, f"ciclo_no_coincide:cierre_C{ciclo_detectado}_pending_C{ciclo_pending}"
+        if int(ciclo_pending) < 1 or int(ciclo_pending) > int(MAX_CICLOS):
+            return False, f"ciclo_pending_fuera_rango:{ciclo_pending}"
+        try:
+            monto_esperado = float(MARTI_ESCALADO[int(ciclo_pending) - 1])
+            if abs(float(monto or 0.0) - monto_esperado) > float(MONTO_TOL):
+                return False, f"monto_no_coincide:{monto}!={monto_esperado}"
+        except Exception as e:
+            return False, f"monto_error:{e}"
+        # baseline queda aplicado por detectar_cierre_martingala(min_fila=baseline);
+        # se lee aquí para que esta aduana dependa explícitamente del pending REAL.
+        _ = baseline
+        # Si el detector no es estricto, no puede mover Martingala.
+        # Esto evita que fallback sin token REAL avance C2/C3/C4/C5.
+        if str(detector or "").lower() not in ("estricto", "pre_emit_csv_strict", "strict"):
+            return False, f"detector_no_estricto:{detector}"
+        return True, "ok"
+    except Exception as e:
+        return False, f"error_validacion:{e}"
 
 def _reconciliar_cierre_real_antes_de_nueva_orden(motivo="pre_emit"):
     """
@@ -21770,43 +21808,23 @@ def _reconciliar_cierre_real_antes_de_nueva_orden(motivo="pre_emit"):
                 detector = "pre_emit_csv_strict"
 
                 if not cierre_info:
-                    # Fallback sin token REAL SOLO permitido si existe pending REAL activo y fresco.
-                    # Sin pending fresco, puede capturar filas DEMO y crear C2/C3 fantasma.
-                    if pending_fresco:
-                        cierre_info = detectar_cierre_martingala(
-                            bot,
-                            min_fila=baseline_ref,
-                            require_closed=True,
-                            require_real_token=False,
-                            expected_ciclo=int(ciclo_ref),
+                    # V16:
+                    # Prohibido reconciliar REAL con una fila sin token REAL.
+                    # Si no hay cierre estricto, no se mueve Martingala.
+                    cierre_info = None
+                    detector = "blocked_no_real_token_v16"
+                    try:
+                        _lxv_5v1x_event_cooldown(
+                            key=f"real_reconcile_no_real_token_blocked:{bot}:{int(ciclo_ref)}",
+                            msg=(
+                                f"🛡️ REAL_RECONCILE V16 bloqueado: "
+                                f"no se acepta cierre sin token REAL | bot={bot} C{int(ciclo_ref)} "
+                                f"motivo={motivo}"
+                            ),
+                            cooldown_s=20.0,
                         )
-                        detector = "pre_emit_csv_post_token_release_pending_fresco"
-                    else:
-                        cierre_info = None
-                        detector = "pre_emit_no_token_fallback_blocked_no_pending_fresco"
-                        try:
-                            _lxv_5v1x_event_cooldown(
-                                key=f"real_reconcile_no_token_blocked:{bot}:{int(ciclo_ref)}",
-                                msg=(
-                                    f"🛡️ REAL_RECONCILE bloqueado: cierre sin token REAL rechazado "
-                                    f"por no tener pending fresco | bot={bot} C{int(ciclo_ref)}"
-                                ),
-                                cooldown_s=20.0,
-                            )
-                        except Exception:
-                            pass
-
-                    # Si se detecta sin token REAL, validar monto del ciclo para evitar tomar DEMO.
-                    if cierre_info:
-                        try:
-                            _res_tmp, monto_tmp, ciclo_tmp, _payout_tmp = cierre_info
-                            ciclo_tmp = int(ciclo_tmp or ciclo_ref)
-                            esperado = float(MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO) - 1, ciclo_tmp - 1))])
-                            monto_tmp_f = float(monto_tmp) if monto_tmp is not None else None
-                            if monto_tmp_f is None or abs(monto_tmp_f - esperado) > float(MONTO_TOL):
-                                cierre_info = None
-                        except Exception:
-                            cierre_info = None
+                    except Exception:
+                        pass
 
             if not cierre_info:
                 continue
@@ -21846,6 +21864,23 @@ def _reconciliar_cierre_real_antes_de_nueva_orden(motivo="pre_emit"):
                     continue
             except Exception:
                 pass
+
+            ok_owner, motivo_owner = _validar_cierre_real_pertenece_a_pending(
+                bot,
+                pending,
+                cierre_info,
+                detector=detector,
+            )
+            if not ok_owner:
+                try:
+                    agregar_evento(
+                        f"🛡️ REAL_RECONCILE V16 rechazado: {bot} "
+                        f"C{ciclo_detectado} {res} detector={detector} "
+                        f"motivo={motivo_owner} | NO mueve Martingala"
+                    )
+                except Exception:
+                    pass
+                continue
 
             # PUNTO CRÍTICO:
             # consolidar la Martingala ANTES de permitir nueva orden.
@@ -33344,6 +33379,177 @@ def _selftest_real_reconcile_no_demo_fantasma():
             pass
 
 
+
+def _selftest_real_reconcile_pending_demo_no_advance():
+    """
+    V16: Simula pending REAL fresco C2, pero el detector estricto no encuentra
+    token REAL. El detector no estricto sí encontraría una fila DEMO C2 PÉRDIDA.
+    Resultado esperado: NO avanzar a C3. Debe quedarse en C2.
+    """
+    global marti_ciclos_perdidos, marti_paso, REAL_CLOSE_PENDING
+
+    bot = "fulll46"
+
+    old_marti_ciclos_perdidos = marti_ciclos_perdidos
+    old_marti_paso = marti_paso
+    old_pending = REAL_CLOSE_PENDING.get(bot) if isinstance(REAL_CLOSE_PENDING, dict) else None
+    old_estado = dict(estado_bots.get(bot, {})) if isinstance(estado_bots, dict) and isinstance(estado_bots.get(bot), dict) else None
+    old_detectar = globals().get("detectar_cierre_martingala")
+    old_limpiar = globals().get("limpiar_orden_real")
+
+    try:
+        marti_ciclos_perdidos = 1
+        marti_paso = 1
+
+        if bot not in estado_bots or not isinstance(estado_bots.get(bot), dict):
+            estado_bots[bot] = {}
+
+        estado_bots[bot]["token"] = "DEMO"
+        estado_bots[bot]["ciclo_actual"] = 2
+
+        REAL_CLOSE_PENDING[bot] = {
+            "active": True,
+            "bot": bot,
+            "ciclo": 2,
+            "baseline": 0,
+            "ts": time.time(),
+        }
+
+        def fake_detectar(*args, **kwargs):
+            if kwargs.get("require_real_token") is True:
+                return None
+            if kwargs.get("require_real_token") is False:
+                return ("PÉRDIDA", 2.0, 2, 0.0)
+            return None
+
+        def fake_limpiar(*args, **kwargs):
+            raise AssertionError("No debe limpiar orden_real con cierre DEMO rechazado")
+
+        globals()["detectar_cierre_martingala"] = fake_detectar
+        globals()["limpiar_orden_real"] = fake_limpiar
+
+        ok = _reconciliar_cierre_real_antes_de_nueva_orden("selftest_pending_demo_no_advance")
+
+        assert ok is False, "No debía procesar cierre DEMO como REAL"
+        assert int(marti_ciclos_perdidos) == 1, (
+            f"marti_ciclos_perdidos cambió indebidamente a {marti_ciclos_perdidos}"
+        )
+        assert int(ciclo_martingala_siguiente()) == 2, (
+            f"Saltó indebidamente a C{ciclo_martingala_siguiente()}, debía quedar en C2"
+        )
+
+        print("✅ SELFTEST REAL_RECONCILE_PENDING_DEMO_NO_ADVANCE OK")
+        return True
+
+    finally:
+        globals()["detectar_cierre_martingala"] = old_detectar
+        globals()["limpiar_orden_real"] = old_limpiar
+        marti_ciclos_perdidos = old_marti_ciclos_perdidos
+        marti_paso = old_marti_paso
+        try:
+            REAL_CLOSE_PENDING[bot] = old_pending
+        except Exception:
+            pass
+        try:
+            if old_estado is not None:
+                estado_bots[bot] = old_estado
+        except Exception:
+            pass
+
+
+def _selftest_real_reconcile_owner_cycle_mismatch():
+    """
+    V16: Simula que el pending REAL válido es fulll47 C1, pero aparece un cierre
+    fulll50 C4 PÉRDIDA. Ese cierre NO debe mover la Martingala a C5.
+    """
+    global marti_ciclos_perdidos, marti_paso, REAL_CLOSE_PENDING
+
+    bot_ok = "fulll47"
+    bot_wrong = "fulll50"
+
+    old_marti_ciclos_perdidos = marti_ciclos_perdidos
+    old_marti_paso = marti_paso
+    old_pending_ok = REAL_CLOSE_PENDING.get(bot_ok) if isinstance(REAL_CLOSE_PENDING, dict) else None
+    old_pending_wrong = REAL_CLOSE_PENDING.get(bot_wrong) if isinstance(REAL_CLOSE_PENDING, dict) else None
+    old_last_sig_wrong = LAST_REAL_CLOSE_SIG.get(bot_wrong) if isinstance(LAST_REAL_CLOSE_SIG, dict) else None
+    old_processed_sig_wrong = REAL_CLOSE_PROCESSED_SIG.get(bot_wrong) if isinstance(REAL_CLOSE_PROCESSED_SIG, dict) else None
+    old_detectar = globals().get("detectar_cierre_martingala")
+    old_limpiar = globals().get("limpiar_orden_real")
+
+    try:
+        marti_ciclos_perdidos = 0
+        marti_paso = 0
+        LAST_REAL_CLOSE_SIG[bot_wrong] = None
+        REAL_CLOSE_PROCESSED_SIG[bot_wrong] = None
+
+        REAL_CLOSE_PENDING[bot_ok] = {
+            "active": True,
+            "bot": bot_ok,
+            "ciclo": 1,
+            "baseline": 0,
+            "ts": time.time(),
+        }
+        REAL_CLOSE_PENDING[bot_wrong] = None
+
+        def fake_detectar(bot, *args, **kwargs):
+            # fulll47 no tiene cierre todavía.
+            if bot == bot_ok:
+                return None
+            # fulll50 trae una pérdida C4, pero no tiene pending activo.
+            # No debe mover Martingala.
+            if bot == bot_wrong:
+                if kwargs.get("require_real_token") is True:
+                    return ("PÉRDIDA", 8.0, 4, 0.0)
+                return ("PÉRDIDA", 8.0, 4, 0.0)
+            return None
+
+        def fake_limpiar(*args, **kwargs):
+            return True
+
+        globals()["detectar_cierre_martingala"] = fake_detectar
+        globals()["limpiar_orden_real"] = fake_limpiar
+
+        ok = _reconciliar_cierre_real_antes_de_nueva_orden("selftest_owner_cycle_mismatch")
+
+        assert ok is False, "No debía procesar fulll50 C4 si el pending oficial es fulll47 C1"
+        assert int(marti_ciclos_perdidos) == 0, (
+            f"marti_ciclos_perdidos cambió indebidamente a {marti_ciclos_perdidos}"
+        )
+        assert int(ciclo_martingala_siguiente()) == 1, (
+            f"Saltó indebidamente a C{ciclo_martingala_siguiente()}"
+        )
+
+        print("✅ SELFTEST REAL_RECONCILE_OWNER_CYCLE_MISMATCH OK")
+        return True
+
+    finally:
+        globals()["detectar_cierre_martingala"] = old_detectar
+        globals()["limpiar_orden_real"] = old_limpiar
+        marti_ciclos_perdidos = old_marti_ciclos_perdidos
+        marti_paso = old_marti_paso
+        try:
+            REAL_CLOSE_PENDING[bot_ok] = old_pending_ok
+        except Exception:
+            pass
+        try:
+            REAL_CLOSE_PENDING[bot_wrong] = old_pending_wrong
+        except Exception:
+            pass
+        try:
+            if old_last_sig_wrong is None:
+                LAST_REAL_CLOSE_SIG.pop(bot_wrong, None)
+            else:
+                LAST_REAL_CLOSE_SIG[bot_wrong] = old_last_sig_wrong
+        except Exception:
+            pass
+        try:
+            if old_processed_sig_wrong is None:
+                REAL_CLOSE_PROCESSED_SIG.pop(bot_wrong, None)
+            else:
+                REAL_CLOSE_PROCESSED_SIG[bot_wrong] = old_processed_sig_wrong
+        except Exception:
+            pass
+
 def _run_requested_selftests_and_exit_if_needed():
     ran = False
     ok = True
@@ -33395,6 +33601,8 @@ def _run_requested_selftests_and_exit_if_needed():
     _run("RUN_REAL_LOSS_NEXT_CYCLE_SELFTEST", _selftest_real_loss_next_cycle)
     _run("RUN_REAL_MARTINGALE_FULL_LADDER_SELFTEST", _selftest_real_martingale_full_ladder)
     _run("RUN_REAL_RECONCILE_NO_DEMO_FANTASMA_SELFTEST", _selftest_real_reconcile_no_demo_fantasma)
+    _run("RUN_REAL_RECONCILE_PENDING_DEMO_NO_ADVANCE_SELFTEST", _selftest_real_reconcile_pending_demo_no_advance)
+    _run("RUN_REAL_RECONCILE_OWNER_CYCLE_MISMATCH_SELFTEST", _selftest_real_reconcile_owner_cycle_mismatch)
 
     if ran:
         sys.exit(0 if ok else 1)
