@@ -46,6 +46,7 @@ if any(os.environ.get(name) == "1" for name in (
     "RUN_SYNC_RECOVERY_SINGLE_BOT_SELFTEST",
     "RUN_READ_JSON_HELPER_SELFTEST",
     "RUN_REAL_LOSS_NEXT_CYCLE_SELFTEST",
+    "RUN_REAL_MARTINGALE_FULL_LADDER_SELFTEST",
 )):
     import types
 
@@ -33105,6 +33106,149 @@ def _selftest_real_loss_next_cycle():
         marti_paso = old_marti_paso
 
 
+def _selftest_real_martingale_full_ladder():
+    """
+    Selftest extendido:
+    valida toda la escalera REAL C1-C5 usando la reconciliación pre-emisión.
+
+    No toca lógica productiva.
+    No modifica bots.
+    """
+    global marti_ciclos_perdidos, marti_paso, REAL_CLOSE_PENDING
+    global REAL_OWNER_LOCK, REAL_COOLDOWN_UNTIL_TS
+
+    bot = "fulll46"
+
+    old_marti_ciclos_perdidos = marti_ciclos_perdidos
+    old_marti_paso = marti_paso
+    old_pending = REAL_CLOSE_PENDING.get(bot) if isinstance(REAL_CLOSE_PENDING, dict) else None
+    old_last_sig = LAST_REAL_CLOSE_SIG.get(bot) if isinstance(LAST_REAL_CLOSE_SIG, dict) else None
+    old_processed_sig = REAL_CLOSE_PROCESSED_SIG.get(bot) if isinstance(REAL_CLOSE_PROCESSED_SIG, dict) else None
+    old_owner = REAL_OWNER_LOCK
+    old_cooldown = REAL_COOLDOWN_UNTIL_TS
+    old_estado = dict(estado_bots.get(bot, {})) if isinstance(estado_bots, dict) and isinstance(estado_bots.get(bot), dict) else None
+
+    old_detectar = globals().get("detectar_cierre_martingala")
+    old_limpiar = globals().get("limpiar_orden_real")
+
+    try:
+        def fake_limpiar(*args, **kwargs):
+            return True
+
+        globals()["limpiar_orden_real"] = fake_limpiar
+
+        casos = []
+
+        # Pérdidas: C1->C2, C2->C3, C3->C4, C4->C5, C5->C1
+        for ciclo in range(1, int(MAX_CICLOS) + 1):
+            esperado = ciclo + 1 if ciclo < int(MAX_CICLOS) else 1
+            casos.append(("PÉRDIDA", ciclo, esperado))
+
+        # Ganancias: cualquier C -> C1
+        for ciclo in range(1, int(MAX_CICLOS) + 1):
+            casos.append(("GANANCIA", ciclo, 1))
+
+        for resultado, ciclo, esperado_next in casos:
+            marti_ciclos_perdidos = 0
+            marti_paso = 0
+            REAL_OWNER_LOCK = bot
+            REAL_COOLDOWN_UNTIL_TS = 0.0
+
+            LAST_REAL_CLOSE_SIG[bot] = None
+            REAL_CLOSE_PROCESSED_SIG[bot] = None
+
+            if bot not in estado_bots or not isinstance(estado_bots.get(bot), dict):
+                estado_bots[bot] = {}
+
+            estado_bots[bot]["token"] = "REAL"
+            estado_bots[bot]["ciclo_actual"] = int(ciclo)
+            estado_bots[bot]["trigger_real"] = True
+            estado_bots[bot]["modo_real_anunciado"] = True
+            estado_bots[bot]["fuente"] = "SELFTEST"
+
+            REAL_CLOSE_PENDING[bot] = {
+                "active": True,
+                "bot": bot,
+                "ciclo": int(ciclo),
+                "baseline": 0,
+                "ts": time.time(),
+            }
+
+            monto = float(MARTI_ESCALADO[int(ciclo) - 1])
+
+            def fake_detectar(*args, **kwargs):
+                expected_ciclo = kwargs.get("expected_ciclo")
+                if expected_ciclo is not None and int(expected_ciclo) != int(ciclo):
+                    return None
+                return (resultado, monto, int(ciclo), 0.0)
+
+            globals()["detectar_cierre_martingala"] = fake_detectar
+
+            ok = _reconciliar_cierre_real_antes_de_nueva_orden(
+                f"selftest_full_ladder_{resultado}_C{ciclo}"
+            )
+
+            assert ok is True, f"reconcile no procesó {resultado} C{ciclo}"
+
+            next_cycle = int(ciclo_martingala_siguiente())
+            assert next_cycle == int(esperado_next), (
+                f"falló {resultado} C{ciclo}: esperado próxima C{esperado_next}, "
+                f"obtenido C{next_cycle}"
+            )
+
+            if resultado == "PÉRDIDA" and int(ciclo) < int(MAX_CICLOS):
+                assert int(marti_ciclos_perdidos) == int(ciclo), (
+                    f"falló contador pérdida C{ciclo}: "
+                    f"marti_ciclos_perdidos={marti_ciclos_perdidos}"
+                )
+            else:
+                assert int(marti_ciclos_perdidos) == 0, (
+                    f"falló reinicio {resultado} C{ciclo}: "
+                    f"marti_ciclos_perdidos={marti_ciclos_perdidos}"
+                )
+
+            REAL_CLOSE_PENDING[bot] = None
+
+        print("✅ SELFTEST REAL_MARTINGALE_FULL_LADDER OK")
+        return True
+
+    finally:
+        globals()["detectar_cierre_martingala"] = old_detectar
+        globals()["limpiar_orden_real"] = old_limpiar
+
+        marti_ciclos_perdidos = old_marti_ciclos_perdidos
+        marti_paso = old_marti_paso
+        REAL_OWNER_LOCK = old_owner
+        REAL_COOLDOWN_UNTIL_TS = old_cooldown
+
+        try:
+            REAL_CLOSE_PENDING[bot] = old_pending
+        except Exception:
+            pass
+
+        try:
+            if old_last_sig is None:
+                LAST_REAL_CLOSE_SIG.pop(bot, None)
+            else:
+                LAST_REAL_CLOSE_SIG[bot] = old_last_sig
+        except Exception:
+            pass
+
+        try:
+            if old_processed_sig is None:
+                REAL_CLOSE_PROCESSED_SIG.pop(bot, None)
+            else:
+                REAL_CLOSE_PROCESSED_SIG[bot] = old_processed_sig
+        except Exception:
+            pass
+
+        try:
+            if old_estado is not None:
+                estado_bots[bot] = old_estado
+        except Exception:
+            pass
+
+
 def _run_requested_selftests_and_exit_if_needed():
     ran = False
     ok = True
@@ -33154,6 +33298,7 @@ def _run_requested_selftests_and_exit_if_needed():
     _run("RUN_DQ_RELEASED_HUD_SELFTEST", _selftest_dq_released_hud)
     _run("RUN_READ_JSON_HELPER_SELFTEST", _selftest_read_json_helper)
     _run("RUN_REAL_LOSS_NEXT_CYCLE_SELFTEST", _selftest_real_loss_next_cycle)
+    _run("RUN_REAL_MARTINGALE_FULL_LADDER_SELFTEST", _selftest_real_martingale_full_ladder)
 
     if ran:
         sys.exit(0 if ok else 1)
