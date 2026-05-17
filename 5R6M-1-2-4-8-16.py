@@ -55,6 +55,7 @@ if any(os.environ.get(name) == "1" for name in (
     "RUN_REAL_STRICT_ACCEPTS_MODO_CUENTA_REAL_SELFTEST",
     "RUN_REAL_STRICT_REJECTS_MODO_CUENTA_DEMO_SELFTEST",
     "RUN_REAL_RECONCILE_RELEASES_TOKEN_AND_SYNC_SELFTEST",
+    "RUN_REAL_CLOSE_ATOMIC_PENDING_SELFTEST",
 )):
     import types
 
@@ -20877,8 +20878,14 @@ def reiniciar_bot(bot, borrar_csv=False):
     if not isinstance(huellas_usadas.get(bot), set):
         huellas_usadas[bot] = set()
 
-def cerrar_por_fin_de_ciclo(bot: str, reason: str, ciclo_visual_siguiente: int | None = None):
+def cerrar_por_fin_de_ciclo(bot: str, reason: str, ciclo_visual_siguiente: int | None = None) -> bool:
     global REAL_OWNER_LOCK, REAL_COOLDOWN_UNTIL_TS
+
+    try:
+        ciclo_vis = int(ciclo_visual_siguiente) if ciclo_visual_siguiente is not None else int(ciclo_martingala_siguiente() or 1)
+    except Exception:
+        ciclo_vis = 1
+    ciclo_vis = max(1, min(int(MAX_CICLOS), int(ciclo_vis)))
 
     # Liberar token REAL en archivo primero (commit de salida)
     liberado = False
@@ -20886,6 +20893,8 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str, ciclo_visual_siguiente: int |
         with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
             if got:
                 liberado = bool(write_token_atomic(TOKEN_FILE, "REAL:none"))
+                if liberado:
+                    liberado = leer_token_archivo_raw() is None
                 if not liberado:
                     agregar_evento("⚠️ Token REAL no liberado: fallo de persistencia en token_actual.txt.")
             else:
@@ -20894,7 +20903,8 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str, ciclo_visual_siguiente: int |
         liberado = False
 
     if not liberado:
-        return
+        agregar_evento("⛔ CIERRE_REAL_NO_ATOMICO: no se pudo liberar token; se conserva estado REAL para reintento seguro")
+        return False
 
     # Liberación consolidada: recién aquí memoria/UI pasan a DEMO
     REAL_OWNER_LOCK = None
@@ -20904,11 +20914,7 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str, ciclo_visual_siguiente: int |
     try:
         estado_bots[bot]["token"] = "DEMO"
         estado_bots[bot]["trigger_real"] = False
-        try:
-            ciclo_vis = int(ciclo_visual_siguiente) if ciclo_visual_siguiente is not None else int(ciclo_martingala_siguiente() or 1)
-        except Exception:
-            ciclo_vis = 1
-        ciclo_vis = max(1, min(int(MAX_CICLOS), int(ciclo_vis)))
+        estado_bots[bot]["modo_cuenta"] = "DEMO"
         estado_bots[bot]["ciclo_actual"] = ciclo_vis
         estado_bots[bot]["ciclo_forzado"] = None
         estado_bots[bot]["modo_real_anunciado"] = False
@@ -20998,6 +21004,8 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str, ciclo_visual_siguiente: int |
         agregar_evento(f"🔓 Cuenta REAL liberada para {bot.upper()} ({reason})")
     except Exception:
         pass
+
+    return True
 
 def _marti_audit_record(kind: str, ciclo: int | None = None, bot: str | None = None, detalle: str = ""):
     """Guarda rastro compacto de la secuencia C1..C{MAX_CICLOS} para diagnóstico."""
@@ -22041,18 +22049,25 @@ def _reconciliar_cierre_real_antes_de_nueva_orden(motivo="pre_emit"):
             except Exception:
                 pass
 
-            # Cierre REAL atómico: pending -> token/estado -> incidente/orden/sync.
+            # Cierre REAL atómico: token/estado -> pending -> incidente/orden/sync.
+            ok_cierre = cerrar_por_fin_de_ciclo(
+                bot,
+                f"REAL reconciliado {res} C{int(ciclo_detectado)}; vuelve a DEMO; próximo ciclo C{prox}",
+                ciclo_visual_siguiente=prox
+            )
+
+            if not ok_cierre:
+                agregar_evento(
+                    f"⛔ REAL_RECONCILE_ABORTADO: cierre no atómico para {bot}; "
+                    f"no se limpia pending, no se libera sync, no se permite nueva REAL."
+                )
+                return False
+
             try:
                 if isinstance(REAL_CLOSE_PENDING, dict) and bot in REAL_CLOSE_PENDING:
                     REAL_CLOSE_PENDING[bot] = None
             except Exception:
                 pass
-
-            cerrar_por_fin_de_ciclo(
-                bot,
-                f"REAL reconciliado {res} C{int(ciclo_detectado)}; vuelve a DEMO; próximo ciclo C{prox}",
-                ciclo_visual_siguiente=prox
-            )
 
             _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
 
@@ -30973,7 +30988,10 @@ async def cargar_datos_bot(bot, token_actual):
                 and resultado in ("GANANCIA", "PÉRDIDA")
             ):
                 reason = f"REAL manual: {resultado} → una operación y regreso a DEMO"
-                cerrar_por_fin_de_ciclo(bot, reason)
+                ok_cierre = cerrar_por_fin_de_ciclo(bot, reason)
+                if not ok_cierre:
+                    agregar_evento("⛔ CIERRE_REAL_FALLIDO: token no liberado; se mantiene bloqueo REAL")
+                    continue
                 try:
                     _set_real_manual_alert(None)
                 except Exception:
@@ -31888,8 +31906,17 @@ async def main():
                             "detector": f"REAL_CLOSE_PENDING_{modo_detector}",
                         })
                         if res == "GANANCIA":
+                            prox = int(ciclo_martingala_siguiente() or 1)
                             agregar_evento(f"✅ REAL C{int(ciclo)} GANANCIA registrada por pending ({modo_detector}): {bot} -> C1")
-                            cerrar_por_fin_de_ciclo(bot, "Ganancia REAL cerrada por pending; vuelve a DEMO")
+                            ok_cierre = cerrar_por_fin_de_ciclo(
+                                bot,
+                                "Ganancia REAL cerrada por pending; vuelve a DEMO",
+                                ciclo_visual_siguiente=prox
+                            )
+                            if not ok_cierre:
+                                agregar_evento("⛔ CIERRE_REAL_FALLIDO: token no liberado; se mantiene bloqueo REAL")
+                                activo_real = bot
+                                break
                             _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
                             REAL_CLOSE_PENDING[bot] = None
                             _sync_round_release_after_real_close(bot, reason="real_win_pending")
@@ -31900,7 +31927,15 @@ async def main():
                         if res == "PÉRDIDA":
                             prox = int(ciclo_martingala_siguiente() or 1)
                             agregar_evento(f"❌ REAL C{int(ciclo)} PÉRDIDA registrada por pending ({modo_detector}): {bot} -> próxima C{prox}")
-                            cerrar_por_fin_de_ciclo(bot, f"Pérdida REAL C{int(ciclo)} cerrada por pending")
+                            ok_cierre = cerrar_por_fin_de_ciclo(
+                                bot,
+                                f"Pérdida REAL C{int(ciclo)} cerrada por pending",
+                                ciclo_visual_siguiente=prox
+                            )
+                            if not ok_cierre:
+                                agregar_evento("⛔ CIERRE_REAL_FALLIDO: token no liberado; se mantiene bloqueo REAL")
+                                activo_real = bot
+                                break
                             _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
                             REAL_CLOSE_PENDING[bot] = None
                             _sync_round_release_after_real_close(bot, reason="real_loss_pending")
@@ -32017,11 +32052,15 @@ async def main():
                                     if res == "GANANCIA":
                                         prox = int(ciclo_martingala_siguiente() or 1)
                                         agregar_evento(f"✅ REAL WIN: {bot} C{int(ciclo or 0)} -> DEMO | próximo ciclo C{prox}")
-                                        cerrar_por_fin_de_ciclo(
+                                        ok_cierre = cerrar_por_fin_de_ciclo(
                                             bot,
                                             "Ganancia REAL cerrada; vuelve a DEMO",
                                             ciclo_visual_siguiente=prox
                                         )
+                                        if not ok_cierre:
+                                            agregar_evento("⛔ CIERRE_REAL_FALLIDO: token no liberado; se mantiene bloqueo REAL")
+                                            activo_real = bot
+                                            break
                                         _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
                                         REAL_CLOSE_PENDING[bot] = None
                                         _sync_round_release_after_real_close(bot, reason="real_win")
@@ -32035,11 +32074,15 @@ async def main():
                                             agregar_evento(f"❌ REAL LOSS FINAL: {bot} C{int(ciclo or 0)} -> DEMO | reinicio próximo ciclo C{prox}")
                                         else:
                                             agregar_evento(f"❌ REAL LOSS: {bot} C{int(ciclo or 0)} -> DEMO | próximo ciclo C{prox}")
-                                        cerrar_por_fin_de_ciclo(
+                                        ok_cierre = cerrar_por_fin_de_ciclo(
                                             bot,
                                             f"Pérdida REAL C{int(ciclo or 0)}; vuelve a DEMO; próximo ciclo C{prox}",
                                             ciclo_visual_siguiente=prox
                                         )
+                                        if not ok_cierre:
+                                            agregar_evento("⛔ CIERRE_REAL_FALLIDO: token no liberado; se mantiene bloqueo REAL")
+                                            activo_real = bot
+                                            break
                                         _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
                                         REAL_CLOSE_PENDING[bot] = None
                                         _sync_round_release_after_real_close(bot, reason="real_loss_next_cycle")
@@ -34079,6 +34122,7 @@ def _selftest_real_reconcile_releases_token_and_sync():
         "bots_usados_en_esta_marti": list(globals().get("bots_usados_en_esta_marti", [])),
         "detectar_cierre_martingala": globals().get("detectar_cierre_martingala"),
         "_sync_round_release_after_real_close": globals().get("_sync_round_release_after_real_close"),
+        "write_token_atomic": globals().get("write_token_atomic"),
     }
     tmp = tempfile.mkdtemp(prefix="real_reconcile_release_")
     sync_calls = []
@@ -34131,6 +34175,8 @@ def _selftest_real_reconcile_releases_token_and_sync():
         assert _reconciliar_cierre_real_antes_de_nueva_orden("selftest_loss_c1") is True
         assert ciclo_martingala_siguiente() == 2
         assert leer_token_archivo_raw() is None
+        with open(globals()["TOKEN_FILE"], encoding="utf-8", errors="replace") as f:
+            assert f.read().strip() == "REAL:none"
         assert REAL_OWNER_LOCK is None
         assert REAL_CLOSE_PENDING["fulll46"] is None
         assert estado_bots["fulll46"]["token"] == "DEMO"
@@ -34163,6 +34209,24 @@ def _selftest_real_reconcile_releases_token_and_sync():
         assert emitir_real_autorizado("fulll47", 1, source="LXV_5V1X", round_id=999) is False
         assert REAL_OWNER_LOCK == "fulll46"
         assert ciclo_martingala_siguiente() == before_cycle
+
+        sync_calls.clear()
+        _reset_common("fulll48", 2, perdidos=1)
+        before_pending = copy.deepcopy(REAL_CLOSE_PENDING.get("fulll48"))
+        before_token = estado_bots["fulll48"].get("token")
+        before_ciclo = estado_bots["fulll48"].get("ciclo_actual")
+        globals()["write_token_atomic"] = lambda *args, **kwargs: False
+        ok_cierre = cerrar_por_fin_de_ciclo(
+            "fulll48",
+            "selftest fallo simulado al liberar token",
+            ciclo_visual_siguiente=3,
+        )
+        assert ok_cierre is False
+        assert leer_token_archivo_raw() == "fulll48"
+        assert estado_bots["fulll48"].get("token") == before_token
+        assert estado_bots["fulll48"].get("ciclo_actual") == before_ciclo
+        assert REAL_CLOSE_PENDING.get("fulll48") == before_pending
+        assert sync_calls == []
 
         print("✅ SELFTEST REAL_RECONCILE_RELEASES_TOKEN_AND_SYNC OK")
         return True
@@ -34235,6 +34299,7 @@ def _run_requested_selftests_and_exit_if_needed():
     _run("RUN_REAL_STRICT_ACCEPTS_MODO_CUENTA_REAL_SELFTEST", _selftest_real_strict_accepts_modo_cuenta_real)
     _run("RUN_REAL_STRICT_REJECTS_MODO_CUENTA_DEMO_SELFTEST", _selftest_real_strict_rejects_modo_cuenta_demo)
     _run("RUN_REAL_RECONCILE_RELEASES_TOKEN_AND_SYNC_SELFTEST", _selftest_real_reconcile_releases_token_and_sync)
+    _run("RUN_REAL_CLOSE_ATOMIC_PENDING_SELFTEST", _selftest_real_reconcile_releases_token_and_sync)
 
     if ran:
         sys.exit(0 if ok else 1)
