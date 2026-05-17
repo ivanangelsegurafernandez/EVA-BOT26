@@ -707,33 +707,46 @@ def _sync_round_write_recovery_request(bot, round_id, next_round, released, reas
         if isinstance(extra_fields, dict) and extra_fields:
             payload.update(extra_fields)
 
+        # === BLINDAJE CENTRAL RECOVERY ARTIFICIAL ===
         try:
-            reason_l = str(payload.get("reason", "") or "").strip().lower()
-            source_u = str(payload.get("source", "") or "").strip().upper()
+            src_txt = str(
+                payload.get("source")
+                or payload.get("src")
+                or payload.get("reason")
+                or payload.get("motivo")
+                or ""
+            ).lower()
 
-            recovery_artificial = bool(
-                payload.get("neutral", False)
-                or payload.get("no_trade_result", False)
-                or payload.get("quarantine", False)
-                or reason_l.startswith("incident_lock_demo")
-                or reason_l in {
-                    "ack_close_missing_after_trade_result",
-                    "incident_lock_demo_stale_open",
-                    "incident_lock_demo_sin_evidencia",
-                    "incident_lock_demo_closed_sin_profit",
-                    "incident_lock_demo_sold_sin_contexto",
-                }
-                or source_u.startswith("INCIDENT_LOCK")
-                or source_u in {
-                    "ACK_CLOSE_NO_CONFIRMADO",
-                    "INCIDENT_LOCK_STALE_OPEN_DEMO",
-                    "INCIDENT_LOCK_SIN_EVIDENCIA_DEMO",
-                    "INCIDENT_LOCK_CLOSED_SIN_PROFIT_DEMO",
-                    "INCIDENT_LOCK_SOLD_SIN_CONTEXTO_DEMO",
-                }
+            reason_txt = str(
+                payload.get("reason")
+                or payload.get("motivo")
+                or payload.get("detalle")
+                or ""
+            ).lower()
+
+            joined = f"{src_txt} {reason_txt}"
+
+            recovery_like = any(k in joined for k in (
+                "recovery",
+                "incident",
+                "incident_lock",
+                "ack_close_missing",
+                "stale_open",
+                "sin_evidencia",
+                "closed_sin_profit",
+                "artificial",
+                "quarantine",
+                "cuarentena",
+            ))
+
+            neutral_like = bool(
+                payload.get("neutral")
+                or payload.get("no_trade_result")
+                or payload.get("quarantine")
+                or payload.get("recovery_artificial")
             )
 
-            if recovery_artificial:
+            if recovery_like or neutral_like:
                 payload["neutral"] = True
                 payload["no_trade_result"] = True
                 payload["quarantine"] = True
@@ -741,16 +754,13 @@ def _sync_round_write_recovery_request(bot, round_id, next_round, released, reas
                 payload["usable_for_lxv"] = False
                 payload["usable_for_training"] = False
                 payload["recovery_artificial"] = True
-                payload["real_block_reason"] = "recovery_artificial_no_usable_para_real_lxv_training"
+                payload["real_block_reason"] = (
+                    payload.get("real_block_reason")
+                    or "recovery_artificial_no_usable_para_real_lxv_training"
+                )
         except Exception:
-            payload["neutral"] = True
-            payload["no_trade_result"] = True
-            payload["quarantine"] = True
-            payload["usable_for_real"] = False
-            payload["usable_for_lxv"] = False
-            payload["usable_for_training"] = False
-            payload["recovery_artificial"] = True
-            payload["real_block_reason"] = "recovery_artificial_guard_exception"
+            pass
+        # === /BLINDAJE CENTRAL RECOVERY ARTIFICIAL ===
         return _sync_round_write_json_atomic(path, payload)
     except Exception:
         return False
