@@ -52,6 +52,8 @@ if any(os.environ.get(name) == "1" for name in (
     "RUN_REAL_RECONCILE_OWNER_CYCLE_MISMATCH_SELFTEST",
     "RUN_REAL_STRICT_REQUIRES_EXPLICIT_TOKEN_SELFTEST",
     "RUN_REAL_STRICT_ACCEPTS_EXPLICIT_REAL_SELFTEST",
+    "RUN_REAL_STRICT_ACCEPTS_MODO_CUENTA_REAL_SELFTEST",
+    "RUN_REAL_STRICT_REJECTS_MODO_CUENTA_DEMO_SELFTEST",
 )):
     import types
 
@@ -20427,6 +20429,9 @@ def _fila_tiene_evidencia_real_explicita(row: dict) -> tuple[bool, str]:
             "cuenta",
             "modo",
             "account_type",
+            "modo_cuenta",
+            "cuenta_modo",
+            "tipo_operacion",
             "tipo_cuenta",
             "token_actual",
             "loginid",
@@ -33849,6 +33854,174 @@ def _selftest_real_strict_accepts_explicit_real():
         except Exception:
             pass
 
+
+def _selftest_real_strict_accepts_modo_cuenta_real():
+    """
+    V18:
+    CSV con modo_cuenta=REAL debe ser aceptado por detectar_cierre_martingala(require_real_token=True).
+    """
+    import tempfile
+    import os as _os
+    import csv as _csv
+
+    bot = "fulll50"
+
+    old_archivos_exists = "ARCHIVOS_BOTS" in globals()
+    old_archivos = globals().get("ARCHIVOS_BOTS", {}).copy() if isinstance(globals().get("ARCHIVOS_BOTS"), dict) else {}
+    tmpdir = None
+
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="v18_modo_cuenta_real_")
+        csv_path = _os.path.join(tmpdir, "registro_enriquecido_fulll50.csv")
+
+        headers = [
+            "fecha",
+            "activo",
+            "direccion",
+            "monto",
+            "resultado",
+            "ganancia_perdida",
+            "payout_total",
+            "ciclo",
+            "trade_status",
+            "modo_cuenta",
+        ]
+
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = _csv.DictWriter(f, fieldnames=headers)
+            w.writeheader()
+            w.writerow({
+                "fecha": "2026-05-17 01:40:00",
+                "activo": "1HZ50V",
+                "direccion": "CALL",
+                "monto": "8",
+                "resultado": "PÉRDIDA",
+                "ganancia_perdida": "-8.00",
+                "payout_total": "15.39",
+                "ciclo": "4",
+                "trade_status": "closed",
+                "modo_cuenta": "REAL",
+            })
+
+        if "ARCHIVOS_BOTS" not in globals() or not isinstance(ARCHIVOS_BOTS, dict):
+            globals()["ARCHIVOS_BOTS"] = {}
+
+        ARCHIVOS_BOTS[bot] = csv_path
+
+        cierre = detectar_cierre_martingala(
+            bot,
+            min_fila=0,
+            require_closed=True,
+            require_real_token=True,
+            expected_ciclo=4,
+        )
+
+        assert cierre is not None, "V18 falló: strict rechazó modo_cuenta=REAL"
+        res, monto, ciclo, payout = cierre
+        assert res == "PÉRDIDA", f"resultado inesperado: {res}"
+        assert int(ciclo) == 4, f"ciclo inesperado: {ciclo}"
+        assert abs(float(monto) - 8.0) <= float(MONTO_TOL), f"monto inesperado: {monto}"
+
+        print("✅ SELFTEST REAL_STRICT_ACCEPTS_MODO_CUENTA_REAL OK")
+        return True
+
+    finally:
+        try:
+            if isinstance(globals().get("ARCHIVOS_BOTS"), dict):
+                ARCHIVOS_BOTS.clear()
+                ARCHIVOS_BOTS.update(old_archivos)
+                if not old_archivos_exists:
+                    globals().pop("ARCHIVOS_BOTS", None)
+        except Exception:
+            pass
+        try:
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _selftest_real_strict_rejects_modo_cuenta_demo():
+    """
+    V18:
+    CSV con modo_cuenta=DEMO nunca debe ser aceptado por detectar_cierre_martingala(require_real_token=True).
+    """
+    import tempfile
+    import os as _os
+    import csv as _csv
+
+    bot = "fulll50"
+
+    old_archivos_exists = "ARCHIVOS_BOTS" in globals()
+    old_archivos = globals().get("ARCHIVOS_BOTS", {}).copy() if isinstance(globals().get("ARCHIVOS_BOTS"), dict) else {}
+    tmpdir = None
+
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="v18_modo_cuenta_demo_")
+        csv_path = _os.path.join(tmpdir, "registro_enriquecido_fulll50.csv")
+
+        headers = [
+            "fecha",
+            "activo",
+            "direccion",
+            "monto",
+            "resultado",
+            "ganancia_perdida",
+            "payout_total",
+            "ciclo",
+            "trade_status",
+            "modo_cuenta",
+        ]
+
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = _csv.DictWriter(f, fieldnames=headers)
+            w.writeheader()
+            w.writerow({
+                "fecha": "2026-05-17 01:41:00",
+                "activo": "1HZ50V",
+                "direccion": "CALL",
+                "monto": "8",
+                "resultado": "PÉRDIDA",
+                "ganancia_perdida": "-8.00",
+                "payout_total": "15.39",
+                "ciclo": "4",
+                "trade_status": "closed",
+                "modo_cuenta": "DEMO",
+            })
+
+        if "ARCHIVOS_BOTS" not in globals() or not isinstance(ARCHIVOS_BOTS, dict):
+            globals()["ARCHIVOS_BOTS"] = {}
+
+        ARCHIVOS_BOTS[bot] = csv_path
+
+        cierre = detectar_cierre_martingala(
+            bot,
+            min_fila=0,
+            require_closed=True,
+            require_real_token=True,
+            expected_ciclo=4,
+        )
+
+        assert cierre is None, f"V18 falló: strict aceptó modo_cuenta=DEMO como REAL: {cierre}"
+
+        print("✅ SELFTEST REAL_STRICT_REJECTS_MODO_CUENTA_DEMO OK")
+        return True
+
+    finally:
+        try:
+            if isinstance(globals().get("ARCHIVOS_BOTS"), dict):
+                ARCHIVOS_BOTS.clear()
+                ARCHIVOS_BOTS.update(old_archivos)
+                if not old_archivos_exists:
+                    globals().pop("ARCHIVOS_BOTS", None)
+        except Exception:
+            pass
+        try:
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
 def _run_requested_selftests_and_exit_if_needed():
     ran = False
     ok = True
@@ -33904,6 +34077,8 @@ def _run_requested_selftests_and_exit_if_needed():
     _run("RUN_REAL_RECONCILE_OWNER_CYCLE_MISMATCH_SELFTEST", _selftest_real_reconcile_owner_cycle_mismatch)
     _run("RUN_REAL_STRICT_REQUIRES_EXPLICIT_TOKEN_SELFTEST", _selftest_real_strict_requires_explicit_token)
     _run("RUN_REAL_STRICT_ACCEPTS_EXPLICIT_REAL_SELFTEST", _selftest_real_strict_accepts_explicit_real)
+    _run("RUN_REAL_STRICT_ACCEPTS_MODO_CUENTA_REAL_SELFTEST", _selftest_real_strict_accepts_modo_cuenta_real)
+    _run("RUN_REAL_STRICT_REJECTS_MODO_CUENTA_DEMO_SELFTEST", _selftest_real_strict_rejects_modo_cuenta_demo)
 
     if ran:
         sys.exit(0 if ok else 1)

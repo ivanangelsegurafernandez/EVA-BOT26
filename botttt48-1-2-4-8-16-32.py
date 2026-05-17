@@ -2311,6 +2311,7 @@ CSV_HEADER = [
     "puntaje_estrategia",
     "result_bin",            # 1 o 0 solo en filas cerradas
     "trade_status",          # "PRE_TRADE" o "CERRADO"
+    "modo_cuenta",
     "epoch",
     "ts",
     "ia_prob_en_juego",
@@ -2432,6 +2433,32 @@ def _build_trade_uid(epoch_val, symbol, direccion, ciclo, token, ts_iso=None):
     tok = str(token or "NA").strip().upper()
     ts_part = str(ts_iso or "").strip()
     return f"{NOMBRE_BOT}|{ep}|C{cyc}|{sym}|{direc}|{tok}|{ts_part}"
+
+
+
+def _resolver_modo_cuenta_csv(token_actual=None, modo_actual=None):
+    """
+    V18:
+    Devuelve DEMO o REAL para escribir evidencia explícita en CSV.
+    No afecta compra, token ni estrategia.
+    """
+    try:
+        try:
+            if "TOKEN_REAL" in globals() and token_actual == TOKEN_REAL:
+                return "REAL"
+            if "TOKEN_DEMO" in globals() and token_actual == TOKEN_DEMO:
+                return "DEMO"
+        except Exception:
+            pass
+        txt = str(modo_actual or token_actual or "").strip().upper()
+        if txt.startswith("REAL") or txt == "CR" or txt.startswith("CR"):
+            return "REAL"
+        if "REAL" in txt:
+            return "REAL"
+        return "DEMO"
+    except Exception:
+        return "DEMO"
+
 
 def _trade_key_from_row(row: dict) -> str:
     rid = str((row or {}).get("ia_decision_id", "") or "").strip()
@@ -2610,6 +2637,11 @@ def write_pretrade_snapshot(
     closes = _extract_close_snapshot(close_snapshot, n=20)
     _warn_close_snapshot_insuficiente(closes)
 
+    modo_cuenta_csv = _resolver_modo_cuenta_csv(
+        token_actual=kwargs.get("token"),
+        modo_actual="REAL" if kwargs.get("token") == globals().get("TOKEN_REAL") else "DEMO",
+    )
+
     row_dict = {
         "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "activo": symbol,
@@ -2632,6 +2664,7 @@ def write_pretrade_snapshot(
         "puntaje_estrategia": float(round(float(puntaje01), 6)),
         "result_bin": "",
         "trade_status": "PRE_TRADE",
+        "modo_cuenta": modo_cuenta_csv,
         "epoch": int(epoch_val),
         "ts": ts_val,
         "ia_prob_en_juego": "",
@@ -2985,6 +3018,7 @@ def _modo_selftest_import_seguro():
         "RUN_LXV_4V2X_CANDIDATE_PANEL_SELFTEST",
         "RUN_ROUND_DRIFT_AHEAD_SELFTEST",
         "RUN_SYNC_DEMO_HOLD_GLOBAL_SELFTEST",
+        "RUN_CSV_MODO_CUENTA_SELFTEST",
     )
     for k in keys:
         if str(os.environ.get(k, "")).strip().lower() in ("1", "true", "yes", "si", "sí"):
@@ -3765,6 +3799,10 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                     trade_uid_final = str(trade_uid or "").strip()
                     if not trade_uid_final:
                         trade_uid_final = _build_trade_uid(epoch_val, symbol, direccion, ciclo, token_antes, ts_iso=ts_val)
+                    modo_cuenta_csv = _resolver_modo_cuenta_csv(
+                        token_actual=token_antes,
+                        modo_actual="REAL" if token_antes == TOKEN_REAL else "DEMO",
+                    )
                     row_dict = {
                         "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "activo": symbol,
@@ -3787,6 +3825,7 @@ async def esperar_resultado(ws, contract_id, symbol, direccion, monto, rsi9, rsi
                         "puntaje_estrategia": float(round(float(puntaje01), 6)),
                         "result_bin": 1 if resultado == "GANANCIA" else 0 if resultado == "PÉRDIDA" else "",
                         "trade_status": "CERRADO",
+                        "modo_cuenta": modo_cuenta_csv,
                         "epoch": int(epoch_val),
                         "ts": ts_val,
                         "ia_prob_en_juego": ia_prob_en_juego,
@@ -3991,6 +4030,10 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
             trade_uid_final = str(trade_uid or "").strip()
             if not trade_uid_final:
                 trade_uid_final = _build_trade_uid(epoch_val, symbol, direccion, ciclo, token_usado, ts_iso=ts_val)
+            modo_cuenta_csv = _resolver_modo_cuenta_csv(
+                token_actual=token_usado,
+                modo_actual="REAL" if token_usado == TOKEN_REAL else "DEMO",
+            )
             row_dict = {
                 "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "activo": symbol,
@@ -4013,6 +4056,7 @@ async def finalizar_contrato_bg(contract_id, remaining, symbol, direccion, monto
                 "puntaje_estrategia": float(round(float(puntaje01), 6)),
                 "result_bin": 1 if resultado == "GANANCIA" else 0 if resultado == "PÉRDIDA" else "",
                 "trade_status": "CERRADO",
+                "modo_cuenta": modo_cuenta_csv,
                 "epoch": int(epoch_val),
                 "ts": ts_val,
                 "ia_decision_id": trade_uid_final,
@@ -4841,6 +4885,18 @@ async def monitor():
             break
         await asyncio.sleep(2)
 
+
+def _selftest_csv_modo_cuenta():
+    if str(os.environ.get("RUN_CSV_MODO_CUENTA_SELFTEST", "0")).strip() != "1":
+        return False
+    assert _resolver_modo_cuenta_csv("REAL:fulll50") == "REAL"
+    assert _resolver_modo_cuenta_csv("REAL") == "REAL"
+    assert _resolver_modo_cuenta_csv("DEMO") == "DEMO"
+    assert _resolver_modo_cuenta_csv("") == "DEMO"
+    print("✅ SELFTEST CSV_MODO_CUENTA OK")
+    return True
+
+
 async def main():
     if not WEBSOCKETS_OK:
         print(Fore.YELLOW + "[WARN] websockets no disponible; bot en espera sin operar.")
@@ -4861,6 +4917,8 @@ async def main():
     await monitor()
 
 if __name__ == "__main__":
+    if _selftest_csv_modo_cuenta():
+        sys.exit(0)
     _selftest_sync_demo_hold_global()
 
     while True:
