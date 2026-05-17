@@ -50,6 +50,8 @@ if any(os.environ.get(name) == "1" for name in (
     "RUN_REAL_RECONCILE_NO_DEMO_FANTASMA_SELFTEST",
     "RUN_REAL_RECONCILE_PENDING_DEMO_NO_ADVANCE_SELFTEST",
     "RUN_REAL_RECONCILE_OWNER_CYCLE_MISMATCH_SELFTEST",
+    "RUN_REAL_STRICT_REQUIRES_EXPLICIT_TOKEN_SELFTEST",
+    "RUN_REAL_STRICT_ACCEPTS_EXPLICIT_REAL_SELFTEST",
 )):
     import types
 
@@ -20397,6 +20399,81 @@ def get_umbral_real_calibrado(force: bool = False) -> float:
         return float(AUTO_REAL_THR_MIN)
 
 
+def _fila_tiene_evidencia_real_explicita(row: dict) -> tuple[bool, str]:
+    """
+    V17:
+    Determina si una fila CSV tiene evidencia explícita de pertenecer a cuenta REAL.
+
+    Regla:
+    - Si no hay columnas de evidencia, NO se acepta como REAL.
+    - Si hay columnas pero vienen vacías, NO se acepta como REAL.
+    - Solo se acepta con REAL explícito o loginid real tipo CR.
+    """
+    try:
+        if not isinstance(row, dict):
+            return False, "row_no_dict"
+
+        # Normalizar llaves para tolerar mayúsculas/espacios.
+        data = {}
+        for k, v in row.items():
+            try:
+                kk = str(k or "").strip().lower()
+                data[kk] = v
+            except Exception:
+                pass
+
+        campos = [
+            "token",
+            "cuenta",
+            "modo",
+            "account_type",
+            "tipo_cuenta",
+            "token_actual",
+            "loginid",
+            "login_id",
+            "is_real",
+            "real",
+            "es_real",
+        ]
+
+        encontrados = []
+        valores = []
+
+        for c in campos:
+            if c in data:
+                encontrados.append(c)
+                val_raw = data.get(c)
+                val = str(val_raw or "").strip()
+                if val:
+                    valores.append((c, val))
+
+        if not encontrados:
+            return False, "sin_columna_evidencia_real"
+
+        if not valores:
+            return False, "columnas_evidencia_vacias"
+
+        for c, val in valores:
+            v = val.strip().upper()
+
+            # Señales explícitas REAL
+            if v in ("REAL", "R", "TRUE", "1", "YES", "SI", "SÍ"):
+                return True, f"{c}={val}"
+
+            # loginid real Deriv suele iniciar con CR
+            if c in ("loginid", "login_id") and v.startswith("CR"):
+                return True, f"{c}={val}"
+
+            # token textual tipo REAL:fulll47 o REAL:xxx
+            if v.startswith("REAL"):
+                return True, f"{c}={val}"
+
+        return False, "sin_valor_real_explicito"
+
+    except Exception as e:
+        return False, f"error_evidencia_real:{e}"
+
+
 def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_real_token=False, expected_ciclo=None):
     """
     Devuelve: (resultado_norm, monto, ciclo, payout_total)
@@ -20404,10 +20481,18 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
               Nota: min_fila se interpreta como "cantidad de filas de datos" (sin header),
               y cuadra con contar_filas_csv().
     - require_closed: si existe trade_status, exige CERRADO/CLOSED.
-    - require_real_token: si hay columna de token/cuenta, ignora cierres DEMO.
+    - require_real_token: exige evidencia REAL explícita y rechaza cierres DEMO.
     - expected_ciclo: si existe columna de ciclo, exige coincidencia con ese ciclo.
     """
-    path = f"registro_enriquecido_{bot}.csv"
+    path = None
+    try:
+        archivos_bots = globals().get("ARCHIVOS_BOTS")
+        if isinstance(archivos_bots, dict):
+            path = archivos_bots.get(bot)
+    except Exception:
+        path = None
+    if not path:
+        path = f"registro_enriquecido_{bot}.csv"
     if not os.path.exists(path):
         return None
 
@@ -20480,6 +20565,33 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
             if st not in ("CERRADO", "CLOSED"):
                 continue
 
+        # Armamos dict de fila antes del filtro REAL estricto.
+        row_dict_full = {}
+        try:
+            for j, h in enumerate(header):
+                if j < len(row):
+                    row_dict_full[str(h).strip()] = row[j]
+        except Exception:
+            row_dict_full = {}
+
+        # V17: si se solicita detector REAL estricto, la fila debe traer
+        # evidencia REAL explícita; sin columna/token REAL no existe cierre REAL.
+        if require_real_token:
+            ok_real, motivo_real = _fila_tiene_evidencia_real_explicita(row_dict_full)
+            if not ok_real:
+                try:
+                    _lxv_5v1x_event_cooldown(
+                        key=f"detect_cierre_no_real_exp:{bot}:{expected_ciclo}:{motivo_real}",
+                        msg=(
+                            f"🛡️ DETECT_CIERRE V17 rechazado: fila sin evidencia REAL explícita "
+                            f"| bot={bot} C{expected_ciclo} motivo={motivo_real}"
+                        ),
+                        cooldown_s=20.0,
+                    )
+                except Exception:
+                    pass
+                continue
+
         # Si el CSV informa token/cuenta, en REAL ignoramos cierres explícitos de DEMO.
         if require_real_token and (i_token is not None) and (i_token < len(row)):
             tok_raw = str(row[i_token] or "").strip().upper()
@@ -20498,15 +20610,6 @@ def detectar_cierre_martingala(bot, min_fila=None, require_closed=True, require_
         res_norm = normalizar_resultado(raw_res)
         if res_norm not in ("GANANCIA", "PÉRDIDA"):
             continue
-
-        # Armamos dict de fila para reutilizar tus extractores robustos
-        row_dict_full = {}
-        try:
-            for j, h in enumerate(header):
-                if j < len(row):
-                    row_dict_full[str(h).strip()] = row[j]
-        except Exception:
-            row_dict_full = {}
 
         # Monto
         monto = None
@@ -21688,6 +21791,10 @@ def _validar_cierre_real_pertenece_a_pending(bot, pending, cierre_info, detector
     al bot/ciclo REAL pendiente y fue detectado por una ruta estricta.
     """
     try:
+        # V17:
+        # Este helper valida owner/ciclo/monto/detector.
+        # La evidencia REAL explícita se exige dentro de detectar_cierre_martingala()
+        # para que ningún cierre sin token/cuenta REAL pueda llegar hasta aquí.
         if not isinstance(pending, dict) or not pending.get("active"):
             return False, "sin_pending_activo"
         res, monto, ciclo_detectado, payout_total = cierre_info
@@ -33550,6 +33657,198 @@ def _selftest_real_reconcile_owner_cycle_mismatch():
         except Exception:
             pass
 
+
+def _selftest_real_strict_requires_explicit_token():
+    """
+    V17:
+    Simula un CSV sin columnas token/cuenta/modo/account_type.
+    Aunque exista pending REAL C4 y la fila coincida en ciclo/monto/resultado,
+    detectar_cierre_martingala(require_real_token=True) NO debe aceptarla.
+    """
+    import tempfile
+    import os as _os
+    import csv as _csv
+
+    bot = "fulll50"
+
+    old_archivos_exists = "ARCHIVOS_BOTS" in globals()
+    old_archivos = globals().get("ARCHIVOS_BOTS", {}).copy() if isinstance(globals().get("ARCHIVOS_BOTS"), dict) else {}
+    old_pending = REAL_CLOSE_PENDING.get(bot) if isinstance(REAL_CLOSE_PENDING, dict) else None
+    old_marti_ciclos = globals().get("marti_ciclos_perdidos", 0)
+    old_marti_paso = globals().get("marti_paso", 0)
+    tmpdir = None
+
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="v17_strict_real_")
+        csv_path = _os.path.join(tmpdir, "registro_enriquecido_fulll50.csv")
+
+        # CSV intencionalmente SIN token/cuenta/modo/account_type/loginid.
+        headers = [
+            "fecha",
+            "activo",
+            "direccion",
+            "monto",
+            "resultado",
+            "ganancia_perdida",
+            "payout_total",
+            "ciclo",
+            "trade_status",
+        ]
+
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = _csv.DictWriter(f, fieldnames=headers)
+            w.writeheader()
+            w.writerow({
+                "fecha": "2026-05-17 01:30:00",
+                "activo": "1HZ50V",
+                "direccion": "CALL",
+                "monto": "8",
+                "resultado": "PÉRDIDA",
+                "ganancia_perdida": "-8.00",
+                "payout_total": "15.39",
+                "ciclo": "4",
+                "trade_status": "closed",
+            })
+
+        if "ARCHIVOS_BOTS" not in globals() or not isinstance(ARCHIVOS_BOTS, dict):
+            globals()["ARCHIVOS_BOTS"] = {}
+
+        ARCHIVOS_BOTS[bot] = csv_path
+
+        REAL_CLOSE_PENDING[bot] = {
+            "active": True,
+            "bot": bot,
+            "ciclo": 4,
+            "baseline": 0,
+            "ts": time.time(),
+        }
+
+        cierre = detectar_cierre_martingala(
+            bot,
+            min_fila=0,
+            require_closed=True,
+            require_real_token=True,
+            expected_ciclo=4,
+        )
+
+        assert cierre is None, (
+            f"V17 falló: strict aceptó fila sin evidencia REAL explícita: {cierre}"
+        )
+
+        print("✅ SELFTEST REAL_STRICT_REQUIRES_EXPLICIT_TOKEN OK")
+        return True
+
+    finally:
+        try:
+            if isinstance(globals().get("ARCHIVOS_BOTS"), dict):
+                ARCHIVOS_BOTS.clear()
+                ARCHIVOS_BOTS.update(old_archivos)
+                if not old_archivos_exists:
+                    globals().pop("ARCHIVOS_BOTS", None)
+        except Exception:
+            pass
+        try:
+            REAL_CLOSE_PENDING[bot] = old_pending
+        except Exception:
+            pass
+        try:
+            globals()["marti_ciclos_perdidos"] = old_marti_ciclos
+            globals()["marti_paso"] = old_marti_paso
+        except Exception:
+            pass
+        try:
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _selftest_real_strict_accepts_explicit_real():
+    """
+    V17:
+    Simula un CSV con token=REAL.
+    detectar_cierre_martingala(require_real_token=True) sí debe aceptar la fila.
+    """
+    import tempfile
+    import os as _os
+    import csv as _csv
+
+    bot = "fulll50"
+
+    old_archivos_exists = "ARCHIVOS_BOTS" in globals()
+    old_archivos = globals().get("ARCHIVOS_BOTS", {}).copy() if isinstance(globals().get("ARCHIVOS_BOTS"), dict) else {}
+    tmpdir = None
+
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="v17_strict_real_ok_")
+        csv_path = _os.path.join(tmpdir, "registro_enriquecido_fulll50.csv")
+
+        headers = [
+            "fecha",
+            "activo",
+            "direccion",
+            "monto",
+            "resultado",
+            "ganancia_perdida",
+            "payout_total",
+            "ciclo",
+            "trade_status",
+            "token",
+        ]
+
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = _csv.DictWriter(f, fieldnames=headers)
+            w.writeheader()
+            w.writerow({
+                "fecha": "2026-05-17 01:31:00",
+                "activo": "1HZ50V",
+                "direccion": "CALL",
+                "monto": "8",
+                "resultado": "PÉRDIDA",
+                "ganancia_perdida": "-8.00",
+                "payout_total": "15.39",
+                "ciclo": "4",
+                "trade_status": "closed",
+                "token": "REAL",
+            })
+
+        if "ARCHIVOS_BOTS" not in globals() or not isinstance(ARCHIVOS_BOTS, dict):
+            globals()["ARCHIVOS_BOTS"] = {}
+
+        ARCHIVOS_BOTS[bot] = csv_path
+
+        cierre = detectar_cierre_martingala(
+            bot,
+            min_fila=0,
+            require_closed=True,
+            require_real_token=True,
+            expected_ciclo=4,
+        )
+
+        assert cierre is not None, "V17 falló: strict rechazó fila con token=REAL"
+        res, monto, ciclo, payout = cierre
+        assert res == "PÉRDIDA", f"resultado inesperado: {res}"
+        assert int(ciclo) == 4, f"ciclo inesperado: {ciclo}"
+        assert abs(float(monto) - 8.0) <= float(MONTO_TOL), f"monto inesperado: {monto}"
+
+        print("✅ SELFTEST REAL_STRICT_ACCEPTS_EXPLICIT_REAL OK")
+        return True
+
+    finally:
+        try:
+            if isinstance(globals().get("ARCHIVOS_BOTS"), dict):
+                ARCHIVOS_BOTS.clear()
+                ARCHIVOS_BOTS.update(old_archivos)
+                if not old_archivos_exists:
+                    globals().pop("ARCHIVOS_BOTS", None)
+        except Exception:
+            pass
+        try:
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
 def _run_requested_selftests_and_exit_if_needed():
     ran = False
     ok = True
@@ -33603,6 +33902,8 @@ def _run_requested_selftests_and_exit_if_needed():
     _run("RUN_REAL_RECONCILE_NO_DEMO_FANTASMA_SELFTEST", _selftest_real_reconcile_no_demo_fantasma)
     _run("RUN_REAL_RECONCILE_PENDING_DEMO_NO_ADVANCE_SELFTEST", _selftest_real_reconcile_pending_demo_no_advance)
     _run("RUN_REAL_RECONCILE_OWNER_CYCLE_MISMATCH_SELFTEST", _selftest_real_reconcile_owner_cycle_mismatch)
+    _run("RUN_REAL_STRICT_REQUIRES_EXPLICIT_TOKEN_SELFTEST", _selftest_real_strict_requires_explicit_token)
+    _run("RUN_REAL_STRICT_ACCEPTS_EXPLICIT_REAL_SELFTEST", _selftest_real_strict_accepts_explicit_real)
 
     if ran:
         sys.exit(0 if ok else 1)
