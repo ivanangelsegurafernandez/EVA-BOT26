@@ -42,7 +42,11 @@ from contextlib import contextmanager
 import sys
 import shutil
 
-if any(os.environ.get(name) == "1" for name in ("RUN_SYNC_RECOVERY_SINGLE_BOT_SELFTEST", "RUN_READ_JSON_HELPER_SELFTEST")):
+if any(os.environ.get(name) == "1" for name in (
+    "RUN_SYNC_RECOVERY_SINGLE_BOT_SELFTEST",
+    "RUN_READ_JSON_HELPER_SELFTEST",
+    "RUN_REAL_LOSS_NEXT_CYCLE_SELFTEST",
+)):
     import types
 
     class _SelftestDummy:
@@ -13743,6 +13747,13 @@ def _sync_round_tick_maestro():
             fase_ok = False
             fase_info = {}
             patron = _lxv_normalizar_patron_txt(partial_pattern or patron) or "0V0X"
+            try:
+                _reconciliar_cierre_real_antes_de_nueva_orden("pre_ciclo_pick")
+            except Exception as e:
+                try:
+                    agregar_evento(f"⚠️ pre_ciclo_pick reconcile falló: {e}")
+                except Exception:
+                    pass
             ciclo_pick = ciclo_martingala_siguiente()
             zona_info_decision = evaluar_fase_zona_verde_lxv(round_id_objetivo=round_id) or {}
             zona_allow, zona_reason = _lxv_zona_es_invertible(zona_info_decision)
@@ -13861,6 +13872,13 @@ def _sync_round_tick_maestro():
             ciclo_snapshot = int(
                 pick.get("ciclo", estado_bots.get(bot_pick, {}).get("ciclo_actual", 1)) or 1
             )
+            try:
+                _reconciliar_cierre_real_antes_de_nueva_orden("pre_ciclo_pick")
+            except Exception as e:
+                try:
+                    agregar_evento(f"⚠️ pre_ciclo_pick reconcile falló: {e}")
+                except Exception:
+                    pass
             ciclo_pick = ciclo_martingala_siguiente()
             saldo_val = obtener_valor_saldo()
             if reset_martingala_por_saldo(ciclo_pick, saldo_val):
@@ -14796,6 +14814,26 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
     Ruta única de emisión REAL cuando LXV_SYNC_REAL_ROUTE_ENABLE está activo.
     Conserva la infraestructura existente (orden_real/token/HUD), pero restringe la decisión.
     """
+    try:
+        _reconciliar_cierre_real_antes_de_nueva_orden("emitir_real_autorizado")
+    except Exception as e:
+        try:
+            agregar_evento(f"⚠️ pre_emit reconcile falló: {e}")
+        except Exception:
+            pass
+
+    try:
+        for _bot, _pending in list((REAL_CLOSE_PENDING or {}).items()):
+            if isinstance(_pending, dict) and _pending.get("active"):
+                _age = time.time() - float(_pending.get("ts", 0) or 0)
+                if _age <= float(REAL_CLOSE_PENDING_TTL_S):
+                    agregar_evento(
+                        f"⛔ REAL bloqueado: cierre REAL pendiente sin reconciliar "
+                        f"{_bot} C{_pending.get('ciclo')} age={_age:.1f}s"
+                    )
+                    return False
+    except Exception:
+        pass
     src = str(source or "LEGACY").strip().upper()
     if src == str(globals().get("IA_AUTO_REAL_SOURCE", "IA_AUTO")).upper():
         _lxv_5v1x_event_cooldown(
@@ -21642,6 +21680,207 @@ def _buscar_cierre_real_pendiente(bot):
     except Exception:
         return None
     return cierre_info, pending, "fallback_seguro"
+
+def _reconciliar_cierre_real_antes_de_nueva_orden(motivo="pre_emit"):
+    """
+    Blindaje maestro:
+    antes de emitir una nueva orden REAL, intenta consolidar cualquier cierre REAL
+    pendiente o recién escrito por CSV, incluso si el bot ya liberó token REAL:none.
+
+    Debe actualizar marti_ciclos_perdidos vía registrar_resultado_real(...)
+    ANTES de calcular ciclo_martingala_siguiente().
+    """
+    global REAL_OWNER_LOCK, REAL_COOLDOWN_UNTIL_TS
+
+    changed = False
+
+    try:
+        bots = list(BOT_NAMES)
+    except Exception:
+        bots = []
+
+    for bot in bots:
+        try:
+            pending = None
+            if isinstance(REAL_CLOSE_PENDING, dict):
+                pending = REAL_CLOSE_PENDING.get(bot)
+
+            pending_active = isinstance(pending, dict) and bool(pending.get("active"))
+
+            # Si hay pending activo, usar ruta oficial existente primero.
+            cierre_info = None
+            detector = None
+            ciclo_ref = None
+            baseline_ref = 0
+
+            if pending_active:
+                try:
+                    ciclo_ref = int(pending.get("ciclo", 1) or 1)
+                except Exception:
+                    ciclo_ref = 1
+                try:
+                    baseline_ref = int(pending.get("baseline", 0) or 0)
+                except Exception:
+                    baseline_ref = 0
+
+                pack = _buscar_cierre_real_pendiente(bot)
+                if pack:
+                    cierre_info, _pending_used, detector = pack
+
+            # Fallback blindado:
+            # si el bot ya liberó token REAL:none, igual buscar el último cierre real por CSV
+            # usando el ciclo de estado/orden/pending cuando exista.
+            if not cierre_info:
+                try:
+                    if ciclo_ref is None:
+                        ciclo_ref = int(
+                            (pending or {}).get("ciclo")
+                            or estado_bots.get(bot, {}).get("ciclo_actual")
+                            or ciclo_martingala_siguiente()
+                            or 1
+                        )
+                except Exception:
+                    ciclo_ref = 1
+
+                if not (1 <= int(ciclo_ref) <= int(MAX_CICLOS)):
+                    ciclo_ref = 1
+
+                try:
+                    baseline_ref = int((pending or {}).get("baseline", 0) or 0)
+                except Exception:
+                    baseline_ref = 0
+
+                cierre_info = detectar_cierre_martingala(
+                    bot,
+                    min_fila=baseline_ref,
+                    require_closed=True,
+                    require_real_token=True,
+                    expected_ciclo=int(ciclo_ref),
+                )
+                detector = "pre_emit_csv_strict"
+
+                if not cierre_info:
+                    cierre_info = detectar_cierre_martingala(
+                        bot,
+                        min_fila=baseline_ref,
+                        require_closed=True,
+                        require_real_token=False,
+                        expected_ciclo=int(ciclo_ref),
+                    )
+                    detector = "pre_emit_csv_post_token_release"
+
+                    # Si se detecta sin token REAL, validar monto del ciclo para evitar tomar DEMO.
+                    if cierre_info:
+                        try:
+                            _res_tmp, monto_tmp, ciclo_tmp, _payout_tmp = cierre_info
+                            ciclo_tmp = int(ciclo_tmp or ciclo_ref)
+                            esperado = float(MARTI_ESCALADO[max(0, min(len(MARTI_ESCALADO) - 1, ciclo_tmp - 1))])
+                            monto_tmp_f = float(monto_tmp) if monto_tmp is not None else None
+                            if monto_tmp_f is None or abs(monto_tmp_f - esperado) > float(MONTO_TOL):
+                                cierre_info = None
+                        except Exception:
+                            cierre_info = None
+
+            if not cierre_info:
+                continue
+
+            try:
+                res, monto, ciclo_detectado, payout_total = cierre_info
+            except Exception:
+                continue
+
+            res = normalizar_resultado(res)
+            if res not in ("GANANCIA", "PÉRDIDA"):
+                continue
+
+            try:
+                ciclo_detectado = int(ciclo_detectado or ciclo_ref or 1)
+            except Exception:
+                ciclo_detectado = int(ciclo_ref or 1)
+
+            if not (1 <= ciclo_detectado <= int(MAX_CICLOS)):
+                ciclo_detectado = 1
+
+            # Firma idempotente para no procesar dos veces el mismo cierre.
+            try:
+                sig = _real_close_sig(
+                    bot,
+                    res,
+                    monto,
+                    ciclo_detectado,
+                    payout_total,
+                    baseline=int(baseline_ref or 0),
+                )
+            except Exception:
+                sig = f"{bot}|{res}|{monto}|C{ciclo_detectado}|{baseline_ref}"
+
+            try:
+                if LAST_REAL_CLOSE_SIG.get(bot) == sig or REAL_CLOSE_PROCESSED_SIG.get(bot) == sig:
+                    continue
+            except Exception:
+                pass
+
+            # PUNTO CRÍTICO:
+            # consolidar la Martingala ANTES de permitir nueva orden.
+            registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo_detectado)
+
+            try:
+                LAST_REAL_CLOSE_SIG[bot] = sig
+                REAL_CLOSE_PROCESSED_SIG[bot] = sig
+            except Exception:
+                pass
+
+            try:
+                agregar_evento(
+                    f"🧩 REAL_CLOSE_RECONCILE[{motivo}]: {bot} C{ciclo_detectado} {res} "
+                    f"detector={detector} -> próxima REAL C{ciclo_martingala_siguiente()}"
+                )
+            except Exception:
+                pass
+
+            # Limpiar pending si era de ese bot.
+            try:
+                if isinstance(REAL_CLOSE_PENDING, dict) and bot in REAL_CLOSE_PENDING:
+                    REAL_CLOSE_PENDING[bot] = None
+            except Exception:
+                pass
+
+            # Limpiar orden vieja para evitar reentrada fantasma.
+            try:
+                limpiar_orden_real(bot, reason=f"real_reconciliado_{str(res).lower()}_{motivo}")
+            except Exception:
+                pass
+
+            # Liberación de estado maestro si todavía quedaba owner fantasma.
+            try:
+                if REAL_OWNER_LOCK == bot:
+                    REAL_OWNER_LOCK = None
+                    REAL_COOLDOWN_UNTIL_TS = time.time() + float(_cooldown_post_trade_s())
+            except Exception:
+                pass
+
+            try:
+                if bot in estado_bots:
+                    estado_bots[bot]["token"] = "DEMO"
+                    estado_bots[bot]["trigger_real"] = False
+                    estado_bots[bot]["modo_real_anunciado"] = False
+                    estado_bots[bot]["fuente"] = None
+                    # Importante:
+                    # NO usar este campo como fuente de Martingala global.
+                    # Solo limpieza visual/local.
+                    estado_bots[bot]["ciclo_actual"] = ciclo_martingala_siguiente()
+            except Exception:
+                pass
+
+            changed = True
+
+        except Exception as e:
+            try:
+                agregar_evento(f"⚠️ REAL_CLOSE_RECONCILE error {bot}: {e}")
+            except Exception:
+                pass
+
+    return changed
 
 def construir_Xy_incremental(
     df: pd.DataFrame,
@@ -32814,6 +33053,58 @@ def _selftest_read_json_helper():
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def _selftest_real_loss_next_cycle():
+    global marti_ciclos_perdidos, marti_paso, REAL_CLOSE_PENDING
+
+    bot = "fulll46"
+    old_marti_ciclos_perdidos = marti_ciclos_perdidos
+    old_marti_paso = marti_paso
+    old_pending = REAL_CLOSE_PENDING.get(bot) if isinstance(REAL_CLOSE_PENDING, dict) else None
+    old_last_sig = LAST_REAL_CLOSE_SIG.get(bot) if isinstance(LAST_REAL_CLOSE_SIG, dict) else None
+    old_processed_sig = REAL_CLOSE_PROCESSED_SIG.get(bot) if isinstance(REAL_CLOSE_PROCESSED_SIG, dict) else None
+
+    marti_ciclos_perdidos = 0
+    marti_paso = 0
+    LAST_REAL_CLOSE_SIG[bot] = None
+    REAL_CLOSE_PROCESSED_SIG[bot] = None
+
+    REAL_CLOSE_PENDING[bot] = {
+        "active": True,
+        "bot": bot,
+        "ciclo": 1,
+        "baseline": 0,
+        "ts": time.time(),
+    }
+
+    old_detectar = globals().get("detectar_cierre_martingala")
+    old_limpiar = globals().get("limpiar_orden_real")
+
+    def fake_detectar(*args, **kwargs):
+        return ("PÉRDIDA", 1.0, 1, 0.0)
+
+    def fake_limpiar(*args, **kwargs):
+        return True
+
+    globals()["detectar_cierre_martingala"] = fake_detectar
+    globals()["limpiar_orden_real"] = fake_limpiar
+
+    try:
+        ok = _reconciliar_cierre_real_antes_de_nueva_orden("selftest")
+        assert ok is True
+        assert int(marti_ciclos_perdidos) == 1
+        assert int(ciclo_martingala_siguiente()) == 2
+        print("✅ SELFTEST REAL_LOSS_NEXT_CYCLE OK")
+        return True
+    finally:
+        globals()["detectar_cierre_martingala"] = old_detectar
+        globals()["limpiar_orden_real"] = old_limpiar
+        REAL_CLOSE_PENDING[bot] = old_pending
+        LAST_REAL_CLOSE_SIG[bot] = old_last_sig
+        REAL_CLOSE_PROCESSED_SIG[bot] = old_processed_sig
+        marti_ciclos_perdidos = old_marti_ciclos_perdidos
+        marti_paso = old_marti_paso
+
+
 def _run_requested_selftests_and_exit_if_needed():
     ran = False
     ok = True
@@ -32862,6 +33153,7 @@ def _run_requested_selftests_and_exit_if_needed():
     _run("RUN_SYNC_RECOVERY_SINGLE_BOT_SELFTEST", _selftest_sync_recovery_single_bot_real_free)
     _run("RUN_DQ_RELEASED_HUD_SELFTEST", _selftest_dq_released_hud)
     _run("RUN_READ_JSON_HELPER_SELFTEST", _selftest_read_json_helper)
+    _run("RUN_REAL_LOSS_NEXT_CYCLE_SELFTEST", _selftest_real_loss_next_cycle)
 
     if ran:
         sys.exit(0 if ok else 1)
