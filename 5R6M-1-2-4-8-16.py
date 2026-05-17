@@ -47,6 +47,7 @@ if any(os.environ.get(name) == "1" for name in (
     "RUN_READ_JSON_HELPER_SELFTEST",
     "RUN_REAL_LOSS_NEXT_CYCLE_SELFTEST",
     "RUN_REAL_MARTINGALE_FULL_LADDER_SELFTEST",
+    "RUN_REAL_RECONCILE_NO_DEMO_FANTASMA_SELFTEST",
 )):
     import types
 
@@ -21708,6 +21709,14 @@ def _reconciliar_cierre_real_antes_de_nueva_orden(motivo="pre_emit"):
 
             pending_active = isinstance(pending, dict) and bool(pending.get("active"))
 
+            pending_fresco = False
+            try:
+                if pending_active and isinstance(pending, dict):
+                    age_pending = time.time() - float(pending.get("ts", 0) or 0)
+                    pending_fresco = bool(age_pending <= float(REAL_CLOSE_PENDING_TTL_S))
+            except Exception:
+                pending_fresco = False
+
             # Si hay pending activo, usar ruta oficial existente primero.
             cierre_info = None
             detector = None
@@ -21761,14 +21770,31 @@ def _reconciliar_cierre_real_antes_de_nueva_orden(motivo="pre_emit"):
                 detector = "pre_emit_csv_strict"
 
                 if not cierre_info:
-                    cierre_info = detectar_cierre_martingala(
-                        bot,
-                        min_fila=baseline_ref,
-                        require_closed=True,
-                        require_real_token=False,
-                        expected_ciclo=int(ciclo_ref),
-                    )
-                    detector = "pre_emit_csv_post_token_release"
+                    # Fallback sin token REAL SOLO permitido si existe pending REAL activo y fresco.
+                    # Sin pending fresco, puede capturar filas DEMO y crear C2/C3 fantasma.
+                    if pending_fresco:
+                        cierre_info = detectar_cierre_martingala(
+                            bot,
+                            min_fila=baseline_ref,
+                            require_closed=True,
+                            require_real_token=False,
+                            expected_ciclo=int(ciclo_ref),
+                        )
+                        detector = "pre_emit_csv_post_token_release_pending_fresco"
+                    else:
+                        cierre_info = None
+                        detector = "pre_emit_no_token_fallback_blocked_no_pending_fresco"
+                        try:
+                            _lxv_5v1x_event_cooldown(
+                                key=f"real_reconcile_no_token_blocked:{bot}:{int(ciclo_ref)}",
+                                msg=(
+                                    f"🛡️ REAL_RECONCILE bloqueado: cierre sin token REAL rechazado "
+                                    f"por no tener pending fresco | bot={bot} C{int(ciclo_ref)}"
+                                ),
+                                cooldown_s=20.0,
+                            )
+                        except Exception:
+                            pass
 
                     # Si se detecta sin token REAL, validar monto del ciclo para evitar tomar DEMO.
                     if cierre_info:
@@ -33249,6 +33275,75 @@ def _selftest_real_martingale_full_ladder():
             pass
 
 
+def _selftest_real_reconcile_no_demo_fantasma():
+    """
+    Verifica que una fila DEMO C2 no sea tomada como cierre REAL C2.
+    Previene salto fantasma C2 -> C3.
+    """
+    global marti_ciclos_perdidos, marti_paso, REAL_CLOSE_PENDING
+
+    bot = "fulll46"
+
+    old_marti_ciclos_perdidos = marti_ciclos_perdidos
+    old_marti_paso = marti_paso
+    old_pending = REAL_CLOSE_PENDING.get(bot) if isinstance(REAL_CLOSE_PENDING, dict) else None
+    old_estado = dict(estado_bots.get(bot, {})) if isinstance(estado_bots, dict) and isinstance(estado_bots.get(bot), dict) else None
+    old_detectar = globals().get("detectar_cierre_martingala")
+    old_limpiar = globals().get("limpiar_orden_real")
+
+    try:
+        marti_ciclos_perdidos = 1
+        marti_paso = 1
+        REAL_CLOSE_PENDING[bot] = None
+
+        if bot not in estado_bots or not isinstance(estado_bots.get(bot), dict):
+            estado_bots[bot] = {}
+
+        estado_bots[bot]["token"] = "DEMO"
+        estado_bots[bot]["ciclo_actual"] = 2
+
+        def fake_detectar(*args, **kwargs):
+            if kwargs.get("require_real_token") is True:
+                return None
+            if kwargs.get("require_real_token") is False and int(kwargs.get("expected_ciclo") or 0) == 2:
+                return ("PÉRDIDA", 2.0, 2, 0.0)
+            return None
+
+        def fake_limpiar(*args, **kwargs):
+            return True
+
+        globals()["detectar_cierre_martingala"] = fake_detectar
+        globals()["limpiar_orden_real"] = fake_limpiar
+
+        ok = _reconciliar_cierre_real_antes_de_nueva_orden("selftest_no_demo_fantasma")
+
+        assert ok is False, "No debía procesar cierre sin token REAL ni pending fresco"
+        assert int(marti_ciclos_perdidos) == 1, (
+            f"marti_ciclos_perdidos cambió indebidamente a {marti_ciclos_perdidos}"
+        )
+        assert int(ciclo_martingala_siguiente()) == 2, (
+            f"saltó indebidamente a C{ciclo_martingala_siguiente()}"
+        )
+
+        print("✅ SELFTEST REAL_RECONCILE_NO_DEMO_FANTASMA OK")
+        return True
+
+    finally:
+        globals()["detectar_cierre_martingala"] = old_detectar
+        globals()["limpiar_orden_real"] = old_limpiar
+        marti_ciclos_perdidos = old_marti_ciclos_perdidos
+        marti_paso = old_marti_paso
+        try:
+            REAL_CLOSE_PENDING[bot] = old_pending
+        except Exception:
+            pass
+        try:
+            if old_estado is not None:
+                estado_bots[bot] = old_estado
+        except Exception:
+            pass
+
+
 def _run_requested_selftests_and_exit_if_needed():
     ran = False
     ok = True
@@ -33299,6 +33394,7 @@ def _run_requested_selftests_and_exit_if_needed():
     _run("RUN_READ_JSON_HELPER_SELFTEST", _selftest_read_json_helper)
     _run("RUN_REAL_LOSS_NEXT_CYCLE_SELFTEST", _selftest_real_loss_next_cycle)
     _run("RUN_REAL_MARTINGALE_FULL_LADDER_SELFTEST", _selftest_real_martingale_full_ladder)
+    _run("RUN_REAL_RECONCILE_NO_DEMO_FANTASMA_SELFTEST", _selftest_real_reconcile_no_demo_fantasma)
 
     if ran:
         sys.exit(0 if ok else 1)
