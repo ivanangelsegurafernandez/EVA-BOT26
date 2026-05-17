@@ -55,6 +55,7 @@ if any(os.environ.get(name) == "1" for name in (
     "RUN_REAL_STRICT_ACCEPTS_MODO_CUENTA_REAL_SELFTEST",
     "RUN_REAL_STRICT_REJECTS_MODO_CUENTA_DEMO_SELFTEST",
     "RUN_REAL_RECONCILE_RELEASES_TOKEN_AND_SYNC_SELFTEST",
+    "RUN_REAL_RECONCILE_NO_MARK_SIG_ON_ATOMIC_FAIL_SELFTEST",
     "RUN_REAL_CLOSE_ATOMIC_PENDING_SELFTEST",
 )):
     import types
@@ -22036,12 +22037,6 @@ def _reconciliar_cierre_real_antes_de_nueva_orden(motivo="pre_emit"):
             prox = int(ciclo_martingala_siguiente() or 1)
 
             try:
-                LAST_REAL_CLOSE_SIG[bot] = sig
-                REAL_CLOSE_PROCESSED_SIG[bot] = sig
-            except Exception:
-                pass
-
-            try:
                 agregar_evento(
                     f"🧩 REAL_CLOSE_RECONCILE[{motivo}]: {bot} C{ciclo_detectado} {res} "
                     f"detector={detector} -> próxima REAL C{prox}"
@@ -22059,9 +22054,15 @@ def _reconciliar_cierre_real_antes_de_nueva_orden(motivo="pre_emit"):
             if not ok_cierre:
                 agregar_evento(
                     f"⛔ REAL_RECONCILE_ABORTADO: cierre no atómico para {bot}; "
-                    f"no se limpia pending, no se libera sync, no se permite nueva REAL."
+                    f"no se marca firma procesada, no se limpia pending, no se libera sync, no se permite nueva REAL."
                 )
                 return False
+
+            try:
+                LAST_REAL_CLOSE_SIG[bot] = sig
+                REAL_CLOSE_PROCESSED_SIG[bot] = sig
+            except Exception:
+                pass
 
             try:
                 if isinstance(REAL_CLOSE_PENDING, dict) and bot in REAL_CLOSE_PENDING:
@@ -34241,6 +34242,135 @@ def _selftest_real_reconcile_releases_token_and_sync():
             globals()[k] = v
         shutil.rmtree(tmp, ignore_errors=True)
 
+
+def _selftest_real_reconcile_no_mark_sig_on_atomic_fail():
+    import tempfile
+    import copy
+
+    bot = "fulll46"
+    cierre_loss = ("PÉRDIDA", 1.0, 1, 0.0)
+    sig_loss = _real_close_sig(bot, "PÉRDIDA", 1.0, 1, 0.0, baseline=0)
+
+    old = {
+        "cwd": os.getcwd(),
+        "TOKEN_FILE": globals().get("TOKEN_FILE"),
+        "REAL_OWNER_LOCK": globals().get("REAL_OWNER_LOCK"),
+        "REAL_CLOSE_PENDING": copy.deepcopy(globals().get("REAL_CLOSE_PENDING")),
+        "REAL_CLOSE_INCIDENT_LOCK": copy.deepcopy(globals().get("REAL_CLOSE_INCIDENT_LOCK")),
+        "LAST_REAL_CLOSE_SIG": copy.deepcopy(globals().get("LAST_REAL_CLOSE_SIG")),
+        "REAL_CLOSE_PROCESSED_SIG": copy.deepcopy(globals().get("REAL_CLOSE_PROCESSED_SIG")),
+        "estado_bots": copy.deepcopy(globals().get("estado_bots")),
+        "marti_ciclos_perdidos": globals().get("marti_ciclos_perdidos"),
+        "marti_paso": globals().get("marti_paso"),
+        "ultimo_bot_real": globals().get("ultimo_bot_real"),
+        "bots_usados_en_esta_marti": list(globals().get("bots_usados_en_esta_marti", [])),
+        "detectar_cierre_martingala": globals().get("detectar_cierre_martingala"),
+        "cerrar_por_fin_de_ciclo": globals().get("cerrar_por_fin_de_ciclo"),
+        "limpiar_orden_real": globals().get("limpiar_orden_real"),
+        "_sync_round_release_after_real_close": globals().get("_sync_round_release_after_real_close"),
+    }
+    tmp = tempfile.mkdtemp(prefix="real_reconcile_atomic_fail_")
+    close_calls = []
+    clean_calls = []
+    sync_calls = []
+
+    def _reset_common(cierre_info=cierre_loss):
+        close_calls.clear()
+        clean_calls.clear()
+        sync_calls.clear()
+        globals()["TOKEN_FILE"] = os.path.join(tmp, "token_actual.txt")
+        with open(globals()["TOKEN_FILE"], "w", encoding="utf-8") as f:
+            f.write(f"REAL:{bot}")
+        globals()["REAL_OWNER_LOCK"] = bot
+        globals()["REAL_CLOSE_PENDING"] = {b: None for b in BOT_NAMES}
+        globals()["REAL_CLOSE_PENDING"][bot] = {
+            "active": True,
+            "bot": bot,
+            "ciclo": 1,
+            "baseline": 0,
+            "ts": time.time(),
+        }
+        globals()["REAL_CLOSE_INCIDENT_LOCK"] = {"active": False, "bot": None, "ts": 0.0, "reason": ""}
+        globals()["LAST_REAL_CLOSE_SIG"] = {b: None for b in BOT_NAMES}
+        globals()["REAL_CLOSE_PROCESSED_SIG"] = {b: None for b in BOT_NAMES}
+        globals()["marti_ciclos_perdidos"] = 0
+        globals()["marti_paso"] = 0
+        globals()["ultimo_bot_real"] = None
+        globals()["bots_usados_en_esta_marti"] = []
+        for b in BOT_NAMES:
+            estado_bots.setdefault(b, {})
+            estado_bots[b].update({
+                "token": "REAL" if b == bot else "DEMO",
+                "trigger_real": b == bot,
+                "ciclo_actual": 1,
+                "ciclo_forzado": 1 if b == bot else None,
+                "modo_real_anunciado": b == bot,
+                "fuente": "SELFTEST" if b == bot else None,
+                "real_activado_en": time.time() if b == bot else 0.0,
+            })
+
+        def _fake_detector(_bot, *args, **kwargs):
+            if _bot == bot and kwargs.get("require_real_token") is True and int(kwargs.get("expected_ciclo") or 0) == 1:
+                return cierre_info
+            return None
+
+        globals()["detectar_cierre_martingala"] = _fake_detector
+        globals()["_sync_round_release_after_real_close"] = lambda _bot, reason="": sync_calls.append((_bot, reason)) or True
+
+    try:
+        os.chdir(tmp)
+
+        _reset_common(cierre_loss)
+
+        def _fake_cerrar_fail(_bot, reason, ciclo_visual_siguiente=None):
+            close_calls.append((_bot, reason, ciclo_visual_siguiente))
+            return False
+
+        globals()["cerrar_por_fin_de_ciclo"] = _fake_cerrar_fail
+        globals()["limpiar_orden_real"] = lambda *args, **kwargs: clean_calls.append((args, kwargs)) or True
+
+        ok_fail = _reconciliar_cierre_real_antes_de_nueva_orden("selftest_atomic_fail")
+
+        assert ok_fail is False, "el fallo atómico debe devolver False"
+        assert close_calls, "debe intentar cerrar atómicamente"
+        assert LAST_REAL_CLOSE_SIG.get(bot) != sig_loss, "no debe marcar LAST_REAL_CLOSE_SIG si cerrar_por_fin_de_ciclo falla"
+        assert REAL_CLOSE_PROCESSED_SIG.get(bot) != sig_loss, "no debe marcar REAL_CLOSE_PROCESSED_SIG si cerrar_por_fin_de_ciclo falla"
+        assert isinstance(REAL_CLOSE_PENDING.get(bot), dict) and REAL_CLOSE_PENDING[bot].get("active"), "pending debe seguir activo"
+        with open(globals()["TOKEN_FILE"], encoding="utf-8", errors="replace") as f:
+            assert f.read().strip() == f"REAL:{bot}", "token_actual.txt debe seguir REAL:fulll46"
+        assert REAL_OWNER_LOCK == bot, "REAL_OWNER_LOCK debe seguir en fulll46"
+        assert sync_calls == [], "no debe liberar sync si el cierre atómico falla"
+        assert clean_calls == [], "no debe limpiar orden_real si el cierre atómico falla"
+        assert emitir_real_autorizado("fulll47", 1, source="LXV_5V1X", round_id=999) is False, "no debe permitir nueva REAL con cierre no atómico"
+
+        _reset_common(cierre_loss)
+        globals()["cerrar_por_fin_de_ciclo"] = old["cerrar_por_fin_de_ciclo"]
+        globals()["limpiar_orden_real"] = lambda *args, **kwargs: clean_calls.append((args, kwargs)) or True
+
+        ok_success = _reconciliar_cierre_real_antes_de_nueva_orden("selftest_atomic_success")
+
+        assert ok_success is True, "el cierre atómico exitoso debe devolver True"
+        assert LAST_REAL_CLOSE_SIG.get(bot) == sig_loss, "debe marcar LAST_REAL_CLOSE_SIG tras cierre atómico exitoso"
+        assert REAL_CLOSE_PROCESSED_SIG.get(bot) == sig_loss, "debe marcar REAL_CLOSE_PROCESSED_SIG tras cierre atómico exitoso"
+        assert REAL_CLOSE_PENDING.get(bot) is None, "debe limpiar pending tras cierre atómico exitoso"
+        assert clean_calls, "debe limpiar orden_real tras cierre atómico exitoso"
+        assert (bot, "real_reconcile_loss_next_cycle") in sync_calls, "debe liberar sync tras cierre atómico exitoso"
+        with open(globals()["TOKEN_FILE"], encoding="utf-8", errors="replace") as f:
+            assert f.read().strip() == "REAL:none", "token_actual.txt debe quedar REAL:none"
+
+        print("✅ SELFTEST REAL_RECONCILE_NO_MARK_SIG_ON_ATOMIC_FAIL OK")
+        return True
+    finally:
+        try:
+            os.chdir(old["cwd"])
+        except Exception:
+            pass
+        for k, v in old.items():
+            if k == "cwd":
+                continue
+            globals()[k] = v
+        shutil.rmtree(tmp, ignore_errors=True)
+
 def _run_requested_selftests_and_exit_if_needed():
     ran = False
     ok = True
@@ -34299,6 +34429,7 @@ def _run_requested_selftests_and_exit_if_needed():
     _run("RUN_REAL_STRICT_ACCEPTS_MODO_CUENTA_REAL_SELFTEST", _selftest_real_strict_accepts_modo_cuenta_real)
     _run("RUN_REAL_STRICT_REJECTS_MODO_CUENTA_DEMO_SELFTEST", _selftest_real_strict_rejects_modo_cuenta_demo)
     _run("RUN_REAL_RECONCILE_RELEASES_TOKEN_AND_SYNC_SELFTEST", _selftest_real_reconcile_releases_token_and_sync)
+    _run("RUN_REAL_RECONCILE_NO_MARK_SIG_ON_ATOMIC_FAIL_SELFTEST", _selftest_real_reconcile_no_mark_sig_on_atomic_fail)
     _run("RUN_REAL_CLOSE_ATOMIC_PENDING_SELFTEST", _selftest_real_reconcile_releases_token_and_sync)
 
     if ran:
