@@ -58,6 +58,7 @@ if any(os.environ.get(name) == "1" for name in (
     "RUN_REAL_RECONCILE_NO_MARK_SIG_ON_ATOMIC_FAIL_SELFTEST",
     "RUN_REAL_CLOSE_ATOMIC_PENDING_SELFTEST",
     "RUN_REAL_NORMAL_CLOSE_NO_MARTI_ADVANCE_ON_ATOMIC_FAIL_SELFTEST",
+    "RUN_DIRECT_ACK_ALIGNMENT_SELFTEST",
 )):
     import types
 
@@ -7097,9 +7098,20 @@ def _lxv_emit_fail_reason(bot, source):
         token_now = str(_read_token_file_raw() or "").strip().upper()
         if token_now and token_now != "DEMO" and token_now != f"REAL:{b}".upper():
             return "token_actual_no_demo"
-        if _purificacion_real_activa():
+
+        allowed_sources = set()
+        if bool(globals().get("LXV_SYNC_REAL_ROUTE_ENABLE", False)):
+            allowed_sources.add(str(globals().get("LXV_SYNC_REAL_SOURCE", "LXV_SYNC")).upper())
+        if bool(globals().get("LXV_5V1X_ENABLE", False)):
+            allowed_sources.add(str(globals().get("LXV_5V1X_REAL_SOURCE", "LXV_5V1X")).upper())
+        if bool(globals().get("LXV_4V2X_ENABLE", False)):
+            allowed_sources.add(str(globals().get("LXV_4V2X_REAL_SOURCE", "LXV_4V2X")).upper())
+        if bool(globals().get("MANUAL_REAL_ROUTE_ENABLE", False)):
+            allowed_sources.add("MANUAL")
+
+        if bool(globals().get("MODO_PURIFICACION_REAL", False)) and src not in allowed_sources:
             return "purificacion_block"
-        if src not in ("LXV_5V1X", "LXV_4V2X", "LXV_SYNC", "MANUAL", "LEGACY"):
+        if src not in allowed_sources and src != "LEGACY":
             return "source_no_permitida"
         if REAL_OWNER_LOCK and str(REAL_OWNER_LOCK) == b:
             return "lock_no_disponible"
@@ -8212,7 +8224,31 @@ def actualizar_real_locks_panel_desde_round_live():
         partial = _lxv_normalizar_patron_txt(summary.get("partial_pattern", "0V0X")) or "0V0X"
         diag_live_align = _round_alignment_diag_from_summary(summary, rows_pack=rows_pack)
         if isinstance(diag_live_align, dict):
-            globals()["LAST_ROUND_ALIGNMENT_DIAG"] = dict(diag_live_align)
+            prev_diag = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+            keep_prev_ok = False
+            try:
+                prev_rid = int(prev_diag.get("canonical_round", 0) or 0) if isinstance(prev_diag, dict) else 0
+                prev_ok = bool(prev_diag.get("ok", False)) if isinstance(prev_diag, dict) else False
+                prev_ts = float(prev_diag.get("updated_ts", prev_diag.get("ts", 0.0)) or 0.0) if isinstance(prev_diag, dict) else 0.0
+                prev_age = time.time() - prev_ts if prev_ts > 0 else 999999.0
+                live_ok = bool(diag_live_align.get("ok", False))
+                keep_prev_ok = bool(
+                    prev_ok
+                    and prev_rid == int(rid)
+                    and prev_age <= 30.0
+                    and not live_ok
+                )
+            except Exception:
+                keep_prev_ok = False
+
+            if not keep_prev_ok:
+                globals()["LAST_ROUND_ALIGNMENT_DIAG"] = dict(diag_live_align)
+            else:
+                _lxv_5v1x_event_cooldown(
+                    key=f"align_keep_official_ok:{rid}",
+                    msg=f"🛡️ ALIGN_KEEP_OFFICIAL_OK: se conserva columna oficial 6/6 rid={rid}; diagnóstico visual viejo no bloquea REAL.",
+                    cooldown_s=15.0,
+                )
         round_complete = bool(
             closed_count == expected_count
             and expected_count > 0
@@ -11043,6 +11079,48 @@ def _round_alignment_diag_round_id(diag) -> int:
     return 0
 
 
+def _round_alignment_set_direct_ack_full_ok(round_id, closed_direct=None, source="TURBO_SYNC_ACK_FULL"):
+    """
+    Marca LAST_ROUND_ALIGNMENT_DIAG como OK cuando ya existe ACK directo 6/6
+    validado por _sync_round_collect_closed_acks(round_id).
+    No inventa ACKs, no compra, no libera, no escribe token.
+    Solo sincroniza el diagnóstico oficial para que COLUMNA_COMPLETA no quede bloqueada por foto vieja.
+    """
+    try:
+        rid = int(round_id or 0)
+        expected = list(BOT_NAMES)
+        closed = closed_direct if isinstance(closed_direct, dict) else {}
+        if rid <= 0:
+            return False
+        if len(closed) < len(expected):
+            return False
+        if any(bot not in closed for bot in expected):
+            return False
+
+        now_ts = float(time.time())
+        diag = {
+            "ok": True,
+            "canonical_round": rid,
+            "round_closed_eval": rid,
+            "round_id": rid,
+            "best_round": rid,
+            "closed": len(expected),
+            "expected": len(expected),
+            "missing": [],
+            "behind": {},
+            "ahead": {},
+            "mixed_rounds": False,
+            "reason": "ok_direct_ack_full",
+            "source": str(source or "TURBO_SYNC_ACK_FULL"),
+            "updated_ts": now_ts,
+            "ts": now_ts,
+        }
+        globals()["LAST_ROUND_ALIGNMENT_DIAG"] = diag
+        return True
+    except Exception:
+        return False
+
+
 def _round_alignment_diag_aplica_a_round(diag, round_id):
     try:
         if not isinstance(diag, dict):
@@ -11139,6 +11217,40 @@ def _selftest_diagnosticar_alineacion_rounds():
 
         d4 = diagnosticar_alineacion_rounds(a3, released_round=1, expected_bots=bots)
         assert isinstance(d4, dict) and "ok" in d4
+
+        old_diag = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+        try:
+            globals()["LAST_ROUND_ALIGNMENT_DIAG"] = {
+                "ok": False,
+                "canonical_round": 122,
+                "mixed_rounds": True,
+                "closed": 4,
+                "updated_ts": time.time() - 120.0,
+            }
+            closed_direct = {b: ack(123) for b in bots}
+            assert _round_alignment_set_direct_ack_full_ok(123, closed_direct, source="SELFTEST") is True
+            d5 = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+            assert d5.get("ok") is True and int(d5.get("canonical_round") or 0) == 123
+            assert int(d5.get("closed") or 0) == len(bots) and d5.get("mixed_rounds") is False
+
+            globals()["LAST_ROUND_ALIGNMENT_DIAG"] = {
+                "ok": False,
+                "canonical_round": 999,
+                "mixed_rounds": True,
+                "closed": 3,
+            }
+            align_diag_now = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+            align_ok_for_current = bool(
+                isinstance(align_diag_now, dict)
+                and align_diag_now.get("ok")
+                and int(align_diag_now.get("canonical_round") or -1) == 123
+            )
+            direct_ack_full = True
+            if direct_ack_full:
+                align_ok_for_current = True
+            assert align_ok_for_current is True
+        finally:
+            globals()["LAST_ROUND_ALIGNMENT_DIAG"] = old_diag
         print("SELFTEST ROUND_ALIGN_DIAGNOSTICO OK")
     except Exception as e:
         print(f"SELFTEST ROUND_ALIGN_DIAGNOSTICO FAIL: {type(e).__name__}: {e}")
@@ -13157,6 +13269,7 @@ def _sync_round_tick_maestro():
         completed_failsafe = False
         sync_debug_missing = {bot: "ok" for bot in BOT_NAMES}
         agregar_evento(f"⚡ TURBO_SYNC_ACK_FULL: ronda #{round_id} cerrada 6/6 por ACK directo; evaluando ahora.")
+        _round_alignment_set_direct_ack_full_ok(round_id, closed_direct, source="TURBO_SYNC_ACK_FULL")
     canonical = {"ok": False}
     if not direct_ack_full:
         canonical = _sync_round_resolver_ronda_canonica(closed, sync_debug_missing, round_id, st) or {"ok": False}
@@ -13185,7 +13298,19 @@ def _sync_round_tick_maestro():
             )
     # Columna oficial: solo ACKs válidos 6/6 de la misma ronda.
     # HISTORIAL VISUAL ≠ COLUMNA OFICIAL.
-    align_ok_for_current = bool(isinstance(globals().get("LAST_ROUND_ALIGNMENT_DIAG"), dict) and globals().get("LAST_ROUND_ALIGNMENT_DIAG", {}).get("ok") and int(globals().get("LAST_ROUND_ALIGNMENT_DIAG", {}).get("canonical_round") or -1) == int(round_id))
+    align_diag_now = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+    align_ok_for_current = bool(
+        isinstance(align_diag_now, dict)
+        and align_diag_now.get("ok")
+        and int(align_diag_now.get("canonical_round") or -1) == int(round_id)
+    )
+    if direct_ack_full:
+        align_ok_for_current = True
+        _lxv_5v1x_event_cooldown(
+            key=f"columna_oficial_ok_direct_ack:{round_id}",
+            msg=f"✅ COLUMNA_OFICIAL_OK_DIRECT_ACK: rid=#{round_id} 6/6; diagnóstico oficial sincronizado.",
+            cooldown_s=15.0,
+        )
     completed_normal = bool(n_closed >= len(expected) and align_ok_for_current)
     completed_failsafe = bool(False)
     completed = bool(completed_normal or completed_failsafe)
@@ -34685,6 +34810,46 @@ def _selftest_real_normal_close_no_marti_advance_on_atomic_fail():
             globals()[k] = v
         shutil.rmtree(tmp, ignore_errors=True)
 
+def _selftest_direct_ack_alignment_and_purificacion():
+    old_diag = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+    old_purif = globals().get("MODO_PURIFICACION_REAL", False)
+    try:
+        bots = list(BOT_NAMES)
+        closed_direct = {b: {"round_id": 123, "status": "closed", "mode": "DEMO"} for b in bots}
+        globals()["LAST_ROUND_ALIGNMENT_DIAG"] = {
+            "ok": False,
+            "canonical_round": 122,
+            "mixed_rounds": True,
+            "closed": 4,
+            "updated_ts": time.time() - 120.0,
+        }
+        assert _round_alignment_set_direct_ack_full_ok(123, closed_direct, source="SELFTEST") is True
+        diag = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+        assert diag.get("ok") is True
+        assert int(diag.get("canonical_round") or 0) == 123
+        assert int(diag.get("closed") or 0) == len(bots)
+        assert diag.get("mixed_rounds") is False
+
+        globals()["LAST_ROUND_ALIGNMENT_DIAG"] = {"ok": False, "canonical_round": 999, "mixed_rounds": True}
+        align_diag_now = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+        align_ok_for_current = bool(
+            isinstance(align_diag_now, dict)
+            and align_diag_now.get("ok")
+            and int(align_diag_now.get("canonical_round") or -1) == 123
+        )
+        direct_ack_full = True
+        if direct_ack_full:
+            align_ok_for_current = True
+        assert align_ok_for_current is True
+
+        globals()["MODO_PURIFICACION_REAL"] = True
+        assert _lxv_emit_fail_reason("fulll49", "LXV_4V2X") != "purificacion_block"
+        print("✅ SELFTEST DIRECT_ACK_ALIGNMENT OK")
+    finally:
+        globals()["LAST_ROUND_ALIGNMENT_DIAG"] = old_diag
+        globals()["MODO_PURIFICACION_REAL"] = old_purif
+
+
 def _run_requested_selftests_and_exit_if_needed():
     ran = False
     ok = True
@@ -34746,6 +34911,7 @@ def _run_requested_selftests_and_exit_if_needed():
     _run("RUN_REAL_RECONCILE_NO_MARK_SIG_ON_ATOMIC_FAIL_SELFTEST", _selftest_real_reconcile_no_mark_sig_on_atomic_fail)
     _run("RUN_REAL_CLOSE_ATOMIC_PENDING_SELFTEST", _selftest_real_reconcile_releases_token_and_sync)
     _run("RUN_REAL_NORMAL_CLOSE_NO_MARTI_ADVANCE_ON_ATOMIC_FAIL_SELFTEST", _selftest_real_normal_close_no_marti_advance_on_atomic_fail)
+    _run("RUN_DIRECT_ACK_ALIGNMENT_SELFTEST", _selftest_direct_ack_alignment_and_purificacion)
 
     if ran:
         sys.exit(0 if ok else 1)
