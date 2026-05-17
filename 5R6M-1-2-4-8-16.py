@@ -54,6 +54,7 @@ if any(os.environ.get(name) == "1" for name in (
     "RUN_REAL_STRICT_ACCEPTS_EXPLICIT_REAL_SELFTEST",
     "RUN_REAL_STRICT_ACCEPTS_MODO_CUENTA_REAL_SELFTEST",
     "RUN_REAL_STRICT_REJECTS_MODO_CUENTA_DEMO_SELFTEST",
+    "RUN_REAL_RECONCILE_RELEASES_TOKEN_AND_SYNC_SELFTEST",
 )):
     import types
 
@@ -14830,6 +14831,18 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
         except Exception:
             pass
 
+    owner_file_now = leer_token_archivo_raw()
+    owner_mem_now = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+    pending_on_now, pending_bot_now, pending_now = _hay_real_close_pending_activo()
+
+    if owner_file_now in BOT_NAMES or owner_mem_now in BOT_NAMES or pending_on_now:
+        agregar_evento(
+            f"⛔ REAL bloqueado post-reconcile: "
+            f"token={owner_file_now or '--'} owner_mem={owner_mem_now or '--'} "
+            f"pending={pending_bot_now or '--'}"
+        )
+        return False
+
     try:
         for _bot, _pending in list((REAL_CLOSE_PENDING or {}).items()):
             if isinstance(_pending, dict) and _pending.get("active"):
@@ -20864,7 +20877,7 @@ def reiniciar_bot(bot, borrar_csv=False):
     if not isinstance(huellas_usadas.get(bot), set):
         huellas_usadas[bot] = set()
 
-def cerrar_por_fin_de_ciclo(bot: str, reason: str):
+def cerrar_por_fin_de_ciclo(bot: str, reason: str, ciclo_visual_siguiente: int | None = None):
     global REAL_OWNER_LOCK, REAL_COOLDOWN_UNTIL_TS
 
     # Liberar token REAL en archivo primero (commit de salida)
@@ -20891,7 +20904,13 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str):
     try:
         estado_bots[bot]["token"] = "DEMO"
         estado_bots[bot]["trigger_real"] = False
-        estado_bots[bot]["ciclo_actual"] = 1
+        try:
+            ciclo_vis = int(ciclo_visual_siguiente) if ciclo_visual_siguiente is not None else int(ciclo_martingala_siguiente() or 1)
+        except Exception:
+            ciclo_vis = 1
+        ciclo_vis = max(1, min(int(MAX_CICLOS), int(ciclo_vis)))
+        estado_bots[bot]["ciclo_actual"] = ciclo_vis
+        estado_bots[bot]["ciclo_forzado"] = None
         estado_bots[bot]["modo_real_anunciado"] = False
         estado_bots[bot]["fuente"] = None
 
@@ -21080,14 +21099,7 @@ def _normalizar_ciclo_audit(ciclo):
 
 
 def _resolver_real_activo_en_curso_audit(contexto=None):
-    """Resuelve owner REAL activo sin usar la última operación cerrada como falso positivo."""
-    try:
-        ctx = contexto if isinstance(contexto, dict) else {}
-        owner_ctx = ctx.get("owner_real") or ctx.get("owner")
-        if owner_ctx:
-            return True, str(owner_ctx), "contexto"
-    except Exception:
-        pass
+    """Resuelve owner REAL activo con prioridad de fuentes vivas; estado_bots solo fallback visual."""
     try:
         pending_on, pending_bot, _pending = _hay_real_close_pending_activo()
         if pending_on:
@@ -21096,17 +21108,21 @@ def _resolver_real_activo_en_curso_audit(contexto=None):
         pass
     try:
         owner = globals().get("REAL_OWNER_LOCK")
-        if owner:
+        if owner in BOT_NAMES:
             return True, str(owner), "REAL_OWNER_LOCK"
     except Exception:
         pass
     try:
-        token_owner = leer_token_actual()
-        token_txt = str(token_owner or "").strip()
-        if token_txt and token_txt.lower() not in ("none", "real:none", "demo", "false", "0", "null"):
-            if token_txt.upper().startswith("REAL:"):
-                token_txt = token_txt.split(":", 1)[1].strip() or "UNKNOWN"
-            return True, token_txt, "TOKEN_REAL"
+        token_owner = leer_token_archivo_raw()
+        if token_owner in BOT_NAMES:
+            return True, str(token_owner), "TOKEN_REAL"
+    except Exception:
+        pass
+    try:
+        ctx = contexto if isinstance(contexto, dict) else {}
+        owner_ctx = ctx.get("owner_real") or ctx.get("owner")
+        if owner_ctx in BOT_NAMES:
+            return True, str(owner_ctx), "contexto"
     except Exception:
         pass
     try:
@@ -21350,6 +21366,13 @@ def render_auditor_real_panel(valor_saldo=None):
             saldo = _audit_float_or_none(audit.get("last_balance"))
         saldo_txt = "--" if saldo is None else f"{saldo:.2f}"
         activo_real, owner_activo, fuente_activa = _resolver_real_activo_en_curso_audit({})
+        token_owner_audit = leer_token_archivo_raw()
+        lock_owner_audit = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+        divergencia_owner = (
+            owner_activo in BOT_NAMES
+            and token_owner_audit in BOT_NAMES
+            and str(owner_activo) != str(token_owner_audit)
+        )
         if activo_real and not bool(en_curso.get("activo", False)):
             try:
                 st_owner = estado_bots.get(owner_activo, {}) if owner_activo in BOT_NAMES else {}
@@ -21365,7 +21388,7 @@ def render_auditor_real_panel(valor_saldo=None):
                 en_curso = globals().setdefault("REAL_EN_CURSO_AUDIT", {})
             except Exception:
                 pass
-        owner = audit.get("last_owner") or owner_activo or _resolver_owner_real_audit({}) or "NONE"
+        owner = owner_activo or token_owner_audit or lock_owner_audit or audit.get("last_owner") or _resolver_owner_real_audit({}) or "NONE"
         if owner == "UNKNOWN":
             owner = "UNKNOWN"
         delta = _audit_float_or_none(audit.get("last_delta"))
@@ -21409,6 +21432,11 @@ def render_auditor_real_panel(valor_saldo=None):
             Fore.CYAN + hud_box_line(hud_pad(var_txt, w), w),
             Fore.CYAN + hud_box_line(hud_pad(ultima_txt, w), w),
         ]
+        if divergencia_owner:
+            lines.append(Fore.YELLOW + hud_box_line(hud_pad(
+                f"⚠️ REAL_OWNER_DIVERGENCIA: audit={owner_activo} token={token_owner_audit} lock={lock_owner_audit or '--'}",
+                w
+            ), w))
         for extra in extra_lines:
             lines.append(Fore.CYAN + hud_box_line(hud_pad(extra, w), w))
         lines.append(Fore.CYAN + hud_border_bottom(w))
@@ -21997,6 +22025,7 @@ def _reconciliar_cierre_real_antes_de_nueva_orden(motivo="pre_emit"):
             # PUNTO CRÍTICO:
             # consolidar la Martingala ANTES de permitir nueva orden.
             registrar_resultado_real(res, bot=bot, ciclo_operado=ciclo_detectado)
+            prox = int(ciclo_martingala_siguiente() or 1)
 
             try:
                 LAST_REAL_CLOSE_SIG[bot] = sig
@@ -22007,42 +22036,43 @@ def _reconciliar_cierre_real_antes_de_nueva_orden(motivo="pre_emit"):
             try:
                 agregar_evento(
                     f"🧩 REAL_CLOSE_RECONCILE[{motivo}]: {bot} C{ciclo_detectado} {res} "
-                    f"detector={detector} -> próxima REAL C{ciclo_martingala_siguiente()}"
+                    f"detector={detector} -> próxima REAL C{prox}"
                 )
             except Exception:
                 pass
 
-            # Limpiar pending si era de ese bot.
+            # Cierre REAL atómico: pending -> token/estado -> incidente/orden/sync.
             try:
                 if isinstance(REAL_CLOSE_PENDING, dict) and bot in REAL_CLOSE_PENDING:
                     REAL_CLOSE_PENDING[bot] = None
             except Exception:
                 pass
 
-            # Limpiar orden vieja para evitar reentrada fantasma.
+            cerrar_por_fin_de_ciclo(
+                bot,
+                f"REAL reconciliado {res} C{int(ciclo_detectado)}; vuelve a DEMO; próximo ciclo C{prox}",
+                ciclo_visual_siguiente=prox
+            )
+
+            _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
+
             try:
                 limpiar_orden_real(bot, reason=f"real_reconciliado_{str(res).lower()}_{motivo}")
             except Exception:
                 pass
 
-            # Liberación de estado maestro si todavía quedaba owner fantasma.
-            try:
-                if REAL_OWNER_LOCK == bot:
-                    REAL_OWNER_LOCK = None
-                    REAL_COOLDOWN_UNTIL_TS = time.time() + float(_cooldown_post_trade_s())
-            except Exception:
-                pass
+            _sync_round_release_after_real_close(
+                bot,
+                reason="real_reconcile_win" if res == "GANANCIA" else "real_reconcile_loss_next_cycle"
+            )
 
             try:
-                if bot in estado_bots:
-                    estado_bots[bot]["token"] = "DEMO"
-                    estado_bots[bot]["trigger_real"] = False
-                    estado_bots[bot]["modo_real_anunciado"] = False
-                    estado_bots[bot]["fuente"] = None
-                    # Importante:
-                    # NO usar este campo como fuente de Martingala global.
-                    # Solo limpieza visual/local.
-                    estado_bots[bot]["ciclo_actual"] = ciclo_martingala_siguiente()
+                owner_file_after = leer_token_archivo_raw()
+                if owner_file_after in BOT_NAMES:
+                    agregar_evento(
+                        f"🚨 REAL_RECONCILE_TOKEN_STILL_BUSY: token_actual sigue en REAL:{owner_file_after}; "
+                        f"NO se debe emitir nueva REAL hasta liberar token."
+                    )
             except Exception:
                 pass
 
@@ -31987,7 +32017,11 @@ async def main():
                                     if res == "GANANCIA":
                                         prox = int(ciclo_martingala_siguiente() or 1)
                                         agregar_evento(f"✅ REAL WIN: {bot} C{int(ciclo or 0)} -> DEMO | próximo ciclo C{prox}")
-                                        cerrar_por_fin_de_ciclo(bot, "Ganancia REAL cerrada; vuelve a DEMO")
+                                        cerrar_por_fin_de_ciclo(
+                                            bot,
+                                            "Ganancia REAL cerrada; vuelve a DEMO",
+                                            ciclo_visual_siguiente=prox
+                                        )
                                         _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
                                         REAL_CLOSE_PENDING[bot] = None
                                         _sync_round_release_after_real_close(bot, reason="real_win")
@@ -32001,7 +32035,11 @@ async def main():
                                             agregar_evento(f"❌ REAL LOSS FINAL: {bot} C{int(ciclo or 0)} -> DEMO | reinicio próximo ciclo C{prox}")
                                         else:
                                             agregar_evento(f"❌ REAL LOSS: {bot} C{int(ciclo or 0)} -> DEMO | próximo ciclo C{prox}")
-                                        cerrar_por_fin_de_ciclo(bot, f"Pérdida REAL C{int(ciclo or 0)}; vuelve a DEMO; próximo ciclo C{prox}")
+                                        cerrar_por_fin_de_ciclo(
+                                            bot,
+                                            f"Pérdida REAL C{int(ciclo or 0)}; vuelve a DEMO; próximo ciclo C{prox}",
+                                            ciclo_visual_siguiente=prox
+                                        )
                                         _limpiar_real_close_incident_lock_after_valid_close(bot, sig=sig)
                                         REAL_CLOSE_PENDING[bot] = None
                                         _sync_round_release_after_real_close(bot, reason="real_loss_next_cycle")
@@ -34022,6 +34060,123 @@ def _selftest_real_strict_rejects_modo_cuenta_demo():
         except Exception:
             pass
 
+def _selftest_real_reconcile_releases_token_and_sync():
+    import tempfile
+    import copy
+
+    old = {
+        "cwd": os.getcwd(),
+        "TOKEN_FILE": globals().get("TOKEN_FILE"),
+        "REAL_OWNER_LOCK": globals().get("REAL_OWNER_LOCK"),
+        "REAL_CLOSE_PENDING": copy.deepcopy(globals().get("REAL_CLOSE_PENDING")),
+        "REAL_CLOSE_INCIDENT_LOCK": copy.deepcopy(globals().get("REAL_CLOSE_INCIDENT_LOCK")),
+        "LAST_REAL_CLOSE_SIG": copy.deepcopy(globals().get("LAST_REAL_CLOSE_SIG")),
+        "REAL_CLOSE_PROCESSED_SIG": copy.deepcopy(globals().get("REAL_CLOSE_PROCESSED_SIG")),
+        "estado_bots": copy.deepcopy(globals().get("estado_bots")),
+        "marti_ciclos_perdidos": globals().get("marti_ciclos_perdidos"),
+        "marti_paso": globals().get("marti_paso"),
+        "ultimo_bot_real": globals().get("ultimo_bot_real"),
+        "bots_usados_en_esta_marti": list(globals().get("bots_usados_en_esta_marti", [])),
+        "detectar_cierre_martingala": globals().get("detectar_cierre_martingala"),
+        "_sync_round_release_after_real_close": globals().get("_sync_round_release_after_real_close"),
+    }
+    tmp = tempfile.mkdtemp(prefix="real_reconcile_release_")
+    sync_calls = []
+
+    def _reset_common(bot, ciclo, token_owner=None, perdidos=0):
+        globals()["TOKEN_FILE"] = os.path.join(tmp, "token_actual.txt")
+        with open(globals()["TOKEN_FILE"], "w", encoding="utf-8") as f:
+            f.write(f"REAL:{token_owner or bot}")
+        globals()["REAL_OWNER_LOCK"] = token_owner or bot
+        globals()["REAL_CLOSE_PENDING"] = {b: None for b in BOT_NAMES}
+        globals()["REAL_CLOSE_PENDING"][bot] = {
+            "active": True,
+            "bot": bot,
+            "ciclo": int(ciclo),
+            "baseline": 0,
+            "ts": time.time(),
+        }
+        globals()["REAL_CLOSE_INCIDENT_LOCK"] = {"active": False, "bot": None, "ts": 0.0, "reason": ""}
+        globals()["LAST_REAL_CLOSE_SIG"] = {b: None for b in BOT_NAMES}
+        globals()["REAL_CLOSE_PROCESSED_SIG"] = {b: None for b in BOT_NAMES}
+        globals()["marti_ciclos_perdidos"] = int(perdidos)
+        globals()["marti_paso"] = int(perdidos)
+        globals()["ultimo_bot_real"] = None
+        globals()["bots_usados_en_esta_marti"] = []
+        for b in BOT_NAMES:
+            estado_bots.setdefault(b, {})
+            estado_bots[b].update({
+                "token": "REAL" if b == bot else "DEMO",
+                "trigger_real": b == bot,
+                "ciclo_actual": int(ciclo) if b == bot else 1,
+                "ciclo_forzado": int(ciclo) if b == bot else None,
+                "modo_real_anunciado": b == bot,
+                "fuente": "SELFTEST" if b == bot else None,
+                "real_activado_en": time.time() if b == bot else 0.0,
+            })
+
+    def _set_fake_detector(result):
+        def _fake(bot, *args, **kwargs):
+            if kwargs.get("require_real_token") is True:
+                return result
+            return None
+        globals()["detectar_cierre_martingala"] = _fake
+
+    try:
+        os.chdir(tmp)
+        globals()["_sync_round_release_after_real_close"] = lambda bot, reason="": sync_calls.append((bot, reason)) or True
+
+        _reset_common("fulll46", 1, perdidos=0)
+        _set_fake_detector(("PÉRDIDA", 1.0, 1, 0.0))
+        assert _reconciliar_cierre_real_antes_de_nueva_orden("selftest_loss_c1") is True
+        assert ciclo_martingala_siguiente() == 2
+        assert leer_token_archivo_raw() is None
+        assert REAL_OWNER_LOCK is None
+        assert REAL_CLOSE_PENDING["fulll46"] is None
+        assert estado_bots["fulll46"]["token"] == "DEMO"
+        assert int(estado_bots["fulll46"]["ciclo_actual"]) == 2
+        assert ("fulll46", "real_reconcile_loss_next_cycle") in sync_calls
+
+        sync_calls.clear()
+        _reset_common("fulll47", 3, perdidos=2)
+        _set_fake_detector(("GANANCIA", 4.0, 3, 7.6))
+        assert _reconciliar_cierre_real_antes_de_nueva_orden("selftest_win_c3") is True
+        assert ciclo_martingala_siguiente() == 1
+        assert leer_token_archivo_raw() is None
+        with open(globals()["TOKEN_FILE"], encoding="utf-8", errors="replace") as f:
+            assert f.read().strip() == "REAL:none"
+        assert int(estado_bots["fulll47"]["ciclo_actual"]) == 1
+        assert ("fulll47", "real_reconcile_win") in sync_calls
+
+        _reset_common("fulll46", 1, perdidos=0)
+        _set_fake_detector(None)
+        assert emitir_real_autorizado("fulll47", 1, source="LXV_5V1X", round_id=999) is False
+        assert leer_token_archivo_raw() == "fulll46"
+        orden_f47 = path_orden("fulll47")
+        assert (not os.path.exists(orden_f47)) or (not _orden_real_viva(_sync_round_safe_read_json(orden_f47) or {}))
+
+        globals()["REAL_CLOSE_PENDING"] = {b: None for b in BOT_NAMES}
+        globals()["REAL_OWNER_LOCK"] = "fulll46"
+        with open(globals()["TOKEN_FILE"], "w", encoding="utf-8") as f:
+            f.write("REAL:fulll46")
+        before_cycle = ciclo_martingala_siguiente()
+        assert emitir_real_autorizado("fulll47", 1, source="LXV_5V1X", round_id=999) is False
+        assert REAL_OWNER_LOCK == "fulll46"
+        assert ciclo_martingala_siguiente() == before_cycle
+
+        print("✅ SELFTEST REAL_RECONCILE_RELEASES_TOKEN_AND_SYNC OK")
+        return True
+    finally:
+        try:
+            os.chdir(old["cwd"])
+        except Exception:
+            pass
+        for k, v in old.items():
+            if k == "cwd":
+                continue
+            globals()[k] = v
+        shutil.rmtree(tmp, ignore_errors=True)
+
 def _run_requested_selftests_and_exit_if_needed():
     ran = False
     ok = True
@@ -34079,6 +34234,7 @@ def _run_requested_selftests_and_exit_if_needed():
     _run("RUN_REAL_STRICT_ACCEPTS_EXPLICIT_REAL_SELFTEST", _selftest_real_strict_accepts_explicit_real)
     _run("RUN_REAL_STRICT_ACCEPTS_MODO_CUENTA_REAL_SELFTEST", _selftest_real_strict_accepts_modo_cuenta_real)
     _run("RUN_REAL_STRICT_REJECTS_MODO_CUENTA_DEMO_SELFTEST", _selftest_real_strict_rejects_modo_cuenta_demo)
+    _run("RUN_REAL_RECONCILE_RELEASES_TOKEN_AND_SYNC_SELFTEST", _selftest_real_reconcile_releases_token_and_sync)
 
     if ran:
         sys.exit(0 if ok else 1)
