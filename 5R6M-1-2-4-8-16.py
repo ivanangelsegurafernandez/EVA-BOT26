@@ -8223,6 +8223,7 @@ def actualizar_real_locks_panel_desde_round_live():
         dq = _dq_oficial_lxv(summary)
         partial = _lxv_normalizar_patron_txt(summary.get("partial_pattern", "0V0X")) or "0V0X"
         diag_live_align = _round_alignment_diag_from_summary(summary, rows_pack=rows_pack)
+        diag_effective_align = diag_live_align if isinstance(diag_live_align, dict) else {}
         if isinstance(diag_live_align, dict):
             prev_diag = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
             keep_prev_ok = False
@@ -8243,18 +8244,26 @@ def actualizar_real_locks_panel_desde_round_live():
 
             if not keep_prev_ok:
                 globals()["LAST_ROUND_ALIGNMENT_DIAG"] = dict(diag_live_align)
+                diag_effective_align = dict(diag_live_align)
             else:
+                diag_effective_align = dict(prev_diag)
+                globals()["LAST_ROUND_ALIGNMENT_DIAG"] = dict(prev_diag)
                 _lxv_5v1x_event_cooldown(
                     key=f"align_keep_official_ok:{rid}",
                     msg=f"🛡️ ALIGN_KEEP_OFFICIAL_OK: se conserva columna oficial 6/6 rid={rid}; diagnóstico visual viejo no bloquea REAL.",
                     cooldown_s=15.0,
                 )
+                _lxv_5v1x_event_cooldown(
+                    key=f"round_complete_uses_official_diag:{rid}",
+                    msg=f"✅ ROUND_COMPLETE_USA_DIAG_OFICIAL: rid={rid} usa LAST_ROUND_ALIGNMENT_DIAG oficial; visual live no pisa columna 6/6.",
+                    cooldown_s=20.0,
+                )
         round_complete = bool(
             closed_count == expected_count
             and expected_count > 0
-            and isinstance(diag_live_align, dict)
-            and bool(diag_live_align.get("ok", False))
-            and int(diag_live_align.get("canonical_round") or -1) == int(rid)
+            and isinstance(diag_effective_align, dict)
+            and bool(diag_effective_align.get("ok", False))
+            and int(diag_effective_align.get("canonical_round") or -1) == int(rid)
         )
         if bool(pref.get("canonical")) and round_complete and str(dq) == "ok":
             round_complete = True
