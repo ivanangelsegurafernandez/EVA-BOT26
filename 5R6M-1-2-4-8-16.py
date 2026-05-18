@@ -60,6 +60,7 @@ if any(os.environ.get(name) == "1" for name in (
     "RUN_REAL_NORMAL_CLOSE_NO_MARTI_ADVANCE_ON_ATOMIC_FAIL_SELFTEST",
     "RUN_DIRECT_ACK_ALIGNMENT_SELFTEST",
     "RUN_LXV_HUD_ACK_REBUILD_SELFTEST",
+    "RUN_SPLIT_REJOIN_SELFTEST",
 )):
     import types
 
@@ -551,6 +552,11 @@ LXV_ZONA_V3_OPERATIVE_ENABLE = False
 LXV_ZONA_V3_CAN_BLOCK = False
 LXV_ZONA_V3_CAN_UNLOCK = False
 LXV_SYNC_GENERIC_REAL_ENABLE = False
+SPLIT_REJOIN_ENABLE = True
+SPLIT_REJOIN_FAST_TIMEOUT_S = 8.0
+SPLIT_REJOIN_MAX_ROUND_GAP = 1
+SPLIT_REJOIN_MIN_TOTAL_ACCOUNTED = 6
+SPLIT_REJOIN_LOG_COOLDOWN_S = 12.0
 LXV_REAL_SIMPLE_ROUTE_ENABLE = True
 LXV_REAL_LOCKS_PANEL_ENABLE = True
 LXV_REAL_LOCKS_PANEL_ENFORCE = True
@@ -11869,6 +11875,225 @@ def _sync_round_single_bot_real_free_guard_reason() -> str:
     return ""
 
 
+
+def _sync_round_try_mixed_adjacent_rejoin_release(round_id, released_round, diag=None, source_hint="mixed_adjacent_rejoin"):
+    """
+    Rejoin seguro para split de rondas adyacentes.
+
+    REGLAS:
+    - No compra.
+    - No emite REAL.
+    - No evalúa LXV.
+    - No usa historial visual.
+    - No inventa ACKs.
+    - No crea resultados.
+    - Solo lee ACKs oficiales de cada bot.
+    - Solo libera DEMO neutral/cuarentena.
+    - La ronda liberada debe quedar usable_for_real=False, usable_for_lxv=False, usable_for_training=False.
+    """
+    try:
+        if not bool(globals().get("SPLIT_REJOIN_ENABLE", True)):
+            return False
+
+        rid = int(round_id or 0)
+        rel = int(released_round or 0)
+        if rid <= 10 or rel <= 0:
+            return False
+
+        dg = diag if isinstance(diag, dict) else globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
+        if not isinstance(dg, dict):
+            return False
+
+        if not bool(dg.get("mixed_rounds", False)):
+            return False
+
+        # Candados REAL duros: cualquier duda bloquea el rejoin.
+        try:
+            real_on, real_bot, real_reason = _sync_real_turn_activo()
+        except Exception:
+            real_on, real_bot, real_reason = True, "--", "guard_error"
+
+        try:
+            close_pending, close_bot, _pending = _hay_real_close_pending_activo()
+        except Exception:
+            close_pending, close_bot = True, "--"
+
+        try:
+            order_on, order_bot = _sync_real_order_viva_any()
+        except Exception:
+            order_on, order_bot = True, "--"
+
+        try:
+            lock_reason = _sync_round_single_bot_real_lock_reason() if callable(globals().get("_sync_round_single_bot_real_lock_reason")) else ""
+        except Exception:
+            lock_reason = "real_lock_guard_error"
+
+        try:
+            token_raw = str(_leer_token_linea_raw() or "").strip() if callable(globals().get("_leer_token_linea_raw")) else ""
+        except Exception:
+            token_raw = ""
+
+        try:
+            token_owner = str(leer_token_archivo_raw() or "").strip() if callable(globals().get("leer_token_archivo_raw")) else str(leer_token_actual() or "").strip()
+        except Exception:
+            token_owner = ""
+
+        token_busy = bool(
+            _token_real_ocupado(token_raw)
+            or _token_real_ocupado(token_owner)
+            or token_owner in BOT_NAMES
+        )
+
+        owner_mem = str(globals().get("REAL_OWNER_LOCK") or "").strip()
+        owner_busy = bool(owner_mem and owner_mem not in ("--", "NONE", "NULL"))
+        lock_busy = bool(str(lock_reason or "").strip())
+
+        if real_on or close_pending or order_on or token_busy or owner_busy or lock_busy:
+            print_rate_limited(
+                f"SPLIT_REJOIN_BLOCK_REAL_BUSY:{rid}",
+                f"🧷 SPLIT_REJOIN bloqueado | ronda=#{rid} | real_on={real_on} close={close_pending} order={order_on} token_busy={token_busy} owner_busy={owner_busy} lock_busy={lock_busy}",
+                ttl=float(globals().get("SPLIT_REJOIN_LOG_COOLDOWN_S", 12.0)),
+            )
+            return False
+
+        # Leer ACKs oficiales por bot. NO usar historial visual.
+        round_by_bot = {}
+        for bot in BOT_NAMES:
+            try:
+                ack = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
+                if not isinstance(ack, dict):
+                    continue
+                br = int(ack.get("round_id", ack.get("sync_round_id", ack.get("ronda", 0))) or 0)
+                if br > 10:
+                    round_by_bot[str(bot)] = int(br)
+            except Exception:
+                continue
+
+        if len(round_by_bot) < int(globals().get("SPLIT_REJOIN_MIN_TOTAL_ACCOUNTED", 6) or 6):
+            print_rate_limited(
+                f"SPLIT_REJOIN_NO_MAP:{rid}:{len(round_by_bot)}",
+                f"🔎 SPLIT_REJOIN_NO_MAP | ronda=#{rid} | ACKs con ronda={len(round_by_bot)}/6 | no se libera",
+                ttl=float(globals().get("SPLIT_REJOIN_LOG_COOLDOWN_S", 12.0)),
+            )
+            return False
+
+        rounds = sorted(set(int(v) for v in round_by_bot.values() if int(v) > 10))
+        if len(rounds) != 2:
+            return False
+
+        low, high = int(rounds[0]), int(rounds[1])
+        if (high - low) != int(globals().get("SPLIT_REJOIN_MAX_ROUND_GAP", 1) or 1):
+            return False
+
+        low_bots = [b for b, r in round_by_bot.items() if int(r) == low]
+        high_bots = [b for b, r in round_by_bot.items() if int(r) == high]
+
+        if not low_bots or not high_bots:
+            return False
+
+        # Debe ser split real entre 6 bots oficiales.
+        if (len(low_bots) + len(high_bots)) != len(BOT_NAMES):
+            return False
+
+        # No actuar si high no coincide con la mejor ronda detectada o con rid.
+        best_round = int(dg.get("best_round", high) or high)
+        if high not in (rid, best_round):
+            return False
+
+        state_key = f"_SPLIT_REJOIN_FIRST_TS_{low}_{high}_{','.join(sorted(low_bots))}"
+        now = float(time.time())
+        first_ts = float(globals().get(state_key, 0.0) or 0.0)
+
+        if first_ts <= 0:
+            globals()[state_key] = now
+            print_rate_limited(
+                f"SPLIT_REJOIN_ARMED:{low}:{high}",
+                f"🧭 SPLIT_REJOIN_ARMED | split {low}->{high} | atrasados={','.join(low_bots)} | actuales={len(high_bots)}/6 | esperando estabilidad",
+                ttl=float(globals().get("SPLIT_REJOIN_LOG_COOLDOWN_S", 12.0)),
+            )
+            return False
+
+        elapsed = now - first_ts
+        if elapsed < float(globals().get("SPLIT_REJOIN_FAST_TIMEOUT_S", 8.0) or 8.0):
+            return False
+
+        # Revalidar que el split sigue igual antes de liberar.
+        round_by_bot_2 = {}
+        for bot in BOT_NAMES:
+            try:
+                ack2 = _sync_round_safe_read_json(_sync_round_ack_path(bot)) or {}
+                if not isinstance(ack2, dict):
+                    continue
+                br2 = int(ack2.get("round_id", ack2.get("sync_round_id", ack2.get("ronda", 0))) or 0)
+                if br2 > 10:
+                    round_by_bot_2[str(bot)] = int(br2)
+            except Exception:
+                continue
+
+        rounds_2 = sorted(set(int(v) for v in round_by_bot_2.values() if int(v) > 10))
+        if rounds_2 != [low, high]:
+            return False
+
+        low_bots_2 = [b for b, r in round_by_bot_2.items() if int(r) == low]
+        high_bots_2 = [b for b, r in round_by_bot_2.items() if int(r) == high]
+        if sorted(low_bots_2) != sorted(low_bots):
+            return False
+
+        # Liberar la ronda vieja low hacia high como cuarentena DEMO neutral.
+        quarantine_info = {
+            "eligible": True,
+            "round_id": int(low),
+            "reason": "MIXED_ADJACENT_REJOIN_RELEASE",
+            "source": str(source_hint or "mixed_adjacent_rejoin"),
+            "neutral": True,
+            "no_trade_result": True,
+            "quarantine": True,
+            "usable_for_real": False,
+            "usable_for_lxv": False,
+            "usable_for_training": False,
+            "released_from": int(low),
+            "released_to": int(high),
+            "split_rejoin": True,
+            "split_low_bots": list(low_bots),
+            "split_high_bots": list(high_bots),
+            "closed": int(len(high_bots)),
+            "expected": int(len(BOT_NAMES)),
+            "expected_count": int(len(BOT_NAMES)),
+            "ts": float(time.time()),
+        }
+
+        if not callable(globals().get("liberar_ronda_por_cuarentena_demo_only")):
+            print_rate_limited(
+                f"SPLIT_REJOIN_FAIL_NO_RELEASE_FN:{low}:{high}",
+                f"⚠️ SPLIT_REJOIN_FAIL | no existe liberar_ronda_por_cuarentena_demo_only | split {low}->{high}",
+                ttl=float(globals().get("SPLIT_REJOIN_LOG_COOLDOWN_S", 12.0)),
+            )
+            return False
+
+        ok = bool(liberar_ronda_por_cuarentena_demo_only(int(low), int(high), quarantine_info))
+        if not ok:
+            print_rate_limited(
+                f"SPLIT_REJOIN_FAIL:{low}:{high}",
+                f"⚠️ SPLIT_REJOIN_FAIL | no se pudo liberar split {low}->{high} | atrasados={','.join(low_bots)}",
+                ttl=float(globals().get("SPLIT_REJOIN_LOG_COOLDOWN_S", 12.0)),
+            )
+            return False
+
+        print_rate_limited(
+            f"SPLIT_REJOIN_RELEASED:{low}:{high}",
+            f"🔁 SPLIT_REJOIN_RELEASED | atrasados {low}->{high} | bots={','.join(low_bots)} | REAL sigue bloqueado hasta columna 6/6 oficial",
+            ttl=float(globals().get("SPLIT_REJOIN_LOG_COOLDOWN_S", 12.0)),
+        )
+        return True
+
+    except Exception as e:
+        print_rate_limited(
+            f"SPLIT_REJOIN_ERROR:{round_id}",
+            f"⚠️ SPLIT_REJOIN_ERROR | ronda=#{round_id} | {e}",
+            ttl=float(globals().get("SPLIT_REJOIN_LOG_COOLDOWN_S", 12.0)),
+        )
+        return False
+
 def _sync_round_try_single_bot_recovery_release(round_id, released_round, requests=None) -> bool:
     """
     RECOVERY_RELEASE_SINGLE_BOT_REAL_FREE:
@@ -12907,6 +13132,16 @@ def _sync_round_try_recovery_release_global() -> bool:
                 ttl=20.0,
             )
             try:
+                if _sync_round_try_mixed_adjacent_rejoin_release(
+                    round_id=round_id,
+                    released_round=released_round,
+                    diag=diag_recovery_global,
+                    source_hint="mixed_rounds_esperar_rejoin_global",
+                ):
+                    return True
+            except Exception as e:
+                agregar_evento(f"⚠️ SPLIT_REJOIN_CALL_ERROR | ronda={round_id} | {e}")
+            try:
                 if _sync_round_try_request_only_before_rejoin_return(round_id, released_round, diag=diag_recovery_global):
                     return True
             except Exception as e:
@@ -13810,6 +14045,16 @@ def _sync_round_tick_maestro():
                 f"🧷 RELEASE_HOLD_MIXED_ROUNDS | best_round=#{diag_recovery.get('best_round')} {int(diag_recovery.get('closed', 0) or 0)}/{int(diag_recovery.get('expected', len(BOT_NAMES)) or len(BOT_NAMES))} | behind={len(diag_recovery.get('behind') or {})} | acción=esperar_rejoin",
                 ttl=20.0,
             )
+            try:
+                if _sync_round_try_mixed_adjacent_rejoin_release(
+                    round_id=round_id,
+                    released_round=released_round,
+                    diag=diag_recovery,
+                    source_hint="mixed_rounds_esperar_rejoin",
+                ):
+                    return
+            except Exception as e:
+                agregar_evento(f"⚠️ SPLIT_REJOIN_CALL_ERROR | ronda={round_id} | {e}")
             try:
                 if _sync_round_try_request_only_before_rejoin_return(round_id, released_round, diag=diag_recovery):
                     return
@@ -35121,6 +35366,134 @@ def _selftest_lxv_hud_ack_rebuild():
             globals()["_round_alignment_set_direct_ack_full_ok"] = old_align
 
 
+
+def _selftest_split_rejoin():
+    """Selftest quirúrgico del rejoin seguro 3/3 entre rondas adyacentes."""
+    saved = {}
+    names_to_patch = [
+        "BOT_NAMES",
+        "SPLIT_REJOIN_ENABLE",
+        "SPLIT_REJOIN_FAST_TIMEOUT_S",
+        "SPLIT_REJOIN_MIN_TOTAL_ACCOUNTED",
+        "SPLIT_REJOIN_LOG_COOLDOWN_S",
+        "REAL_OWNER_LOCK",
+        "_sync_round_safe_read_json",
+        "_sync_real_turn_activo",
+        "_hay_real_close_pending_activo",
+        "_sync_real_order_viva_any",
+        "_sync_round_single_bot_real_lock_reason",
+        "_leer_token_linea_raw",
+        "leer_token_archivo_raw",
+        "leer_token_actual",
+        "liberar_ronda_por_cuarentena_demo_only",
+    ]
+    for name in names_to_patch:
+        saved[name] = globals().get(name, None)
+    sentinel_missing = object()
+    existing_state_keys = [k for k in list(globals()) if str(k).startswith("_SPLIT_REJOIN_FIRST_TS_")]
+    saved_state = {k: globals().get(k, sentinel_missing) for k in existing_state_keys}
+    releases = []
+
+    def _clear_split_state():
+        for key in [k for k in list(globals()) if str(k).startswith("_SPLIT_REJOIN_FIRST_TS_")]:
+            globals().pop(key, None)
+
+    try:
+        bots = [f"fulll{i}" for i in range(45, 51)]
+        globals()["BOT_NAMES"] = list(bots)
+        globals()["SPLIT_REJOIN_ENABLE"] = True
+        globals()["SPLIT_REJOIN_FAST_TIMEOUT_S"] = 8.0
+        globals()["SPLIT_REJOIN_MIN_TOTAL_ACCOUNTED"] = 6
+        globals()["SPLIT_REJOIN_LOG_COOLDOWN_S"] = 0.0
+        globals()["REAL_OWNER_LOCK"] = "--"
+
+        ack_rounds = {bot: (2390 if idx < 3 else 2391) for idx, bot in enumerate(bots)}
+
+        def _fake_ack_path(bot):
+            return f"/tmp/split_rejoin_selftest/{bot}.json"
+
+        old_ack_path = globals().get("_sync_round_ack_path", None)
+        saved["_sync_round_ack_path"] = old_ack_path
+        globals()["_sync_round_ack_path"] = _fake_ack_path
+
+        def _fake_read_json(path):
+            bot = Path(str(path)).stem
+            if bot not in ack_rounds:
+                return None
+            return {"round_id": int(ack_rounds[bot])}
+
+        def _fake_release(from_round, to_round, quarantine_info):
+            assert int(from_round) == 2390, from_round
+            assert int(to_round) == 2391, to_round
+            assert isinstance(quarantine_info, dict)
+            assert quarantine_info.get("usable_for_real") is False
+            assert quarantine_info.get("usable_for_lxv") is False
+            assert quarantine_info.get("usable_for_training") is False
+            assert quarantine_info.get("neutral") is True
+            assert quarantine_info.get("quarantine") is True
+            assert quarantine_info.get("split_rejoin") is True
+            releases.append((int(from_round), int(to_round), dict(quarantine_info)))
+            return True
+
+        globals()["_sync_round_safe_read_json"] = _fake_read_json
+        globals()["_sync_real_turn_activo"] = lambda: (False, None, "selftest_free")
+        globals()["_hay_real_close_pending_activo"] = lambda: (False, None, None)
+        globals()["_sync_real_order_viva_any"] = lambda: (False, None)
+        globals()["_sync_round_single_bot_real_lock_reason"] = lambda: ""
+        globals()["_leer_token_linea_raw"] = lambda: "DEMO"
+        globals()["leer_token_archivo_raw"] = lambda: "DEMO"
+        globals()["leer_token_actual"] = lambda: "DEMO"
+        globals()["liberar_ronda_por_cuarentena_demo_only"] = _fake_release
+
+        diag = {"mixed_rounds": True, "best_round": 2391}
+        _clear_split_state()
+
+        # Caso A: primera llamada arma el rejoin, no libera aún.
+        ok_a = _sync_round_try_mixed_adjacent_rejoin_release(2391, 2390, diag=diag, source_hint="selftest_a")
+        assert ok_a is False, "Caso A debía retornar False"
+        assert not releases, "Caso A no debe liberar"
+
+        state_keys = [k for k in globals() if str(k).startswith("_SPLIT_REJOIN_FIRST_TS_2390_2391_")]
+        assert state_keys, "Caso A no armó estado SPLIT_REJOIN"
+
+        # Caso B: estado ya viejo; debe liberar cuarentena DEMO neutral.
+        globals()[state_keys[0]] = float(time.time()) - 99.0
+        ok_b = _sync_round_try_mixed_adjacent_rejoin_release(2391, 2390, diag=diag, source_hint="selftest_b")
+        assert ok_b is True, "Caso B debía liberar y retornar True"
+        assert len(releases) == 1, "Caso B debía ejecutar una liberación"
+
+        # Caso C: con solo 5 ACKs oficiales no libera.
+        _clear_split_state()
+        releases.clear()
+        removed_bot = bots[-1]
+        old_removed = ack_rounds.pop(removed_bot)
+        ok_c = _sync_round_try_mixed_adjacent_rejoin_release(2391, 2390, diag=diag, source_hint="selftest_c")
+        assert ok_c is False, "Caso C debía retornar False con 5 ACKs"
+        assert not releases, "Caso C no debe liberar"
+        ack_rounds[removed_bot] = old_removed
+
+        # Caso D: si hay REAL activo, no libera aunque el split sea válido y estable.
+        _clear_split_state()
+        releases.clear()
+        globals()["_sync_real_turn_activo"] = lambda: (True, "fulll45", "selftest_real_active")
+        ok_d = _sync_round_try_mixed_adjacent_rejoin_release(2391, 2390, diag=diag, source_hint="selftest_d")
+        assert ok_d is False, "Caso D debía retornar False con REAL activo"
+        assert not releases, "Caso D no debe liberar"
+
+        print("✅ SELFTEST SPLIT_REJOIN OK")
+        return True
+    finally:
+        for key in [k for k in list(globals()) if str(k).startswith("_SPLIT_REJOIN_FIRST_TS_")]:
+            globals().pop(key, None)
+        for key, value in saved_state.items():
+            if value is not sentinel_missing:
+                globals()[key] = value
+        for name, value in saved.items():
+            if value is None and name in globals():
+                globals().pop(name, None)
+            elif value is not None:
+                globals()[name] = value
+
 def _run_requested_selftests_and_exit_if_needed():
     ran = False
     ok = True
@@ -35183,6 +35556,10 @@ def _run_requested_selftests_and_exit_if_needed():
     _run("RUN_REAL_CLOSE_ATOMIC_PENDING_SELFTEST", _selftest_real_reconcile_releases_token_and_sync)
     _run("RUN_REAL_NORMAL_CLOSE_NO_MARTI_ADVANCE_ON_ATOMIC_FAIL_SELFTEST", _selftest_real_normal_close_no_marti_advance_on_atomic_fail)
     _run("RUN_DIRECT_ACK_ALIGNMENT_SELFTEST", _selftest_direct_ack_alignment_and_purificacion)
+
+    if os.environ.get("RUN_SPLIT_REJOIN_SELFTEST") == "1":
+        _selftest_split_rejoin()
+        raise SystemExit(0)
 
     if os.environ.get("RUN_LXV_HUD_ACK_REBUILD_SELFTEST") == "1":
         _selftest_lxv_hud_ack_rebuild()
