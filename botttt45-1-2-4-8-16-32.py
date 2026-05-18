@@ -5,6 +5,41 @@ import glob
 import csv
 import os
 import sys
+
+
+def _early_api_error_text_for_buy_selftest(exc) -> str:
+    try:
+        return str(exc or "")
+    except Exception:
+        return ""
+
+def _early_is_insufficient_balance_error_for_buy_selftest(exc) -> bool:
+    txt = _early_api_error_text_for_buy_selftest(exc).lower()
+    return (
+        "insufficientbalance" in txt
+        or "insufficient balance" in txt
+        or "balance (0.00" in txt
+        or "account balance" in txt and "insufficient" in txt
+    )
+
+def _early_is_rate_limit_error_for_buy_selftest(exc) -> bool:
+    txt = _early_api_error_text_for_buy_selftest(exc).lower()
+    return (
+        "ratelimit" in txt
+        or "rate limit" in txt
+        or "ticks_history" in txt and "limit" in txt
+    )
+
+if os.environ.get("RUN_BUY_ERROR_CLASSIFIER_SELFTEST") == "1":
+    _digits = "".join(ch for ch in os.path.basename(__file__) if ch.isdigit())
+    _nombre_bot_selftest = f"fulll{_digits[:2]}" if _digits else os.path.basename(__file__)
+    assert _early_is_insufficient_balance_error_for_buy_selftest("API error: InsufficientBalance - Your account balance (0.00 USD) is insufficient to buy this contract (1.00 USD)")
+    assert _early_is_insufficient_balance_error_for_buy_selftest(RuntimeError("InsufficientBalance"))
+    assert not _early_is_insufficient_balance_error_for_buy_selftest("API error: RateLimit - You have reached the rate limit for ticks_history.")
+    assert _early_is_rate_limit_error_for_buy_selftest("API error: RateLimit - You have reached the rate limit for ticks_history.")
+    assert _early_is_rate_limit_error_for_buy_selftest(RuntimeError("rate limit"))
+    print(f"✅ SELFTEST BUY_ERROR_CLASSIFIER OK | {_nombre_bot_selftest}")
+    raise SystemExit(0)
 from datetime import datetime, timezone
 from statistics import mean
 import pandas as pd
@@ -1486,6 +1521,125 @@ def _print_once(key: str, ttl: float = 25.0) -> bool:
         return False
     _last_log[key] = now + ttl
     return True
+
+
+BUY_INSUFFICIENT_BALANCE_PAUSE_S = 120.0
+BUY_RATE_LIMIT_PAUSE_S = 45.0
+BUY_INSUFFICIENT_BALANCE_MAX_FAST_RETRIES = 1
+
+def _api_error_text(exc) -> str:
+    try:
+        return str(exc or "")
+    except Exception:
+        return ""
+
+def _is_insufficient_balance_error(exc) -> bool:
+    txt = _api_error_text(exc).lower()
+    return (
+        "insufficientbalance" in txt
+        or "insufficient balance" in txt
+        or "balance (0.00" in txt
+        or "account balance" in txt and "insufficient" in txt
+    )
+
+def _is_rate_limit_error(exc) -> bool:
+    txt = _api_error_text(exc).lower()
+    return (
+        "ratelimit" in txt
+        or "rate limit" in txt
+        or "ticks_history" in txt and "limit" in txt
+    )
+
+def _set_buy_pause(reason: str, seconds: float):
+    try:
+        until = time.time() + max(5.0, float(seconds or 0.0))
+        estado_bot["buy_pause_until"] = until
+        estado_bot["buy_pause_reason"] = str(reason or "buy_pause")
+        return until
+    except Exception:
+        return time.time() + 30.0
+
+async def _esperar_buy_pause_si_activa(contexto=""):
+    try:
+        until = float(estado_bot.get("buy_pause_until", 0.0) or 0.0)
+        if until <= time.time():
+            return False
+
+        remaining = max(0.0, until - time.time())
+        reason = str(estado_bot.get("buy_pause_reason", "buy_pause") or "buy_pause")
+
+        if _print_once(f"buy_pause:{reason}", ttl=10.0):
+            print(
+                Fore.YELLOW + Style.BRIGHT +
+                f"⏸️ BUY_PAUSE activa ({reason}) | {remaining:.0f}s restantes | {contexto} | ciclo se conserva"
+            )
+
+        await asyncio.sleep(min(remaining, 5.0))
+        return True
+    except Exception:
+        return False
+
+async def _manejar_buy_insufficient_balance(api_e, modo_real: bool, monto, ciclo):
+    """
+    Manejo seguro de InsufficientBalance.
+
+    REGLAS:
+    - No marcar GANANCIA.
+    - No marcar PÉRDIDA.
+    - No marcar INDEFINIDO.
+    - No avanzar Martingala.
+    - No escribir resultado en CSV.
+    - No emitir ACK de cierre.
+    - No tocar token_actual.txt.
+    - No liberar real.lock.
+    - Solo pausar compras y conservar el mismo ciclo.
+    """
+    try:
+        modo_txt = "REAL" if modo_real else "DEMO"
+        estado_bot["ciclo_forzado"] = ciclo
+        estado_bot["token_msg_mostrado"] = False
+
+        key = "insufficient_balance_real" if modo_real else "insufficient_balance_demo"
+        until = _set_buy_pause(key, BUY_INSUFFICIENT_BALANCE_PAUSE_S)
+
+        print(
+            Fore.RED + Style.BRIGHT +
+            f"⛔ SALDO_INSUFICIENTE_{modo_txt}: no se compró contrato | monto={monto} | "
+            f"ciclo C{ciclo} conservado | pausa={BUY_INSUFFICIENT_BALANCE_PAUSE_S:.0f}s"
+        )
+        print(
+            Fore.YELLOW + Style.BRIGHT +
+            "🛡️ No se registra resultado, no avanza Martingala y no se emite ACK de cierre."
+        )
+
+        if not modo_real:
+            print(
+                Fore.YELLOW + Style.BRIGHT +
+                "🔎 Revisar TOKEN DEMO / cuenta DEMO: Deriv reporta saldo 0.00 USD."
+            )
+        else:
+            print(
+                Fore.RED + Style.BRIGHT +
+                "🚨 REAL sin saldo suficiente: no hubo contrato. Mantener ciclo y esperar control del maestro."
+            )
+
+        await asyncio.sleep(min(10.0, max(1.0, until - time.time())))
+        return True
+    except Exception:
+        await asyncio.sleep(15.0)
+        return True
+
+def _selftest_buy_error_classifier():
+    assert _is_insufficient_balance_error("API error: InsufficientBalance - Your account balance (0.00 USD) is insufficient to buy this contract (1.00 USD)")
+    assert _is_insufficient_balance_error(RuntimeError("InsufficientBalance"))
+    assert not _is_insufficient_balance_error("API error: RateLimit - You have reached the rate limit for ticks_history.")
+    assert _is_rate_limit_error("API error: RateLimit - You have reached the rate limit for ticks_history.")
+    assert _is_rate_limit_error(RuntimeError("rate limit"))
+    print(f"✅ SELFTEST BUY_ERROR_CLASSIFIER OK | {NOMBRE_BOT}")
+
+if os.environ.get("RUN_BUY_ERROR_CLASSIFIER_SELFTEST") == "1":
+    _selftest_buy_error_classifier()
+    raise SystemExit(0)
 
 async def _desactivar_silencioso_en(seg=90):
     await asyncio.sleep(seg)
@@ -3019,6 +3173,7 @@ def _modo_selftest_import_seguro():
         "RUN_ROUND_DRIFT_AHEAD_SELFTEST",
         "RUN_SYNC_DEMO_HOLD_GLOBAL_SELFTEST",
         "RUN_CSV_MODO_CUENTA_SELFTEST",
+        "RUN_BUY_ERROR_CLASSIFIER_SELFTEST",
     )
     for k in keys:
         if str(os.environ.get(k, "")).strip().lower() in ("1", "true", "yes", "si", "sí"):
@@ -3345,6 +3500,8 @@ async def obtener_velas(ws, symbol, token, reintentos=4):
                     return candles2 or []
             except Exception as e2:
                 # si también falla, seguimos con backoff
+                if _is_rate_limit_error(e2):
+                    _set_buy_pause("rate_limit_ticks_history", BUY_RATE_LIMIT_PAUSE_S)
                 if _print_once(f"ws-efimera-{symbol}", ttl=8):
                     print(Fore.YELLOW + f"Fallback efímero falló en {symbol}: {e2}")
         await asyncio.sleep(delay + random.uniform(0.0, 0.5))  # Jitter para evitar rate-limits
@@ -3592,6 +3749,8 @@ async def consultar_saldo_real(ws):
 # ==================== LÓGICA DE OPERACIÓN ====================
 async def buscar_estrategia(ws, ciclo, token):
     await _sync_wait_global_real_clear("pre_search")
+    if await _esperar_buy_pause_si_activa(contexto=f"pre_scan C{ciclo}"):
+        return "REINTENTAR", None, None, None, None, None, None, None, None, None, None
     print(Fore.MAGENTA + Style.BRIGHT + f"\nBuscando señal válida para Martingala #{ciclo}")
     for intento in range(1, 11):
         if reinicio_forzado.is_set():
@@ -4669,6 +4828,24 @@ async def ejecutar_panel():
                         }
                     }, expect_msg_type="buy", timeout=8.0)
                 except RuntimeError as api_e:
+                    if _is_insufficient_balance_error(api_e):
+                        await _manejar_buy_insufficient_balance(
+                            api_e=api_e,
+                            modo_real=bool(modo_real),
+                            monto=monto,
+                            ciclo=ciclo,
+                        )
+                        continue
+
+                    if _is_rate_limit_error(api_e):
+                        _set_buy_pause("rate_limit_buy", BUY_RATE_LIMIT_PAUSE_S)
+                        print(
+                            Fore.YELLOW + Style.BRIGHT +
+                            f"⏳ RATE_LIMIT_BUY: {api_e} | pausa={BUY_RATE_LIMIT_PAUSE_S:.0f}s | ciclo C{ciclo} conservado"
+                        )
+                        await asyncio.sleep(10 + random.uniform(0.0, 0.5))
+                        continue
+
                     print(Fore.RED + Style.BRIGHT + f"[ERROR] Compra: {api_e}. Reintentando mismo ciclo...")
                     estado_bot["token_msg_mostrado"] = False
                     await asyncio.sleep(10 + random.uniform(0.0, 0.5))
