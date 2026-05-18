@@ -62,6 +62,9 @@ if any(os.environ.get(name) == "1" for name in (
     "RUN_LXV_HUD_ACK_REBUILD_SELFTEST",
     "RUN_SPLIT_REJOIN_SELFTEST",
     "RUN_LXV_SUSPICIOUS_LOCKS_SELFTEST",
+    "RUN_DQ_RELEASED_HUD_SELFTEST",
+    "RUN_LXV_4V2X_CANDIDATE_PANEL_SELFTEST",
+    "RUN_HUD_LXV_ESTADO_CLARO_SELFTEST",
 )):
     import types
 
@@ -6301,7 +6304,7 @@ def _column_quarantine_can_bypass_real_block(round_id) -> bool:
         pattern = _lxv_normalizar_patron_txt(ss.get("partial_pattern", ss.get("patron_lxv", ss.get("patron", "")))) or str(ss.get("partial_pattern", "") or "").strip().upper()
         return bool(
             closed_count == expected_count == 6
-            and dq in ("ok", "released_post_eval", "canonical", "force_complete")
+            and dq in ("ok", "released_post_eval", "canonical", "force_complete", "released", "closed")
             and str(pattern).upper() in ("5V1X", "4V2X")
         )
     except Exception:
@@ -7062,9 +7065,15 @@ def _lxv_5v1x_gate_ok(candidate: dict | None) -> tuple[bool, str]:
     if bool(globals().get("LXV_5V1X_REQUIRE_ROUND_COMPLETE", True)) and not bool(c.get("round_complete", False)):
         return False, "round_incomplete"
     dq = str(c.get("data_quality", "") or "").strip().lower()
-    if bool(globals().get("LXV_5V1X_REQUIRE_DATA_QUALITY_OK", True)) and dq != "ok":
-        if not (bool(c.get("round_complete", False)) and dq in ("released_post_eval", "canonical", "closed", "force_complete", "released")):
-            return False, "data_quality_bad"
+    dq_equiv_ok = (
+        dq == "ok"
+        or (
+            bool(c.get("round_complete", False))
+            and dq in ("released_post_eval", "canonical", "closed", "force_complete", "released")
+        )
+    )
+    if bool(globals().get("LXV_5V1X_REQUIRE_DATA_QUALITY_OK", True)) and not dq_equiv_ok:
+        return False, "data_quality_bad"
     return True, "ok"
 
 def _lxv_5v1x_pick_real_bot(candidate: dict | None) -> str | None:
@@ -7100,9 +7109,15 @@ def _lxv_4v2x_gate_ok(candidate: dict | None) -> tuple[bool, str]:
     if bool(globals().get("LXV_4V2X_REQUIRE_ROUND_COMPLETE", True)) and not bool(c.get("round_complete", False)):
         return False, "round_incomplete"
     dq = str(c.get("data_quality", "") or "").strip().lower()
-    if bool(globals().get("LXV_4V2X_REQUIRE_DATA_QUALITY_OK", True)) and dq != "ok":
-        if not (bool(c.get("round_complete", False)) and dq in ("released_post_eval", "canonical", "closed", "force_complete", "released")):
-            return False, "data_quality_bad"
+    dq_equiv_ok = (
+        dq == "ok"
+        or (
+            bool(c.get("round_complete", False))
+            and dq in ("released_post_eval", "canonical", "closed", "force_complete", "released")
+        )
+    )
+    if bool(globals().get("LXV_4V2X_REQUIRE_DATA_QUALITY_OK", True)) and not dq_equiv_ok:
+        return False, "data_quality_bad"
     return True, "ok"
 
 def _lxv_4v2x_pick_real_bot(candidate: dict | None) -> str | None:
@@ -7703,7 +7718,7 @@ def _real_locks_first_off():
                 return name
     except Exception:
         pass
-    return "UNKNOWN_LOCK"
+    return None
 
 def _real_locks_ready_pre_real():
     try:
@@ -15544,23 +15559,23 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
         except Exception:
             rid_int = 0
         if rid_int <= 0:
-            agregar_evento(f"🧱 REAL HARD BLOCK ZONA: source={src} bot={bot} rid_faltante")
+            agregar_evento(f"🧱 REAL HARD BLOCK: source={src} bot={bot} rid_faltante")
             return False
-        zona_info = resolver_zona_final_lxv(round_id_objetivo=rid_int)
+        zona_info = resolver_zona_final_lxv(round_id_objetivo=rid_int) or {}
         allow_zona, reason_zona = _lxv_zona_es_invertible(zona_info)
         if not allow_zona:
             agregar_evento(
-                f"🧱 REAL HARD BLOCK ZONA: source={src} rid={rid_int} bot={bot} "
+                f"🟡 ZONA_DIAGNOSTICO_NO_BLOQUEANTE: source={src} rid={rid_int} bot={bot} "
                 f"zona_base={zona_info.get('zona_base', zona_info.get('zona', zona_info.get('fase')))} "
                 f"subzona={zona_info.get('subzona', zona_info.get('zona', zona_info.get('fase')))} "
                 f"decision={zona_info.get('decision')} "
                 f"allow_real={bool(zona_info.get('allow_real', False))} "
-                f"motivo={zona_info.get('motivo')} reason={reason_zona}"
+                f"motivo={zona_info.get('motivo')} reason={reason_zona} "
+                f"| REAL sigue permitido por LXV válido"
             )
             LXV_REAL_AUDIT["ultimo_bloqueo"] = (
-                f"hard_zone_{zona_info.get('zona_base', zona_info.get('fase', zona_info.get('zona')))}_{zona_info.get('motivo')}"
+                f"zona_diag_no_bloqueante_{zona_info.get('zona_base', zona_info.get('fase', zona_info.get('zona')))}_{zona_info.get('motivo')}"
             )
-            return False
     agregar_evento(f"✅ REAL source autorizada: {src}.")
     prev_src = globals().get("_REAL_ROUTE_SOURCE", None)
     globals()["_REAL_ROUTE_SOURCE"] = src
@@ -26376,7 +26391,7 @@ def diagnosticar_candado_bloqueante_lxv(locks: dict, summary: dict | None = None
     """Devuelve el primer candado que impide REAL. No cambia nada."""
     try:
         lk = locks if isinstance(locks, dict) else {}
-        prioridad = ["REAL_CLOSE_LIBRE","COLUMNA_COMPLETA","DATA_QUALITY_OK","PATRON_VALIDO","CANDIDATO_VALIDO","ZONA_OK","NO_DUPLICADO_RONDA","TOKEN_REAL_LIBRE","ORDEN_REAL_OK"]
+        prioridad = ["REAL_CLOSE_LIBRE", "COLUMNA_COMPLETA", "PATRON_VALIDO", "CANDIDATO_VALIDO", "NO_DUPLICADO_RONDA", "TOKEN_REAL_LIBRE"]
         for key in prioridad:
             if lk.get(key) is False:
                 return key
@@ -26620,10 +26635,18 @@ def render_zona_lxv_panel():
         zref = refinar_zona_lxv_para_real(dict(zf, data_quality=dq, cerrados=cerr, esperados=esp, patron_lxv=patron), patron_lxv=patron)
         zref_txt = f"{zref.get('nivel_real_zona','--')} | decisión={'SI' if str(zref.get('decision_real_refinada','')).upper() == 'SI_INVERTIR' else 'NO'} | motivo={zref.get('motivo_real_refinado','--')}"
         real_txt = "POSIBLE si patrón/candidato/token/cierre están OK"
-        if dq != "ok": real_txt = "NO, data_quality no ok"
-        elif esp <= 0 or cerr < esp: real_txt = "NO, esperando columna completa"
-        elif bool(zf.get("bloqueo_mrv_v2", False)): real_txt = "NO, bloqueo MRV_ZONA_V2"
-        elif not zona_allow: real_txt = "NO, zona oficial no invertible"
+        lxv_valido_6_6 = bool(patron in ("5V1X", "4V2X") and cerr == esp and esp == 6)
+        zref_no_real = str(zref.get("decision_real_refinada", "")).upper() not in ("", "SI_INVERTIR")
+        if lxv_valido_6_6:
+            if dq != "ok": real_txt = "DIAG, data_quality no bloquea LXV válido"
+            elif bool(zf.get("bloqueo_mrv_v2", False)): real_txt = "DIAG, MRV_ZONA_V2 no bloquea LXV válido"
+            elif not zona_allow: real_txt = "DIAG, zona no bloquea LXV válido"
+            elif zref_no_real: real_txt = "DIAG, zona refinada no bloquea LXV válido"
+        else:
+            if dq != "ok": real_txt = "NO, data_quality no ok"
+            elif esp <= 0 or cerr < esp: real_txt = "NO, esperando columna completa"
+            elif bool(zf.get("bloqueo_mrv_v2", False)): real_txt = "NO, bloqueo MRV_ZONA_V2"
+            elif not zona_allow: real_txt = "NO, zona oficial no invertible"
         reg_line = f"ZONA REGIONAL: {str(info.get('zona_regional','NEUTRO_REGIONAL'))} | R1={float(info.get('green_ratio_r1',0.0)):.2f} R2={float(info.get('green_ratio_r2',0.0)):.2f} R3={float(info.get('green_ratio_r3',0.0)):.2f} | decisión={str(info.get('decision_regional','NO_INVERTIR'))}"
         return ["╔════════════════════════════════════════════════════════════╗","║ 🧭 ZONA LXV / MRV_ZONA_V2                                ║","╠════════════════════════════════════════════════════════════╣",f"║ ZONA OFICIAL REAL : {z[:37].ljust(37)}║",f"║ SUBZONA / VISUAL  : {subz[:37].ljust(37)}║",f"║ DECISIÓN ZONA     : {d[:37].ljust(37)}║",f"║ MOTIVO            : {m[:37].ljust(37)}║",f"║ FUENTE            : {fuente[:37].ljust(37)}║",f"║ MRV_V2      : {z2[:43].ljust(43)}║",f"║ Decisión V2 : {d2[:43].ljust(43)}║",f"║ Motivo V2   : {m2[:43].ljust(43)}║",f"║ V3          : {'OFF / sin influencia operativa'[:43].ljust(43)}║",f"║ Columna     : {cerr}/{esp} | dq={dq} | patrón={patron}"[:61].ljust(61)+"║",f"║ Regional    : SOLO_DIAGNOSTICO, NO_HABILITA_REAL"[:61].ljust(61)+"║",f"║ Regional+   : {reg_line[:47].ljust(47)}║",f"║ REAL        : {real_txt[:47].ljust(47)}║",f"║ ZONA_REAL_REFINADA: {zref_txt[:39].ljust(39)}║","╚════════════════════════════════════════════════════════════╝"]
     except Exception:
@@ -26954,22 +26977,25 @@ def _resolver_decision_final_real_hud(summary: dict, locks: dict, zona_final: di
         candidato_valido = bool(lk.get("CANDIDATO_VALIDO", False) and candidato != "ninguno")
         dq_ok = bool(lk.get("DATA_QUALITY_OK", False) or str(dq).lower() == "ok")
 
+        hard = ["REAL_CLOSE_LIBRE", "COLUMNA_COMPLETA", "PATRON_VALIDO", "CANDIDATO_VALIDO", "NO_DUPLICADO_RONDA", "TOKEN_REAL_LIBRE"]
+        first_off = next((k for k in hard if lk.get(k) is False), "")
+        lxv_valido_6_6 = bool(patron in ("5V1X", "4V2X") and ex > 0 and cc == ex and ex == 6 and candidato_valido)
+
         if ex > 0 and cc < ex:
             return {"decision": "ESPERANDO", "motivo": f"columna_incompleta_{cc}_de_{ex}", "zona": zona, "zona_permite": zona_permite, "patron": patron, "patron_valido": patron_valido, "candidato": candidato, "dq_ok": dq_ok}
+        if not patron_valido:
+            return {"decision": "NO_INVERTIR", "motivo": f"patron_no_valido_{patron}", "zona": zona, "zona_permite": zona_permite, "patron": patron, "patron_valido": False, "candidato": "ninguno", "dq_ok": dq_ok}
+        if not candidato_valido:
+            return {"decision": "NO_INVERTIR", "motivo": "patron_ok_pero_sin_candidato_valido", "zona": zona, "zona_permite": zona_permite, "patron": patron, "patron_valido": True, "candidato": candidato, "dq_ok": dq_ok}
+        if first_off:
+            return {"decision": "NO_INVERTIR", "motivo": f"candado_automatico_off_{first_off}", "zona": zona, "zona_permite": zona_permite, "patron": patron, "patron_valido": True, "candidato": candidato, "dq_ok": dq_ok}
+        if lxv_valido_6_6:
+            return {"decision": "SI_INVERTIR", "motivo": f"lxv_ok_{patron.lower()}_candidato_valido_zona_dq_diagnostico", "zona": zona, "zona_permite": zona_permite, "patron": patron, "patron_valido": True, "candidato": candidato, "dq_ok": dq_ok}
         if not dq_ok:
             return {"decision": "NO_INVERTIR", "motivo": f"ronda_vencida_{dq}", "zona": zona, "zona_permite": zona_permite, "patron": patron, "patron_valido": patron_valido, "candidato": candidato, "dq_ok": False}
         if not zona_permite:
             return {"decision": "NO_INVERTIR", "motivo": f"zona_no_permite_{zona}", "zona": zona, "zona_permite": False, "patron": patron, "patron_valido": patron_valido, "candidato": candidato, "dq_ok": True}
-        if not patron_valido:
-            return {"decision": "NO_INVERTIR", "motivo": f"zona_ok_pero_patron_no_valido_{patron}", "zona": zona, "zona_permite": True, "patron": patron, "patron_valido": False, "candidato": "ninguno", "dq_ok": True}
-        if not candidato_valido:
-            return {"decision": "NO_INVERTIR", "motivo": "patron_ok_pero_sin_candidato_valido", "zona": zona, "zona_permite": True, "patron": patron, "patron_valido": True, "candidato": candidato, "dq_ok": True}
-
-        hard = ["REAL_CLOSE_LIBRE", "COLUMNA_COMPLETA", "DATA_QUALITY_OK", "PATRON_VALIDO", "CANDIDATO_VALIDO", "ZONA_OK", "NO_DUPLICADO_RONDA", "TOKEN_REAL_LIBRE"]
-        first_off = next((k for k in hard if lk.get(k) is False), "")
-        if first_off:
-            return {"decision": "NO_INVERTIR", "motivo": f"candado_automatico_off_{first_off}", "zona": zona, "zona_permite": True, "patron": patron, "patron_valido": True, "candidato": candidato, "dq_ok": True}
-        return {"decision": "SI_INVERTIR", "motivo": f"lxv_ok_{patron.lower()}_candidato_valido", "zona": zona, "zona_permite": True, "patron": patron, "patron_valido": True, "candidato": candidato, "dq_ok": True}
+        return {"decision": "SI_INVERTIR", "motivo": f"lxv_ok_{patron.lower()}_candidato_valido", "zona": zona, "zona_permite": zona_permite, "patron": patron, "patron_valido": True, "candidato": candidato, "dq_ok": dq_ok}
     except Exception as e:
         return {"decision": "ESPERANDO", "motivo": f"hud_final_error_{type(e).__name__}", "zona": "--", "zona_permite": False, "patron": "--", "patron_valido": False, "candidato": "ninguno", "dq_ok": False}
 
@@ -33451,7 +33477,7 @@ def _selftest_hud_lxv_estado_claro():
         "ZONA_OK": False,
         "TOKEN_REAL_LIBRE": True,
     }
-    hard_lock_names = ["REAL_CLOSE_LIBRE", "COLUMNA_COMPLETA", "DATA_QUALITY_OK", "PATRON_VALIDO", "CANDIDATO_VALIDO", "ZONA_OK", "TOKEN_REAL_LIBRE"]
+    hard_lock_names = ["REAL_CLOSE_LIBRE", "COLUMNA_COMPLETA", "PATRON_VALIDO", "CANDIDATO_VALIDO", "NO_DUPLICADO_RONDA", "TOKEN_REAL_LIBRE"]
     if any(locks.get(k) is False for k in hard_lock_names):
         locks["ORDEN_REAL_OK"] = False
     assert locks["ORDEN_REAL_OK"] is False
@@ -33539,7 +33565,8 @@ def _selftest_lxv_4v2x_candidate_panel():
     assert locks.get("COLUMNA_COMPLETA") is True
     assert locks.get("DATA_QUALITY_OK") is True
     assert locks.get("ZONA_OK") is False
-    assert p.get("falta_principal") == "ZONA_OK"
+    assert p.get("falta_principal") not in ("ZONA_OK", "DATA_QUALITY_OK")
+    assert _real_locks_ready_pre_real() is True
 
     print("SELFTEST LXV_4V2X_CANDIDATE_PANEL OK")
 
@@ -33602,16 +33629,19 @@ def _selftest_hud_oficial_vs_regional_lxv():
 
 
 
-def _selftest_lxv_suspicious_locks_diagnostic():
+
+def _selftest_lxv_suspicious_locks_total_off():
     old_panel = globals().get("REAL_LOCKS_PANEL")
     old_summary = globals().get("LAST_SYNC_ROUND_SUMMARY", None)
     patch_names = [
         "resolver_zona_final_lxv", "clasificar_zona_regional_dominante_lxv", "combinar_zona_lxv_con_regional",
         "refinar_zona_lxv_para_real", "_hay_real_close_pending_activo", "leer_token_actual",
         "hay_real_activo_global", "_lxv_real_round_already_emitted", "es_ronda_cuarentenada",
-        "_lxv_5v1x_event_cooldown",
+        "_lxv_5v1x_event_cooldown", "agregar_evento", "escribir_orden_real",
     ]
     old = {name: globals().get(name) for name in patch_names}
+    old_flags = {name: globals().get(name) for name in ("LXV_SYNC_REAL_ROUTE_ENABLE", "LXV_5V1X_ENABLE", "LXV_4V2X_ENABLE")}
+    events = []
     try:
         def _reset_panel():
             globals()["REAL_LOCKS_PANEL"] = {
@@ -33623,6 +33653,9 @@ def _selftest_lxv_suspicious_locks_diagnostic():
                 },
                 "detalles": {}, "ready_pre_real": False, "resultado": "BLOQUEADO", "falta_principal": "", "updated_ts": 0.0, "error": "",
             }
+        def _zone_block(*args, **kwargs):
+            return {"zona_base": "INSUFICIENTE", "zona": "INSUFICIENTE", "fase": "target_round_missing", "allow_real": False, "decision": "NO_INVERTIR", "motivo": "target_round_missing"}
+        globals()["resolver_zona_final_lxv"] = _zone_block
         globals()["clasificar_zona_regional_dominante_lxv"] = lambda round_id_objetivo=None: {}
         globals()["combinar_zona_lxv_con_regional"] = lambda zi, info_regional, patron_valido=False, candidato_valido=False: dict(zi or {})
         globals()["refinar_zona_lxv_para_real"] = lambda info, patron_lxv="": dict(info or {})
@@ -33631,44 +33664,78 @@ def _selftest_lxv_suspicious_locks_diagnostic():
         globals()["hay_real_activo_global"] = lambda: (False, "selftest")
         globals()["_lxv_real_round_already_emitted"] = lambda rid: False
         globals()["_lxv_5v1x_event_cooldown"] = lambda *a, **k: None
+        globals()["agregar_evento"] = lambda msg: events.append(str(msg))
+        globals()["LXV_SYNC_REAL_ROUTE_ENABLE"] = True
+        globals()["LXV_5V1X_ENABLE"] = True
+        globals()["LXV_4V2X_ENABLE"] = True
 
-        # 1) 5V1X con ZONA_OK False no bloquea si los locks obligatorios están OK.
+        # A) 5V1X con zona bloqueada: ZONA_OK queda diagnóstico, no candado duro.
         _reset_panel()
-        globals()["resolver_zona_final_lxv"] = lambda round_id_objetivo=None, zona_info_previa=None: {"zona_base": "INSUFICIENTE", "allow_real": False, "decision": "NO_INVERTIR", "motivo": "target_round_missing", "fase": "INSUFICIENTE"}
-        actualizar_real_locks_panel_lxv(source="SELFTEST", round_id=9101, patron="5V1X", bot_candidato=BOT_NAMES[0], round_complete=True, data_quality="ok", zona_info={}, candidate_info={"candidate_ok": True, "reason": "selftest"}, order_status=None)
-        assert globals()["REAL_LOCKS_PANEL"]["locks"]["ZONA_OK"] is False
+        actualizar_real_locks_panel_lxv(source="LXV_5V1X", round_id=9101, patron="5V1X", bot_candidato=BOT_NAMES[0], round_complete=True, data_quality="ok", zona_info={}, candidate_info={"candidate_ok": True, "reason": "selftest"}, order_status=None)
+        locks = globals()["REAL_LOCKS_PANEL"]["locks"]
+        assert locks["ZONA_OK"] is False
+        assert locks["DATA_QUALITY_OK"] is True
         assert _real_locks_ready_pre_real() is True
+        assert diagnosticar_candado_bloqueante_lxv(locks, {"partial_pattern": "5V1X"}) != "ZONA_OK"
+        decision = _resolver_decision_final_real_hud({"round_id": 9101, "closed_count": 6, "expected_count": 6, "partial_pattern": "5V1X", "data_quality": "ok"}, locks, _zone_block())
+        assert decision.get("decision") == "SI_INVERTIR"
 
-        # 2) 4V2X con data_quality released_post_eval queda listo.
+        # B) 4V2X con data_quality released_post_eval: gate y panel listos aunque zona sea NO.
         _reset_panel()
-        actualizar_real_locks_panel_lxv(source="SELFTEST", round_id=9102, patron="4V2X", bot_candidato=BOT_NAMES[1], round_complete=True, data_quality="released_post_eval", zona_info={}, candidate_info={"candidate_ok": True, "reason": "selftest"}, order_status=None)
-        assert globals()["REAL_LOCKS_PANEL"]["locks"]["DATA_QUALITY_OK"] is True
+        c4 = {"round_id": 9102, "patron_lxv": "4V2X", "bot_x_debil": BOT_NAMES[1], "x_bots_4v2x": [BOT_NAMES[1], BOT_NAMES[2]], "x_probs_4v2x": {BOT_NAMES[1]: 0.20, BOT_NAMES[2]: 0.30}, "round_complete": True, "data_quality": "released_post_eval"}
+        assert _lxv_4v2x_gate_ok(c4) == (True, "ok")
+        actualizar_real_locks_panel_lxv(source="LXV_4V2X", round_id=9102, patron="4V2X", bot_candidato=BOT_NAMES[1], round_complete=True, data_quality="released_post_eval", zona_info={}, candidate_info={"candidate_ok": True, "reason": "selftest"}, order_status=None)
         assert _real_locks_ready_pre_real() is True
+        assert globals()["REAL_LOCKS_PANEL"].get("falta_principal") not in ("ZONA_OK", "DATA_QUALITY_OK")
 
-        # 3) Cuarentena antigua sobre ronda luego canónica no apaga candados.
+        # C) 5V1X con data_quality released_post_eval.
+        c5 = {"round_id": 9103, "patron_lxv": "5V1X", "x_unica": True, "bot_x_fuerte": BOT_NAMES[0], "round_complete": True, "data_quality": "released_post_eval"}
+        assert _lxv_5v1x_gate_ok(c5) == (True, "ok")
+
+        # D) Cuarentena recuperada/canónica 6/6 queda diagnóstico y no apaga locks.
         _reset_panel()
         for k in ("REAL_CLOSE_LIBRE", "COLUMNA_COMPLETA", "PATRON_VALIDO", "CANDIDATO_VALIDO", "ZONA_OK", "NO_DUPLICADO_RONDA", "TOKEN_REAL_LIBRE"):
             globals()["REAL_LOCKS_PANEL"]["locks"][k] = True
-        globals()["LAST_SYNC_ROUND_SUMMARY"] = {"round_closed_eval": 9103, "round_id": 9103, "closed_count": 6, "expected_count": 6, "data_quality": "ok", "partial_pattern": "5V1X"}
-        globals()["es_ronda_cuarentenada"] = lambda rid: int(rid) == 9103
+        globals()["LAST_SYNC_ROUND_SUMMARY"] = {"round_closed_eval": 9104, "round_id": 9104, "closed_count": 6, "expected_count": 6, "data_quality": "ok", "partial_pattern": "5V1X"}
+        globals()["es_ronda_cuarentenada"] = lambda rid: int(rid) == 9104
         before = dict(globals()["REAL_LOCKS_PANEL"]["locks"])
-        assert _column_quarantine_apply_real_block(9103) is False
+        assert _column_quarantine_apply_real_block(9104) is False
         for k in ("PATRON_VALIDO", "CANDIDATO_VALIDO", "COLUMNA_COMPLETA", "ZONA_OK"):
             assert globals()["REAL_LOCKS_PANEL"]["locks"][k] == before[k]
+        globals()["es_ronda_cuarentenada"] = lambda rid: False
 
-        # 4) Patrón no válido no queda listo.
+        # E) Emisión LXV con zona bloqueada no retorna False por zona; continúa hasta escribir orden.
+        events.clear()
+        globals()["escribir_orden_real"] = lambda bot, ciclo, round_id=None: True
+        assert emitir_real_autorizado(BOT_NAMES[0], 1, source="LXV_5V1X", round_id=9105) is True
+        assert any("ZONA_DIAGNOSTICO_NO_BLOQUEANTE" in e for e in events)
+
+        # F) Patrón inválido: no listo y decisión NO_INVERTIR.
         _reset_panel()
-        actualizar_real_locks_panel_lxv(source="SELFTEST", round_id=9104, patron="6V0X", bot_candidato="--", round_complete=True, data_quality="ok", zona_info={}, candidate_info={"candidate_ok": False, "reason": "patron_no_valido"}, order_status=None)
-        assert globals()["REAL_LOCKS_PANEL"]["locks"]["PATRON_VALIDO"] is False
-        assert globals()["REAL_LOCKS_PANEL"]["locks"]["CANDIDATO_VALIDO"] is False
+        actualizar_real_locks_panel_lxv(source="SELFTEST", round_id=9106, patron="6V0X", bot_candidato="--", round_complete=True, data_quality="ok", zona_info={}, candidate_info={"candidate_ok": False, "reason": "patron_no_valido"}, order_status=None)
+        locks = globals()["REAL_LOCKS_PANEL"]["locks"]
+        assert locks["PATRON_VALIDO"] is False and locks["CANDIDATO_VALIDO"] is False
         assert _real_locks_ready_pre_real() is False
+        decision = _resolver_decision_final_real_hud({"round_id": 9106, "closed_count": 6, "expected_count": 6, "partial_pattern": "6V0X", "data_quality": "ok"}, locks, _zone_block())
+        assert decision.get("decision") == "NO_INVERTIR"
 
-        # 5) Columna incompleta no queda lista.
+        # G) Columna incompleta: no listo y no emisión por candado COLUMNA_COMPLETA.
         _reset_panel()
-        actualizar_real_locks_panel_lxv(source="SELFTEST", round_id=9105, patron="4V1X", bot_candidato=BOT_NAMES[2], round_complete=False, data_quality="partial", zona_info={}, candidate_info={"candidate_ok": False, "reason": "columna_incompleta"}, order_status=None)
+        actualizar_real_locks_panel_lxv(source="SELFTEST", round_id=9107, patron="4V2X", bot_candidato=BOT_NAMES[2], round_complete=False, data_quality="partial", zona_info={}, candidate_info={"candidate_ok": True, "reason": "selftest"}, order_status=None)
         assert globals()["REAL_LOCKS_PANEL"]["locks"]["COLUMNA_COMPLETA"] is False
         assert _real_locks_ready_pre_real() is False
-        print("SELFTEST LXV_SUSPICIOUS_LOCKS_DIAGNOSTIC OK")
+
+        # H) Token ocupado: solo token duro bloquea y es bloqueo principal.
+        _reset_panel()
+        globals()["leer_token_actual"] = lambda: BOT_NAMES[1]
+        actualizar_real_locks_panel_lxv(source="LXV_5V1X", round_id=9108, patron="5V1X", bot_candidato=BOT_NAMES[0], round_complete=True, data_quality="ok", zona_info={}, candidate_info={"candidate_ok": True, "reason": "selftest"}, order_status=None)
+        locks = globals()["REAL_LOCKS_PANEL"]["locks"]
+        assert locks["TOKEN_REAL_LIBRE"] is False
+        assert _real_locks_ready_pre_real() is False
+        assert diagnosticar_candado_bloqueante_lxv(locks, {"partial_pattern": "5V1X"}) == "TOKEN_REAL_LIBRE"
+
+        print("SELFTEST LXV_SUSPICIOUS_LOCKS_TOTAL_OFF OK")
+        return True
     finally:
         globals()["REAL_LOCKS_PANEL"] = old_panel
         if old_summary is None:
@@ -33680,7 +33747,15 @@ def _selftest_lxv_suspicious_locks_diagnostic():
                 globals().pop(name, None)
             else:
                 globals()[name] = value
+        for name, value in old_flags.items():
+            if value is None:
+                globals().pop(name, None)
+            else:
+                globals()[name] = value
 
+
+def _selftest_lxv_suspicious_locks_diagnostic():
+    return _selftest_lxv_suspicious_locks_total_off()
 
 def _selftest_real_pending_release_policy():
     def _simulate(rid, pending_on, closed_count, expected_count, dq, patron):
