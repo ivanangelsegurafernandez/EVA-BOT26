@@ -61,6 +61,7 @@ if any(os.environ.get(name) == "1" for name in (
     "RUN_DIRECT_ACK_ALIGNMENT_SELFTEST",
     "RUN_LXV_HUD_ACK_REBUILD_SELFTEST",
     "RUN_SPLIT_REJOIN_SELFTEST",
+    "RUN_LXV_SUSPICIOUS_LOCKS_SELFTEST",
 )):
     import types
 
@@ -567,10 +568,8 @@ IA_AUTO_REAL_SOURCE = "IA_AUTO"
 LXV_REAL_REQUIRED_LOCKS = [
     "REAL_CLOSE_LIBRE",
     "COLUMNA_COMPLETA",
-    "DATA_QUALITY_OK",
     "PATRON_VALIDO",
     "CANDIDATO_VALIDO",
-    "ZONA_OK",
     "NO_DUPLICADO_RONDA",
     "TOKEN_REAL_LIBRE",
 ]
@@ -6285,9 +6284,47 @@ def es_ronda_cuarentenada(round_id):
     return False
 
 
+def _column_quarantine_can_bypass_real_block(round_id) -> bool:
+    try:
+        rid = int(round_id or 0)
+        if rid <= 0:
+            return False
+        ss = globals().get("LAST_SYNC_ROUND_SUMMARY", {})
+        if not isinstance(ss, dict):
+            ss = {}
+        ss_rid = int(ss.get("round_closed_eval", ss.get("round_id", ss.get("obj_round", 0))) or 0)
+        if ss_rid != rid:
+            return False
+        closed_count = int(ss.get("closed_count", ss.get("cerrados", 0)) or 0)
+        expected_count = int(ss.get("expected_count", ss.get("expected", ss.get("esperados", len(BOT_NAMES)))) or len(BOT_NAMES))
+        dq = str(ss.get("data_quality", ss.get("dq", "")) or "").strip().lower()
+        pattern = _lxv_normalizar_patron_txt(ss.get("partial_pattern", ss.get("patron_lxv", ss.get("patron", "")))) or str(ss.get("partial_pattern", "") or "").strip().upper()
+        return bool(
+            closed_count == expected_count == 6
+            and dq in ("ok", "released_post_eval", "canonical", "force_complete")
+            and str(pattern).upper() in ("5V1X", "4V2X")
+        )
+    except Exception:
+        return False
+
+
 def _column_quarantine_apply_real_block(round_id, motivo="columna_cuarentenada_no_usable_para_real") -> bool:
     try:
         if not es_ronda_cuarentenada(round_id):
+            return False
+        if _column_quarantine_can_bypass_real_block(round_id):
+            _lxv_5v1x_event_cooldown(
+                key=f"column_quarantine_bypass:{int(round_id or 0)}",
+                msg="🧯 CUARENTENA BYPASS: ronda canónica 6/6 con patrón LXV válido; cuarentena queda solo diagnóstico",
+                cooldown_s=float(globals().get("COLUMN_QUARANTINE_LOG_COOLDOWN_S", 20.0) or 20.0),
+            )
+            try:
+                p_diag = globals().get("REAL_LOCKS_PANEL", {})
+                if isinstance(p_diag, dict):
+                    p_diag.setdefault("detalles", {})["CUARENTENA"] = "CUARENTENA=solo_diagnostico_no_bloqueante"
+                    p_diag["quarantine_diag"] = True
+            except Exception:
+                pass
             return False
         p = globals().get("REAL_LOCKS_PANEL", {})
         if isinstance(p, dict):
@@ -7009,8 +7046,8 @@ def _lxv_5v1x_gate_ok(candidate: dict | None) -> tuple[bool, str]:
     c = candidate if isinstance(candidate, dict) else {}
     try:
         if es_ronda_cuarentenada(int(c.get("round_id", 0) or 0)):
-            _column_quarantine_apply_real_block(int(c.get("round_id", 0) or 0))
-            return False, "quarantine"
+            if _column_quarantine_apply_real_block(int(c.get("round_id", 0) or 0)):
+                return False, "quarantine"
     except Exception:
         return False, "quarantine_guard_error"
     if str(c.get("patron_lxv", "")).upper() != "5V1X":
@@ -7026,7 +7063,8 @@ def _lxv_5v1x_gate_ok(candidate: dict | None) -> tuple[bool, str]:
         return False, "round_incomplete"
     dq = str(c.get("data_quality", "") or "").strip().lower()
     if bool(globals().get("LXV_5V1X_REQUIRE_DATA_QUALITY_OK", True)) and dq != "ok":
-        return False, "data_quality_bad"
+        if not (bool(c.get("round_complete", False)) and dq in ("released_post_eval", "canonical", "closed", "force_complete", "released")):
+            return False, "data_quality_bad"
     return True, "ok"
 
 def _lxv_5v1x_pick_real_bot(candidate: dict | None) -> str | None:
@@ -7040,8 +7078,8 @@ def _lxv_4v2x_gate_ok(candidate: dict | None) -> tuple[bool, str]:
     c = candidate if isinstance(candidate, dict) else {}
     try:
         if es_ronda_cuarentenada(int(c.get("round_id", 0) or 0)):
-            _column_quarantine_apply_real_block(int(c.get("round_id", 0) or 0))
-            return False, "quarantine"
+            if _column_quarantine_apply_real_block(int(c.get("round_id", 0) or 0)):
+                return False, "quarantine"
     except Exception:
         return False, "quarantine_guard_error"
     patron_norm = str(c.get("patron_lxv", "") or "").upper().replace("/", "")
@@ -7063,7 +7101,8 @@ def _lxv_4v2x_gate_ok(candidate: dict | None) -> tuple[bool, str]:
         return False, "round_incomplete"
     dq = str(c.get("data_quality", "") or "").strip().lower()
     if bool(globals().get("LXV_4V2X_REQUIRE_DATA_QUALITY_OK", True)) and dq != "ok":
-        return False, "data_quality_bad"
+        if not (bool(c.get("round_complete", False)) and dq in ("released_post_eval", "canonical", "closed", "force_complete", "released")):
+            return False, "data_quality_bad"
     return True, "ok"
 
 def _lxv_4v2x_pick_real_bot(candidate: dict | None) -> str | None:
@@ -8062,9 +8101,11 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
         zi = resolver_zona_final_lxv(round_id_objetivo=round_id, zona_info_previa=zona_info if isinstance(zona_info, dict) else None)
         p["zona"] = str(zi.get("zona_base", zi.get("zona", zi.get("fase", ""))) or "")
         p["decision"] = str(zi.get("decision", "") or "")
-        dq_ok = str(data_quality or "").strip().lower() == "ok"
-        _real_lock_set("DATA_QUALITY_OK", dq_ok, f"dq={data_quality}")
-        _real_lock_set("PATRON_VALIDO", str(patron) in ("4V2X", "5V1X"), patron)
+        patron_ok = str(patron) in ("4V2X", "5V1X")
+        dq_norm = str(data_quality or "").strip().lower()
+        dq_ok = bool(dq_norm == "ok" or (bool(round_complete) and patron_ok and dq_norm in ("released_post_eval", "canonical", "closed", "force_complete", "released")))
+        _real_lock_set("DATA_QUALITY_OK", dq_ok, "DATA_QUALITY_OK=diagnóstico_relajado_no_bloqueante")
+        _real_lock_set("PATRON_VALIDO", patron_ok, patron)
         _real_lock_set("COLUMNA_COMPLETA", bool(round_complete), f"round_complete={bool(round_complete)}")
         diag_panel_align = globals().get("LAST_ROUND_ALIGNMENT_DIAG", {})
         diag_panel_align_same_round = _round_alignment_diag_aplica_a_round(diag_panel_align, round_id)
@@ -8088,7 +8129,6 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
                 pass
         zona_ok, zona_reason = _lxv_zona_es_invertible(zi)
         info_regional = clasificar_zona_regional_dominante_lxv(round_id_objetivo=round_id)
-        patron_ok = str(patron) in ("4V2X", "5V1X")
         cand_ok_try = bool(ci.get("candidate_ok", False))
         zi2 = combinar_zona_lxv_con_regional(zi, info_regional, patron_valido=patron_ok, candidato_valido=cand_ok_try)
         if isinstance(zi2, dict):
@@ -8119,7 +8159,11 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
                     _lxv_5v1x_event_cooldown(key=f"zona_ref_observar:{str(patron)}:{round_id}:{motivo_ref}", msg=f"🟡 LXV verde OBSERVAR_NO_REAL | patrón={patron} | rid={round_id} | motivo={motivo_ref}", cooldown_s=float(globals().get("LXV_GREEN_OPPORTUNITY_LOG_COOLDOWN_S", 15.0)))
         zona_ok = bool(str(zi.get("decision_real_refinada", "")).upper() == "SI_INVERTIR") if patron_ok and str(patron) in ("4V2X", "5V1X") else bool(zi.get("zona_base", "UNKNOWN") in LXV_ZONAS_INVERTIBLES and bool(zi.get("allow_real", False)))
         zona_reason_ref = str(zi.get("motivo_real_refinado", zona_reason or "zona_no_invertible"))
-        _real_lock_set("ZONA_OK", bool(zona_ok), zona_reason_ref)
+        fase_diag_reasons = {"target_round_missing", "INSUFICIENTE", "VERDE_TARDIO", "VERDE_TARDIO_SATURADO_NO_REAL"}
+        fase_motivo = str(zi.get("motivo", zi.get("fase", zi.get("subzona", ""))) or "")
+        if patron_ok and bool(round_complete) and any(tok in fase_motivo or tok in str(zi.get("fase", "")) or tok in str(zi.get("subzona", "")) for tok in fase_diag_reasons):
+            p.setdefault("detalles", {})["FASE_ZV"] = "FASE_ZV=diagnóstico_no_bloqueante_para_LXV_VALIDO"
+        _real_lock_set("ZONA_OK", bool(zona_ok), "ZONA_OK=solo_diagnostico_no_bloqueante")
         _real_lock_set("NO_DUPLICADO_RONDA", bool(round_id) and (not _lxv_real_round_already_emitted(round_id)), f"rid={round_id}")
         try:
             if callable(globals().get("_hay_real_close_pending_activo")):
@@ -8164,10 +8208,9 @@ def actualizar_real_locks_panel_lxv(source="", round_id=None, patron="", bot_can
         hard_lock_names = [
             "REAL_CLOSE_LIBRE",
             "COLUMNA_COMPLETA",
-            "DATA_QUALITY_OK",
             "PATRON_VALIDO",
             "CANDIDATO_VALIDO",
-            "ZONA_OK",
+            "NO_DUPLICADO_RONDA",
             "TOKEN_REAL_LIBRE",
         ]
         if any(locks_panel.get(k) is False for k in hard_lock_names):
@@ -8299,6 +8342,7 @@ def actualizar_real_locks_panel_desde_round_live():
             p["decision"] = str((zi_norm or {}).get("decision", "") or "")
             p.setdefault("locks", {})
             p["locks"]["ZONA_OK"] = bool(zona_ok_live)
+            p.setdefault("detalles", {})["ZONA_OK"] = "ZONA_OK=solo_diagnostico_no_bloqueante"
             p["ready_pre_real"] = bool(_real_locks_ready_pre_real())
             p["falta_principal"] = _real_locks_first_off() or "---"
             p["resultado"] = "LISTO PARA REAL" if p["ready_pre_real"] else "BLOQUEADO"
@@ -8894,10 +8938,8 @@ def render_real_locks_panel():
         out.append("╠" + "═"*(W-2) + "╣")
 
         groups = [
-            (Fore.CYAN, "🔵 SINCRONIZACIÓN", ["REAL_CLOSE_LIBRE", "COLUMNA_COMPLETA", "DATA_QUALITY_OK"]),
-            (Fore.YELLOW, "🟡 PATRÓN", ["PATRON_VALIDO", "CANDIDATO_VALIDO"]),
-            (Fore.MAGENTA, "🟣 ZONA", ["ZONA_OK"]),
-            (Fore.GREEN, "🟢 EJECUCIÓN", ["NO_DUPLICADO_RONDA", "TOKEN_REAL_LIBRE", "ORDEN_REAL_OK"]),
+            (Fore.GREEN, "🟢 BLOQUEANTES", ["REAL_CLOSE_LIBRE", "COLUMNA_COMPLETA", "PATRON_VALIDO", "CANDIDATO_VALIDO", "NO_DUPLICADO_RONDA", "TOKEN_REAL_LIBRE", "ORDEN_REAL_OK"]),
+            (Fore.MAGENTA, "🟣 DIAGNÓSTICOS", ["DATA_QUALITY_OK", "ZONA_OK", "CUARENTENA", "FASE_ZV", "BOTX_FRESHNESS"]),
         ]
         for color, title, names in groups:
             out.append(row(ctext(color, title)))
@@ -8906,7 +8948,10 @@ def render_real_locks_panel():
                     color_row = Fore.GREEN if locks.get(name) is True else (Fore.RED if locks.get(name) is False else Fore.YELLOW)
                 else:
                     color_row = Fore.WHITE
-                out.append(row(ctext(color_row, f"  {name:<22} {estado_lock(locks.get(name))}")))
+                val = locks.get(name) if name in locks else None
+                detalle = str((p.get("detalles", {}) if isinstance(p.get("detalles", {}), dict) else {}).get(name, "") or "")
+                suffix = f" | {trunc(detalle, 32)}" if detalle and name in ("DATA_QUALITY_OK", "ZONA_OK", "CUARENTENA", "FASE_ZV", "BOTX_FRESHNESS") else ""
+                out.append(row(ctext(color_row, f"  {name:<22} {estado_lock(val)}{suffix}")))
             out.append(row(""))
 
         diag_txt = str(p.get("diag_visual") or "")
@@ -14284,17 +14329,20 @@ def _sync_round_tick_maestro():
     real_hold_bot = None
     motivo_no_real = ""
     if es_ronda_cuarentenada(round_id):
-        _column_quarantine_apply_real_block(round_id)
-        completed = False
-        payload["completed"] = False
-        payload["status"] = "hold_quarantined_round"
-        payload["reason"] = "NO_INVERTIR_COLUMNA_CUARENTENA"
-        payload["data_quality"] = "quarantine"
-        payload["quarantine"] = True
-        payload["usable_for_training"] = False
-        payload["usable_for_real"] = False
-        payload["usable_for_lxv"] = False
-        motivo_no_real = "columna_cuarentenada_no_usable_para_real"
+        quarantine_blocked = bool(_column_quarantine_apply_real_block(round_id))
+        if quarantine_blocked:
+            completed = False
+            payload["completed"] = False
+            payload["status"] = "hold_quarantined_round"
+            payload["reason"] = "NO_INVERTIR_COLUMNA_CUARENTENA"
+            payload["data_quality"] = "quarantine"
+            payload["quarantine"] = True
+            payload["usable_for_training"] = False
+            payload["usable_for_real"] = False
+            payload["usable_for_lxv"] = False
+            motivo_no_real = "columna_cuarentenada_no_usable_para_real"
+        else:
+            payload["quarantine"] = "diagnostico_no_bloqueante"
 
     if completed:
         next_round = round_id + 1
@@ -14348,7 +14396,7 @@ def _sync_round_tick_maestro():
                     f"⛔ REAL_EMISION_BLOQUEADA_POR_PENDING: ronda #{round_id} patrón={patron} "
                     f"bot={real_close_pending_bot} pending={real_close_pending_data.get('ciclo')}"
                 )
-            elif not zona_allow:
+            elif (not zona_allow) and not (patron in ("5V1X", "4V2X") and bool(completed)):
                 motivo_no_real = f"zona_no_invertir_{zona_info_decision.get('fase', zona_info_decision.get('zona'))}_{zona_info_decision.get('motivo')}"
                 agregar_evento(
                     f"🧱 ROUND LIVE REAL BLOQUEADO POR ZONA: rid={round_id} "
@@ -14359,6 +14407,8 @@ def _sync_round_tick_maestro():
                 ok_emit = False
                 patron = _lxv_normalizar_patron_txt(partial_pattern or patron) or "0V0X"
             else:
+                if not zona_allow:
+                    agregar_evento("FASE_ZV=diagnóstico_no_bloqueante_para_LXV_VALIDO")
                 try:
                     if patron == "5V1X":
                         bot_pick = str(summary.get("bot_x_actual") or "").strip()
@@ -14490,22 +14540,28 @@ def _sync_round_tick_maestro():
                     except Exception:
                         candidate_age = None
                 if candidate_age is None:
-                    motivo_no_emit = "edad_no_calculable"
                     _lxv_5v1x_event_cooldown(
                         key=f"real_age_missing:{round_id}",
-                        msg=f"⏱️ REAL bloqueado: edad BotX no calculable | bot={bot_pick}",
+                        msg=f"⚠️ BOTX_FRESHNESS: edad no calculable, solo diagnóstico, no bloquea REAL LXV | bot={bot_pick}",
                         cooldown_s=8.0,
                     )
-                elif not _real_candidate_age_ok_lxv({"edad_s": candidate_age}):
+                    try:
+                        (globals().get("REAL_LOCKS_PANEL", {}) or {}).setdefault("detalles", {})["BOTX_FRESHNESS"] = "BOTX_FRESHNESS=diagnóstico_no_bloqueante"
+                    except Exception:
+                        pass
+                    candidate_age = 0.0
+                if not _real_candidate_age_ok_lxv({"edad_s": candidate_age}):
                     max_age = float(globals().get("LXV_BOTX_MAX_AGE_S", REAL_CLOSE_MAX_AGE_S))
-                    motivo_no_emit = f"botx_viejo_{float(candidate_age):.1f}s_max{max_age:.0f}s"
-                    LXV_REAL_AUDIT["ultimo_bloqueo"] = motivo_no_emit
                     _lxv_5v1x_event_cooldown(
-                        key=f"real_age_block:{round_id}",
-                        msg=f"⏱️ REAL bloqueado: BotX viejo edad={float(candidate_age):.1f}s max={max_age:.0f}s | bot={bot_pick}",
+                        key=f"real_age_diag:{round_id}",
+                        msg=f"⚠️ BOTX_FRESHNESS: X vieja, solo diagnóstico, no bloquea REAL LXV | edad={float(candidate_age):.1f}s max={max_age:.0f}s | bot={bot_pick}",
                         cooldown_s=8.0,
                     )
-                else:
+                    try:
+                        (globals().get("REAL_LOCKS_PANEL", {}) or {}).setdefault("detalles", {})["BOTX_FRESHNESS"] = "BOTX_FRESHNESS=diagnóstico_no_bloqueante"
+                    except Exception:
+                        pass
+                if True:
                     _lxv_5v1x_event_cooldown(
                         key=f"real_age_ok:{round_id}:{bot_pick}",
                         msg=f"⏱️ Frescura BotX OK: bot={bot_pick} edad={float(candidate_age):.1f}s",
@@ -33545,6 +33601,87 @@ def _selftest_hud_oficial_vs_regional_lxv():
 
 
 
+
+def _selftest_lxv_suspicious_locks_diagnostic():
+    old_panel = globals().get("REAL_LOCKS_PANEL")
+    old_summary = globals().get("LAST_SYNC_ROUND_SUMMARY", None)
+    patch_names = [
+        "resolver_zona_final_lxv", "clasificar_zona_regional_dominante_lxv", "combinar_zona_lxv_con_regional",
+        "refinar_zona_lxv_para_real", "_hay_real_close_pending_activo", "leer_token_actual",
+        "hay_real_activo_global", "_lxv_real_round_already_emitted", "es_ronda_cuarentenada",
+        "_lxv_5v1x_event_cooldown",
+    ]
+    old = {name: globals().get(name) for name in patch_names}
+    try:
+        def _reset_panel():
+            globals()["REAL_LOCKS_PANEL"] = {
+                "enabled": True, "source": "SELFTEST", "round_id": None, "bot": "", "patron": "", "zona": "", "decision": "",
+                "locks": {
+                    "REAL_CLOSE_LIBRE": False, "COLUMNA_COMPLETA": False, "DATA_QUALITY_OK": False,
+                    "PATRON_VALIDO": False, "CANDIDATO_VALIDO": False, "ZONA_OK": False,
+                    "NO_DUPLICADO_RONDA": False, "TOKEN_REAL_LIBRE": False, "ORDEN_REAL_OK": None,
+                },
+                "detalles": {}, "ready_pre_real": False, "resultado": "BLOQUEADO", "falta_principal": "", "updated_ts": 0.0, "error": "",
+            }
+        globals()["clasificar_zona_regional_dominante_lxv"] = lambda round_id_objetivo=None: {}
+        globals()["combinar_zona_lxv_con_regional"] = lambda zi, info_regional, patron_valido=False, candidato_valido=False: dict(zi or {})
+        globals()["refinar_zona_lxv_para_real"] = lambda info, patron_lxv="": dict(info or {})
+        globals()["_hay_real_close_pending_activo"] = lambda: (False, None, "selftest")
+        globals()["leer_token_actual"] = lambda: None
+        globals()["hay_real_activo_global"] = lambda: (False, "selftest")
+        globals()["_lxv_real_round_already_emitted"] = lambda rid: False
+        globals()["_lxv_5v1x_event_cooldown"] = lambda *a, **k: None
+
+        # 1) 5V1X con ZONA_OK False no bloquea si los locks obligatorios están OK.
+        _reset_panel()
+        globals()["resolver_zona_final_lxv"] = lambda round_id_objetivo=None, zona_info_previa=None: {"zona_base": "INSUFICIENTE", "allow_real": False, "decision": "NO_INVERTIR", "motivo": "target_round_missing", "fase": "INSUFICIENTE"}
+        actualizar_real_locks_panel_lxv(source="SELFTEST", round_id=9101, patron="5V1X", bot_candidato=BOT_NAMES[0], round_complete=True, data_quality="ok", zona_info={}, candidate_info={"candidate_ok": True, "reason": "selftest"}, order_status=None)
+        assert globals()["REAL_LOCKS_PANEL"]["locks"]["ZONA_OK"] is False
+        assert _real_locks_ready_pre_real() is True
+
+        # 2) 4V2X con data_quality released_post_eval queda listo.
+        _reset_panel()
+        actualizar_real_locks_panel_lxv(source="SELFTEST", round_id=9102, patron="4V2X", bot_candidato=BOT_NAMES[1], round_complete=True, data_quality="released_post_eval", zona_info={}, candidate_info={"candidate_ok": True, "reason": "selftest"}, order_status=None)
+        assert globals()["REAL_LOCKS_PANEL"]["locks"]["DATA_QUALITY_OK"] is True
+        assert _real_locks_ready_pre_real() is True
+
+        # 3) Cuarentena antigua sobre ronda luego canónica no apaga candados.
+        _reset_panel()
+        for k in ("REAL_CLOSE_LIBRE", "COLUMNA_COMPLETA", "PATRON_VALIDO", "CANDIDATO_VALIDO", "ZONA_OK", "NO_DUPLICADO_RONDA", "TOKEN_REAL_LIBRE"):
+            globals()["REAL_LOCKS_PANEL"]["locks"][k] = True
+        globals()["LAST_SYNC_ROUND_SUMMARY"] = {"round_closed_eval": 9103, "round_id": 9103, "closed_count": 6, "expected_count": 6, "data_quality": "ok", "partial_pattern": "5V1X"}
+        globals()["es_ronda_cuarentenada"] = lambda rid: int(rid) == 9103
+        before = dict(globals()["REAL_LOCKS_PANEL"]["locks"])
+        assert _column_quarantine_apply_real_block(9103) is False
+        for k in ("PATRON_VALIDO", "CANDIDATO_VALIDO", "COLUMNA_COMPLETA", "ZONA_OK"):
+            assert globals()["REAL_LOCKS_PANEL"]["locks"][k] == before[k]
+
+        # 4) Patrón no válido no queda listo.
+        _reset_panel()
+        actualizar_real_locks_panel_lxv(source="SELFTEST", round_id=9104, patron="6V0X", bot_candidato="--", round_complete=True, data_quality="ok", zona_info={}, candidate_info={"candidate_ok": False, "reason": "patron_no_valido"}, order_status=None)
+        assert globals()["REAL_LOCKS_PANEL"]["locks"]["PATRON_VALIDO"] is False
+        assert globals()["REAL_LOCKS_PANEL"]["locks"]["CANDIDATO_VALIDO"] is False
+        assert _real_locks_ready_pre_real() is False
+
+        # 5) Columna incompleta no queda lista.
+        _reset_panel()
+        actualizar_real_locks_panel_lxv(source="SELFTEST", round_id=9105, patron="4V1X", bot_candidato=BOT_NAMES[2], round_complete=False, data_quality="partial", zona_info={}, candidate_info={"candidate_ok": False, "reason": "columna_incompleta"}, order_status=None)
+        assert globals()["REAL_LOCKS_PANEL"]["locks"]["COLUMNA_COMPLETA"] is False
+        assert _real_locks_ready_pre_real() is False
+        print("SELFTEST LXV_SUSPICIOUS_LOCKS_DIAGNOSTIC OK")
+    finally:
+        globals()["REAL_LOCKS_PANEL"] = old_panel
+        if old_summary is None:
+            globals().pop("LAST_SYNC_ROUND_SUMMARY", None)
+        else:
+            globals()["LAST_SYNC_ROUND_SUMMARY"] = old_summary
+        for name, value in old.items():
+            if value is None:
+                globals().pop(name, None)
+            else:
+                globals()[name] = value
+
+
 def _selftest_real_pending_release_policy():
     def _simulate(rid, pending_on, closed_count, expected_count, dq, patron):
         real_emitido = False
@@ -35534,6 +35671,7 @@ def _run_requested_selftests_and_exit_if_needed():
     _run("RUN_LXV_PREARMADO_SELFTEST", _selftest_lxv_prearmado_seguro)
     _run("RUN_LXV_4V2X_CANDIDATE_PANEL_SELFTEST", _selftest_lxv_4v2x_candidate_panel)
     _run("RUN_HUD_OFICIAL_VS_REGIONAL_SELFTEST", _selftest_hud_oficial_vs_regional_lxv)
+    _run("RUN_LXV_SUSPICIOUS_LOCKS_SELFTEST", _selftest_lxv_suspicious_locks_diagnostic)
     _run("RUN_REAL_PENDING_RELEASE_SELFTEST", _selftest_real_pending_release_policy)
     _run("RUN_DQ_VISUAL_UNICO_SELFTEST", _selftest_dq_visual_unico)
     _run("RUN_ACK_HEARTBEAT_FRESHNESS_SELFTEST", _selftest_ack_heartbeat_freshness)
