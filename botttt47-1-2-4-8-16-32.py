@@ -1616,9 +1616,15 @@ def leer_orden_real(bot: str):
                 or data.get("ciclo_orden")
                 or data.get("ciclo_forzado")
                 or data.get("marti_ciclo")
-                or 1
             )
+            if raw_ciclo is None:
+                if _print_once("orden_real_sin_ciclo", ttl=8):
+                    print(Fore.RED + Style.BRIGHT + "🚨 ORDEN_REAL_SIN_CICLO: orden ignorada, NO COMPRA.")
+                return None, None, 0, None
             cyc = int(raw_ciclo)
+            if cyc < 1 or cyc > MAX_CICLOS:
+                print(Fore.RED + Style.BRIGHT + f"🚨 ORDEN_REAL_CICLO_INVALIDO: C{cyc}, orden ignorada.")
+                return None, None, 0, None
             ts = float(data.get("created_ts") or data.get("ts") or 0.0)
             ttl = float(data.get("ttl_s") or data.get("ttl") or 45.0)
             quiet = 1 if int(data.get("quiet", 0)) == 1 else 0
@@ -4631,42 +4637,45 @@ async def ejecutar_panel():
                 ciclo_forzado = max(1, min(ciclo_forzado, MAX_CICLOS))
                 print(Fore.YELLOW + f"⚠️ ciclo>MAX_CICLOS detectado, normalizado a C{ciclo_forzado} (retenido=C{ciclo_prev})")
 
-            ciclo = ciclo_maestro if ciclo_maestro is not None else ciclo_forzado
             if modo_real:
                 now_guard = time.time()
                 last_guard = float(estado_bot.get("real_cycle_guard_last_ts", 0.0) or 0.0)
                 if (now_guard - last_guard) >= 8.0:
                     if ciclo_maestro is None and ciclo_forzado is not None:
                         print(Fore.YELLOW + "REAL sin orden viva del maestro, usando retenido")
-                    elif ciclo_maestro is None and ciclo_forzado is None:
-                        print(Fore.YELLOW + "🚨 TOKEN_REAL_SIN_ORDEN_VALIDA: no compro, espero orden maestro.")
-                        await asyncio.sleep(2)
-                        continue
                     estado_bot["real_cycle_guard_last_ts"] = now_guard
-            if modo_real and ciclo_maestro is None:
-                print(Fore.YELLOW + "🚨 TOKEN_REAL_SIN_ORDEN_VALIDA: no compro, espero orden maestro.")
-                await asyncio.sleep(2)
-                continue
-            if modo_real and ciclo_maestro is not None and ciclo_forzado is not None and int(ciclo_maestro) < int(ciclo_forzado):
-                if not _owner_state_confirma_ciclo(ciclo_maestro):
-                    print(
-                        Fore.CYAN + Style.BRIGHT +
-                        f"🚨 CICLO_REAL_MISMATCH_CRITICO: orden=C{ciclo_maestro} < retenido=C{ciclo_forzado}. NO COMPRA. Esperando orden corregida."
-                    )
-                    await asyncio.sleep(2)
+                if ciclo_maestro is not None:
+                    ciclo = int(ciclo_maestro)
+                elif ciclo_forzado is not None:
+                    ciclo = int(ciclo_forzado)
+                else:
+                    if _print_once("real_sin_ciclo_no_compra", ttl=8):
+                        print(Fore.RED + Style.BRIGHT + "🚨 REAL SIN CICLO/ORDEN VÁLIDA: NO COMPRA. Esperando orden maestro.")
+                    estado_bot["ciclo_en_progreso"] = False
+                    estado_bot["token_msg_mostrado"] = False
+                    await asyncio.sleep(1.0)
                     continue
-                print(Fore.GREEN + f"✅ HANDSHAKE REAL OK: orden=C{ciclo_maestro} confirmada por owner_state fresco")
+            else:
+                ciclo = ciclo_maestro or ciclo_forzado or 1
+            if modo_real and ciclo_maestro is not None and ciclo_forzado is not None and int(ciclo_maestro) != int(ciclo_forzado):
+                print(Fore.CYAN + Style.BRIGHT + f"🔎 Divergencia ciclo: maestro=C{ciclo_maestro} | retenido=C{ciclo_forzado}. NO COMPRA. Esperando orden corregida.")
+                estado_bot["ciclo_en_progreso"] = False
+                estado_bot["token_msg_mostrado"] = False
+                await asyncio.sleep(1.0)
+                continue
             if modo_real and estado_bot.get("real_first_cycle_reset_pending"):
                 if ciclo_maestro is not None:
-                    print(Fore.YELLOW + f"Primer ciclo REAL confirmado por maestro en C{ciclo_maestro}")
+                    ciclo_real_entrada = int(ciclo_maestro)
                 elif ciclo_forzado is not None:
-                    print(Fore.YELLOW + "🚨 TOKEN_REAL_SIN_ORDEN_VALIDA: no compro, espero orden maestro.")
-                    await asyncio.sleep(2)
-                    continue
+                    ciclo_real_entrada = int(ciclo_forzado)
                 else:
-                    print(Fore.YELLOW + "🚨 TOKEN_REAL_SIN_ORDEN_VALIDA: no compro, espero orden maestro.")
-                    await asyncio.sleep(2)
-                    continue
+                    print(Fore.RED + Style.BRIGHT + "🚨 TOKEN_REAL_SIN_ORDEN_VALIDA: NO COMPRA. Esperando orden maestro.")
+                    estado_bot["real_first_cycle_reset_pending"] = False
+                    estado_bot["ciclo_en_progreso"] = False
+                    estado_bot["token_msg_mostrado"] = False
+                    return ws, current_token
+                print(Fore.YELLOW + f"Primer ciclo REAL confirmado para entrada en C{ciclo_real_entrada}")
+                ciclo = int(ciclo_real_entrada)
                 estado_bot["real_first_cycle_reset_pending"] = False
 
             estado_bot["ciclo_forzado"] = None
@@ -5364,3 +5373,26 @@ def _run_bot_real_cycle_guard_selftest():
 
 if __name__ == "__main__" and _run_bot_real_cycle_guard_selftest():
     raise SystemExit(0)
+
+
+def _selftest_real_no_fallback_c1():
+    modo_real = True
+    ciclo_maestro = None
+    ciclo_forzado = None
+    assert not (modo_real and ciclo_maestro is None and ciclo_forzado is None and 1)
+    raw = {"bot": NOMBRE_BOT, "consumed": False}
+    raw_ciclo = (raw.get("ciclo") or raw.get("ciclo_orden") or raw.get("ciclo_forzado") or raw.get("marti_ciclo"))
+    assert raw_ciclo is None
+    ciclo_maestro, ciclo_forzado = 2, 1
+    assert bool(modo_real and ciclo_maestro is not None and ciclo_forzado is not None and int(ciclo_maestro) != int(ciclo_forzado)) is True
+    ciclo_maestro, ciclo_forzado = 3, None
+    ciclo = int(ciclo_maestro) if ciclo_maestro is not None else int(ciclo_forzado)
+    assert ciclo == 3
+    ciclo_maestro, ciclo_forzado = None, 4
+    ciclo = int(ciclo_maestro) if ciclo_maestro is not None else int(ciclo_forzado)
+    assert ciclo == 4
+    print("✅ RUN_REAL_NO_FALLBACK_C1_SELFTEST OK")
+    return True
+
+if str(os.getenv("RUN_REAL_NO_FALLBACK_C1_SELFTEST", "0")).strip() == "1":
+    _selftest_real_no_fallback_c1()

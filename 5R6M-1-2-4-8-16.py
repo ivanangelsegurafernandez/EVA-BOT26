@@ -15671,18 +15671,17 @@ def emitir_real_autorizado(bot: str, ciclo: int, source: str = "LEGACY", round_i
         zona_info = resolver_zona_final_lxv(round_id_objetivo=rid_int) or {}
         allow_zona, reason_zona = _lxv_zona_es_invertible(zona_info)
         if not allow_zona:
-            agregar_evento(
-                f"🟡 ZONA_DIAGNOSTICO_NO_BLOQUEANTE: source={src} rid={rid_int} bot={bot} "
-                f"zona_base={zona_info.get('zona_base', zona_info.get('zona', zona_info.get('fase')))} "
-                f"subzona={zona_info.get('subzona', zona_info.get('zona', zona_info.get('fase')))} "
-                f"decision={zona_info.get('decision')} "
-                f"allow_real={bool(zona_info.get('allow_real', False))} "
-                f"motivo={zona_info.get('motivo')} reason={reason_zona} "
-                f"| REAL sigue permitido por LXV válido"
-            )
+            zona_txt = zona_info.get('zona_base', zona_info.get('zona', zona_info.get('fase')))
+            motivo_txt = zona_info.get('motivo') or reason_zona
+            agregar_evento(f"⛔ REAL BLOQUEADO POR ZONA LXV: zona={zona_txt} motivo={motivo_txt} origen={src} round={rid_int}")
+            try:
+                REAL_LOCKS_PANEL["locks"]["ZONA_OK"] = False
+            except Exception:
+                pass
             LXV_REAL_AUDIT["ultimo_bloqueo"] = (
-                f"zona_diag_no_bloqueante_{zona_info.get('zona_base', zona_info.get('fase', zona_info.get('zona')))}_{zona_info.get('motivo')}"
+                f"zona_hard_block_{zona_info.get('zona_base', zona_info.get('fase', zona_info.get('zona')))}_{zona_info.get('motivo')}"
             )
+            return False
     agregar_evento(f"✅ REAL source autorizada: {src}.")
     prev_src = globals().get("_REAL_ROUTE_SOURCE", None)
     globals()["_REAL_ROUTE_SOURCE"] = src
@@ -33811,11 +33810,12 @@ def _selftest_lxv_suspicious_locks_total_off():
             assert globals()["REAL_LOCKS_PANEL"]["locks"][k] == before[k]
         globals()["es_ronda_cuarentenada"] = lambda rid: False
 
-        # E) Emisión LXV con zona bloqueada no retorna False por zona; continúa hasta escribir orden.
+        # E) Emisión LXV con zona bloqueada retorna False (hard block).
         events.clear()
         globals()["escribir_orden_real"] = lambda bot, ciclo, round_id=None: True
-        assert emitir_real_autorizado(BOT_NAMES[0], 1, source="LXV_5V1X", round_id=9105) is True
-        assert any("ZONA_DIAGNOSTICO_NO_BLOQUEANTE" in e for e in events)
+        globals()["resolver_zona_final_lxv"] = lambda round_id_objetivo=None: {"zona_base":"VERDE_TARDIO","subzona":"VERDE_TARDIO","decision":"NO_INVERTIR","allow_real":False,"motivo":"selftest"}
+        assert emitir_real_autorizado(BOT_NAMES[0], 1, source="LXV_5V1X", round_id=9105) is False
+        assert any("REAL BLOQUEADO POR ZONA LXV" in e for e in events)
 
         # F) Patrón inválido: no listo y decisión NO_INVERTIR.
         _reset_panel()
@@ -35931,3 +35931,30 @@ if __name__ == "__main__":
             print(f"⛔ Error crítico: {str(e)}")
             _log_exception("Error crítico en __main__", e)
             time.sleep(5)
+
+
+def _selftest_lxv_zone_hard_block():
+    old = {k: globals().get(k) for k in ("resolver_zona_final_lxv", "escribir_orden_real", "BOT_NAMES", "MANUAL_REAL_ROUTE_ENABLE", "LXV_5V1X_ENABLE", "LXV_4V2X_ENABLE", "LXV_SYNC_REAL_ROUTE_ENABLE", "MANUAL_REAL_FORCE_BYPASS_FASE_ZV") }
+    globals()["BOT_NAMES"] = globals().get("BOT_NAMES", ["fulll45"])
+    globals()["escribir_orden_real"] = lambda bot, ciclo, round_id=None: True
+    globals()["LXV_SYNC_REAL_ROUTE_ENABLE"] = True
+    globals()["LXV_5V1X_ENABLE"] = True
+    globals()["LXV_4V2X_ENABLE"] = True
+    globals()["MANUAL_REAL_ROUTE_ENABLE"] = True
+    globals()["resolver_zona_final_lxv"] = lambda round_id_objetivo=None: {"zona_base":"VERDE_TARDIO","subzona":"VERDE_TARDIO","decision":"NO_INVERTIR","allow_real":False,"motivo":"selftest"}
+    assert emitir_real_autorizado(globals()["BOT_NAMES"][0], 1, source="LXV_4V2X", round_id=991) is False
+    globals()["resolver_zona_final_lxv"] = lambda round_id_objetivo=None: {"zona_base":"VERDE_SATURADO_TARDIO","subzona":"VERDE_SATURADO_TARDIO","decision":"NO_INVERTIR","allow_real":False,"motivo":"selftest"}
+    assert emitir_real_autorizado(globals()["BOT_NAMES"][0], 1, source="LXV_5V1X", round_id=992) is False
+    globals()["MANUAL_REAL_FORCE_BYPASS_FASE_ZV"] = True
+    globals()["resolver_zona_final_lxv"] = lambda round_id_objetivo=None: {"zona_base":"VERDE_TARDIO","subzona":"VERDE_TARDIO","decision":"NO_INVERTIR","allow_real":False,"motivo":"selftest"}
+    assert _fase_zv_gate_allow_real("MANUAL", 0) is True
+    print("✅ RUN_LXV_ZONE_HARD_BLOCK_SELFTEST OK")
+    for k,v in old.items():
+        if v is None:
+            globals().pop(k, None)
+        else:
+            globals()[k]=v
+    return True
+
+if str(os.getenv("RUN_LXV_ZONE_HARD_BLOCK_SELFTEST", "0")).strip() == "1":
+    _selftest_lxv_zone_hard_block()
