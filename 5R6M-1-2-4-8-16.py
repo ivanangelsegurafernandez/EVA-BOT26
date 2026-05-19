@@ -15249,6 +15249,21 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
         _last_real_push_ts[bot] = now
 
         ciclo_obj = max(1, min(int(ciclo), MAX_CICLOS))
+        try:
+            ciclo_oficial = int(ciclo_real_oficial_actual())
+        except Exception as e:
+            agregar_evento(f"🚨 REAL_ABORTADO_SIN_CICLO_OFICIAL: bot={bot} error={e}")
+            return False
+        if str(origen or "").lower() == "token_sync" and int(ciclo_obj) < int(ciclo_oficial):
+            agregar_evento(
+                f"⚠️ TOKEN_SYNC_CICLO_DIFERENTE: bot={bot} actual=C{ciclo_oficial} recibido=C{ciclo_obj} no se rebaja ciclo"
+            )
+            return False
+        if str(origen or "").lower() != "manual" and int(ciclo_obj) != int(ciclo_oficial):
+            agregar_evento(
+                f"🚨 REAL_ABORTADO_CICLO_MISMATCH_PRETOKEN: bot={bot} recibido=C{ciclo_obj} oficial=C{ciclo_oficial} origen={origen}"
+            )
+            return False
 
         # Baseline REAL: a partir de aquí recién aceptamos cierres para este turno.
         try:
@@ -15276,6 +15291,13 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
             prev_holder = leer_token_actual()  # sincroniza UI
         except Exception:
             prev_holder = None
+
+        ok_rb, why_rb, orden_rb = _orden_real_readback_ok_para_token(bot, ciclo_obj, max_age_s=5.0)
+        if not ok_rb:
+            agregar_evento(
+                f"🚨 REAL_ABORTADO_READBACK_ORDEN: bot={bot} esperado=C{ciclo_obj} motivo={why_rb} token NO activado"
+            )
+            return False
 
         # Persistir primero token REAL y confirmar después memoria/UI
         if origen in ("orden_real", "manual", "token_sync"):
@@ -15375,6 +15397,22 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
         # 4) Standby estricto del resto (evita doble-REAL visual)
         try:
             _enforce_single_real_standby(bot)
+        except Exception:
+            pass
+        try:
+            _guardar_real_owner_state(
+                bot=bot,
+                ciclo=int(ciclo_obj),
+                source=str(origen or "orden_real").upper(),
+                token_state=f"REAL:{bot}",
+                order_id=str((orden_rb or {}).get("order_id") or ""),
+            )
+        except Exception:
+            pass
+        try:
+            agregar_evento(
+                f"✅ TOKEN_REAL_ACTIVADO_CON_ORDEN_CONFIRMADA: bot={bot} ciclo=C{ciclo_obj} order_id={str((orden_rb or {}).get('order_id') or '')}"
+            )
         except Exception:
             pass
 

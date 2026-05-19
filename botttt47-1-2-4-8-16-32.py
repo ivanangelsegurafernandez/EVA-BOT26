@@ -3577,7 +3577,9 @@ async def check_token_and_reconnect(ws, current_token):
                     if ciclo_maestro is not None:
                         print(Fore.YELLOW + f"Entrada REAL detectada -> respetando orden maestro C{ciclo_maestro}")
                     elif ciclo_forzado_prev is not None:
-                        print(Fore.YELLOW + f"Entrada REAL detectada sin orden válida -> usando ciclo_forzado C{ciclo_forzado_prev}")
+                        print(Fore.YELLOW + "🚨 TOKEN_REAL_SIN_ORDEN_VALIDA: no compro, espero orden maestro.")
+                        await asyncio.sleep(2)
+                        return ws, current_token
                     else:
                         print(Fore.YELLOW + "🚨 TOKEN_REAL_SIN_ORDEN_VALIDA: no compro, espero orden maestro.")
 
@@ -3672,7 +3674,9 @@ async def check_token_and_reconnect(ws, current_token):
                 if ciclo_maestro is not None:
                     print(Fore.YELLOW + f"Entrada REAL detectada -> respetando orden maestro C{ciclo_maestro}")
                 elif ciclo_forzado_prev is not None:
-                    print(Fore.YELLOW + f"Entrada REAL detectada sin orden válida -> usando ciclo_forzado C{ciclo_forzado_prev}")
+                    print(Fore.YELLOW + "🚨 TOKEN_REAL_SIN_ORDEN_VALIDA: no compro, espero orden maestro.")
+                    await asyncio.sleep(2)
+                    return ws, current_token
                 else:
                     print(Fore.YELLOW + "🚨 TOKEN_REAL_SIN_ORDEN_VALIDA: no compro, espero orden maestro.")
                 try:
@@ -4469,7 +4473,7 @@ async def ejecutar_panel():
                 ciclo_forzado = max(1, min(ciclo_forzado, MAX_CICLOS))
                 print(Fore.YELLOW + f"⚠️ ciclo>MAX_CICLOS detectado, normalizado a C{ciclo_forzado} (retenido=C{ciclo_prev})")
 
-            ciclo = ciclo_maestro or ciclo_forzado or 1
+            ciclo = ciclo_maestro if ciclo_maestro is not None else ciclo_forzado
             if modo_real:
                 now_guard = time.time()
                 last_guard = float(estado_bot.get("real_cycle_guard_last_ts", 0.0) or 0.0)
@@ -4477,20 +4481,32 @@ async def ejecutar_panel():
                     if ciclo_maestro is None and ciclo_forzado is not None:
                         print(Fore.YELLOW + "REAL sin orden viva del maestro, usando retenido")
                     elif ciclo_maestro is None and ciclo_forzado is None:
-                        print(Fore.RED + Style.BRIGHT + "REAL sin ciclo válido")
+                        print(Fore.YELLOW + "🚨 TOKEN_REAL_SIN_ORDEN_VALIDA: no compro, espero orden maestro.")
+                        await asyncio.sleep(2)
+                        continue
                     estado_bot["real_cycle_guard_last_ts"] = now_guard
-            if ciclo_maestro is not None and ciclo_forzado is not None and int(ciclo_maestro) != int(ciclo_forzado):
+            if modo_real and ciclo_maestro is None:
+                print(Fore.YELLOW + "🚨 TOKEN_REAL_SIN_ORDEN_VALIDA: no compro, espero orden maestro.")
+                await asyncio.sleep(2)
+                continue
+            if modo_real and ciclo_maestro is not None and ciclo_forzado is not None and int(ciclo_maestro) < int(ciclo_forzado):
                 print(
                     Fore.CYAN + Style.BRIGHT +
-                    f"🔎 Divergencia ciclo: maestro=C{ciclo_maestro} | retenido=C{ciclo_forzado} . NO COMPRA. Esperando orden corregida."
+                    f"🚨 CICLO_REAL_MISMATCH_CRITICO: orden=C{ciclo_maestro} < retenido=C{ciclo_forzado}. NO COMPRA. Esperando orden corregida."
                 )
+                await asyncio.sleep(2)
+                continue
             if modo_real and estado_bot.get("real_first_cycle_reset_pending"):
                 if ciclo_maestro is not None:
                     print(Fore.YELLOW + f"Primer ciclo REAL confirmado por maestro en C{ciclo_maestro}")
                 elif ciclo_forzado is not None:
-                    print(Fore.YELLOW + f"Primer ciclo REAL sin orden válida -> usando ciclo_forzado C{ciclo_forzado}")
+                    print(Fore.YELLOW + "🚨 TOKEN_REAL_SIN_ORDEN_VALIDA: no compro, espero orden maestro.")
+                    await asyncio.sleep(2)
+                    continue
                 else:
-                    print(Fore.YELLOW + "Primer ciclo REAL sin orden válida -> fallback C1")
+                    print(Fore.YELLOW + "🚨 TOKEN_REAL_SIN_ORDEN_VALIDA: no compro, espero orden maestro.")
+                    await asyncio.sleep(2)
+                    continue
                 estado_bot["real_first_cycle_reset_pending"] = False
 
             estado_bot["ciclo_forzado"] = None
