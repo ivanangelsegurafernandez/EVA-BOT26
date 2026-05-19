@@ -1019,9 +1019,55 @@ def _emitir_marca_purificacion_real() -> None:
         pass
 
 
-def _guardar_real_owner_state(bot: str, ciclo: int, source: str, round_id: int | None = None, token_state: str | None = None) -> None:
+def ciclo_real_oficial_actual() -> int:
+    try:
+        c = int(ciclo_martingala_siguiente())
+        if 1 <= c <= MAX_CICLOS:
+            return c
+    except Exception:
+        pass
+    try:
+        c = int(globals().get("marti_paso", 0) or 0) + 1
+        c = max(1, min(c, MAX_CICLOS))
+        return c
+    except Exception:
+        pass
+    raise RuntimeError("No se pudo resolver ciclo_real_oficial_actual()")
+
+
+def _orden_real_readback_ok_para_token(bot: str, ciclo_esperado: int, max_age_s: float = 5.0) -> tuple[bool, str, dict]:
+    data = {}
+    try:
+        with open(path_orden(bot), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return False, f"read_error:{e}", data
+    if not isinstance(data, dict):
+        return False, "not_dict", data
+    if str(data.get("bot") or "") != str(bot) or str(data.get("owner") or "") != str(bot):
+        return False, "bot_owner_mismatch", data
+    for k in ("ciclo", "ciclo_orden", "ciclo_forzado", "marti_ciclo", "ciclo_real_oficial"):
+        try:
+            if int(data.get(k)) != int(ciclo_esperado):
+                return False, f"{k}_mismatch", data
+        except Exception:
+            return False, f"{k}_invalid", data
+    if not str(data.get("order_id") or "").strip():
+        return False, "order_id_empty", data
+    ts = float(data.get("ts") or data.get("created_ts") or 0.0)
+    if ts <= 0 or (time.time() - ts) > float(max_age_s):
+        return False, "stale_ts", data
+    if bool(data.get("consumed", False)):
+        return False, "consumed", data
+    return True, "ok", data
+
+
+def _guardar_real_owner_state(bot: str, ciclo: int, source: str, round_id: int | None = None, token_state: str | None = None, order_id: str | None = None, marti_run_id: str | None = None) -> None:
     """Telemetría mínima del owner REAL asignado por el maestro."""
     try:
+        if not (1 <= int(ciclo) <= MAX_CICLOS):
+            agregar_evento("⚠️ OWNER_STATE_CICLO_INVALIDO")
+            return
         payload = {
             "owner_bot": str(bot),
             "assigned_ts": float(time.time()),
@@ -1029,6 +1075,8 @@ def _guardar_real_owner_state(bot: str, ciclo: int, source: str, round_id: int |
             "source": str(source or "UNKNOWN"),
             "round_id": int(round_id) if isinstance(round_id, (int, float)) else None,
             "token_state": str(token_state) if token_state is not None else None,
+            "order_id": str(order_id) if order_id is not None else None,
+            "marti_run_id": str(marti_run_id) if marti_run_id is not None else None,
         }
         _atomic_write(REAL_OWNER_STATE_FILE, json.dumps(payload, ensure_ascii=False, indent=2))
         globals()["LAST_REAL_OWNER_STATE"] = payload
@@ -15100,39 +15148,61 @@ def _escribir_orden_real_raw(bot: str, ciclo: int):
     """
     Escritura RAW de orden_real (sin activar_real_inmediato, sin recursión).
     """
-    ciclo = max(1, min(int(ciclo), MAX_CICLOS))
     source_val = str(globals().get("_REAL_ROUTE_SOURCE", "LEGACY") or "LEGACY").upper()
+    manual_override = (source_val == "MANUAL")
+    try:
+        ciclo_oficial = int(ciclo_real_oficial_actual())
+    except Exception as e:
+        agregar_evento(f"🚨 ORDEN_REAL_ABORTADA_SIN_CICLO_OFICIAL: bot={bot} error={e}")
+        return False
+    try:
+        ciclo_recibido = max(1, min(int(ciclo), MAX_CICLOS))
+    except Exception:
+        ciclo_recibido = 0
+    if (not manual_override) and ciclo_recibido != ciclo_oficial:
+        agregar_evento(f"🚨 ORDEN_REAL_ABORTADA_CICLO_MISMATCH: bot={bot} recibido=C{ciclo_recibido} oficial=C{ciclo_oficial} source={source_val}")
+        return False
+    ciclo_final = ciclo_recibido if manual_override else ciclo_oficial
     ttl_s = float(globals().get("MANUAL_FORCE_ORDER_TTL_S", REAL_ORDER_TTL_S) if source_val == "MANUAL" else REAL_ORDER_TTL_S)
     now_ts = time.time()
     payload = {
         "bot": bot,
         "owner": bot,
-        "ciclo": ciclo,
-        "ciclo_orden": ciclo,
-        "ciclo_forzado": ciclo,
-        "marti_ciclo": ciclo,
+        "ciclo": ciclo_final,
+        "ciclo_orden": ciclo_final,
+        "ciclo_forzado": ciclo_final,
+        "marti_ciclo": ciclo_final,
+        "ciclo_real_oficial": ciclo_final,
+        "hud_ciclo_actual": ciclo_final,
+        "hud_proxima_real": ciclo_final,
         "source": source_val,
         "ts": now_ts,
         "created_ts": now_ts,
         "ttl_s": ttl_s,
-        "order_id": None,
+        "order_id": f"{source_val}:{bot}:C{ciclo_final}:{int(now_ts*1000)}",
         "consumed": False,
-        "manual_override": (source_val == "MANUAL"),
-        "force_exit_sync_wait": (source_val == "MANUAL"),
+        "manual_override": manual_override,
+        "force_exit_sync_wait": manual_override,
     }
     try:
-        try:
-            payload["order_id"] = str(payload.get("order_id") or f"{payload.get('source', 'LEGACY')}:{bot}:C{ciclo}:{int(time.time()*1000)}")
-        except Exception:
-            payload["order_id"] = None
         _atomic_write(path_orden(bot), json.dumps(payload, ensure_ascii=False, indent=2))
-        agregar_evento(f"📝 Orden REAL escrita para {bot}: ciclo #{ciclo}")
-        _manual_key_audit(f"orden_real_payload bot={bot} ciclo={ciclo} source={source_val}")
+        ok_rb, why_rb, _od = _orden_real_readback_ok_para_token(bot, ciclo_final, max_age_s=3.0)
+        if not ok_rb:
+            try:
+                limpiar_orden_real(bot, reason="readback_cycle_mismatch")
+            except Exception:
+                pass
+            agregar_evento(f"🚨 ORDEN_REAL_READBACK_FAIL: bot={bot} esperado=C{ciclo_final} motivo={why_rb}")
+            return False
+        agregar_evento(f"✅ ORDEN_REAL_CONFIRMADA: bot={bot} ciclo=C{ciclo_final} order_id={payload.get('order_id')}")
+        _manual_key_audit(f"orden_real_payload bot={bot} ciclo={ciclo_final} source={source_val}")
+        return True
     except Exception as e:
         try:
             agregar_evento(f"⚠️ Falló escritura de orden para {bot}: {e}")
         except Exception:
             pass
+        return False
 
 def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> bool:
 
@@ -15198,10 +15268,8 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
 
         # ✅ Solo “manual” auto-escribe orden_real (la orden explícita)
         if origen == "manual":
-            try:
-                _escribir_orden_real_raw(bot, ciclo_obj)
-            except Exception:
-                pass
+            if not _escribir_orden_real_raw(bot, ciclo_obj):
+                return False
 
         prev_holder = None
         try:
@@ -15365,7 +15433,8 @@ def escribir_orden_real(bot: str, ciclo: int, round_id=None) -> bool:
     except Exception:
         pass
 
-    _escribir_orden_real_raw(bot, ciclo)
+    if not _escribir_orden_real_raw(bot, ciclo):
+        return False
     ok_activate = bool(activar_real_inmediato(bot, ciclo, origen="orden_real"))
 
     owner_after_mem = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None

@@ -3579,7 +3579,7 @@ async def check_token_and_reconnect(ws, current_token):
                     elif ciclo_forzado_prev is not None:
                         print(Fore.YELLOW + f"Entrada REAL detectada sin orden válida -> usando ciclo_forzado C{ciclo_forzado_prev}")
                     else:
-                        print(Fore.YELLOW + "Entrada REAL detectada sin orden válida -> fallback C1")
+                        print(Fore.YELLOW + "🚨 TOKEN_REAL_SIN_ORDEN_VALIDA: no compro, espero orden maestro.")
 
                     # Silenciar ruido guiado por maestro (BLOQUE 3)
                     if quiet or (str(src).upper() == "MANUAL"):
@@ -3674,7 +3674,7 @@ async def check_token_and_reconnect(ws, current_token):
                 elif ciclo_forzado_prev is not None:
                     print(Fore.YELLOW + f"Entrada REAL detectada sin orden válida -> usando ciclo_forzado C{ciclo_forzado_prev}")
                 else:
-                    print(Fore.YELLOW + "Entrada REAL detectada sin orden válida -> fallback C1")
+                    print(Fore.YELLOW + "🚨 TOKEN_REAL_SIN_ORDEN_VALIDA: no compro, espero orden maestro.")
                 try:
                     real_activado_en_bot = time.time()
                 except Exception:
@@ -4482,7 +4482,7 @@ async def ejecutar_panel():
             if ciclo_maestro is not None and ciclo_forzado is not None and int(ciclo_maestro) != int(ciclo_forzado):
                 print(
                     Fore.CYAN + Style.BRIGHT +
-                    f"🔎 Divergencia ciclo: maestro=C{ciclo_maestro} | retenido=C{ciclo_forzado} -> prevalece maestro."
+                    f"🔎 Divergencia ciclo: maestro=C{ciclo_maestro} | retenido=C{ciclo_forzado} . NO COMPRA. Esperando orden corregida."
                 )
             if modo_real and estado_bot.get("real_first_cycle_reset_pending"):
                 if ciclo_maestro is not None:
