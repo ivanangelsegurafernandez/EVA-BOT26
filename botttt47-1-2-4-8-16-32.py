@@ -4657,35 +4657,37 @@ async def ejecutar_panel():
                 print(Fore.YELLOW + f"⚠️ ciclo>MAX_CICLOS detectado, normalizado a C{ciclo_forzado} (retenido=C{ciclo_prev})")
 
             if modo_real:
-                now_guard = time.time()
-                last_guard = float(estado_bot.get("real_cycle_guard_last_ts", 0.0) or 0.0)
+                if ciclo_maestro is None:
+                    owner = {}
+                    c_owner = None
 
-                if (now_guard - last_guard) >= 8.0:
-                    if ciclo_maestro is None:
+                    try:
                         owner = _leer_owner_state_vivo()
-                        c_owner = _safe_int_cycle(owner.get("ciclo"), None) if isinstance(owner, dict) else None
+                        if isinstance(owner, dict):
+                            c_owner = _safe_int_cycle(owner.get("ciclo"), None)
+                    except Exception:
+                        owner = {}
+                        c_owner = None
 
-                        if c_owner is not None and 1 <= int(c_owner) <= MAX_CICLOS:
-                            estado_bot["ciclo_forzado"] = int(c_owner)
-                            estado_bot["ciclo_actual"] = int(c_owner)
-                            print(
-                                Fore.YELLOW +
-                                f"⏸️ REAL SIN ORDEN VIVA: owner_state confirma C{int(c_owner)}, "
-                                f"pero NO autoriza compra. Esperando orden fresca del maestro."
-                            )
-                        else:
-                            print(
-                                Fore.RED +
-                                "⏸️ REAL SIN ORDEN VIVA NI OWNER_STATE VÁLIDO: NO COMPRA. Esperando maestro."
-                            )
+                    if c_owner is not None and 1 <= int(c_owner) <= MAX_CICLOS:
+                        estado_bot["ciclo_actual"] = int(c_owner)
+                        estado_bot["ciclo_forzado"] = int(c_owner)
+                        print(
+                            Fore.YELLOW +
+                            f"⏸️ REAL SIN ORDEN VIVA: owner_state confirma C{int(c_owner)}, "
+                            f"pero NO autoriza compra. Esperando orden fresca del maestro."
+                        )
+                    else:
+                        print(
+                            Fore.RED +
+                            "⏸️ REAL SIN ORDEN VIVA NI OWNER_STATE VÁLIDO: NO COMPRA. Esperando maestro."
+                        )
 
-                        estado_bot["ciclo_en_progreso"] = False
-                        estado_bot["token_msg_mostrado"] = False
-                        estado_bot["real_cycle_guard_last_ts"] = now_guard
-                        await asyncio.sleep(2.0)
-                        continue
+                    estado_bot["ciclo_en_progreso"] = False
+                    estado_bot["token_msg_mostrado"] = False
+                    await asyncio.sleep(2.0)
+                    continue
 
-                    estado_bot["real_cycle_guard_last_ts"] = now_guard
                 if ciclo_maestro is not None:
                     ciclo = int(ciclo_maestro)
                 elif ciclo_forzado is not None:
@@ -5052,11 +5054,49 @@ async def ejecutar_panel():
 
                     # Si el token cambió durante la ventana, NO compramos con estado viejo.
                     if reinicio_forzado.is_set():
-                        estado_bot["ciclo_forzado"] = ciclo
-                        print(
-                            Fore.YELLOW + Style.BRIGHT +
-                            f"[VENTANA IA] Token cambió durante la decisión. Reintentando ciclo #{ciclo} (sin comprar)."
-                        )
+                        if modo_real:
+                            ciclo_tmp = None
+
+                            try:
+                                _res = leer_orden_real(NOMBRE_BOT)
+                                if isinstance(_res, tuple) and len(_res) >= 1:
+                                    ciclo_tmp = _res[0]
+                                else:
+                                    ciclo_tmp = None
+                            except Exception:
+                                ciclo_tmp = None
+
+                            try:
+                                ciclo_tmp = int(ciclo_tmp) if ciclo_tmp is not None else None
+                            except Exception:
+                                ciclo_tmp = None
+
+                            if ciclo_tmp is not None and 1 <= ciclo_tmp <= MAX_CICLOS:
+                                estado_bot["ciclo_forzado"] = ciclo_tmp
+                                estado_bot["ciclo_actual"] = ciclo_tmp
+                                print(
+                                    Fore.YELLOW + Style.BRIGHT +
+                                    f"[VENTANA IA] Token cambió. Adoptando orden REAL fresca C{ciclo_tmp} sin comprar."
+                                )
+                            else:
+                                print(
+                                    Fore.YELLOW + Style.BRIGHT +
+                                    "[VENTANA IA] Token cambió, pero NO hay orden REAL fresca. "
+                                    "No fijo ciclo local. Esperando maestro."
+                                )
+                                estado_bot["ciclo_en_progreso"] = False
+                                estado_bot["token_msg_mostrado"] = False
+                                reinicio_forzado.clear()
+                                await asyncio.sleep(1.0)
+                                continue
+
+                        else:
+                            estado_bot["ciclo_forzado"] = ciclo
+                            print(
+                                Fore.YELLOW + Style.BRIGHT +
+                                f"[VENTANA IA] Token cambió durante la decisión. Reintentando ciclo #{ciclo} sin comprar."
+                            )
+
                         reinicio_forzado.clear()
                         await asyncio.sleep(0.8)
                         continue
@@ -5406,8 +5446,10 @@ def _run_real_order_expired_no_buy_selftest():
 
 if os.getenv("RUN_BOT_PREBUY_RETURN3_SELFTEST") == "1":
     _run_prebuy_return3_selftest()
+    raise SystemExit(0)
 if os.getenv("RUN_REAL_ORDER_EXPIRED_NO_BUY_SELFTEST") == "1":
     _run_real_order_expired_no_buy_selftest()
+    raise SystemExit(0)
 
 if __name__ == "__main__":
     if _selftest_csv_modo_cuenta():

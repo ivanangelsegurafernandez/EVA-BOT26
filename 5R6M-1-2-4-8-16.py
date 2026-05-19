@@ -14809,6 +14809,13 @@ def _sync_round_tick_maestro():
 def _sync_turbo_watcher_loop():
     while True:
         try:
+            watchdog_real_order_expired_no_buy()
+        except Exception as e:
+            try:
+                agregar_evento(f"⚠️ watchdog_real_order_expired_no_buy fallo temprano: {e}")
+            except Exception:
+                pass
+        try:
             _sync_round_tick_maestro()
         except Exception as e:
             try:
@@ -36051,6 +36058,7 @@ def _run_master_expired_order_release_selftest():
 
 if os.getenv("RUN_MASTER_EXPIRED_ORDER_RELEASE_SELFTEST") == "1":
     _run_master_expired_order_release_selftest()
+    raise SystemExit(0)
 
 if __name__ == "__main__":
     _run_requested_selftests_and_exit_if_needed()
