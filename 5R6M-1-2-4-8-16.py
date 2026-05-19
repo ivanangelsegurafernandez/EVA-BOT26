@@ -5928,7 +5928,14 @@ def render_cuadro_martingala_visible():
         lines.append(border + hud_box_line("   " + hud_pad(cycles_line, HUD_BOX_WIDTH - 3), HUD_BOX_WIDTH) + srs)
         lines.append(border + hud_border_mid(HUD_BOX_WIDTH) + srs)
         lines.append(border + hud_box_line(f"   CICLO ACTUAL : {hi}C{ciclo_act}{srs}{border}", HUD_BOX_WIDTH) + srs)
-        lines.append(border + hud_box_line(f"   PROXIMA REAL : {hi}C{prox}{srs}{border}", HUD_BOX_WIDTH) + srs)
+        if real_on:
+            if ciclo_act >= max_c:
+                prox_txt = "pendiente cierre | gana→C1 pierde→C1"
+            else:
+                prox_txt = f"pendiente cierre | gana→C1 pierde→C{ciclo_act + 1}"
+        else:
+            prox_txt = f"C{prox}"
+        lines.append(border + hud_box_line(f"   PROXIMA REAL : {hi}{prox_txt}{srs}{border}", HUD_BOX_WIDTH) + srs)
         lines.append(border + hud_box_line(f"   ESTADO       : {st}{estado_txt}{srs}{border}", HUD_BOX_WIDTH) + srs)
         lines.append(border + hud_box_line(f"   BOT REAL     : {(hi if real_on else fc)}{bot_real}{srs}{border}", HUD_BOX_WIDTH) + srs)
         if is_final_loss:
@@ -22235,6 +22242,139 @@ def marti_audit_resumen_linea() -> str:
         return "Audit run#? desvíos=? último=--"
 
 
+def liberar_real_sin_compra_confirmada(owner: str, ciclo: int | None = None, motivo: str = "orden_vencida_sin_compra"):
+    """
+    Libera REAL cuando NO hubo compra confirmada.
+    No llama registrar_resultado_real.
+    No modifica marti_paso.
+    No modifica marti_ciclos_perdidos.
+    No cuenta pérdida ni ganancia.
+    """
+    global REAL_OWNER_LOCK, REAL_COOLDOWN_UNTIL_TS
+
+    try:
+        if owner not in BOT_NAMES:
+            return False
+
+        try:
+            with file_lock_required("real.lock", timeout=6.0, stale_after=30.0) as got:
+                if got:
+                    write_token_atomic(TOKEN_FILE, "REAL:none")
+        except Exception:
+            try:
+                write_token_atomic(TOKEN_FILE, "REAL:none")
+            except Exception:
+                pass
+
+        REAL_OWNER_LOCK = None
+        REAL_COOLDOWN_UNTIL_TS = time.time() + 2.0
+
+        try:
+            limpiar_orden_real(owner, reason=motivo)
+        except Exception:
+            pass
+
+        try:
+            _set_ui_token_holder(None)
+        except Exception:
+            pass
+
+        try:
+            estado_bots[owner]["token"] = "DEMO"
+            estado_bots[owner]["trigger_real"] = False
+            estado_bots[owner]["modo_real_anunciado"] = False
+            estado_bots[owner]["fuente"] = None
+            estado_bots[owner]["real_activado_en"] = 0.0
+        except Exception:
+            pass
+
+        try:
+            _atomic_write(
+                REAL_OWNER_STATE_FILE,
+                json.dumps({
+                    "owner_bot": None,
+                    "assigned_ts": 0.0,
+                    "ciclo": None,
+                    "source": None,
+                    "token_state": "REAL:none",
+                    "reason": motivo,
+                }, ensure_ascii=False, indent=2)
+            )
+        except Exception:
+            pass
+
+        try:
+            agregar_evento(
+                f"🧯 REAL liberado sin compra confirmada: owner={owner} "
+                f"C{ciclo if ciclo is not None else '--'} motivo={motivo} | Martingala NO cambia"
+            )
+        except Exception:
+            pass
+
+        return True
+
+    except Exception as e:
+        try:
+            agregar_evento(f"⚠️ liberar_real_sin_compra_confirmada error: {e}")
+        except Exception:
+            pass
+        return False
+
+
+def watchdog_real_order_expired_no_buy():
+    """
+    Corrige el caso exacto:
+    token/owner REAL activo, orden_real vencida o consumida, sin cierre REAL fresco pendiente.
+    Acción: liberar REAL sin avanzar Martingala.
+    """
+    try:
+        owner = leer_token_archivo_raw()
+        if owner not in BOT_NAMES:
+            owner = REAL_OWNER_LOCK if REAL_OWNER_LOCK in BOT_NAMES else None
+        if owner not in BOT_NAMES:
+            return False
+
+        pending_on, pending_bot, pending = _hay_real_close_pending_activo()
+        if pending_on:
+            try:
+                age_pending = time.time() - float((pending or {}).get("ts", 0) or 0)
+            except Exception:
+                age_pending = 0
+            if age_pending <= float(REAL_CLOSE_MAX_AGE_S):
+                return False
+
+        payload = _sync_round_safe_read_json(path_orden(owner)) or {}
+        orden_viva = _orden_real_viva(payload) if isinstance(payload, dict) else False
+
+        if orden_viva:
+            return False
+
+        state = _sync_round_safe_read_json(REAL_OWNER_STATE_FILE) or {}
+        ciclo = None
+        assigned_ts = 0.0
+
+        if isinstance(state, dict):
+            ciclo = _safe_int_cycle(state.get("ciclo"), None)
+            try:
+                assigned_ts = float(state.get("assigned_ts", state.get("ts", 0)) or 0)
+            except Exception:
+                assigned_ts = 0.0
+
+        age_owner = time.time() - assigned_ts if assigned_ts > 0 else 999999
+
+        if age_owner < float(REAL_ORDER_TTL_S) + 10.0:
+            return False
+
+        return liberar_real_sin_compra_confirmada(owner=owner, ciclo=ciclo, motivo="orden_real_vencida_sin_buy")
+
+    except Exception as e:
+        try:
+            agregar_evento(f"⚠️ watchdog_real_order_expired_no_buy error: {e}")
+        except Exception:
+            pass
+        return False
+
+
 def registrar_resultado_real(resultado: str, bot: str | None = None, ciclo_operado: int | None = None):
     """
     Actualiza el contador global de ciclos martingala para el HUD y la próxima
@@ -28120,6 +28260,11 @@ def mostrar_panel():
 
     try:
         if bool(globals().get("HUD_MARTINGALA_LIVE_ENABLE", True)):
+            try:
+                watchdog_real_order_expired_no_buy()
+            except Exception:
+                pass
+
             for _ml in render_cuadro_martingala_visible():
                 print(_ml)
             if not bool(globals().get("HUD_MARTI_CLEAN_LAYOUT", True)):
@@ -35887,6 +36032,25 @@ def _run_requested_selftests_and_exit_if_needed():
 
     if ran:
         sys.exit(0 if ok else 1)
+
+def _run_master_expired_order_release_selftest():
+    if os.getenv("RUN_MASTER_EXPIRED_ORDER_RELEASE_SELFTEST") != "1":
+        return
+    print("[SELFTEST] MASTER_EXPIRED_ORDER_RELEASE")
+    bot = BOT_NAMES[0]
+    global REAL_OWNER_LOCK
+    before=(marti_paso, marti_ciclos_perdidos)
+    REAL_OWNER_LOCK = bot
+    _atomic_write(TOKEN_FILE, f"REAL:{bot}")
+    _atomic_write(REAL_OWNER_STATE_FILE, json.dumps({"owner_bot": bot, "assigned_ts": time.time()-999, "ciclo":2}, ensure_ascii=False))
+    _atomic_write(path_orden(bot), json.dumps({"bot":bot,"ciclo":2,"created_ts":time.time()-999,"ttl_s":5,"consumed":False}, ensure_ascii=False))
+    watchdog_real_order_expired_no_buy()
+    assert read_file_safe(TOKEN_FILE, "").strip() == "REAL:none"
+    assert REAL_OWNER_LOCK is None
+    assert (marti_paso, marti_ciclos_perdidos)==before
+
+if os.getenv("RUN_MASTER_EXPIRED_ORDER_RELEASE_SELFTEST") == "1":
+    _run_master_expired_order_release_selftest()
 
 if __name__ == "__main__":
     _run_requested_selftests_and_exit_if_needed()

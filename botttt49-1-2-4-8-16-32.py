@@ -1566,15 +1566,32 @@ def _owner_state_confirma_ciclo(ciclo_esperado, max_age_s=120):
 
 def _validar_pre_buy_real(ciclo_local):
     try:
+        ciclo_local = int(ciclo_local)
+    except Exception:
+        return False, "ciclo_local_invalid", None
+
+    if ciclo_local < 1 or ciclo_local > MAX_CICLOS:
+        return False, f"ciclo_local_fuera_rango:C{ciclo_local}", None
+
+    try:
         token_actual = leer_token_actual() if "leer_token_actual" in globals() else ""
     except Exception:
         token_actual = ""
+
     if str(token_actual).strip() != f"REAL:{NOMBRE_BOT}":
-        return False, f"token={token_actual}"
+        return False, f"token={token_actual}", None
+
     orden = _leer_orden_real_viva_para_bot()
     ok, ciclo_orden, motivo = _orden_real_bot_ok(orden, ciclo_esperado=ciclo_local)
+    motivo_txt = str(motivo or "")
+
     if not ok:
-        return False, f"orden={ciclo_orden} motivo={motivo}", ciclo_orden
+        if motivo_txt == "ciclo_esperado_mismatch" and ciclo_orden is not None:
+            return False, f"orden={ciclo_orden} motivo={motivo_txt}", int(ciclo_orden)
+        if motivo_txt in ("orden_vencida","orden_consumida","orden_missing","order_id_missing","sin_ciclo","bot_owner_mismatch","ciclos_no_coinciden",):
+            return False, f"orden={ciclo_orden} motivo={motivo_txt}", None
+        return False, f"orden={ciclo_orden} motivo={motivo_txt}", None
+
     owner = _leer_owner_state_vivo()
     if isinstance(owner, dict) and owner:
         try:
@@ -1582,11 +1599,13 @@ def _validar_pre_buy_real(ciclo_local):
             owner_ciclo = _safe_int_cycle(owner.get("ciclo"), None)
             owner_ts = float(owner.get("assigned_ts", owner.get("ts", 0)) or 0)
             if owner_ts > 0 and (time.time() - owner_ts) <= 120:
-                if owner_bot != NOMBRE_BOT or owner_ciclo != int(ciclo_local):
-                    return False, f"owner_state=C{owner_ciclo} owner={owner_bot}"
+                if owner_bot != NOMBRE_BOT:
+                    return False, f"owner_state_bot={owner_bot}", None
+                if owner_ciclo != int(ciclo_local):
+                    return False, f"owner_state=C{owner_ciclo} owner={owner_bot}", owner_ciclo
         except Exception:
-            return False, "owner_state_err"
-    return True, "ok", ciclo_local
+            return False, "owner_state_err", None
+    return True, "ok", int(ciclo_local)
 
 def leer_orden_real(bot: str):
     """
@@ -4640,21 +4659,32 @@ async def ejecutar_panel():
             if modo_real:
                 now_guard = time.time()
                 last_guard = float(estado_bot.get("real_cycle_guard_last_ts", 0.0) or 0.0)
+
                 if (now_guard - last_guard) >= 8.0:
-                    if ciclo_maestro is None and ciclo_forzado is not None:
+                    if ciclo_maestro is None:
                         owner = _leer_owner_state_vivo()
                         c_owner = _safe_int_cycle(owner.get("ciclo"), None) if isinstance(owner, dict) else None
-                        if c_owner == ciclo_forzado:
-                            print(Fore.YELLOW + "REAL sin orden viva, usando retenido VALIDADO por owner_state")
-                        elif c_owner is not None:
-                            ciclo_forzado = c_owner
-                            estado_bot["ciclo_forzado"] = c_owner
-                            print(Fore.YELLOW + f"REAL sin orden viva, adoptando owner_state C{c_owner}")
+
+                        if c_owner is not None and 1 <= int(c_owner) <= MAX_CICLOS:
+                            estado_bot["ciclo_forzado"] = int(c_owner)
+                            estado_bot["ciclo_actual"] = int(c_owner)
+                            print(
+                                Fore.YELLOW +
+                                f"⏸️ REAL SIN ORDEN VIVA: owner_state confirma C{int(c_owner)}, "
+                                f"pero NO autoriza compra. Esperando orden fresca del maestro."
+                            )
                         else:
-                            print(Fore.RED + "REAL sin orden viva ni owner_state válido: NO COMPRA")
-                            estado_bot["ciclo_en_progreso"] = False
-                            await asyncio.sleep(1.0)
-                            continue
+                            print(
+                                Fore.RED +
+                                "⏸️ REAL SIN ORDEN VIVA NI OWNER_STATE VÁLIDO: NO COMPRA. Esperando maestro."
+                            )
+
+                        estado_bot["ciclo_en_progreso"] = False
+                        estado_bot["token_msg_mostrado"] = False
+                        estado_bot["real_cycle_guard_last_ts"] = now_guard
+                        await asyncio.sleep(2.0)
+                        continue
+
                     estado_bot["real_cycle_guard_last_ts"] = now_guard
                 if ciclo_maestro is not None:
                     ciclo = int(ciclo_maestro)
@@ -5051,7 +5081,19 @@ async def ejecutar_panel():
                     if not ok_prebuy:
                         ciclo_local_prebuy = int(estado_bot.get("ciclo_actual", ciclo) or ciclo)
 
-                        if ciclo_orden_prebuy is not None and 1 <= int(ciclo_orden_prebuy) <= MAX_CICLOS:
+                        why_txt = str(why_prebuy or "")
+
+                        if "orden_vencida" in why_txt:
+                            print(
+                                f"⏱️ REAL_BUY_ABORT_ORDEN_VENCIDA: local=C{ciclo_local_prebuy} "
+                                f"motivo={why_prebuy} | NO COMPRA. Esperando orden fresca del maestro."
+                            )
+                            estado_bot["ciclo_en_progreso"] = False
+                            estado_bot["token_msg_mostrado"] = False
+                            await asyncio.sleep(2.0)
+                            continue
+
+                        if "ciclo_esperado_mismatch" in why_txt and ciclo_orden_prebuy is not None and 1 <= int(ciclo_orden_prebuy) <= MAX_CICLOS:
                             print(
                                 f"🚨 REAL_BUY_ABORT_CICLO_DESALINEADO: local=C{ciclo_local_prebuy} orden=C{int(ciclo_orden_prebuy)} "
                                 f"motivo={why_prebuy} | ADOPTO CICLO MAESTRO Y REINTENTO SIN COMPRAR"
@@ -5349,6 +5391,23 @@ async def main():
 
     # loop principal
     await monitor()
+
+def _run_prebuy_return3_selftest():
+    if os.getenv("RUN_BOT_PREBUY_RETURN3_SELFTEST") != "1":
+        return
+    print("[SELFTEST] PREBUY_RETURN3")
+    assert len(_validar_pre_buy_real(2)) == 3
+
+def _run_real_order_expired_no_buy_selftest():
+    if os.getenv("RUN_REAL_ORDER_EXPIRED_NO_BUY_SELFTEST") != "1":
+        return
+    why_txt = str("orden=2 motivo=orden_vencida")
+    assert "orden_vencida" in why_txt and "ciclo_esperado_mismatch" not in why_txt
+
+if os.getenv("RUN_BOT_PREBUY_RETURN3_SELFTEST") == "1":
+    _run_prebuy_return3_selftest()
+if os.getenv("RUN_REAL_ORDER_EXPIRED_NO_BUY_SELFTEST") == "1":
+    _run_real_order_expired_no_buy_selftest()
 
 if __name__ == "__main__":
     if _selftest_csv_modo_cuenta():
