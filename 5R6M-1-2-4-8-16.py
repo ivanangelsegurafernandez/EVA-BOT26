@@ -12413,10 +12413,24 @@ def _sync_round_try_single_bot_recovery_release(round_id, released_round, reques
         candidates.append((bot, req, req_round, req_next, reason_txt))
     if not candidates:
         return _blocked("--", "sin_recovery_request_single_bot_valido")
-    if len(candidates) != 1:
-        return _blocked("--", f"multiples_requests_single_bot:{len(candidates)}")
 
-    bot, req, req_round, req_next, reason_txt = candidates[0]
+    groups = {}
+    for bot_i, req_i, req_round_i, req_next_i, reason_i in candidates:
+        try:
+            key_next = int(req_next_i)
+        except Exception:
+            continue
+        groups.setdefault(key_next, []).append((bot_i, req_i, req_round_i, req_next_i, reason_i))
+    valid_nexts = sorted(n for n in groups.keys() if int(n) > int(rel))
+    if not valid_nexts:
+        return _blocked("--", "sin_req_next_avanza")
+    target_next = valid_nexts[0]
+    selected = list(groups.get(target_next) or [])
+    if not selected:
+        return _blocked("--", "sin_recovery_request_single_bot_valido")
+
+    bot, req, req_round, req_next, reason_txt = selected[0]
+    recovery_bots = [b for b, _req, _rr, _rn, _rs in selected]
     guard_reason = _sync_round_single_bot_real_free_guard_reason()
     if guard_reason:
         return _blocked(bot, guard_reason)
@@ -12451,6 +12465,10 @@ def _sync_round_try_single_bot_recovery_release(round_id, released_round, reques
         "real_emitido": False,
         "motivo_no_real": "recovery_single_bot_neutral_quarantine_demo_only",
         "single_bot_recovery_bot": bot,
+        "recovery_bots": recovery_bots,
+        "multi_bot_recovery": True,
+        "multi_bot_recovery_bots": recovery_bots,
+        "multi_bot_recovery_count": len(recovery_bots),
         "single_bot_recovery_round": int(req_round),
         "single_bot_recovery_from": int(rel),
         "single_bot_recovery_to": int(nuevo_released),
@@ -12465,15 +12483,16 @@ def _sync_round_try_single_bot_recovery_release(round_id, released_round, reques
         return _blocked(bot, "write_state_failed")
     try:
         req_dir = os.path.join(SYNC_ROUND_DIR, "recovery_requests")
-        path = os.path.join(req_dir, f"{bot}.json")
-        consumed = dict(req)
-        consumed.update({
-            "consumed": True,
-            "consumed_ts": now_ts,
-            "consumed_by": release_reason_code,
-            "consumed_release": int(nuevo_released),
-        })
-        _sync_round_write_json_atomic(path, consumed)
+        for bot_i, req_i, req_round_i, req_next_i, reason_i in selected:
+            path = os.path.join(req_dir, f"{bot_i}.json")
+            consumed = dict(req_i)
+            consumed.update({
+                "consumed": True,
+                "consumed_ts": now_ts,
+                "consumed_by": release_reason_code,
+                "consumed_release": int(nuevo_released),
+            })
+            _sync_round_write_json_atomic(path, consumed)
     except Exception:
         pass
     try:
@@ -12485,8 +12504,8 @@ def _sync_round_try_single_bot_recovery_release(round_id, released_round, reques
             )
         else:
             print_rate_limited(
-                f"{reason_code}:{bot}:{rel}:{nuevo_released}",
-                f"🔓 {reason_code}: bot={bot} | released={int(rel)} -> {int(nuevo_released)} | REAL libre | neutral/quarantine=SI",
+                f"{reason_code}:{target_next}:{rel}:{nuevo_released}:{','.join(recovery_bots)}",
+                f"🔓 RECOVERY_MULTI_BOT_RELEASED | bots={','.join(recovery_bots)} | released {int(rel)}→{int(nuevo_released)} | REAL libre | neutral/cuarentena",
                 ttl=20.0,
             )
     except Exception:
@@ -36377,4 +36396,3 @@ def _selftest_lxv_zone_hard_block():
 
 if str(os.getenv("RUN_LXV_ZONE_HARD_BLOCK_SELFTEST", "0")).strip() == "1":
     _selftest_lxv_zone_hard_block()
-
