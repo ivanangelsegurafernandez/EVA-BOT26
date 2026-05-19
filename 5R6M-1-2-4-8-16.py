@@ -12409,7 +12409,21 @@ def _sync_round_try_single_bot_recovery_release(round_id, released_round, reques
         if req_ts <= 0.0 or (now_ts - req_ts) > ttl_s:
             continue
         if req_next <= rel:
-            return _blocked(bot, f"next_round_no_avanza:{req_next}<=released:{rel}")
+            try:
+                req_dir = os.path.join(SYNC_ROUND_DIR, "recovery_requests")
+                path = os.path.join(req_dir, f"{bot}.json")
+                stale_req = dict(req)
+                stale_req.update({
+                    "consumed": True,
+                    "consumed_ts": now_ts,
+                    "consumed_by": "STALE_RECOVERY_REQUEST_IGNORED",
+                    "consumed_release": int(rel),
+                    "stale_reason": f"next_round_no_avanza:{req_next}<=released:{rel}",
+                })
+                _sync_round_write_json_atomic(path, stale_req)
+            except Exception:
+                pass
+            continue
         candidates.append((bot, req, req_round, req_next, reason_txt))
     if not candidates:
         return _blocked("--", "sin_recovery_request_single_bot_valido")
