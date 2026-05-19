@@ -695,6 +695,30 @@ def _sync_round_emit_close_ack_confirmado(round_id, resultado, max_retries=3, **
     print(Fore.YELLOW + Style.BRIGHT + f"⚠️ ACK_CLOSE_NO_CONFIRMADO | bot={NOMBRE_BOT} | ronda=#{rid} | resultado={res} | recovery_request=SI")
     return False
 
+
+
+def _emit_real_close_event_inmediato(resultado, ciclo, ganancia_perdida, contract_id, round_id, source="bot_real_close"):
+    try:
+        payload = {
+            "bot": NOMBRE_BOT,
+            "modo": "REAL",
+            "ciclo": int(ciclo or 1),
+            "resultado": str(resultado or "").upper().strip().replace("PERDIDA", "PÉRDIDA"),
+            "ganancia_perdida": float(ganancia_perdida or 0.0),
+            "contract_id": str(contract_id or ""),
+            "round_id": int(round_id or 1),
+            "ts": time.time(),
+            "source": str(source or "bot_real_close"),
+        }
+        path = f"real_close_event_{NOMBRE_BOT}.json"
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
 def _sync_round_write_wait_heartbeat(round_id: int, next_round: int):
     path = _sync_round_ack_path()
     prev = _sync_round_safe_read_json(path) or {}
@@ -5291,6 +5315,15 @@ async def ejecutar_panel():
                     ciclo=ciclo,
                     modo_real_contrato=bool(modo_real),
                 )
+                if bool(modo_real):
+                    _emit_real_close_event_inmediato(
+                        resultado=resultado,
+                        ciclo=ciclo,
+                        ganancia_perdida=profit,
+                        contract_id=contract_id,
+                        round_id=round_id_local,
+                        source="bot_real_close",
+                    )
 
                 print(Back.BLUE + Style.BRIGHT + f"\nTotal DEMO: {resultado_global['demo']:.2f} USD | Total REAL: {resultado_global['real']:.2f} USD")
                 await mostrar_saldos()
