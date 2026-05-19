@@ -22399,6 +22399,49 @@ def marti_audit_resumen_linea() -> str:
         return "Audit run#? desvíos=? último=--"
 
 
+def _safe_int_cycle(value, default=None):
+    """
+    Normaliza un ciclo Martingala REAL de forma segura.
+
+    Uso principal:
+    - watchdog_real_order_expired_no_buy()
+    - lectura de real_owner_state.json
+    - liberación segura de REAL vencido sin avanzar Martingala
+
+    Reglas:
+    - Acepta solo enteros entre 1 y MAX_CICLOS.
+    - Si MAX_CICLOS no existe, usa len(MARTI_ESCALADO).
+    - Si MARTI_ESCALADO tampoco existe, usa 5.
+    - Nunca lanza excepción.
+    - Nunca modifica estado global.
+    - Nunca avanza ni reinicia Martingala.
+    """
+    try:
+        c = int(value)
+
+        try:
+            max_c = int(globals().get("MAX_CICLOS", 0) or 0)
+        except Exception:
+            max_c = 0
+
+        if max_c <= 0:
+            try:
+                max_c = int(len(globals().get("MARTI_ESCALADO", []) or []))
+            except Exception:
+                max_c = 0
+
+        if max_c <= 0:
+            max_c = 5
+
+        if 1 <= c <= max_c:
+            return c
+
+    except Exception:
+        pass
+
+    return default
+
+
 def liberar_real_sin_compra_confirmada(owner: str, ciclo: int | None = None, motivo: str = "orden_vencida_sin_compra"):
     """
     Libera REAL cuando NO hubo compra confirmada.
