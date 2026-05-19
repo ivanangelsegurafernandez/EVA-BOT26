@@ -65,7 +65,6 @@ if any(os.environ.get(name) == "1" for name in (
     "RUN_DQ_RELEASED_HUD_SELFTEST",
     "RUN_LXV_4V2X_CANDIDATE_PANEL_SELFTEST",
     "RUN_HUD_LXV_ESTADO_CLARO_SELFTEST",
-    "RUN_REAL_CLOSE_EVENT_IMMEDIATE_HUD_SELFTEST",
 )):
     import types
 
@@ -1954,6 +1953,14 @@ HUD_MARTI_REAL_SNAPSHOT = {
     "resultado_ultimo": None,
     "source": "init",
 }
+MARTI_HUD_FORCE_DEMO = {
+    "active": False,
+    "ts": 0.0,
+    "bot": None,
+    "ciclo": 1,
+    "resultado": None,
+    "reason": "",
+}
 REAL_LOCK_MISMATCH_SINCE = 0.0
 REAL_LOCK_RECONCILE_S = 6.0
 REAL_UI_RECON_LOG_TS = 0.0
@@ -3368,6 +3375,94 @@ _LXV_HEADER_WARN_TS = {}
 _LXV_HEADER_WARN_COOLDOWN_S = 180.0
 _MATRIZ_SKIP_WARN_TS = 0.0
 _MARTI_HUD_DEMO_IGNORED_TS = {}
+
+def _marti_hud_force_demo_set(bot=None, ciclo=None, resultado=None, reason="real_close"):
+    """
+    Override SOLO VISUAL para el cuadro MARTINGALA REAL - CICLOS.
+    No cambia Martingala.
+    No cambia token.
+    No compra.
+    No libera sync.
+    Solo evita que el HUD siga mostrando REAL viejo después de un cierre atómico ya confirmado.
+    """
+    try:
+        c = int(ciclo or ciclo_martingala_siguiente() or 1)
+    except Exception:
+        c = 1
+    try:
+        c = max(1, min(int(MAX_CICLOS), c))
+    except Exception:
+        c = max(1, min(5, c))
+    try:
+        MARTI_HUD_FORCE_DEMO.update({
+            "active": True,
+            "ts": time.time(),
+            "bot": bot,
+            "ciclo": c,
+            "resultado": str(resultado or ""),
+            "reason": str(reason or "real_close"),
+        })
+    except Exception:
+        pass
+
+def _marti_hud_force_demo_get():
+    """
+    Devuelve el ciclo visual forzado si es seguro usarlo.
+    Solo aplica cuando REAL ya NO está activo de verdad.
+    """
+    try:
+        data = MARTI_HUD_FORCE_DEMO if isinstance(MARTI_HUD_FORCE_DEMO, dict) else {}
+        if not bool(data.get("active", False)):
+            return None
+        age = time.time() - float(data.get("ts", 0.0) or 0.0)
+        if age < 0 or age > 12.0:
+            return None
+        try:
+            pending_on, pending_bot, pending = _hay_real_close_pending_activo()
+            if pending_on:
+                return None
+        except Exception:
+            return None
+        try:
+            if "_real_close_incident_active" in globals() and _real_close_incident_active():
+                return None
+        except Exception:
+            return None
+        try:
+            owner_file = leer_token_archivo_raw()
+            if owner_file in BOT_NAMES:
+                return None
+        except Exception:
+            pass
+        try:
+            if REAL_OWNER_LOCK in BOT_NAMES:
+                return None
+        except Exception:
+            pass
+        c = int(data.get("ciclo", 1) or 1)
+        c = max(1, min(int(MAX_CICLOS), c))
+        return {
+            "bot": data.get("bot"),
+            "ciclo": c,
+            "resultado": data.get("resultado"),
+            "reason": data.get("reason"),
+            "age": age,
+        }
+    except Exception:
+        return None
+
+def _marti_hud_force_demo_clear(reason="clear"):
+    try:
+        MARTI_HUD_FORCE_DEMO.update({
+            "active": False,
+            "ts": 0.0,
+            "bot": None,
+            "ciclo": 1,
+            "resultado": None,
+            "reason": str(reason or "clear"),
+        })
+    except Exception:
+        pass
 _MATRIZ_STRICT_MODE_ANNOUNCED = False
 _FOLLOWUP_5V1X_EVENT_TS = {}
 _FOLLOWUP_5V1X_LAST_APPLIED = {}
@@ -5905,6 +6000,26 @@ def render_cuadro_martingala_visible():
         bot_real = owner if real_on and str(owner or "").strip() else "--"
         estado_txt = "REAL ACTIVO | DEMO GLOBAL EN HOLD" if real_on else "DEMO | ESPERANDO SEÑAL"
         try:
+            force_demo = _marti_hud_force_demo_get()
+        except Exception:
+            force_demo = None
+        if force_demo:
+            try:
+                forced_cycle = int(force_demo.get("ciclo", ciclo_martingala_siguiente() or 1) or 1)
+            except Exception:
+                forced_cycle = int(ciclo_martingala_siguiente() or 1)
+            try:
+                forced_cycle = max(1, min(int(MAX_CICLOS), forced_cycle))
+            except Exception:
+                forced_cycle = max(1, min(5, forced_cycle))
+            real_on = False
+            owner = ""
+            bot_real = "--"
+            estado_txt = "DEMO | ESPERANDO SEÑAL"
+            ciclo_act = forced_cycle
+            prox = forced_cycle
+            highlight_cycle = forced_cycle
+        try:
             hud_snap = globals().get("HUD_MARTI_REAL_SNAPSHOT", {}) or {}
             snap_age = time.time() - float(hud_snap.get("ts", 0) or 0)
             token_raw = str(leer_token_archivo_raw() or "").strip().upper()
@@ -5917,7 +6032,7 @@ def render_cuadro_martingala_visible():
         except Exception:
             pass
         is_final_loss = bool(str(snap.get("estado", "")).upper() == "FIN_C5")
-        highlight_cycle = prox if not real_on else ciclo_act
+        highlight_cycle = locals().get("highlight_cycle", (prox if not real_on else ciclo_act))
 
         def _clr(name, default=""):
             return globals().get(name, default)
@@ -15358,6 +15473,10 @@ def activar_real_inmediato(bot: str, ciclo: int, origen: str = "orden_real") -> 
 
         # Confirmación en memoria SOLO tras persistencia correcta
         REAL_OWNER_LOCK = bot
+        try:
+            _marti_hud_force_demo_clear("nueva_real_activada")
+        except Exception:
+            pass
 
         # 2) Estado interno inmediato (HUD)
         _set_ui_token_holder(bot)
@@ -21788,6 +21907,15 @@ def cerrar_por_fin_de_ciclo(bot: str, reason: str, ciclo_visual_siguiente: int |
         agregar_evento(f"🔓 Cuenta REAL liberada para {bot.upper()} ({reason})")
     except Exception:
         pass
+    try:
+        _marti_hud_force_demo_set(
+            bot=bot,
+            ciclo=ciclo_vis,
+            resultado=None,
+            reason=f"cerrar_por_fin_de_ciclo:{reason}",
+        )
+    except Exception:
+        pass
 
     return True
 
@@ -23122,56 +23250,6 @@ def _reconciliar_cierre_real_antes_de_nueva_orden(motivo="pre_emit"):
 
     return changed
 
-def consumir_real_close_events_inmediatos():
-    global REAL_OWNER_LOCK
-    processed = globals().setdefault("REAL_CLOSE_EVENT_PROCESSED", set())
-    for bot in BOT_NAMES:
-        path = f"real_close_event_{bot}.json"
-        data = _sync_round_safe_read_json(path) if os.path.exists(path) else None
-        if not isinstance(data, dict) or str(data.get("modo", "")).upper() != "REAL":
-            continue
-        try:
-            ts = float(data.get("ts", 0) or 0)
-        except Exception:
-            ts = 0
-        if ts <= 0 or (time.time() - ts) > 30:
-            continue
-        contract_id = str(data.get("contract_id") or "")
-        resultado = str(data.get("resultado") or "").upper().strip().replace("PERDIDA", "PÉRDIDA")
-        ciclo = _safe_int_cycle(data.get("ciclo"), None)
-        sig = f"{bot}|{contract_id}|{resultado}|C{ciclo}|{int(ts)}"
-        if sig in processed or resultado not in ("GANANCIA", "PÉRDIDA", "INDEFINIDO"):
-            continue
-        if ciclo is None or ciclo < 1 or ciclo > MAX_CICLOS:
-            continue
-        pending = REAL_CLOSE_PENDING.get(bot) if isinstance(REAL_CLOSE_PENDING, dict) else None
-        pending_ok = isinstance(pending, dict) and bool(pending.get("active", False)) and _safe_int_cycle(pending.get("ciclo"), None) == ciclo
-        if not pending_ok and REAL_OWNER_LOCK != bot:
-            continue
-        processed.add(sig)
-        try:
-            LAST_REAL_CLOSE_SIG[bot] = sig
-            REAL_CLOSE_PROCESSED_SIG[bot] = sig
-        except Exception:
-            pass
-        if resultado == "INDEFINIDO":
-            continue
-        registrar_resultado_real(resultado, bot=bot, ciclo_operado=ciclo)
-        actualizar_hud_martingala_snapshot(bot=bot, ciclo_operado=ciclo, resultado=resultado, source=str(data.get("source") or "real_close_event"))
-        try:
-            REAL_OWNER_LOCK = None
-            write_token_atomic(TOKEN_FILE, "REAL:none")
-        except Exception:
-            pass
-        try:
-            if bot in estado_bots:
-                estado_bots[bot]["token"] = "DEMO"
-                estado_bots[bot]["trigger_real"] = False
-                estado_bots[bot]["modo_real_anunciado"] = False
-            limpiar_orden_real(bot, reason="real_close_event_consumed")
-        except Exception:
-            pass
-    return True
 
 def construir_Xy_incremental(
     df: pd.DataFrame,
@@ -28398,14 +28476,6 @@ def mostrar_panel():
                 watchdog_real_order_expired_no_buy()
             except Exception:
                 pass
-            try:
-                consumir_real_close_events_inmediatos()
-            except Exception as e:
-                try:
-                    agregar_evento(f"⚠️ consumir_real_close_events_inmediatos fallo: {e}")
-                except Exception:
-                    pass
-
             for _ml in render_cuadro_martingala_visible():
                 print(_ml)
             if not bool(globals().get("HUD_MARTI_CLEAN_LAYOUT", True)):
@@ -36265,33 +36335,3 @@ def _selftest_lxv_zone_hard_block():
 if str(os.getenv("RUN_LXV_ZONE_HARD_BLOCK_SELFTEST", "0")).strip() == "1":
     _selftest_lxv_zone_hard_block()
 
-def _selftest_real_close_event_immediate_hud():
-    bot = "fulll45"
-    globals()["REAL_OWNER_LOCK"] = bot
-    globals()["REAL_CLOSE_PENDING"] = {b: None for b in BOT_NAMES}
-    globals()["REAL_CLOSE_PENDING"][bot] = {"active": True, "bot": bot, "ciclo": 1, "ts": time.time()}
-    globals()["marti_ciclos_perdidos"] = 0
-    globals()["marti_paso"] = 0
-    write_token_atomic(TOKEN_FILE, f"REAL:{bot}")
-    _sync_round_write_json_atomic(f"real_close_event_{bot}.json", {"modo": "REAL", "ciclo": 1, "resultado": "PÉRDIDA", "contract_id": "t1", "ts": time.time(), "source": "selftest"})
-    consumir_real_close_events_inmediatos()
-    assert REAL_OWNER_LOCK is None and int(ciclo_martingala_siguiente()) == 2
-    _sync_round_write_json_atomic(f"real_close_event_{bot}.json", {"modo": "REAL", "ciclo": 3, "resultado": "GANANCIA", "contract_id": "t2", "ts": time.time(), "source": "selftest"})
-    globals()["REAL_OWNER_LOCK"] = bot
-    consumir_real_close_events_inmediatos()
-    assert int(ciclo_martingala_siguiente()) == 1
-    before = int(marti_paso)
-    _sync_round_write_json_atomic(f"real_close_event_{bot}.json", {"modo": "REAL", "ciclo": 2, "resultado": "INDEFINIDO", "contract_id": "t3", "ts": time.time(), "source": "selftest"})
-    globals()["REAL_OWNER_LOCK"] = bot
-    consumir_real_close_events_inmediatos()
-    assert int(marti_paso) == before
-    _sync_round_write_json_atomic(f"real_close_event_{bot}.json", {"modo": "REAL", "ciclo": 1, "resultado": "PÉRDIDA", "contract_id": "old", "ts": time.time()-31, "source": "selftest"})
-    globals()["REAL_OWNER_LOCK"] = bot
-    before2 = int(marti_paso)
-    consumir_real_close_events_inmediatos()
-    assert int(marti_paso) == before2
-    print("✅ RUN_REAL_CLOSE_EVENT_IMMEDIATE_HUD_SELFTEST OK")
-    raise SystemExit(0)
-
-if str(os.getenv("RUN_REAL_CLOSE_EVENT_IMMEDIATE_HUD_SELFTEST", "0")).strip() == "1":
-    _selftest_real_close_event_immediate_hud()
